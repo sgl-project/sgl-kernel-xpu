@@ -228,12 +228,15 @@ class NormConfig {
         semaphores_ptr(nullptr),
         scratchpad_ptr(nullptr),
         sub_group_num_global(1) {
-    // Cache the device properties only; the cap depends on row width and batch, so it is per call.
+    // Cache the device properties per device; the cap depends on row width and batch, so it is per call.
+    // Keyed on the current device because that is whose queue the kernel is submitted to.
+    static thread_local DeviceId cached_device = -1;
     static thread_local int cached_device_max_wg = 0;
     static thread_local int cached_total_resource = 0;
     static thread_local int cached_wide_rows_per_wave = 0;
-    if (cached_device_max_wg == 0) {
-      auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
+    const DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue();
+    if (dev_id != cached_device) {
+      cached_device = dev_id;
       cached_device_max_wg = static_cast<int>(dpcppMaxWorkGroupSize(dev_id));
       cached_wide_rows_per_wave = wide_rows_per_wave(dev_id);
       cached_total_resource = static_cast<int>(dpcppMaxWorkItemsPerTile(dev_id)) /

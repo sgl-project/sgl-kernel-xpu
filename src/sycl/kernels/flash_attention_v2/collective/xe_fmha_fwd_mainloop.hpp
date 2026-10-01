@@ -526,14 +526,17 @@ struct FMHAFwdMainloop<
     auto prefetch_k = make_block_2d_prefetch(copy_k);
     auto prefetch_v = make_block_2d_prefetch(copy_v);
     auto prefetch_k_cache = make_block_2d_prefetch(copy_k_cache);
-    auto prefetch_v_cache = make_block_2d_prefetch(copy_v_cache);
+    // Every subgroup consumes the same V tile, so spread one prefetch of the
+    // whole (v,k) tile across the work-group instead of having each subgroup
+    // prefetch it (VTiles times) through its own copy layout.
+    auto prefetch_v_cache = make_block_2d_prefetch<SGPerWG::value>(tile_shape_v, V_cache_2D);
 
     /* Partition global tensors for prefetch */
     auto pQgQ = prefetch_q.get_slice(thr_id).partition_S(gQ);
     auto pKgK = prefetch_k.get_slice(thr_id).partition_S(gK);
     auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV_split);
     auto pKgK_cache = prefetch_k_cache.get_slice(thr_id).partition_S(gK_cache);
-    auto pVgV_cache = prefetch_v_cache.get_slice(thr_id).partition_S(gV_cache_split);
+    auto pVgV_cache = prefetch_v_cache.get_slice(thr_id).partition_S(gV_cache);
 
     // ------
     // Kernel
@@ -634,6 +637,13 @@ struct FMHAFwdMainloop<
         }
       }
 
+      /* V prefetch for GEMM 2, issued ahead of GEMM 1 so the tile has the
+         whole QK phase and the softmax to land. ScoreBlock2D only knows
+         next_page_idx after GEMM 1 and keeps the later placement below. */
+      if constexpr (!ScoreBlock2D) {
+        prefetch(prefetch_v_cache, pVgV_cache(_, _, _, page_idx));
+      }
+
       if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
         /* GEMM 1: S = K * Q */
         clear(tSrS);
@@ -667,6 +677,26 @@ struct FMHAFwdMainloop<
         }
       }
 
+      /* K prefetch for the next iteration's GEMM 1, issued here rather than
+         after GEMM 2 so the softmax and GEMM 2 cover the fetch. */
+      if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
+        if (ScoreBlock2D || K + 1 < k_end) {
+          const int nPf = size<4>(pKgK);
+          const bool rev = ZigzagD && ((K + 1) & 1);
+          const int pf_skew = (DSkew > 0) ? (int(thr_id / intel::sg_size) * DSkew) % nPf : 0;
+          for (int Di = 0; Di < nPf; Di++) {
+            int D = rev ? (nPf - 1 - Di) : Di;
+            if constexpr (DSkew > 0) {
+              D += pf_skew;
+              if (D >= nPf) {
+                D -= nPf;
+              }
+            }
+            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
+          }
+        }
+      }
+
       if constexpr (ScoreBlock2D && StaticScoreMode == 1) {
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
         if (score_pf_dist > 0) {
@@ -677,14 +707,13 @@ struct FMHAFwdMainloop<
 #endif
       }
 
-      /* V prefetch for GEMM 2 */
-      int v_pf_idx = page_idx;
-      if constexpr (VPfNext) {
-        v_pf_idx = next_page_idx;
-      }
-      CUTLASS_PRAGMA_UNROLL
-      for (int VV = 0; VV < VTiles; VV++) {
-        prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, v_pf_idx));
+      if constexpr (ScoreBlock2D) {
+        /* V prefetch for GEMM 2 */
+        int v_pf_idx = page_idx;
+        if constexpr (VPfNext) {
+          v_pf_idx = next_page_idx;
+        }
+        prefetch(prefetch_v_cache, pVgV_cache(_, _, _, v_pf_idx));
       }
 
       /* Causal masking */
@@ -825,25 +854,6 @@ struct FMHAFwdMainloop<
           }
         }
         cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
-      }
-
-      /* K prefetch */
-      if constexpr (!(ScoreBlock2D && StaticScoreMode == 1)) {
-        if (ScoreBlock2D || K + 1 < k_end) {
-          const int nPf = size<4>(pKgK);
-          const bool rev = ZigzagD && ((K + 1) & 1);
-          const int pf_skew = (DSkew > 0) ? (int(thr_id / intel::sg_size) * DSkew) % nPf : 0;
-          for (int Di = 0; Di < nPf; Di++) {
-            int D = rev ? (nPf - 1 - Di) : Di;
-            if constexpr (DSkew > 0) {
-              D += pf_skew;
-              if (D >= nPf) {
-                D -= nPf;
-              }
-            }
-            prefetch(prefetch_k_cache, pKgK_cache(_, _, _, next_page_idx, D));
-          }
-        }
       }
 
       if constexpr (!SkipSplitBarrier) {

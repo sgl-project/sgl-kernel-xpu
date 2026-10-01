@@ -15,20 +15,6 @@ const char* elem_sycl_type(bool is_fp16) {
   return is_fp16 ? "sycl::half" : "sycl::ext::oneapi::bfloat16";
 }
 
-// The MLA *.cpp.in templates are arch-parameterized the same way the AOT
-// generators are: @ARCH_TAG@ picks the sycl/kernels/mla{,_sparse}/<arch> device
-// stack and @SYCL_TARGET@ pins SYCL_INTEL_TARGET (which is what cutlass-sycl
-// reads to select Xe2 vs Xe3P atoms/vISA). AOT gets both from CMake; the JIT
-// path must supply them from the runtime-classified arch, because
-// render_template() leaves an unknown @TOKEN@ in the source verbatim and the
-// on-demand compile would then fail.
-const char* arch_tag(int arch) {
-  return arch == static_cast<int>(jit::Arch::XE3P) ? "xe35" : "xe20";
-}
-const char* arch_sycl_target(int arch) {
-  return arch == static_cast<int>(jit::Arch::XE3P) ? "35" : "20";
-}
-
 // Shared config validation for all MLA JIT resolves.
 bool check_config(const char* op_label, std::string* err) {
   const jit::JitConfig& cfg = jit::default_config();
@@ -66,8 +52,6 @@ DecodeFn resolve_decode(bool is_fp16, int page_size, int arch, std::string* err)
     spec.subs["ELEM_TAG"] = elem_tag(is_fp16);
     spec.subs["ELEM_SYCL_TYPE"] = elem_sycl_type(is_fp16);
     spec.subs["PAGE_SIZE"] = std::to_string(page_size);
-    spec.subs["ARCH_TAG"] = arch_tag(arch);
-    spec.subs["SYCL_TARGET"] = arch_sycl_target(arch);
     const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
     spec.extra_flags = as.extra_flags;
     spec.target = as.target;
@@ -136,8 +120,6 @@ PrefillFn resolve_prefill(bool is_fp16, int page_size, int arch, std::string* er
     spec.subs["ELEM_TAG"] = elem_tag(is_fp16);
     spec.subs["ELEM_SYCL_TYPE"] = elem_sycl_type(is_fp16);
     spec.subs["PAGE_SIZE"] = std::to_string(page_size);
-    spec.subs["ARCH_TAG"] = arch_tag(arch);
-    spec.subs["SYCL_TARGET"] = arch_sycl_target(arch);
     const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
     spec.extra_flags = as.extra_flags;
     spec.target = as.target;
@@ -243,8 +225,6 @@ void* resolve_sparse(
   spec.subs["D_QK"] = std::to_string(d_qk);
   spec.subs["B_H"] = std::to_string(b_h);
   spec.subs["HAS_ATTN_SINK"] = sink ? "1" : "0";
-  spec.subs["ARCH_TAG"] = arch_tag(arch);
-  spec.subs["SYCL_TARGET"] = arch_sycl_target(arch);
   const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
   spec.extra_flags = as.extra_flags;
   spec.target = as.target;

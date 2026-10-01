@@ -176,5 +176,212 @@ def test_flash_mla_decode(
     del workspace, seq_lens_xpu
 
 
+# --------------------------------------------------------------------------- #
+# Multi-token decode: s_q in {2, 4, 8, 16} query tokens per request (MTP /
+# speculative decode). q is 4D (bs, s_q, num_heads, dim); the s_q tokens are the
+# last s_q positions of the sequence and are causally masked among themselves.
+# --------------------------------------------------------------------------- #
+
+
+def ref_mla_multi_token(
+    query: Tensor,  # (bs, s_q, num_heads, head_dim)
+    kv_cache: Tensor,  # (num_blocks, block_size, head_dim)
+    scale: float,
+    block_tables: Tensor,  # (bs, max_num_blocks)
+    seq_lens: Tensor,  # (bs,), includes the s_q new tokens
+    dv: int,
+):
+    """Causal multi-token decode reference.
+
+    Token t of request i attends to KV positions [0, seq_lens[i] - s_q + t].
+    Returns out (bs, s_q, num_heads, dv) fp32 and lse (bs, s_q, num_heads) fp32
+    in the log2 domain, matching the kernel.
+    """
+    bs, s_q, num_heads, head_dim = query.shape
+    out = torch.empty(bs, s_q, num_heads, dv, dtype=torch.float32)
+    lse = torch.empty(bs, s_q, num_heads, dtype=torch.float32)
+    for i in range(bs):
+        seq_len = int(seq_lens[i])
+        kv = kv_cache[block_tables[i]].view(-1, head_dim)[:seq_len].float()
+        v = kv[:, :dv]
+
+        # (s_q, num_heads, head_dim) x (seq_len, head_dim) -> (s_q, num_heads, seq_len)
+        scores = torch.einsum("shd,kd->shk", query[i].float(), kv) * scale
+        q_pos = torch.arange(s_q).view(s_q, 1, 1)
+        k_pos = torch.arange(seq_len).view(1, 1, seq_len)
+        scores = scores.masked_fill(k_pos > (seq_len - s_q) + q_pos, float("-inf"))
+
+        out[i] = scores.softmax(dim=-1) @ v
+        lse[i] = torch.logsumexp(scores, dim=-1) / math.log(2)
+    return out, lse
+
+
+def _make_decode_inputs(bs, s_q, h_q, d, mean_seq_len, varlen, block_size, dtype):
+    if varlen:
+        seq_lens = torch.empty(bs, dtype=torch.float32).normal_(
+            mean_seq_len, mean_seq_len / 2
+        )
+        # Every sequence must hold at least its s_q new tokens.
+        seq_lens = seq_lens.clip(min=max(2, s_q)).to(torch.int32)
+    else:
+        seq_lens = torch.full((bs,), max(mean_seq_len, s_q), dtype=torch.int32)
+    max_seq_len = seq_lens.max().item()
+    block_num = (max_seq_len + block_size - 1) // block_size
+    pack_factor = 128 // block_size
+    block_num = ((block_num + pack_factor - 1) // pack_factor) * pack_factor
+
+    q = torch.randn(bs, s_q, h_q, d, dtype=dtype) * 100
+    block_table = torch.randint(0, bs * block_num, (bs, block_num), dtype=torch.int32)
+    kv_cache = torch.randn(block_table.numel(), block_size, d, dtype=dtype)
+    return q, kv_cache, block_table, seq_lens, block_num
+
+
+@pytest.mark.arch("xe20", "xe35")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("s_q", [2, 4, 8, 16])
+# 20 is shorter than one 128-wide split, so num_kv_splits=4 leaves empty splits,
+# and with s_q=16 the causal boundary falls inside the only (partial) KV tile.
+@pytest.mark.parametrize("mean_seq_len", [20, 1024])
+@pytest.mark.parametrize("bs", [1, 3])
+@pytest.mark.parametrize("varlen", [True, False])
+# 16: one subgroup along KV; 64/128: sub-page KV tiles for s_q >= 8 / >= 4.
+@pytest.mark.parametrize("block_size", [16, 64, 128])
+@pytest.mark.parametrize("num_heads", [16, 128])
+@pytest.mark.parametrize("num_kv_splits", [-1, 1, 4])
+def test_flash_mla_decode_multi_token(
+    dtype: torch.dtype,
+    s_q: int,
+    mean_seq_len: int,
+    bs: int,
+    varlen: bool,
+    block_size: int,
+    num_heads: int,
+    num_kv_splits: int,
+):
+    torch.random.manual_seed(42)
+
+    dv, q_pe_dim = 512, 64
+    d = dv + q_pe_dim
+    scale = d ** (-0.5)
+
+    q, kv_cache, block_table, seq_lens, block_num = _make_decode_inputs(
+        bs, s_q, num_heads, d, mean_seq_len, varlen, block_size, dtype
+    )
+    out_ref, lse_ref = ref_mla_multi_token(
+        q, kv_cache, scale, block_table, seq_lens, dv
+    )
+
+    workspace_size = flash_mla_decode_get_workspace_size(
+        block_num * block_size,
+        bs,
+        num_heads,
+        block_size,
+        num_kv_splits=num_kv_splits,
+        seq_len_q=s_q,
+    )
+    workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
+
+    q_xpu = q.to(device)
+    out, lse = flash_mla_decode(
+        q_xpu[..., :dv].contiguous(),
+        q_xpu[..., dv:].contiguous(),
+        kv_cache.to(device),
+        seq_lens.to(device),
+        block_table.to(device),
+        workspace,
+        scale,
+        num_kv_splits,
+        return_lse=True,
+    )
+    torch.xpu.synchronize()
+
+    assert out.shape == (bs, s_q, num_heads, dv)
+    assert lse.shape == (bs, s_q, num_heads)
+    assert lse.dtype == torch.float32
+    atol, rtol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
+    torch.testing.assert_close(out_ref, out.cpu().float(), atol=atol, rtol=rtol)
+    lse_atol, lse_rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
+    torch.testing.assert_close(lse_ref, lse.cpu(), atol=lse_atol, rtol=lse_rtol)
+
+    del out, lse, out_ref, lse_ref, q, q_xpu, kv_cache, block_table, workspace
+
+
+@pytest.mark.arch("xe20", "xe35")
+@pytest.mark.parametrize("num_kv_splits", [-1, 1, 4])
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_flash_mla_decode_4d_s_q_1_matches_3d(num_kv_splits: int, block_size: int):
+    """(bs, 1, H, D) must give exactly the (bs, H, D) result: same kernel, no causal mask."""
+    torch.random.manual_seed(0)
+    bs, num_heads, dv, q_pe_dim = 2, 32, 512, 64
+    d = dv + q_pe_dim
+    scale = d ** (-0.5)
+
+    q, kv_cache, block_table, seq_lens, block_num = _make_decode_inputs(
+        bs, 1, num_heads, d, 512, True, block_size, torch.bfloat16
+    )
+    workspace_size = flash_mla_decode_get_workspace_size(
+        block_num * block_size, bs, num_heads, block_size, num_kv_splits=num_kv_splits
+    )
+    workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
+    q_xpu = q.to(device)
+    args = (
+        kv_cache.to(device),
+        seq_lens.to(device),
+        block_table.to(device),
+        workspace,
+        scale,
+        num_kv_splits,
+    )
+
+    out_4d, lse_4d = flash_mla_decode(
+        q_xpu[..., :dv].contiguous(),
+        q_xpu[..., dv:].contiguous(),
+        *args,
+        return_lse=True,
+    )
+    out_3d, lse_3d = flash_mla_decode(
+        q_xpu[:, 0, :, :dv].contiguous(),
+        q_xpu[:, 0, :, dv:].contiguous(),
+        *args,
+        return_lse=True,
+    )
+    torch.xpu.synchronize()
+
+    assert out_4d.shape == (bs, 1, num_heads, dv)
+    assert lse_4d.shape == (bs, 1, num_heads)
+    torch.testing.assert_close(out_4d[:, 0], out_3d, atol=0, rtol=0)
+    torch.testing.assert_close(lse_4d[:, 0], lse_3d, atol=0, rtol=0)
+
+
+@pytest.mark.arch("xe20", "xe35")
+def test_flash_mla_decode_workspace_scales_with_s_q():
+    args = (4096, 4, 128, 64)
+    ws_1 = flash_mla_decode_get_workspace_size(*args, num_kv_splits=8)
+    ws_8 = flash_mla_decode_get_workspace_size(*args, num_kv_splits=8, seq_len_q=8)
+    assert ws_1 > 0
+    # Each of the three sub-buffers is padded to 256 B, so allow that slack.
+    assert ws_8 >= 8 * ws_1 - 8 * 3 * 256
+    assert ws_8 <= 8 * ws_1 + 3 * 256
+
+
+@pytest.mark.arch("xe20", "xe35")
+def test_flash_mla_decode_rejects_unsupported_s_q():
+    bs, s_q, num_heads, dv, q_pe_dim, block_size = 1, 3, 16, 512, 64, 64
+    q_nope = torch.randn(bs, s_q, num_heads, dv, dtype=torch.bfloat16, device=device)
+    q_pe = torch.randn(
+        bs, s_q, num_heads, q_pe_dim, dtype=torch.bfloat16, device=device
+    )
+    kv_cache = torch.randn(
+        2, block_size, dv + q_pe_dim, dtype=torch.bfloat16, device=device
+    )
+    seq_lens = torch.full((bs,), 64, dtype=torch.int32, device=device)
+    block_table = torch.zeros(bs, 2, dtype=torch.int32, device=device)
+    workspace = torch.empty(0, dtype=torch.uint8, device=device)
+    with pytest.raises(AssertionError, match="s_q must be"):
+        flash_mla_decode(
+            q_nope, q_pe, kv_cache, seq_lens, block_table, workspace, 1.0, 1
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

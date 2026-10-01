@@ -50,9 +50,12 @@ struct SplitKVWorkspaceLayout {
   size_t max_logits_offset;
   size_t total_bytes;
 
-  SplitKVWorkspaceLayout(int batch, int num_heads, int num_splits, int head_size_o, size_t elem_o_size) {
-    size_t o_accum_bytes = size_t(batch) * num_heads * num_splits * head_size_o * elem_o_size;
-    size_t lse_bytes = size_t(batch) * num_heads * num_splits * sizeof(float);
+  // Layouts are [seq_len_q][batch][head][split][...]; seq_len_q > 1 is the
+  // multi-token (MTP / speculative) decode path.
+  SplitKVWorkspaceLayout(
+      int batch, int num_heads, int num_splits, int head_size_o, size_t elem_o_size, int seq_len_q = 1) {
+    size_t o_accum_bytes = size_t(seq_len_q) * batch * num_heads * num_splits * head_size_o * elem_o_size;
+    size_t lse_bytes = size_t(seq_len_q) * batch * num_heads * num_splits * sizeof(float);
 
     size_t o_accum_aligned = (o_accum_bytes + 255) & ~size_t(255);
     size_t lse_aligned = (lse_bytes + 255) & ~size_t(255);
@@ -245,8 +248,8 @@ class XeMlaFwdKernel {
 
       // --- Varlen Q handling (prefill only) ---
       // For prefill, Q/O are ragged 3D (total_q, heads, dim) and cu_seqlens_q
-      // gives per-batch Q starts. For decode, Q is fixed-shape (seq_len_qo == 1)
-      // and cu_seqlens_q is always nullptr — gating on IsPrefill lets the
+      // gives per-batch Q starts. For decode, Q is fixed-shape (seq_len_qo ==
+      // Q_TILE_M, one tile) and cu_seqlens_q is always nullptr — gating on IsPrefill lets the
       // compiler skip the runtime branch + offset arithmetic + per-WG continue
       // check entirely on the decode path. At high WG counts (bs=16, long seq)
       // the per-WG-dispatch overhead from these dead branches is measurable.
@@ -329,23 +332,27 @@ class XeMlaFwdKernel {
       Tensor K_pe = make_tensor(make_gmem_ptr(dcK_pe), make_layout(shape_K_pe, p.dK_pe));  // (k,d,h,page)
       Tensor V = make_tensor(make_gmem_ptr(dcK), make_layout(shape_V, p.dV));
 
-      // For causal prefill: limit K loop with causal offset.
+      // For causal attention: limit K loop with causal offset.
       // causal_offset = seqlen_k - seqlen_q; mask: k_idx <= causal_offset + q_idx
-      // For decode (CausalMask=false): blk_k1 stays at total_blk.
+      // Prefill is always causal. Decode is causal only for seq_len_qo > 1 (the
+      // s_q query tokens are the last s_q positions of the sequence); its single
+      // Q tile then spans all of them and blk_k1 folds to total_blk.
+      // For single-token decode (CausalMask=false): blk_k1 stays at total_blk.
       int blk_k1 = total_blk;
       int causal_offset = 0;
       if constexpr (CollectiveMainloop::CausalMask) {
         causal_offset = seq_len_kv - seqlen_q_i;
-        int causal_blk_k1 =
-            cute::ceil_div(causal_offset + (blk_q + 1) * static_cast<int>(get<0>(TileShapeQK{})), page_size);
+        int causal_blk_k1 = cute::ceil_div(
+            causal_offset + (blk_q + 1) * static_cast<int>(get<0>(TileShapeQK{})),
+            static_cast<int>(get<1>(TileShapeQK{})));
         blk_k1 = cute::min(total_blk, causal_blk_k1);
       }
 
       // Valid Q rows in this tile; < QK_BLK_M only on the last partial tile.
-      // Decode (Q_TILE_M=1, blk_q=0, seqlen_q_i=1) folds to constexpr 1 — the
-      // mainloop's `if constexpr (QK_BLK_M > 1)` mask block is then dead and
-      // q_valid_rows is unused, but compiling the min/sub still has measurable
-      // cost at high WG count. Gate to skip it entirely on the decode path.
+      // Decode (Q_TILE_M == seq_len_qo, blk_q=0) always has a full tile, so
+      // this folds to the constexpr tile height — the mainloop's partial-tile
+      // mask is then skipped at runtime (or dead for Q_TILE_M=1). Compiling the
+      // min/sub still has measurable cost at high WG count; gate it to prefill.
       constexpr int Q_TILE_M_C = static_cast<int>(get<0>(TileShapeQK{}));
       int q_valid_rows = Q_TILE_M_C;
       if constexpr (CollectiveMainloop::IsPrefill) {
@@ -529,7 +536,7 @@ class XeMlaSplitKVKernel {
       assert(false && "non Split-K workspace size is calculated in different path");
     }
     auto const& s = args.kernel.shape;
-    SplitKVWorkspaceLayout ws(s.batch, s.num_heads_q, splits, s.head_size_o, sizeof(ElementO));
+    SplitKVWorkspaceLayout ws(s.batch, s.num_heads_q, splits, s.head_size_o, sizeof(ElementO), s.seq_len_qo);
     return ws.total_bytes;
   }
 
@@ -581,10 +588,11 @@ class XeMlaSplitKVKernel {
       // Empty split: write zero-contribution sentinels and skip.
       // exp_sums=0 gates any garbage in O_accum for this split.
       // max_logits=lowest() ensures empty splits don't pollute global_max.
+      // One lane per query row (seq_len_qo <= 16 <= WG size).
       if (start_blk >= total_blk) {
-        if (thr_id == 0) {
-          gExpSums(0, idx_kv_split, head_coord, batch_coord) = ElementAcc(0);
-          gMaxLogits(0, idx_kv_split, head_coord, batch_coord) = std::numeric_limits<ElementAcc>::lowest();
+        if (thr_id < s.seq_len_qo) {
+          gExpSums(thr_id, idx_kv_split, head_coord, batch_coord) = ElementAcc(0);
+          gMaxLogits(thr_id, idx_kv_split, head_coord, batch_coord) = std::numeric_limits<ElementAcc>::lowest();
         }
         continue;
       }
@@ -618,6 +626,15 @@ class XeMlaSplitKVKernel {
       Tensor K_pe = make_tensor(make_gmem_ptr(dcK_pe), make_layout(shape_K_pe, p.dK_pe));
       Tensor V = make_tensor(make_gmem_ptr(dcK), make_layout(shape_V, p.dV));
 
+      // Multi-token decode (seq_len_qo > 1) is causal among the s_q new tokens:
+      // query row q attends to k <= causal_offset + q. The single Q tile holds
+      // all s_q rows, so the causal K bound equals total_blk and the split's
+      // [start_blk, end_blk) range needs no further clamp.
+      int causal_offset = 0;
+      if constexpr (CollectiveMainloop::CausalMask) {
+        causal_offset = seq_len_kv - s.seq_len_qo;
+      }
+
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
       mainloop(
           Q_nope(_, _, head_coord, batch_coord),
@@ -634,7 +651,8 @@ class XeMlaSplitKVKernel {
           total_blk,
           thr_id,
           seq_len_kv,
-          batch_coord);
+          batch_coord,
+          causal_offset);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
@@ -653,8 +671,8 @@ class XeMlaSplitKVKernel {
           tA_sum,
           blk_qv,
           thr_id,
-          gExpSums(0, idx_kv_split, head_coord, batch_coord),
-          gMaxLogits(0, idx_kv_split, head_coord, batch_coord),
+          gExpSums(_, idx_kv_split, head_coord, batch_coord),
+          gMaxLogits(_, idx_kv_split, head_coord, batch_coord),
           num_kv_splits);
     }
   }

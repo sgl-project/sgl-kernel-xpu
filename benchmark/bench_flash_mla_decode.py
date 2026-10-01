@@ -40,7 +40,9 @@ all_results = []
         args={},
     )
 )
-def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits):
+def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits, seq_len_q=1):
+    # seq_len_q > 1 is multi-token (MTP / speculative) decode: q is 4D
+    # (batch, s_q, heads, d) and seq_len includes the s_q new tokens.
     d = 576
     dv = 512
 
@@ -67,7 +69,10 @@ def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits):
     pack_factor = 128 // block_size
     block_num = ((block_num + pack_factor - 1) // pack_factor) * pack_factor
 
-    q = torch.randn(batch_size, h_q, d, dtype=torch.bfloat16, device="xpu") * 100.0
+    q_shape = (
+        (batch_size, h_q, d) if seq_len_q == 1 else (batch_size, seq_len_q, h_q, d)
+    )
+    q = torch.randn(*q_shape, dtype=torch.bfloat16, device="xpu") * 100.0
     block_table = torch.randint(
         0,
         batch_size * block_num,
@@ -79,14 +84,22 @@ def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits):
     kv_cache = torch.randn(
         block_table.numel(), block_size, d, dtype=torch.bfloat16, device="xpu"
     )
-    q_nope = torch.empty(
-        (h_q, batch_size, dv), device="xpu", dtype=torch.bfloat16
-    ).transpose(0, 1)
-    q_nope.copy_(q[:, :, :dv])
-    q_pe = q[:, :, dv:].clone()
+    if seq_len_q == 1:
+        q_nope = torch.empty(
+            (h_q, batch_size, dv), device="xpu", dtype=torch.bfloat16
+        ).transpose(0, 1)
+        q_nope.copy_(q[:, :, :dv])
+    else:
+        q_nope = q[..., :dv].contiguous()
+    q_pe = q[..., dv:].clone()
 
     workspace_size = flash_mla_decode_get_workspace_size(
-        block_num * block_size, batch_size, h_q, block_size, num_kv_splits=num_kv_splits
+        block_num * block_size,
+        batch_size,
+        h_q,
+        block_size,
+        num_kv_splits=num_kv_splits,
+        seq_len_q=seq_len_q,
     )
     workspace = torch.empty(workspace_size, device="xpu", dtype=torch.uint8)
     scale = (512 + 64) ** (-0.5)
@@ -121,6 +134,7 @@ def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits):
         {
             "batch_size": batch_size,
             "seq_len": seq_len,
+            "seq_len_q": seq_len_q,
             "num_heads": h_q,
             "block_size": block_size,
             "num_kv_splits": num_kv_splits,
@@ -314,6 +328,14 @@ if __name__ == "__main__":
         default=[-1],
         help="List of num_kv_splits",
     )
+    parser.add_argument(
+        "--seq-len-q",
+        nargs="+",
+        type=int,
+        default=[1],
+        choices=[1, 2, 4, 8, 16],
+        help="List of query tokens per request (1 = single-token decode)",
+    )
     # How it works:
     # First run (no previous.csv): Creates current.csv and plots the current results only
     # Subsequent runs (with previous.csv): Compares against previous.csv and plots both
@@ -329,14 +351,19 @@ if __name__ == "__main__":
 
     for block_size in args.block_sizes:
         for kv_split in args.num_kv_splits:
-            print(f"Running: block_size={block_size}, num_kv_splits={kv_split}")
-            benchmark.run(
-                print_data=False,
-                show_plots=False,
-                save_path=None,  # Disable triton's plotting, we'll create custom plots
-                block_size=block_size,
-                num_kv_splits=kv_split,
-            )
+            for seq_len_q in args.seq_len_q:
+                print(
+                    f"Running: block_size={block_size}, num_kv_splits={kv_split}, "
+                    f"seq_len_q={seq_len_q}"
+                )
+                benchmark.run(
+                    print_data=False,
+                    show_plots=False,
+                    save_path=None,  # Disable triton's plotting, we'll create custom plots
+                    block_size=block_size,
+                    num_kv_splits=kv_split,
+                    seq_len_q=seq_len_q,
+                )
 
     # Print final summary table
     print("\n" + "=" * 80)

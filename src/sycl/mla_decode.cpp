@@ -105,25 +105,50 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
   return std::clamp(num_splits, 1, 128);
 }
 
-// Leaf of the dispatch ladder: ELEM and PS must be literals when pasted.
-#define DISPATCH_MLA_LAUNCH(ELEM, PS)          \
-  mla_decode::launch_mla_decode_##ELEM##_##PS( \
+// Leaf of the dispatch ladder: ELEM, PS and QT must be literals when pasted.
+#define DISPATCH_MLA_LAUNCH(ELEM, PS, QT)              \
+  mla_decode::launch_mla_decode_##ELEM##_##PS##_q##QT( \
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits)
+
+// seq_len_q (query tokens per request) selects the Q-tile instantiation. Must
+// match MLA_DECODE_Q_TILES in MlaDecodeXe{20,35}.cmake.
+#define DISPATCH_MLA_Q_TILE(ELEM, PS)                                                             \
+  do {                                                                                            \
+    switch (seq_len_q) {                                                                          \
+      case 1:                                                                                     \
+        DISPATCH_MLA_LAUNCH(ELEM, PS, 1);                                                         \
+        break;                                                                                    \
+      case 2:                                                                                     \
+        DISPATCH_MLA_LAUNCH(ELEM, PS, 2);                                                         \
+        break;                                                                                    \
+      case 4:                                                                                     \
+        DISPATCH_MLA_LAUNCH(ELEM, PS, 4);                                                         \
+        break;                                                                                    \
+      case 8:                                                                                     \
+        DISPATCH_MLA_LAUNCH(ELEM, PS, 8);                                                         \
+        break;                                                                                    \
+      case 16:                                                                                    \
+        DISPATCH_MLA_LAUNCH(ELEM, PS, 16);                                                        \
+        break;                                                                                    \
+      default:                                                                                    \
+        TORCH_CHECK(false, "MLA decode supports seq_len_q in {1, 2, 4, 8, 16}, got ", seq_len_q); \
+    }                                                                                             \
+  } while (0)
 
 #define DISPATCH_MLA_PAGE_SIZE(ELEM)                                             \
   do {                                                                           \
     switch (page_size) {                                                         \
       case 16:                                                                   \
-        DISPATCH_MLA_LAUNCH(ELEM, 16);                                           \
+        DISPATCH_MLA_Q_TILE(ELEM, 16);                                           \
         break;                                                                   \
       case 32:                                                                   \
-        DISPATCH_MLA_LAUNCH(ELEM, 32);                                           \
+        DISPATCH_MLA_Q_TILE(ELEM, 32);                                           \
         break;                                                                   \
       case 64:                                                                   \
-        DISPATCH_MLA_LAUNCH(ELEM, 64);                                           \
+        DISPATCH_MLA_Q_TILE(ELEM, 64);                                           \
         break;                                                                   \
       case 128:                                                                  \
-        DISPATCH_MLA_LAUNCH(ELEM, 128);                                          \
+        DISPATCH_MLA_Q_TILE(ELEM, 128);                                          \
         break;                                                                   \
       default:                                                                   \
         TORCH_CHECK(false, "Unsupported page size for MLA decode: ", page_size); \
@@ -147,13 +172,20 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
 
 /// @brief Dispatch kernel implementation for MLA decode.
 ///
+/// q_nope / q_pe / out / lse are either 3D (batch, num_heads, ...) for one query
+/// token per request, or 4D (batch, s_q, num_heads, ...) for s_q in
+/// {1, 2, 4, 8, 16} query tokens per request (MTP / speculative decode). With
+/// s_q > 1 the tokens are the last s_q positions of the sequence (seq_lens
+/// includes them) and are causally masked: token i attends to KV positions
+/// [0, seq_lens - s_q + i].
+///
 /// `lse` is an output taken by const ref: the bindings cannot box a non-const
 /// optional, and at::Tensor constness is shallow.
 SGL_KERNEL_EXPORT void flash_mla_decode(
-    at::Tensor& out,                        // (batch, num_heads, latent_dim)
-    const std::optional<at::Tensor>& lse,   // (batch, num_heads) fp32, log2 domain; nullopt = skip
-    const at::Tensor& q_nope,               // (batch, num_heads, latent_dim)
-    const at::Tensor& q_pe,                 // (batch, num_heads, rope_dim)
+    at::Tensor& out,                        // (batch, [s_q,] num_heads, latent_dim)
+    const std::optional<at::Tensor>& lse,   // (batch, [s_q,] num_heads) fp32, log2 domain; nullopt = skip
+    const at::Tensor& q_nope,               // (batch, [s_q,] num_heads, latent_dim)
+    const at::Tensor& q_pe,                 // (batch, [s_q,] num_heads, rope_dim)
     const at::Tensor& kv_c_and_k_pe_cache,  // (total_no_of_pages, page_size, (latent_dim + rope_dim))
     const at::Tensor& seq_lens,             // (batch_size,)
     const at::Tensor& page_table,           // (batch_size, max_num_pages_per_seq)
@@ -182,36 +214,48 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
       "Unsupported page size for MLA decode: ",
       page_size,
       ". Supported: 16, 32, 64, 128");
+
+  // 3D (batch, num_heads, dim) is single-token decode; 4D (batch, s_q, num_heads, dim)
+  // is multi-token decode with s_q query tokens per request.
+  TORCH_CHECK(
+      q_nope.dim() == 3 || q_nope.dim() == 4,
+      "q_nope must be (batch, num_heads, dim) or (batch, s_q, num_heads, dim), got ",
+      q_nope.dim(),
+      "D");
+  TORCH_CHECK(
+      q_pe.dim() == q_nope.dim() && out.dim() == q_nope.dim(), "q_pe and out must have the same rank as q_nope");
+  const int64_t seq_len_q = q_nope.dim() == 4 ? q_nope.size(1) : 1;
+  const int64_t num_heads = q_nope.size(-2);
+  TORCH_CHECK(
+      seq_len_q == 1 || seq_len_q == 2 || seq_len_q == 4 || seq_len_q == 8 || seq_len_q == 16,
+      "MLA decode supports seq_len_q in {1, 2, 4, 8, 16}, got ",
+      seq_len_q);
+  const auto row_shape = q_nope.sizes().slice(0, q_nope.dim() - 1);  // (batch, [s_q,] num_heads)
+  TORCH_CHECK(q_pe.sizes().slice(0, q_pe.dim() - 1) == row_shape, "q_pe leading dims must match q_nope");
+  TORCH_CHECK(out.sizes().slice(0, out.dim() - 1) == row_shape, "out leading dims must match q_nope");
+
   if (lse.has_value()) {
     CHECK_INPUT(lse.value());
     TORCH_CHECK(lse->scalar_type() == at::ScalarType::Float, "lse must be float32, got ", lse->scalar_type());
-    TORCH_CHECK(lse->dim() == 2, "lse must be 2D (batch, num_heads), got ", lse->dim());
     TORCH_CHECK(
-        lse->size(0) == q_nope.size(0) && lse->size(1) == q_nope.size(1),
-        "lse must be (batch, num_heads) = (",
-        q_nope.size(0),
-        ", ",
-        q_nope.size(1),
-        "), got (",
-        lse->size(0),
-        ", ",
-        lse->size(1),
-        ")");
-    TORCH_CHECK(lse->stride(1) == 1, "lse must be contiguous along num_heads");
+        lse->sizes() == row_shape, "lse must be ", row_shape, " (q_nope without its last dim), got ", lse->sizes());
+    TORCH_CHECK(lse->stride(-1) == 1, "lse must be contiguous along num_heads");
   }
 
   if (num_kv_splits < 1) {
     int page_count_per_seq = page_table.size(1);
     int max_seq_len = page_size * page_count_per_seq;
-    num_kv_splits = set_split_kv(q_nope.size(0), q_nope.size(1), max_seq_len, page_size);
+    // Heuristic tuned for single-token decode; it keys on the (batch, heads)
+    // work-group count, which is unchanged by seq_len_q.
+    num_kv_splits = set_split_kv(q_nope.size(0), num_heads, max_seq_len, page_size);
   }
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  // Decode: batch B, 1 query per row over the full kv_len; QK + PV.
-  const int64_t B = q_nope.size(0);
-  const int64_t H = q_nope.size(1);
-  const int64_t D_nope = q_nope.size(2);
-  const int64_t D_pe = q_pe.size(2);
+  // Decode: batch B, s_q queries per request over the full kv_len; QK + PV.
+  const int64_t B = q_nope.size(0) * seq_len_q;
+  const int64_t H = num_heads;
+  const int64_t D_nope = q_nope.size(-1);
+  const int64_t D_pe = q_pe.size(-1);
   const int64_t D_qk = D_nope + D_pe;
   const int64_t page_count_per_seq = page_table.size(1);
   const int64_t max_seq_len = static_cast<int64_t>(page_size) * page_count_per_seq;
@@ -235,6 +279,7 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
         sgl::mla_jit::mla_decode_launch(
             in_dtype == at::ScalarType::Half,
             page_size,
+            static_cast<int>(seq_len_q),
             &out,
             &lse,
             &q_nope,
@@ -255,15 +300,19 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
 }
 
 #undef DISPATCH_MLA_LAUNCH
+#undef DISPATCH_MLA_Q_TILE
 #undef DISPATCH_MLA_PAGE_SIZE
 #undef DISPATCH_MLA_DTYPE
 
 namespace {
+// The split-KV workspace layout does not depend on the Q tile, so the
+// single-token instantiation (QTileM=1) sizes every seq_len_q.
 template <typename MlaXeType>
-int64_t mla_workspace_size(int64_t num_batches, int64_t num_heads, int64_t num_kv_splits) {
+int64_t mla_workspace_size(int64_t num_batches, int64_t num_heads, int64_t num_kv_splits, int64_t seq_len_q) {
   typename MlaXeType::Fmla::Arguments args{};
   args.kernel.shape.batch = num_batches;
   args.kernel.shape.num_heads_q = num_heads;
+  args.kernel.shape.seq_len_qo = seq_len_q;
   args.kernel.shape.head_size_o = 512;
   args.split_kv = num_kv_splits;
   return MlaXeType::Fmla::get_workspace_size(args);
@@ -271,7 +320,13 @@ int64_t mla_workspace_size(int64_t num_batches, int64_t num_heads, int64_t num_k
 }  // namespace
 
 SGL_KERNEL_EXPORT int64_t flash_mla_decode_get_workspace_size(
-    int64_t max_seq_len, int64_t num_batches, int64_t num_heads, int64_t page_size, int64_t num_kv_splits) {
+    int64_t max_seq_len,
+    int64_t num_batches,
+    int64_t num_heads,
+    int64_t page_size,
+    int64_t num_kv_splits,
+    int64_t seq_len_q) {
+  TORCH_CHECK(seq_len_q >= 1, "seq_len_q must be >= 1, got ", seq_len_q);
   if (num_kv_splits < 1) {
     TORCH_CHECK(num_heads > 0, "num_heads must be > 0 when num_kv_splits is auto-selected");
     TORCH_CHECK(
@@ -286,16 +341,16 @@ SGL_KERNEL_EXPORT int64_t flash_mla_decode_get_workspace_size(
     switch (page_size) {
       case 16:
         return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<16>, EnabledSplitKV<true>>>(
-            num_batches, num_heads, num_kv_splits);
+            num_batches, num_heads, num_kv_splits, seq_len_q);
       case 32:
         return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<32>, EnabledSplitKV<true>>>(
-            num_batches, num_heads, num_kv_splits);
+            num_batches, num_heads, num_kv_splits, seq_len_q);
       case 64:
         return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<64>, EnabledSplitKV<true>>>(
-            num_batches, num_heads, num_kv_splits);
+            num_batches, num_heads, num_kv_splits, seq_len_q);
       case 128:
         return mla_workspace_size<MlaXe<cutlass::half_t, PageSizeOption<128>, EnabledSplitKV<true>>>(
-            num_batches, num_heads, num_kv_splits);
+            num_batches, num_heads, num_kv_splits, seq_len_q);
       default:
         TORCH_CHECK(false, "Unsupported page size: ", page_size);
         return 0;

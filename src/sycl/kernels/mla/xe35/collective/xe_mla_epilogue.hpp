@@ -198,35 +198,25 @@ class XeMlaEpilogue {
     copy(copy_o, tOrO, tOgO);
   }
 
-  /// Write the per-row log-sum-exp, in the log2 domain the softmax state already
-  /// uses: lse = rA_max + log2(rA_sum). No unmasked keys (rA_sum == 0) => -INFINITY.
-  /// Only the v == 0 column stores, so each query row is written once.
-  template <class RedFragA, class RedFragARow, class FragO, class CoordO, class CoordFull, class QVCoord>
-  CUTLASS_DEVICE void write_lse(
-      RedFragA const& rA,         // Reduced O accumulator: (q,v)
-      RedFragARow const& rA_sum,  // Reduced softmax row-wise sum
-      RedFragARow const& rA_max,  // Reduced softmax row-wise max (log2 domain)
-      FragO const& tOrO,          // Output fragment (TV-layout witness, ReduceK > 1)
-      CoordO const& tOgO,         // Output coordinates: (q,v), ReduceK > 1
-      CoordFull const& cO,        // Identity tensor over the whole O: (q,v)
-      QVCoord blk_qv,             // WG tile indices: (Q,V)
-      int thr_id,                 // Work-item ID
-      TensorLSE1D const& gLSE) {  // Global LSE: (q)
+  /// Call store(row, i) once per query row this thread owns, from the v == 0
+  /// column only, so each row is stored exactly once. `i` indexes rA, for use
+  /// with broadcast<0>(row_frag, rA, i). Rows >= num_rows (a partial Q tile's
+  /// padding) are skipped: unlike O's block store these per-row stores are not
+  /// bounds-clamped.
+  template <class RedFragA, class FragO, class CoordO, class CoordFull, class QVCoord, class StoreFn>
+  CUTLASS_DEVICE void for_each_row(
+      RedFragA const& rA,   // Reduced O accumulator: (q,v)
+      FragO const& tOrO,    // Output fragment (TV-layout witness, ReduceK > 1)
+      CoordO const& tOgO,   // Output coordinates: (q,v), ReduceK > 1
+      CoordFull const& cO,  // Identity tensor over the whole O: (q,v)
+      QVCoord blk_qv,       // WG tile indices: (Q,V)
+      int thr_id,           // Work-item ID
+      int num_rows,         // # valid query rows
+      StoreFn&& store) {    // store(int row, int i)
     using namespace cute;
 
     /* V is not split for MLA; guard against a future V-split double-writing. */
     if (int(get<1>(blk_qv)) != 0) return;
-
-    auto row_lse = rA_sum;
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < rA_sum.size(); i++) {
-      float d = float(rA_sum(i));
-      row_lse(i) = ElementA((d > 0.f) ? (float(rA_max(i)) + sycl::log2(d)) : -INFINITY);
-    }
-
-    /* Unlike O's block store these are not bounds-clamped, so a partial Q tile's
-       padding rows are skipped. */
-    int num_rows = int(size<0>(gLSE));
 
     if constexpr (ReduceK{} == _1{}) {
       /* rA is the raw PV accumulator; the MMA's partitioning of the identity tile
@@ -244,7 +234,7 @@ class XeMlaEpilogue {
         if (int(get<1>(cArA(i))) != 0) continue;
         int row = int(get<0>(cArA(i)));
         if (row >= num_rows) continue;
-        gLSE(row) = static_cast<ElementLSE>(broadcast<0>(row_lse, rA, i));
+        store(row, i);
       }
     } else {
       /* rA is the SLM-reduced fragment, remapped by reduce_A(); tOgO carries that
@@ -260,41 +250,79 @@ class XeMlaEpilogue {
         if (int(get<1>(tOgO(j))) != 0) continue;
         int row = int(get<0>(tOgO(j)));
         if (row >= num_rows) continue;
-        gLSE(row) = static_cast<ElementLSE>(broadcast<0>(row_lse, rA, j));
+        store(row, j);
       }
     }
   }
 
+  /// Write the per-row log-sum-exp, in the log2 domain the softmax state already
+  /// uses: lse = rA_max + log2(rA_sum). No unmasked keys (rA_sum == 0) => -INFINITY.
+  template <class RedFragA, class RedFragARow, class FragO, class CoordO, class CoordFull, class QVCoord>
+  CUTLASS_DEVICE void write_lse(
+      RedFragA const& rA,         // Reduced O accumulator: (q,v)
+      RedFragARow const& rA_sum,  // Reduced softmax row-wise sum
+      RedFragARow const& rA_max,  // Reduced softmax row-wise max (log2 domain)
+      FragO const& tOrO,          // Output fragment (TV-layout witness, ReduceK > 1)
+      CoordO const& tOgO,         // Output coordinates: (q,v), ReduceK > 1
+      CoordFull const& cO,        // Identity tensor over the whole O: (q,v)
+      QVCoord blk_qv,             // WG tile indices: (Q,V)
+      int thr_id,                 // Work-item ID
+      TensorLSE1D const& gLSE) {  // Global LSE: (q)
+    using namespace cute;
+
+    auto row_lse = rA_sum;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < rA_sum.size(); i++) {
+      float d = float(rA_sum(i));
+      row_lse(i) = ElementA((d > 0.f) ? (float(rA_max(i)) + sycl::log2(d)) : -INFINITY);
+    }
+
+    for_each_row(rA, tOrO, tOgO, cO, blk_qv, thr_id, int(size<0>(gLSE)), [&](int row, int i) {
+      gLSE(row) = static_cast<ElementLSE>(broadcast<0>(row_lse, rA, i));
+    });
+  }
+
   /// Split-KV epilogue operator.
   ///
-  /// Stores unnormalized partial O to O_accum and writes exp_sum / max_logit
-  /// for this (head, batch, kv_split) to global memory.
+  /// Stores unnormalized partial O to O_accum and writes the per-query-row
+  /// exp_sum / max_logit for this (head, batch, kv_split) to global memory.
   ///
-  template <typename QVCoord>
+  template <typename QVCoord, typename TensorStat>
   CUTLASS_DEVICE void operator()(
-      TensorO2D const& O_accum,  // 2D slice of partial output buffer: (q, v)
-      FragA& tArA,               // O accumulator fragment from mainloop
-      FragARow& tA_max,          // Softmax row-wise max accumulator
-      FragARow& tA_sum,          // Softmax row-wise sum accumulator
-      QVCoord blk_qv,            // WG tile indices: (Q, V)
-      int thr_id,                // Work-item ID
-      ElementAcc& exp_sum,       // Reference to this split's exp_sum element
-      ElementAcc& max_logit,     // Reference to this split's max_logit element
-      int num_kv_splits) {       // Total number of KV splits
+      TensorO2D const& O_accum,      // 2D slice of partial output buffer: (q, v)
+      FragA& tArA,                   // O accumulator fragment from mainloop
+      FragARow& tA_max,              // Softmax row-wise max accumulator
+      FragARow& tA_sum,              // Softmax row-wise sum accumulator
+      QVCoord blk_qv,                // WG tile indices: (Q, V)
+      int thr_id,                    // Work-item ID
+      TensorStat const& gExpSums,    // This split's exp_sum per query row: (q)
+      TensorStat const& gMaxLogits,  // This split's max_logit per query row: (q)
+      int num_kv_splits) {           // Total number of KV splits
     using namespace cute;
 
     // Step 1: Cross-subgroup reduction of accumulators
     auto [rA, rA_sum, rA_max, active] = reduce_A(tArA, tA_max, tA_sum, thr_id);
 
-    // Step 2: Store LSE statistics for this split.
-    // Thread 0 (subgroup 0, lane 0) is always active after reduce_A.
-    if (thr_id == 0) {
-      exp_sum = static_cast<ElementAcc>(rA_sum(0));
-      max_logit = static_cast<ElementAcc>(rA_max(0));
-    }
-
     // Inactive subgroups (when ReduceK > 1) have no work to do.
     if (!active) return;
+
+    /* Tile output */
+    Tensor cO = make_identity_tensor(O_accum.shape());  // (q,v)
+    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);   // (q,v)
+
+    /* Prepare slices */
+    TiledCopyO copy_o{O_accum};
+    auto thr_copy_o = copy_o.get_slice(thr_id);
+
+    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
+    auto tOgO = thr_copy_o.partition_D(gO);
+
+    // Step 2: Store the per-row softmax statistics for this split while rA_sum
+    // is still the raw denominator. One store per row, from the v == 0 column.
+    for_each_row(rA, tOrO, tOgO, cO, blk_qv, thr_id, int(size<0>(gExpSums)), [&](int row, int i) {
+      gExpSums(row) = static_cast<ElementAcc>(broadcast<0>(rA_sum, rA, i));
+      gMaxLogits(row) = static_cast<ElementAcc>(broadcast<0>(rA_max, rA, i));
+    });
 
     // Step 3: Write O_accum.
     // For num_kv_splits > 1, O_accum is stored UNNORMALIZED (raw numerator):
@@ -314,17 +342,6 @@ class XeMlaEpilogue {
         rA(i) *= broadcast<0>(rA_sum, rA, i);
       }
     }
-
-    /* Tile output */
-    Tensor cO = make_identity_tensor(O_accum.shape());  // (q,v)
-    Tensor gO = local_tile(cO, TileShapeO{}, blk_qv);   // (q,v)
-
-    /* Prepare slices */
-    TiledCopyO copy_o{O_accum};
-    auto thr_copy_o = copy_o.get_slice(thr_id);
-
-    auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
-    auto tOgO = thr_copy_o.partition_D(gO);
 
     /* Reorder tile and write out */
     reorder(rA, tOrO);

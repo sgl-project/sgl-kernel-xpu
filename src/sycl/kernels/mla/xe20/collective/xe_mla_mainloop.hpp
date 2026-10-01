@@ -66,9 +66,11 @@ template <
     class TiledCopyV_ = void,  // Optional TiledCopy for loading V
     bool IsPrefill_ = true>    // Prefill: 256-GRF launch (large per-thread
                                // register footprint avoids spill on Q_TILE_M
-                               // up to 256). Decode: 128-GRF launch (small
-                               // per-thread footprint, doubles thread/EU
-                               // occupancy for memory-bound decode).
+                               // up to 256). Decode: 128-GRF launch at
+                               // Q_TILE_M=1 (small per-thread footprint,
+                               // doubles thread/EU occupancy for memory-bound
+                               // decode); 256-GRF at Q_TILE_M>1 (two query
+                               // rows per subgroup). See device::MLA::kGrfSize.
 struct XeMlaMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -428,7 +430,10 @@ struct XeMlaMainloop<
       /* PagedKV masking - mask out invalid positions beyond seq_len_kv */
       if (check_remainder_k && K == total_blk - 1) {
         FragSRow k_rem_mask;
-        int k_intra_page = get<0>(tKgK(0, 0, 0, intra_page_tile_idx, 0, physical_block_idx)) + K * params.page_size;
+        // tKgK carries the intra-page coordinate; add the logical page base so
+        // sub-page K tiles (QK_BLK_N < page_size) land on the right position.
+        int k_intra_page = get<0>(tKgK(0, 0, 0, intra_page_tile_idx, 0, physical_block_idx)) +
+                           (K * static_cast<int>(QK_BLK_N) / params.page_size) * params.page_size;
         int k = k_intra_page + get_sub_group().get_local_id()[0];
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < k_rem_mask.size(); i++, k += intel::sg_size) {
@@ -446,7 +451,7 @@ struct XeMlaMainloop<
        * For full prefill (offset=0): standard lower-triangular mask.
        * For incremental prefill (offset>0): prefix is unmasked, only new tokens get triangular mask. */
       if constexpr (CausalMask) {
-        int k_tile_start = K * params.page_size;
+        int k_tile_start = K * static_cast<int>(QK_BLK_N);
         int q_tile_start = get<0>(blk_qv) * static_cast<int>(QK_BLK_M);
         // Check if any element in this tile could be masked
         if (k_tile_start + static_cast<int>(QK_BLK_N) - 1 > causal_offset + q_tile_start) {
@@ -465,7 +470,8 @@ struct XeMlaMainloop<
       }
 
       // Mask out phantom Q rows in partial last tile so softmax stats stay finite.
-      // Compiled out for decode (QK_BLK_M=1); skipped for full tiles at runtime.
+      // Compiled out for QK_BLK_M=1; skipped for full tiles at runtime (decode's
+      // Q tile is exactly seq_len_qo, so it is always full).
       if constexpr (QK_BLK_M > 1) {
         if (q_valid_rows < static_cast<int>(QK_BLK_M)) {
           Tensor cPgPq = make_identity_tensor(take<0, 2>(TileShapeQK{}));

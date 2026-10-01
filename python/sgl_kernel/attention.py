@@ -64,24 +64,43 @@ def flash_mla_decode(
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """MLA decode.
 
+    q_nope / q_pe are either 3D (batch, num_heads, dim) for one query token per
+    request, or 4D (batch, s_q, num_heads, dim) for s_q in {1, 2, 4, 8, 16}
+    query tokens per request (MTP / speculative decode). With s_q > 1 the
+    tokens are the last s_q positions of the sequence (seq_lens includes them)
+    and are causally masked: token i attends to KV positions
+    [0, seq_lens - s_q + i].
+
     Args:
         return_lse: also return the softmax log-sum-exp. Default False.
 
     Returns:
         (out, lse) when return_lse, else out.
-        out: (batch, num_heads, latent_dim)  same dtype as q_nope
-        lse: (batch, num_heads)              fp32, log2-domain log-sum-exp
+        out: (batch, [s_q,] num_heads, latent_dim)  same dtype as q_nope
+        lse: (batch, [s_q,] num_heads)              fp32, log2-domain log-sum-exp
     """
-    assert q_nope.ndim == 3, f"q_nope must be a 3D tensor, but got {q_nope.ndim}"
-    assert q_pe.ndim == 3, f"q_pe must be a 3D tensor, but got {q_pe.ndim}"
+    assert q_nope.ndim in (
+        3,
+        4,
+    ), f"q_nope must be a 3D or 4D tensor, but got {q_nope.ndim}"
+    assert (
+        q_pe.ndim == q_nope.ndim
+    ), f"q_pe must have the same rank as q_nope ({q_nope.ndim}), but got {q_pe.ndim}"
     assert (
         kv_c_and_k_pe_cache.ndim == 3
     ), f"kv_c_and_k_pe_cache must be a 3D tensor, but got {kv_c_and_k_pe_cache.ndim}"
 
     device_type = q_nope.device.type
-    B_q, H, D_q_nope = q_nope.shape
-    B_q_2, H_2, D_q_pe = q_pe.shape
-    assert (B_q == B_q_2) and (H == H_2)
+    if q_nope.ndim == 4:
+        B_q, S_q, H, D_q_nope = q_nope.shape
+        assert S_q in (1, 2, 4, 8, 16), f"s_q must be 1, 2, 4, 8 or 16, but got {S_q}"
+        assert device_type == "xpu", "4D (multi-token) q is only supported on xpu"
+    else:
+        B_q, H, D_q_nope = q_nope.shape
+    assert (
+        q_pe.shape[:-1] == q_nope.shape[:-1]
+    ), f"q_pe leading dims {tuple(q_pe.shape[:-1])} must match q_nope {tuple(q_nope.shape[:-1])}"
+    D_q_pe = q_pe.shape[-1]
 
     _, PAGE_SIZE, D_ckv = kv_c_and_k_pe_cache.shape
 
@@ -124,12 +143,12 @@ def flash_mla_decode(
     ), f"page_table.dtype needs to be int32 but got {page_table.dtype}."
 
     out = (
-        q_nope.new_empty((B_q, H, D_latent))
+        q_nope.new_empty((*q_nope.shape[:-1], D_latent))
         if device_type == "xpu"
         else q_nope.new_empty((B_q, MAX_HEADS, D_latent))
     )
     lse = (
-        torch.empty((B_q, q_nope.shape[1]), dtype=torch.float32, device=q_nope.device)
+        torch.empty(q_nope.shape[:-1], dtype=torch.float32, device=q_nope.device)
         if return_lse
         else None
     )
@@ -159,9 +178,10 @@ def flash_mla_get_workspace_size(
     num_heads: int = 0,
     page_size: int = 0,
     num_kv_splits: int = -1,
+    seq_len_q: int = 1,
 ) -> int:
     return flash_mla_decode_get_workspace_size(
-        max_seq_len, num_batches, num_heads, page_size, num_kv_splits
+        max_seq_len, num_batches, num_heads, page_size, num_kv_splits, seq_len_q
     )
 
 
@@ -171,11 +191,18 @@ def flash_mla_decode_get_workspace_size(
     num_heads: int = 0,
     page_size: int = 0,
     num_kv_splits: int = -1,
+    seq_len_q: int = 1,
 ) -> int:
+    """Split-KV workspace bytes for flash_mla_decode.
+
+    seq_len_q is the number of query tokens per request (1 for 3D q, else
+    q.shape[1]); the workspace scales linearly with it.
+    """
     assert max_seq_len > 0, f"max_seq_len must be greater than 0, got {max_seq_len}"
     assert num_batches > 0, f"num_batches must be greater than 0, got {num_batches}"
+    assert seq_len_q > 0, f"seq_len_q must be greater than 0, got {seq_len_q}"
     return torch.ops.sgl_kernel.flash_mla_decode_get_workspace_size.default(
-        max_seq_len, num_batches, num_heads, page_size, num_kv_splits
+        max_seq_len, num_batches, num_heads, page_size, num_kv_splits, seq_len_q
     )
 
 

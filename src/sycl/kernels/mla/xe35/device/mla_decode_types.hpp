@@ -44,12 +44,12 @@
 #include <optional>
 #include <sycl/sycl.hpp>
 
-#include "../../../Utils.h"
-#include "sycl/kernels/mla/collective/xe_mla_epilogue.hpp"
-#include "sycl/kernels/mla/collective/xe_mla_mainloop.hpp"
-#include "sycl/kernels/mla/device/mla_runner.hpp"
-#include "sycl/kernels/mla/kernel/mla_tile_scheduler.hpp"
-#include "sycl/kernels/mla/kernel/xe_mla_kernel.hpp"
+#include "../../../../Utils.h"
+#include "sycl/kernels/mla/xe35/collective/xe_mla_epilogue.hpp"
+#include "sycl/kernels/mla/xe35/collective/xe_mla_mainloop.hpp"
+#include "sycl/kernels/mla/xe35/device/mla_runner.hpp"
+#include "sycl/kernels/mla/xe35/kernel/mla_tile_scheduler.hpp"
+#include "sycl/kernels/mla/xe35/kernel/xe_mla_kernel.hpp"
 
 using namespace cute;
 

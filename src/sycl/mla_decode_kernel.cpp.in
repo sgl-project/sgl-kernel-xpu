@@ -29,10 +29,10 @@
  *
  **************************************************************************************************/
 // Auto-generated from mla_decode_kernel.cpp.in
-// Template parameters: ELEM_TAG=@ELEM_TAG@, PAGE_SIZE=@PAGE_SIZE@
-#define SYCL_INTEL_TARGET 20
+// Template parameters: ELEM_TAG=@ELEM_TAG@, PAGE_SIZE=@PAGE_SIZE@, ARCH_TAG=@ARCH_TAG@
+#define SYCL_INTEL_TARGET @SYCL_TARGET@
 
-#include "sycl/kernels/mla/device/mla_decode_types.hpp"
+#include "sycl/kernels/mla/@ARCH_TAG@/device/mla_decode_types.hpp"
 
 namespace mla_decode {
 

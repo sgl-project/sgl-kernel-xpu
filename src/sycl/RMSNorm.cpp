@@ -161,10 +161,10 @@ class RMSNormNoRstdForward : public NormNoRstdForward<scalar_t> {
     return static_cast<scalar_t>(x * rstd * gamma);
   }
 
-  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename index_t>
+  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename index_t, typename Cfg>
   void reduce_combine(
       sycl::nd_item<1> item_id,
-      const NormConfig& cfg,
+      const Cfg& cfg,
       index_t x_group_offset,
       accscalar_t& sum_value,
       vec_t (&reg)[cache_inputs ? ITERS : 1]) const {
@@ -197,17 +197,25 @@ class RMSNormNoRstdForward : public NormNoRstdForward<scalar_t> {
     }
   }
 
-  accscalar_t reduce_project(sycl::nd_item<1> item_id, const NormConfig& cfg, accscalar_t sum_value) const {
+  template <typename Cfg>
+  accscalar_t reduce_project(sycl::nd_item<1> item_id, const Cfg& cfg, accscalar_t sum_value) const {
     sum_value = sycl::reduce_over_group(item_id.get_group(), sum_value, sycl::plus<accscalar_t>());
     sum_value = sum_value < static_cast<accscalar_t>(0) ? static_cast<accscalar_t>(0) : sum_value;
     return Numerics<accscalar_t>::rsqrt(
         sum_value / static_cast<accscalar_t>(cfg.Plane) + static_cast<accscalar_t>(NF::eps));
   }
 
-  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename weight_vec_t, typename index_t>
+  template <
+      int vec_size,
+      int ITERS,
+      bool cache_inputs,
+      typename vec_t,
+      typename weight_vec_t,
+      typename index_t,
+      typename Cfg>
   void update(
       sycl::nd_item<1> item_id,
-      const NormConfig& cfg,
+      const Cfg& cfg,
       index_t x_group_offset,
       index_t y_group_offset,
       accscalar_t rstd,
@@ -272,10 +280,10 @@ class AddNoRstdForward : public BaseNorm {
     return NF::get_aligned_update_vec_size(Plane, vec_size, NF::X_data, NF::Y_data, Base::gamma_data, add_data);
   }
 
-  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename index_t>
+  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename index_t, typename Cfg>
   void reduce_combine(
       sycl::nd_item<1> item_id,
-      const NormConfig& cfg,
+      const Cfg& cfg,
       index_t x_group_offset,
       accscalar_t& sum_value,
       vec_t (&reg)[cache_inputs ? ITERS : 1]) const {
@@ -320,10 +328,17 @@ class AddNoRstdForward : public BaseNorm {
     }
   }
 
-  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename weight_vec_t, typename index_t>
+  template <
+      int vec_size,
+      int ITERS,
+      bool cache_inputs,
+      typename vec_t,
+      typename weight_vec_t,
+      typename index_t,
+      typename Cfg>
   void update(
       sycl::nd_item<1> item_id,
-      const NormConfig& cfg,
+      const Cfg& cfg,
       index_t x_group_offset,
       index_t y_group_offset,
       accscalar_t rstd,
@@ -370,10 +385,17 @@ class GemmaRMSNormNoRstdForward : public RMSNormNoRstdForward<scalar_t, weight_t
     return static_cast<scalar_t>(x * rstd * (static_cast<accscalar_t>(1.0) + gamma));
   }
 
-  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename weight_vec_t, typename index_t>
+  template <
+      int vec_size,
+      int ITERS,
+      bool cache_inputs,
+      typename vec_t,
+      typename weight_vec_t,
+      typename index_t,
+      typename Cfg>
   void update(
       sycl::nd_item<1> item_id,
-      const NormConfig& cfg,
+      const Cfg& cfg,
       index_t x_group_offset,
       index_t y_group_offset,
       accscalar_t rstd,
@@ -422,7 +444,8 @@ template <
     int ITERS,
     typename Norm,
     bool cache_inputs,
-    typename index_t = uint32_t>
+    typename index_t = uint32_t,
+    typename Cfg = NormConfig>
 struct RMSNormNoRstdKernelFunctor {
   using accscalar_t = acc_type<scalar_t>;
   using vec_t = aligned_vector_loop<scalar_t, vec_size>;
@@ -454,11 +477,11 @@ struct RMSNormNoRstdKernelFunctor {
         item_id, cfg, x_group_offset, y_group_offset, rstd, reg);
   }
 
-  RMSNormNoRstdKernelFunctor(Norm norm_, NormConfig cfg_) : norm(norm_), cfg(cfg_) {}
+  RMSNormNoRstdKernelFunctor(Norm norm_, Cfg cfg_) : norm(norm_), cfg(cfg_) {}
 
  private:
   Norm norm;
-  const NormConfig cfg;
+  const Cfg cfg;
 };
 
 template <typename scalar_t, typename weight_t, int vec_size, int ITERS, typename Norm, bool cache_inputs>
@@ -756,6 +779,75 @@ SGL_KERNEL_EXPORT void
 fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps) {
   TORCH_CHECK(input.is_contiguous(), "fused_add_rmsnorm: input must be contiguous");
   TORCH_CHECK(residual.is_contiguous(), "fused_add_rmsnorm: residual must be contiguous");
+
+  // Fast path for contiguous 2D/3D/4D inputs of a 2-byte dtype with 16B-aligned pointers. Anything
+  // it rejects, including a strided or off-device weight, takes the general path below, which
+  // validates and reports it. Each accessor is read once: this path is host-bound at decode sizes.
+  const auto isz = input.sizes();
+  const auto rsz = residual.sizes();
+  const auto wsz = weight.sizes();
+  const auto st = input.scalar_type();
+  if (isz.size() >= 2 && isz.size() <= 4 && isz == rsz && wsz.size() == 1 && isz.back() == wsz[0] &&
+      (st == at::ScalarType::BFloat16 || st == at::ScalarType::Half) && weight.scalar_type() == st &&
+      weight.is_contiguous() && weight.device() == input.device()) {
+    constexpr std::uintptr_t kAlignBytes = 16;
+    constexpr int kVec = kAlignBytes / 2;  // the guard admits 2-byte dtypes only
+    const int64_t N2 = isz.back(), M2 = input.numel() / N2;
+    const auto req = kAlignBytes;
+    const auto ip = reinterpret_cast<std::uintptr_t>(input.data_ptr());
+    const auto rp = reinterpret_cast<std::uintptr_t>(residual.data_ptr());
+    const auto wp = reinterpret_cast<std::uintptr_t>(weight.data_ptr());
+    if (N2 % kVec == 0 && ip % req == 0 && rp % req == 0 && wp % req == 0) {
+      // The guard makes weight dtype equal input dtype, so one dispatch covers both.
+      SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, st, "FusedAddRMSNormFast", [&]() {
+        using weight_t = scalar_t;
+        auto* X_data = input.data_ptr<scalar_t>();
+        auto* gemma_data = weight.data_ptr<weight_t>();
+        auto* residual_data = residual.data_ptr<scalar_t>();
+        AddRMSNormNoRstdForward<scalar_t, weight_t> fwd(
+            X_data, X_data, gemma_data, static_cast<acc_type<scalar_t>>(eps), residual_data);
+        auto cfg = NormConfig(
+            NormConfig::FastRowTag{},
+            static_cast<int>(M2),
+            static_cast<int>(N2),
+            static_cast<int>(sizeof(scalar_t)),
+            kVec,
+            static_cast<int>(N2));
+        const int iters_fast = (static_cast<int>(N2) + cfg.workgroup_size * kVec - 1) / (cfg.workgroup_size * kVec);
+        // 1, 2, 4 or 8 passes per row use NormFastParams; any other count takes the general launcher.
+        auto launch_fast = [&](auto iters_tag) {
+          constexpr int kIters = decltype(iters_tag)::value;
+          const NormFastParams fast_cfg{
+              static_cast<int>(N2), cfg.workgroup_size, static_cast<int>(N2), static_cast<int>(N2)};
+          using KF = RMSNormNoRstdKernelFunctor<
+              scalar_t,
+              weight_t,
+              kVec,
+              kIters,
+              AddRMSNormNoRstdForward<scalar_t, weight_t>,
+              /*cache_inputs=*/true,
+              uint32_t,
+              NormFastParams>;
+          const sycl::range<1> local_range{static_cast<size_t>(cfg.workgroup_size)};
+          const sycl::range<1> global_range{
+              static_cast<size_t>(cfg.workgroup_num) * static_cast<size_t>(cfg.workgroup_size)};
+          sycl_kernel_submit(global_range, local_range, at::xpu::getCurrentXPUStream().queue(), KF(fwd, fast_cfg));
+        };
+        if (iters_fast == 1) {
+          launch_fast(std::integral_constant<int, 1>{});
+        } else if (iters_fast == 2) {
+          launch_fast(std::integral_constant<int, 2>{});
+        } else if (iters_fast == 4) {
+          launch_fast(std::integral_constant<int, 4>{});
+        } else if (iters_fast == 8) {
+          launch_fast(std::integral_constant<int, 8>{});
+        } else {
+          launch_vectorized_rmsnorm_no_rstd_kernel<scalar_t, weight_t>(fwd, cfg);
+        }
+      });
+      return;
+    }
+  }
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
   auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);

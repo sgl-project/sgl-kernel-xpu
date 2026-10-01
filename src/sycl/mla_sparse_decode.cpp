@@ -236,7 +236,7 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
     std::string jit_err;
     TORCH_CHECK(
         sgl::mla_jit::sparse_decode_launch(
-            in_dtype == at::ScalarType::BFloat16,
+            in_dtype == at::ScalarType::Half,
             d_qk,
             b_h,
             attn_sink.has_value(),

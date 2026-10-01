@@ -112,6 +112,32 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("reconstruct_indices_from_tree_mask", torch::kXPU, &reconstruct_indices_from_tree_mask);
 
   /*
+   * Ngram embedding (LongCat-Flash)
+   */
+  m.def(
+      "compute_n_gram_ids(int ne_n, int ne_k, Tensor ne_weights, Tensor ne_mods, "
+      "Tensor exclusive_ne_embedder_size_sums, Tensor tokens, Tensor exclusive_req_len_sums, "
+      "Tensor ne_token_table, Tensor row_indices, Tensor column_starts, Tensor! n_gram_ids, "
+      "int eos_token_id) -> ()");
+  m.impl("compute_n_gram_ids", torch::kXPU, &compute_n_gram_ids);
+
+  m.def(
+      "compute_n_gram_ids_decode(int ne_n, int ne_k, Tensor ne_weights, Tensor ne_mods, "
+      "Tensor exclusive_ne_embedder_size_sums, Tensor ne_token_table, Tensor row_indices, "
+      "Tensor column_starts, Tensor! n_gram_ids, int eos_token_id) -> ()");
+  m.impl("compute_n_gram_ids_decode", torch::kXPU, &compute_n_gram_ids_decode);
+
+  m.def(
+      "update_token_table(Tensor tokens, Tensor! ne_token_table, Tensor row_indices, "
+      "Tensor column_starts, Tensor req_lens, Tensor ignore_tokens) -> ()");
+  m.impl("update_token_table", torch::kXPU, &update_token_table);
+
+  m.def(
+      "update_token_table_decode(Tensor tokens, Tensor! ne_token_table, Tensor row_indices, "
+      "Tensor column_starts) -> ()");
+  m.impl("update_token_table_decode", torch::kXPU, &update_token_table_decode);
+
+  /*
    * Fast radix top-k (DeepSeek V3.2 indexer)
    */
   m.def("fast_topk(Tensor score, Tensor lengths, int topk, Tensor? row_starts) -> Tensor");

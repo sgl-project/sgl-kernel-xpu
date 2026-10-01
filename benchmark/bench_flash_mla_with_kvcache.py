@@ -17,19 +17,91 @@ import triton.language as tl
 from _bench import BenchSpec, ProblemShape, format_tables, make_row, require_arch
 from sgl_kernel import flash_mla_with_kvcache
 
-# ── DeepSeek V4 constants ──
-NOPE_DIM_VAL = 448
-ROPE_DIM_VAL = 64
-D_VAL = 512
-TOKEN_DATA_STRIDE_VAL = 576
-SCALE_STRIDE_VAL = 8
-
-_TOKEN_DATA_STRIDE = tl.constexpr(TOKEN_DATA_STRIDE_VAL)
-_SCALE_STRIDE = tl.constexpr(SCALE_STRIDE_VAL)
-
+# ── Layout-independent constants (DeepSeek V4 production trace) ──
+D_V = 512  # value head dim (output width); identical for both layouts
 H_PER_RANK = 16
-SM_SCALE = 1.0 / math.sqrt(D_VAL)
 PAGE_SIZE = 256
+
+
+class KvLayout(NamedTuple):
+    """Byte geometry of one packed FP8 KV cache layout, keyed by d_qk.
+
+    DSv4 : d_qk=512, 584 B/token, page-end UE8M0 scale section.
+    DSA  : d_qk=576, 656 B/token, inline fp32 scales per token record.
+    """
+
+    name: str
+    nope_dim: int
+    rope_dim: int
+    tile_size: int  # nope values sharing one scale
+    scales_inline: bool  # inline in record vs separate page-end section
+    scales_fp32: bool  # fp32 scales vs UE8M0 exponent bytes
+
+    @property
+    def d_qk(self) -> int:
+        return self.nope_dim + self.rope_dim
+
+    @property
+    def num_tiles(self) -> int:
+        return self.nope_dim // self.tile_size
+
+    @property
+    def scale_bytes(self) -> int:
+        """Per-token scale footprint: 4 B per fp32 tile scale, or 1 B per UE8M0 + 1 pad."""
+        return self.num_tiles * 4 if self.scales_fp32 else self.num_tiles + 1
+
+    @property
+    def token_stride(self) -> int:
+        """Spacing between consecutive token records in the data region."""
+        inline = self.scale_bytes if self.scales_inline else 0
+        return self.nope_dim + inline + self.rope_dim * 2
+
+    @property
+    def rope_byte_offset(self) -> int:
+        """Where RoPE starts in a token record (after NoPE, and after inline scales)."""
+        return self.nope_dim + (self.scale_bytes if self.scales_inline else 0)
+
+    @property
+    def head_bytes(self) -> int:
+        """k_cache.shape[-1] -- the per-token width the kernel validates d_qk against."""
+        return self.token_stride + (0 if self.scales_inline else self.scale_bytes)
+
+    @property
+    def sm_scale(self) -> float:
+        return 1.0 / math.sqrt(self.d_qk)
+
+    def total_page_bytes(self, page_size: int) -> int:
+        """Real byte stride between pages (k_cache.stride(0))."""
+        data = page_size * self.token_stride
+        if self.scales_inline:
+            return data
+        scale_section = page_size * self.scale_bytes
+        return data + ((scale_section + 575) // 576) * 576
+
+
+DSV4_LAYOUT = KvLayout(
+    name="dsv4-584",
+    nope_dim=448,
+    rope_dim=64,
+    tile_size=64,
+    scales_inline=False,
+    scales_fp32=False,
+)
+DSA_LAYOUT = KvLayout(
+    name="dsa-656",
+    nope_dim=512,
+    rope_dim=64,
+    tile_size=128,
+    scales_inline=True,
+    scales_fp32=True,
+)
+ALL_LAYOUTS = [DSV4_LAYOUT, DSA_LAYOUT]
+LAYOUTS = {lo.d_qk: lo for lo in ALL_LAYOUTS}
+
+# Pin the derived geometry to the two production widths the kernel dispatches on.
+assert (DSV4_LAYOUT.d_qk, DSV4_LAYOUT.head_bytes) == (512, 584), DSV4_LAYOUT
+assert (DSA_LAYOUT.d_qk, DSA_LAYOUT.head_bytes) == (576, 656), DSA_LAYOUT
+assert (DSA_LAYOUT.rope_byte_offset, DSA_LAYOUT.num_tiles) == (528, 4), DSA_LAYOUT
 
 SPEC = BenchSpec(
     kernel="flash_mla_sparse_decode",
@@ -37,6 +109,7 @@ SPEC = BenchSpec(
         (
             "b",
             "h_q",
+            "d_qk",
             "topk",
             "extra_topk",
             "num_pages",
@@ -44,7 +117,7 @@ SPEC = BenchSpec(
             "extra_num_pages",
             "extra_page_size",
         ),
-        description="fp8 paged sparse MLA decode; extra_* is the optional second KV pool",
+        description="fp8 paged sparse MLA decode; d_qk ∈ {512, 576}, extra_* is the optional second KV pool",
     ),
     metrics=("time_us", "bandwidth_gbs"),
 )
@@ -67,18 +140,25 @@ def _gather_dequant_kernel(
     cache_fp8_ptr,
     cache_uint8_ptr,
     cache_bf16_ptr,
+    cache_fp32_ptr,
     indices_ptr,
     out_ptr,
     page_size: tl.int32,
     page_bytes: tl.int64,
+    token_stride: tl.int64,
     scale_section_off: tl.int64,
+    rope_byte_offset: tl.int32,
+    scale_stride: tl.int32,
     topk: tl.int32,
     stride_ib: tl.int32,
     stride_ob: tl.int32,
     stride_ot: tl.int32,
     NOPE_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
-    D_OUT: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    SCALES_INLINE: tl.constexpr,
+    SCALES_FP32: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
     bid = tl.program_id(0)
@@ -97,12 +177,20 @@ def _gather_dequant_kernel(
 
     page_ids = (safe_indices // page_size).to(tl.int64)
     page_offs = (safe_indices % page_size).to(tl.int64)
-    token_data_bases = page_ids * page_bytes + page_offs * _TOKEN_DATA_STRIDE
-    scale_bases = page_ids * page_bytes + scale_section_off + page_offs * _SCALE_STRIDE
+    token_data_bases = page_ids * page_bytes + page_offs * token_stride
 
-    for g in tl.static_range(7):
-        d_start = g * 64
-        d_offs = tl.arange(0, 64)
+    if SCALES_INLINE:
+        # DSv3.2 / GLM-DSA: fp32 scales sit inside the record, right after NoPE.
+        scale_byte_bases = token_data_bases + NOPE_DIM
+    else:
+        # DSv4: UE8M0 scales live in a page-end section indexed by in-page offset.
+        scale_byte_bases = (
+            page_ids * page_bytes + scale_section_off + page_offs * scale_stride
+        )
+
+    for g in tl.static_range(NUM_TILES):
+        d_start = g * TILE_SIZE
+        d_offs = tl.arange(0, TILE_SIZE)
         d_abs = d_start + d_offs
         d_mask = d_abs < NOPE_DIM
 
@@ -110,12 +198,16 @@ def _gather_dequant_kernel(
         load_mask = idx_valid[:, None] & d_mask[None, :]
         fp8_vals = tl.load(cache_fp8_ptr + fp8_addrs, mask=load_mask, other=0.0)
 
-        scale_val = tl.load(
-            cache_uint8_ptr + scale_bases + g,
-            mask=idx_valid,
-            other=127,
-        )
-        scale_f32 = tl.math.exp2(scale_val.to(tl.float32) - 127.0)
+        if SCALES_FP32:
+            scale_elem = (scale_byte_bases + g * 4) // 4
+            scale_f32 = tl.load(cache_fp32_ptr + scale_elem, mask=idx_valid, other=1.0)
+        else:
+            scale_val = tl.load(
+                cache_uint8_ptr + scale_byte_bases + g,
+                mask=idx_valid,
+                other=127,
+            )
+            scale_f32 = tl.math.exp2(scale_val.to(tl.float32) - 127.0)
 
         bf16_vals = (fp8_vals.to(tl.float32) * scale_f32[:, None]).to(tl.bfloat16)
         bf16_vals = tl.where(load_mask, bf16_vals, tl.zeros_like(bf16_vals))
@@ -124,7 +216,7 @@ def _gather_dequant_kernel(
         tl.store(out_ptr + out_addrs, bf16_vals, mask=load_mask)
 
     rope_offs = tl.arange(0, ROPE_DIM)
-    rope_byte_bases = token_data_bases + NOPE_DIM
+    rope_byte_bases = token_data_bases + rope_byte_offset
     rope_elem_bases = (rope_byte_bases // 2).to(tl.int64)
     rope_addrs = rope_elem_bases[:, None] + rope_offs[None, :].to(tl.int64)
     rope_vals = tl.load(
@@ -150,6 +242,7 @@ def _gather_kv_pages(
     k_cache: torch.Tensor,
     indices: torch.Tensor,
     topk_length: Optional[torch.Tensor],
+    layout: "KvLayout",
 ) -> torch.Tensor:
     B = indices.shape[0]
     topk = indices.shape[1]
@@ -161,8 +254,11 @@ def _gather_kv_pages(
     raw_fp8 = k_cache.as_strided((total_elems,), (1,))
     raw_uint8 = raw_fp8.view(torch.uint8)
     raw_bf16 = raw_uint8.view(torch.bfloat16)
+    raw_fp32 = raw_uint8.view(torch.float32)
 
-    kv_dense = torch.zeros(B, topk, D_VAL, dtype=torch.bfloat16, device=k_cache.device)
+    kv_dense = torch.zeros(
+        B, topk, layout.d_qk, dtype=torch.bfloat16, device=k_cache.device
+    )
 
     if topk_length is not None:
         arange = torch.arange(topk, device=indices.device)
@@ -175,18 +271,25 @@ def _gather_kv_pages(
         raw_fp8,
         raw_uint8,
         raw_bf16,
+        raw_fp32,
         indices,
         kv_dense,
         page_size,
         int(page_bytes),
-        int(page_size * TOKEN_DATA_STRIDE_VAL),
+        layout.token_stride,
+        int(page_size * layout.token_stride),
+        layout.rope_byte_offset,
+        layout.scale_bytes,
         topk,
         indices.stride(0),
         kv_dense.stride(0),
         kv_dense.stride(1),
-        NOPE_DIM=NOPE_DIM_VAL,
-        ROPE_DIM=ROPE_DIM_VAL,
-        D_OUT=D_VAL,
+        NOPE_DIM=layout.nope_dim,
+        ROPE_DIM=layout.rope_dim,
+        TILE_SIZE=layout.tile_size,
+        NUM_TILES=layout.num_tiles,
+        SCALES_INLINE=layout.scales_inline,
+        SCALES_FP32=layout.scales_fp32,
     )
 
     return kv_dense
@@ -209,6 +312,7 @@ def _compute_attention(
     kv_dense: torch.Tensor,
     invalid_mask: torch.Tensor,
     softmax_scale: float,
+    head_dim_v: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     scores = torch.matmul(q_3d, kv_dense.transpose(-1, -2))
     scores = scores.float() * softmax_scale
@@ -217,7 +321,7 @@ def _compute_attention(
     p = torch.softmax(scores, dim=-1)
     del scores
     p = torch.nan_to_num(p, 0.0)
-    out = torch.matmul(p.to(torch.bfloat16), kv_dense)
+    out = torch.matmul(p.to(torch.bfloat16), kv_dense[..., :head_dim_v])
     del p
     return out, lse
 
@@ -258,6 +362,7 @@ def flash_mla_sparse_decode_triton(
     attn_sink: Optional[torch.Tensor],
     head_dim_v: int,
     softmax_scale: float,
+    layout: "KvLayout",
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
@@ -272,15 +377,19 @@ def flash_mla_sparse_decode_triton(
 
     flat_indices = indices.reshape(B, -1).contiguous()
 
-    kv_dense = _gather_kv_pages(k_cache, flat_indices, topk_length)
+    kv_dense = _gather_kv_pages(k_cache, flat_indices, topk_length, layout)
     invalid_mask = _build_invalid_mask(flat_indices, topk_length)
 
-    out, lse = _compute_attention(q_3d, kv_dense, invalid_mask, softmax_scale)
+    out, lse = _compute_attention(
+        q_3d, kv_dense, invalid_mask, softmax_scale, head_dim_v
+    )
     del kv_dense, invalid_mask
 
     if extra_k_cache is not None and extra_indices is not None:
         extra_flat = extra_indices.reshape(B, -1).contiguous()
-        kv_extra = _gather_kv_pages(extra_k_cache, extra_flat, extra_topk_length)
+        kv_extra = _gather_kv_pages(
+            extra_k_cache, extra_flat, extra_topk_length, layout
+        )
         extra_mask = _build_invalid_mask(extra_flat, extra_topk_length)
 
         out_extra, lse_extra = _compute_attention(
@@ -288,6 +397,7 @@ def flash_mla_sparse_decode_triton(
             kv_extra,
             extra_mask,
             softmax_scale,
+            head_dim_v,
         )
         del kv_extra, extra_mask, extra_flat
 
@@ -312,50 +422,71 @@ def flash_mla_sparse_decode_triton(
 # ============================================================================
 # KV cache construction
 # ============================================================================
-def _ceil_to_576(x):
-    return ((x + 575) // 576) * 576
+def _tile_scale_values(num_tiles, varied):
+    """Per-tile NoPE scale multipliers. Powers of two so UE8M0 can represent them exactly."""
+    if not varied:
+        return [1.0] * num_tiles
+    return [2.0 ** ((t % 3) - 1) for t in range(num_tiles)]  # 0.5, 1.0, 2.0, ...
 
 
-def _total_page_bytes(page_size):
-    return page_size * TOKEN_DATA_STRIDE_VAL + _ceil_to_576(
-        page_size * SCALE_STRIDE_VAL
-    )
-
-
-def make_fp8_kv_cache(num_pages, page_size, device):
-    total_pb = _total_page_bytes(page_size)
+def make_fp8_kv_cache(
+    num_pages, layout, device, page_size=PAGE_SIZE, varied_scales=False
+):
+    """Create a packed FP8 KV cache in `layout`'s production byte format."""
+    total_pb = layout.total_page_bytes(page_size)
     raw = torch.zeros(num_pages, total_pb, dtype=torch.uint8, device=device)
+    scale_values = _tile_scale_values(layout.num_tiles, varied_scales)
 
-    fill_pages = min(num_pages, 8)
-    for p in range(fill_pages):
-        for t in range(min(page_size, 4)):
-            t_offset = t * TOKEN_DATA_STRIDE_VAL
-            raw[p, t_offset : t_offset + NOPE_DIM_VAL] = torch.randint(
-                0, 200, (NOPE_DIM_VAL,), dtype=torch.uint8, device=device
-            )
-            rope_bf16 = torch.randn(ROPE_DIM_VAL, dtype=torch.bfloat16, device=device)
-            raw[
-                p, t_offset + NOPE_DIM_VAL : t_offset + NOPE_DIM_VAL + ROPE_DIM_VAL * 2
-            ] = rope_bf16.view(torch.uint8)
+    # Token data records: NoPE, then RoPE at the layout's offset (past inline scales).
+    for t in range(page_size):
+        rec = t * layout.token_stride
+        nope_bf16 = torch.randn(
+            num_pages, layout.nope_dim, dtype=torch.bfloat16, device=device
+        )
+        nope_fp8 = nope_bf16.to(torch.float8_e4m3fn)
+        raw[:, rec : rec + layout.nope_dim] = nope_fp8.view(torch.uint8)
 
-    scale_section_start = page_size * TOKEN_DATA_STRIDE_VAL
-    for p in range(fill_pages):
-        for t in range(min(page_size, 4)):
-            s_offset = scale_section_start + t * SCALE_STRIDE_VAL
-            raw[p, s_offset : s_offset + 7] = 127
+        rope_bf16 = torch.randn(
+            num_pages, layout.rope_dim, dtype=torch.bfloat16, device=device
+        )
+        r0 = rec + layout.rope_byte_offset
+        raw[:, r0 : r0 + layout.rope_dim * 2] = rope_bf16.view(torch.uint8)
 
-    k_cache = raw.as_strided(
-        (num_pages, page_size, 1, 584),
-        (total_pb, 584, 584, 1),
+        if layout.scales_inline:
+            # fp32 tile scales, inline immediately after NoPE.
+            s0 = rec + layout.nope_dim
+            scales = torch.tensor(
+                scale_values, dtype=torch.float32, device=device
+            ).expand(num_pages, layout.num_tiles)
+            raw[:, s0 : s0 + layout.scale_bytes] = scales.contiguous().view(torch.uint8)
+
+    if not layout.scales_inline:
+        # UE8M0 page-end section: byte b encodes 2^(b-127), so 127 is a unit scale.
+        scale_bytes = torch.tensor(
+            [127 + int(math.log2(v)) for v in scale_values],
+            dtype=torch.uint8,
+            device=device,
+        )
+        scale_section_start = page_size * layout.token_stride
+        for t in range(page_size):
+            s0 = scale_section_start + t * layout.scale_bytes
+            raw[:, s0 : s0 + layout.num_tiles] = scale_bytes
+
+    hb = layout.head_bytes
+    return raw.as_strided(
+        (num_pages, page_size, 1, hb),
+        (total_pb, hb, hb, 1),
     ).view(torch.float8_e4m3fn)
-    return k_cache
 
 
-def make_indices(B, topk, num_pages, page_size, device):
+def make_indices(B, topk, num_pages, device, page_size=PAGE_SIZE, s_q=1):
+    """Token-level indices [B, s_q, topk] drawn without replacement per row."""
     total_tokens = num_pages * page_size
-    return torch.randint(
-        0, total_tokens, (B, 1, topk), dtype=torch.int32, device=device
-    )
+    idx = torch.full((B, s_q, topk), -1, dtype=torch.int32, device=device)
+    n = min(topk, total_tokens)
+    for b in range(B):
+        idx[b, 0, :n] = torch.randperm(total_tokens, device=device)[:n].to(torch.int32)
+    return idx
 
 
 # ============================================================================
@@ -368,13 +499,16 @@ def build_inputs(
     num_pages,
     page_size,
     H,
+    layout,
     device,
     extra_num_pages=0,
     extra_page_size=64,
 ):
-    k_cache = make_fp8_kv_cache(num_pages, page_size, device)
-    indices = make_indices(B, topk, num_pages, page_size, device)
-    q = torch.randn(B, 1, H, D_VAL, dtype=torch.bfloat16, device=device)
+    k_cache = make_fp8_kv_cache(
+        num_pages, layout, device, page_size=page_size, varied_scales=True
+    )
+    indices = make_indices(B, topk, num_pages, device, page_size=page_size)
+    q = torch.randn(B, 1, H, layout.d_qk, dtype=torch.bfloat16, device=device)
     topk_length = torch.full((B,), topk, dtype=torch.int32, device=device)
     attn_sink = torch.randn(H, dtype=torch.float32, device=device) * 0.1
 
@@ -384,15 +518,18 @@ def build_inputs(
         "indices": indices,
         "topk_length": topk_length,
         "attn_sink": attn_sink,
-        "head_dim_v": D_VAL,
+        "head_dim_v": D_V,
+        "layout": layout,
     }
 
     if extra_topk > 0:
         # extra pool defaults to the main pool's sizing unless overridden.
         extra_pages = extra_num_pages or num_pages
-        extra_cache = make_fp8_kv_cache(extra_pages, extra_page_size, device)
+        extra_cache = make_fp8_kv_cache(
+            extra_pages, layout, device, page_size=extra_page_size, varied_scales=True
+        )
         extra_indices = make_indices(
-            B, extra_topk, extra_pages, extra_page_size, device
+            B, extra_topk, extra_pages, device, page_size=extra_page_size
         )
         extra_topk_length = torch.full(
             (B,), extra_topk, dtype=torch.int32, device=device
@@ -407,16 +544,12 @@ def build_inputs(
 # ============================================================================
 # Bandwidth calculation
 # ============================================================================
-def _compute_total_bytes(B, topk, extra_topk, H):
-    read_q = B * H * D_VAL * 2
-    read_kv = B * topk * (TOKEN_DATA_STRIDE_VAL + SCALE_STRIDE_VAL)
-    read_extra_kv = (
-        B * extra_topk * (TOKEN_DATA_STRIDE_VAL + SCALE_STRIDE_VAL)
-        if extra_topk > 0
-        else 0
-    )
+def _compute_total_bytes(B, topk, extra_topk, H, layout):
+    read_q = B * H * layout.d_qk * 2
+    read_kv = B * topk * layout.head_bytes
+    read_extra_kv = B * extra_topk * layout.head_bytes if extra_topk > 0 else 0
     read_indices = B * (topk + extra_topk) * 4
-    write_out = B * H * D_VAL * 2
+    write_out = B * H * D_V * 2
     write_lse = B * H * 4
     return read_q + read_kv + read_extra_kv + read_indices + write_out + write_lse
 
@@ -434,6 +567,7 @@ class DecodeConfig(NamedTuple):
     extra_num_pages: int = 0
     extra_page_size: int = 0
     sm_scale: float | None = None
+    d_qk: int = 512  # 512 -> DSv4 (584 B/token); 576 -> DSv3.2/GLM-DSA (656 B/token)
 
 
 batch_size_range = [1, 8, 42, 128, 256]
@@ -572,6 +706,39 @@ configs += [
     DecodeConfig(32, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE),
 ]
 
+# ---- DECODE-stage for DEEPSEEK V3.2 / GLM-DSA (d_qk=576, 656 B/token) ----
+configs += [
+    # steady-state, no extra pool
+    DecodeConfig(1, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE, d_qk=576),
+    DecodeConfig(2, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE, d_qk=576),
+    DecodeConfig(8, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE, d_qk=576),
+    DecodeConfig(16, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE, d_qk=576),
+    DecodeConfig(32, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE, d_qk=576),
+    # with extra KV pool
+    DecodeConfig(
+        32,
+        64,
+        128,
+        128,
+        num_pages=129,
+        page_size=PAGE_SIZE,
+        extra_num_pages=1281,
+        extra_page_size=256,
+        d_qk=576,
+    ),
+    DecodeConfig(
+        128,
+        64,
+        128,
+        512,
+        num_pages=513,
+        page_size=PAGE_SIZE,
+        extra_num_pages=5121,
+        extra_page_size=256,
+        d_qk=576,
+    ),
+]
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -586,6 +753,7 @@ if __name__ == "__main__":
     results = []
 
     for cfg in configs:
+        layout = LAYOUTS[cfg.d_qk]
         inputs = build_inputs(
             cfg.b,
             cfg.topk,
@@ -593,12 +761,15 @@ if __name__ == "__main__":
             cfg.num_pages,
             cfg.page_size,
             cfg.h_q,
+            layout,
             device,
             extra_num_pages=cfg.extra_num_pages,
             extra_page_size=cfg.extra_page_size,
         )
-        sm_scale = cfg.sm_scale if cfg.sm_scale is not None else SM_SCALE
-        total_bytes = _compute_total_bytes(cfg.b, cfg.topk, cfg.extra_topk, cfg.h_q)
+        sm_scale = cfg.sm_scale if cfg.sm_scale is not None else layout.sm_scale
+        total_bytes = _compute_total_bytes(
+            cfg.b, cfg.topk, cfg.extra_topk, cfg.h_q, layout
+        )
 
         # Triton reference (Triton gather+dequant -> PyTorch attention)
         fn_triton = lambda: flash_mla_sparse_decode_triton(
@@ -637,6 +808,7 @@ if __name__ == "__main__":
                 size=(
                     cfg.b,
                     cfg.h_q,
+                    cfg.d_qk,
                     cfg.topk,
                     cfg.extra_topk,
                     cfg.num_pages,

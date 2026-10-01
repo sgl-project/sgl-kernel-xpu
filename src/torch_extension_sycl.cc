@@ -626,6 +626,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "chunked_sgmv_lora_shrink_fwd(Tensor! output, Tensor x, Tensor weights, int num_slices, int num_segments, "
       "Tensor seg_indptr, Tensor weight_indices, Tensor lora_ranks, Tensor? permutation) -> ()");
   m.impl("chunked_sgmv_lora_shrink_fwd", torch::kXPU, &chunked_sgmv_lora_shrink_fwd);
+  m.def(
+      "chunked_sgmv_lora_expand_fwd(Tensor! output, Tensor x, Tensor weights, Tensor slice_offsets, "
+      "int max_slice_size, int num_slices, int num_segments, Tensor seg_indptr, Tensor weight_indices, "
+      "Tensor lora_ranks, Tensor scalings, Tensor? permutation, Tensor? base_output) -> ()");
+  m.impl("chunked_sgmv_lora_expand_fwd", torch::kXPU, &chunked_sgmv_lora_expand_fwd);
 
   /* NSA (Native Sparse Attention) indexer scoring */
   // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.

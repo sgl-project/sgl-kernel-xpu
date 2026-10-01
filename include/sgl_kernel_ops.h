@@ -1323,6 +1323,22 @@ void chunked_sgmv_lora_shrink_fwd(
     const std::optional<torch::Tensor>& permutation  // [num_tokens,] logical -> physical (optional)
 );
 
+void chunked_sgmv_lora_expand_fwd(
+    torch::Tensor& output,               // [num_tokens, N_total]
+    const torch::Tensor& x,              // [num_tokens, num_slices*max_rank]
+    const torch::Tensor& weights,        // [num_loras, N_total, max_rank]
+    const torch::Tensor& slice_offsets,  // [num_slices + 1,]
+    const int64_t max_slice_size,        // max per-slice output width
+    const int64_t num_slices,            // stacked projections (qkv=3, gate_up=2, else 1)
+    const int64_t num_segments,
+    const torch::Tensor& seg_indptr,                  // [num_segments + 1,]
+    const torch::Tensor& weight_indices,              // [num_segments,]
+    const torch::Tensor& lora_ranks,                  // [num_loras,]
+    const torch::Tensor& scalings,                    // [num_loras,]
+    const std::optional<torch::Tensor>& permutation,  // [num_tokens,] logical -> physical (optional)
+    const std::optional<torch::Tensor>& base_output   // [num_tokens, N_total] optional residual
+);
+
 /*
  * From GDN (Gated DeltaNet) attention
  */

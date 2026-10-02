@@ -1,0 +1,24 @@
+/* Copyright 2026 SGLang Team. All Rights Reserved.
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ */
+
+#define SYCL_INTEL_TARGET 20
+
+#include "sycl/kernels/inkling_moe_gate/inkling_moe_gate_projection.hpp"
+
+namespace inkling_moe_gate_impl {
+
+__attribute__((visibility("default"))) void launch_projection_@ELEM_TAG@(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    at::Tensor& output,
+    sycl::queue& queue) {
+  run_projection<@ELEMENT_TYPE@>(input, weight, output, queue);
+}
+
+}  // namespace inkling_moe_gate_impl
+
+#undef SYCL_INTEL_TARGET

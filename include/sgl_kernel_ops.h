@@ -271,6 +271,15 @@ void biased_topk(
     bool apply_routed_scaling_factor_on_output);
 }  // namespace at::native::xpu
 
+at::Tensor inkling_moe_gate_projection(const at::Tensor& input, const at::Tensor& weight);
+
+std::vector<at::Tensor> inkling_moe_gate_topk_renorm(
+    const at::Tensor& logits,
+    const at::Tensor& bias,
+    const at::Tensor& global_scale,
+    double route_scale,
+    bool return_packed);
+
 /*
  * From csrc/kvcacheio — KV cache scatter/gather transfer kernels
  */

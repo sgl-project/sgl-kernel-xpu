@@ -151,6 +151,7 @@ set(SGL_XE20_BUNDLE_PREFIXES
   "mla_sparse_prefill_2stage_kernel_"
   "sgemm_lora_a_fwd_kernel_"
   "sgemm_lora_b_fwd_kernel_"
+  "inkling_moe_gate_projection_"
 )
 
 # Pass 1: classify each xe20 source, recording the bundle key it belongs to (or

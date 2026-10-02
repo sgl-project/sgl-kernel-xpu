@@ -151,6 +151,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "apply_routed_scaling_factor_on_output) -> ()");
   m.impl("biased_topk", torch::kXPU, &at::native::xpu::biased_topk);
 
+#ifdef USE_MOE
+  m.def("inkling_moe_gate_projection(Tensor input, Tensor weight) -> Tensor");
+  m.impl("inkling_moe_gate_projection", torch::kXPU, &inkling_moe_gate_projection);
+
+  m.def(
+      "inkling_moe_gate_topk_renorm(Tensor logits, Tensor bias, Tensor global_scale, float route_scale, "
+      "bool return_packed=False) -> Tensor[]");
+  m.impl("inkling_moe_gate_topk_renorm", torch::kXPU, &inkling_moe_gate_topk_renorm);
+#endif
+
   m.def(
       "rotary_embedding(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");

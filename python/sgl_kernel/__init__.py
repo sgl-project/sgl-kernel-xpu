@@ -132,6 +132,10 @@ from sgl_kernel.inkling_attn_prologue import (
     inkling_attn_prologue_extend,
     inkling_attn_prologue_verify,
 )
+from sgl_kernel.inkling_moe_gate import (
+    inkling_moe_gate_projection,
+    inkling_moe_gate_topk_renorm,
+)
 from sgl_kernel.inkling_sconv import (
     causal_conv1d,
     fused_causal_conv1d_update_decode,

@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_group_quant_int8
+from sgl_kernel import sgl_per_token_group_quant_8bit
 
 fp8_type_ = torch.float8_e4m3fn
 
@@ -123,24 +123,24 @@ def sglang_per_token_group_quant_8bit(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    m, n = x.shape
-    num_groups = n // group_size
-
-    # Allocate output tensors
-    x_q = torch.empty_like(x, dtype=dst_dtype)
-    x_s = torch.empty((m, num_groups), device=x.device, dtype=torch.float32)
-
     if dst_dtype == torch.int8:
         iinfo = torch.iinfo(dst_dtype)
-        sgl_per_token_group_quant_int8(
-            x, x_q, x_s, group_size, eps, float(iinfo.min), float(iinfo.max)
-        )
+        min_8bit = float(iinfo.min)
+        max_8bit = float(iinfo.max)
     else:
-        f8_info = torch.finfo(dst_dtype)
-        sgl_per_token_group_quant_fp8(
-            x, x_q, x_s, group_size, eps, float(f8_info.min), float(f8_info.max)
-        )
+        finfo = torch.finfo(dst_dtype)
+        min_8bit = float(finfo.min)
+        max_8bit = float(finfo.max)
 
+    x_q = torch.empty(x.shape, device=x.device, dtype=dst_dtype)
+    x_s = torch.empty(
+        (*x.shape[:-1], x.shape[-1] // group_size),
+        device=x.device,
+        dtype=torch.float32,
+    )
+    sgl_per_token_group_quant_8bit(
+        x, x_q, x_s, group_size, eps, min_8bit, max_8bit, False, False, None, False
+    )
     return x_q, x_s
 
 

@@ -41,9 +41,27 @@
 #include "cutlass/float8.h"
 #include "sgl_kernel_export.h"
 
+// Xe35 fused-VISA quantize atom: mul + F32->HF + fcvt(HF->E4M3/E5M2).
+// Only available with the bumped CRI cutlass pin (>= 1e7e39b07). Include
+// `cute/tensor.hpp` BEFORE `quantize_xe.hpp`: the latter pulls in
+// `cute/util/sycl_vec.hpp` which references `cute::Int<>` and `cute::ceil_div`
+// at namespace scope without declaring them itself, so anything that brings
+// those names in (tensor.hpp does) has to be visible first. clang-format off
+// protects the order from alphabetical include sorting.
+#if defined(SYCL_INTEL_TARGET) && (SYCL_INTEL_TARGET == 35)
+// clang-format off
+#include <cute/tensor.hpp>
+#include <cute/arch/quantize_xe.hpp>
+// clang-format on
+#endif
+
 namespace at::native::xpu {
 
 constexpr float LOCAL_ABSMAX_ABS = 1e-10;
+// Default per-lane primary-load width in bytes. The fast Xe35 FP8 dispatch
+// overrides this via the VEC_NUM_BYTES template parameter so that one quant
+// group fits in a single SIMD-16 subgroup (THREADS_PER_SUBWARP=16) and each
+// lane carries a multiple of 4 elements for the cute quantize atom.
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
 // Use SYCL native vector type for efficient loading
@@ -77,7 +95,9 @@ template <
     bool IS_COLUMN_MAJOR,
     bool SCALE_UE8M0,
     bool FUSE_SILU_AND_MUL,
-    typename scale_packed_t>
+    typename scale_packed_t,
+    int SUB_GROUP_SIZE = 32,
+    uint32_t VEC_NUM_BYTES = INPUT_PRIMARY_VEC_NUM_BYTES>
 struct MainKernel {
   MainKernel(
       const T* input,
@@ -110,6 +130,20 @@ struct MainKernel {
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
   using fp8x2_storage_t = uint16_t;
+
+  // Xe35 fused-VISA quantize fast path. Conditions mirror v1 (see
+  // per_token_group_quant_8bit.cpp): the cute atom expects one quant group per
+  // SIMD-16 subgroup so the per-value scale broadcast (<0;1,0>) is uniform,
+  // and processes elements in chunks of 4. SCALE_UE8M0 / non-E4M3 fall through
+  // to the scalar emulator below.
+  static constexpr uint32_t INPUT_PRIMARY_VEC_SIZE_CT = VEC_NUM_BYTES / sizeof(T);
+  static constexpr bool USE_XE35_FAST_FP8 =
+#if defined(SYCL_INTEL_TARGET) && (SYCL_INTEL_TARGET == 35)
+      std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn> && SUB_GROUP_SIZE == 16 && THREADS_PER_SUBWARP == 16 &&
+      (INPUT_PRIMARY_VEC_SIZE_CT % 4 == 0);
+#else
+      false;
+#endif
 
   inline float silu(const float& val) const {
     float half = 0.5f * val;
@@ -165,8 +199,9 @@ struct MainKernel {
       const int lane_id,
       const int input_group_start_offset,
       sycl::sub_group sg) const {
-    constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
-    constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / (4 * sizeof(int));
+    constexpr uint32_t INPUT_PRIMARY_VEC_SIZE = VEC_NUM_BYTES / sizeof(T);
+    constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = VEC_NUM_BYTES / (4 * sizeof(int));
+    static_assert(INPUT_PRIMARY_INT4_SIZE >= 1, "Per-lane chunk must be at least one 16-byte int4");
 
     const int offset_num_groups = expert_idx * num_tokens_per_expert * hidden_dim_num_groups +
                                   token_idx * hidden_dim_num_groups + hidden_dim_group_idx;
@@ -223,10 +258,13 @@ struct MainKernel {
                       hidden_idx_packed * scale_hidden_stride * num_elems_per_pack +
                       output_token_idx * scale_token_stride * num_elems_per_pack + pack_idx);
     } else {
-      // Plain row-major scale layout. Supports float scales (non-UE8M0) and, when
-      // instantiated with scale_packed_t=uint8_t, the UE8M0 byte written
-      // contiguously at the group index -- a plain [tokens, K/group] uint8 scale.
-      scale_output = reinterpret_cast<scale_element_t*>(output_s) + offset_num_groups;
+      // Row-major: scale_packed_t is instantiated to scale_element_t
+      // (uint8_t for UE8M0, float otherwise), so this is a plain
+      // one-element-per-group index -- no reinterpret needed. This is the
+      // plain [tokens, K/group] uint8 UE8M0 scale consumed directly by e.g.
+      // torch._scaled_mm BlockWise1x32.
+      static_assert(std::is_same_v<scale_packed_t, scale_element_t>);
+      scale_output = output_s + offset_num_groups;
     }
 
     // TMA alignment padding for column-major mode
@@ -308,17 +346,42 @@ struct MainKernel {
     using output_vec_type = vec_t<output_storage_t, INPUT_PRIMARY_VEC_SIZE>;
     output_vec_type output_vec;
 
-    for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j++) {
-      float val = input_primary_vec[j];
-      float q_val = sycl::fmin(sycl::fmax(val * inv_y_s, min_8bit), max_8bit);
+    if constexpr (USE_XE35_FAST_FP8) {
+#if defined(SYCL_INTEL_TARGET) && (SYCL_INTEL_TARGET == 35)
+      // Xe35 fused-VISA path: mul + F32->HF + fcvt(HF->E4M3) per 4 elements.
+      // The asm saturates on overflow (matches the [-448, 448] clamp the
+      // scalar path applies for E4M3), and broadcasts inv_y_s across the 16
+      // lanes of the subgroup (one quant group per subgroup -> uniform scale).
+      using Atom = cute::Xe_Quantize_Optimized<float, cutlass::float_e4m3_t>;
+      cute::intel::float4 scales{inv_y_s, inv_y_s, inv_y_s, inv_y_s};
+#pragma unroll
+      for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j += 4) {
+        cute::intel::float4 src{
+            static_cast<float>(input_primary_vec[j]),
+            static_cast<float>(input_primary_vec[j + 1]),
+            static_cast<float>(input_primary_vec[j + 2]),
+            static_cast<float>(input_primary_vec[j + 3])};
+        cute::intel::uchar4 dst;
+        Atom::quantize(&src, &dst, scales);
+        output_vec[j] = dst[0];
+        output_vec[j + 1] = dst[1];
+        output_vec[j + 2] = dst[2];
+        output_vec[j + 3] = dst[3];
+      }
+#endif
+    } else {
+      for (uint32_t j = 0; j < INPUT_PRIMARY_VEC_SIZE; j++) {
+        float val = input_primary_vec[j];
+        float q_val = sycl::fmin(sycl::fmax(val * inv_y_s, min_8bit), max_8bit);
 
-      // Special handling for FP8 types using CUTLASS
-      if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
-        // TODO: Remove CUTLASS emulation of float e4m3_t and use native SYCL FP8 when available
-        DST_DTYPE fp8_val = static_cast<DST_DTYPE>(q_val);
-        output_vec[j] = sycl::bit_cast<output_storage_t>(fp8_val);
-      } else {
-        output_vec[j] = static_cast<DST_DTYPE>(q_val);
+        // Special handling for FP8 types using CUTLASS
+        if constexpr (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn>) {
+          // TODO: Remove CUTLASS emulation of float e4m3_t and use native SYCL FP8 when available
+          DST_DTYPE fp8_val = static_cast<DST_DTYPE>(q_val);
+          output_vec[j] = sycl::bit_cast<output_storage_t>(fp8_val);
+        } else {
+          output_vec[j] = static_cast<DST_DTYPE>(q_val);
+        }
       }
     }
 
@@ -353,7 +416,9 @@ template <
     bool IS_COLUMN_MAJOR,
     bool SCALE_UE8M0,
     bool FUSE_SILU_AND_MUL,
-    typename scale_packed_t>
+    typename scale_packed_t,
+    int SUB_GROUP_SIZE = 32,
+    uint32_t VEC_NUM_BYTES = INPUT_PRIMARY_VEC_NUM_BYTES>
 struct NaiveKernel : MainKernel<
                          GROUP_SIZE,
                          THREADS_PER_SUBWARP,
@@ -362,7 +427,9 @@ struct NaiveKernel : MainKernel<
                          IS_COLUMN_MAJOR,
                          SCALE_UE8M0,
                          FUSE_SILU_AND_MUL,
-                         scale_packed_t> {
+                         scale_packed_t,
+                         SUB_GROUP_SIZE,
+                         VEC_NUM_BYTES> {
   NaiveKernel(
       const T* input,
       DST_DTYPE* output_q,
@@ -384,7 +451,9 @@ struct NaiveKernel : MainKernel<
             IS_COLUMN_MAJOR,
             SCALE_UE8M0,
             FUSE_SILU_AND_MUL,
-            scale_packed_t>(
+            scale_packed_t,
+            SUB_GROUP_SIZE,
+            VEC_NUM_BYTES>(
             input,
             output_q,
             output_s,
@@ -414,7 +483,7 @@ struct NaiveKernel : MainKernel<
            token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * group_size;
   }
 
-  [[sycl::reqd_sub_group_size(32)]]
+  [[sycl::reqd_sub_group_size(SUB_GROUP_SIZE)]]
   void operator()(sycl::nd_item<3> item) const {
     constexpr int expert_idx = 0;
 
@@ -461,7 +530,9 @@ template <
     bool IS_COLUMN_MAJOR,
     bool SCALE_UE8M0,
     bool FUSE_SILU_AND_MUL,
-    typename scale_packed_t>
+    typename scale_packed_t,
+    int SUB_GROUP_SIZE = 32,
+    uint32_t VEC_NUM_BYTES = INPUT_PRIMARY_VEC_NUM_BYTES>
 struct MaskedKernel : MainKernel<
                           GROUP_SIZE,
                           THREADS_PER_SUBWARP,
@@ -470,7 +541,9 @@ struct MaskedKernel : MainKernel<
                           IS_COLUMN_MAJOR,
                           SCALE_UE8M0,
                           FUSE_SILU_AND_MUL,
-                          scale_packed_t> {
+                          scale_packed_t,
+                          SUB_GROUP_SIZE,
+                          VEC_NUM_BYTES> {
   MaskedKernel(
       const T* input,
       DST_DTYPE* output_q,
@@ -492,7 +565,9 @@ struct MaskedKernel : MainKernel<
             IS_COLUMN_MAJOR,
             SCALE_UE8M0,
             FUSE_SILU_AND_MUL,
-            scale_packed_t>(
+            scale_packed_t,
+            SUB_GROUP_SIZE,
+            VEC_NUM_BYTES>(
             input,
             output_q,
             output_s,
@@ -523,7 +598,7 @@ struct MaskedKernel : MainKernel<
            token_idx * hidden_size * (FUSE_SILU_AND_MUL ? 2 : 1) + hidden_dim_group_idx * group_size;
   }
 
-  [[sycl::reqd_sub_group_size(32)]]
+  [[sycl::reqd_sub_group_size(SUB_GROUP_SIZE)]]
   void operator()(sycl::nd_item<3> item) const {
     int threadIdx_x = item.get_local_linear_id();
     const int64_t subwarp_id = threadIdx_x / THREADS_PER_SUBWARP;
@@ -605,7 +680,7 @@ struct MaskedLayoutScheduler {
     subwarps_per_block = SUBWARPS_PER_BLOCK;
     TORCH_CHECK(hidden_dim_num_groups % subwarps_per_block == 0);
     grid = dim3{hidden_dim_num_groups / subwarps_per_block, TOKEN_DIM_BLOCK_NUM_PER_EXPERT, num_local_experts};
-    block = dim3{subwarps_per_block * threads_per_subwarp};
+    block = dim3{subwarps_per_block * threads_per_subwarp, 1, 1};
   }
 };
 
@@ -618,7 +693,9 @@ template <
     bool IS_COLUMN_MAJOR = false,
     bool SCALE_UE8M0 = false,
     bool FUSE_SILU_AND_MUL = false,
-    typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>>
+    typename scale_packed_t = std::conditional_t<SCALE_UE8M0, uint32_t, float>,
+    int SUB_GROUP_SIZE = 32,
+    uint32_t VEC_NUM_BYTES = INPUT_PRIMARY_VEC_NUM_BYTES>
 void per_token_group_quant_8bit_kernel_impl(
     const T* input,
     DST_DTYPE* output_q,
@@ -645,7 +722,9 @@ void per_token_group_quant_8bit_kernel_impl(
         IS_COLUMN_MAJOR,
         SCALE_UE8M0,
         FUSE_SILU_AND_MUL,
-        scale_packed_t>;
+        scale_packed_t,
+        SUB_GROUP_SIZE,
+        VEC_NUM_BYTES>;
 
     auto stream = at::xpu::getCurrentXPUStream();
     auto queue = stream.queue();
@@ -681,7 +760,9 @@ void per_token_group_quant_8bit_kernel_impl(
         IS_COLUMN_MAJOR,
         SCALE_UE8M0,
         FUSE_SILU_AND_MUL,
-        scale_packed_t>;
+        scale_packed_t,
+        SUB_GROUP_SIZE,
+        VEC_NUM_BYTES>;
 
     auto stream = at::xpu::getCurrentXPUStream();
     auto queue = stream.queue();
@@ -781,40 +862,131 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit_v2(
         num_tokens_per_expert);                                                                                      \
   } while (0)
 
-#define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                                     \
-  do {                                                                                                              \
-    constexpr int THREADS_PER_SUBWARP = GROUP_SIZE / 16;                                                            \
-    TORCH_CHECK(THREADS_PER_SUBWARP* INPUT_PRIMARY_VEC_NUM_BYTES == group_size * sizeof(T));                        \
-                                                                                                                    \
-    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                                    \
-    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                                        \
-    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                                        \
-                                                                                                                    \
-    if (is_column_major) {                                                                                          \
-      if (scale_ue8m0) {                                                                                            \
-        if (fuse_silu_and_mul) {                                                                                    \
-          if (masked_layout) {                                                                                      \
-            LAUNCH_KERNEL_INNER(                                                                                    \
-                MaskedLayoutScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true, true);  \
-          } else {                                                                                                  \
-            LAUNCH_KERNEL_INNER(                                                                                    \
-                NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true, true);         \
-          }                                                                                                         \
-        } else {                                                                                                    \
-          LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true); \
-        }                                                                                                           \
-      } else {                                                                                                      \
-        LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true);            \
-      }                                                                                                             \
-    } else {                                                                                                        \
-      if (scale_ue8m0) {                                                                                            \
-        /* Plain row-major UE8M0: output_s is uint8 [tokens, K/group] */                                            \
-        LAUNCH_KERNEL_INNER(                                                                                        \
-            NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint8_t, false, true, false, uint8_t);   \
-      } else {                                                                                                      \
-        LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);           \
-      }                                                                                                             \
-    }                                                                                                               \
+// Xe35 fast-path eligibility check (FP8 only, GROUP_SIZE big enough to fit a
+// full quant group in one SIMD-16 subgroup with >=4 elements per lane).
+// Keep this as a compile-time bool so the variadic LAUNCH_KERNEL_INNER macro
+// expansion below stays a single function-template instantiation.
+#if defined(SYCL_INTEL_TARGET) && (SYCL_INTEL_TARGET == 35)
+#define V2_USE_XE35_FP8(GROUP_SIZE, T, DST_DTYPE) \
+  (std::is_same_v<DST_DTYPE, c10::Float8_e4m3fn> && (GROUP_SIZE) >= 64 && ((GROUP_SIZE) / 16) * sizeof(T) >= 16)
+#else
+#define V2_USE_XE35_FP8(GROUP_SIZE, T, DST_DTYPE) false
+#endif
+
+#define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                            \
+  do {                                                                                                     \
+    /* Default SIMD-32 layout. Each subgroup carries 32/THREADS_PER_SUBWARP quant groups. */               \
+    constexpr int THREADS_PER_SUBWARP_DEFAULT = GROUP_SIZE / 16;                                           \
+    constexpr int SUB_GROUP_SIZE_DEFAULT = 32;                                                             \
+    constexpr uint32_t VEC_NUM_BYTES_DEFAULT = INPUT_PRIMARY_VEC_NUM_BYTES;                                \
+    /* Xe35 fast path: one quant group fills one SIMD-16 subgroup so the cute */                           \
+    /* vISA atom can broadcast inv_y_s and process 4 elements per lane per call. */                        \
+    constexpr int THREADS_PER_SUBWARP_FAST = 16;                                                           \
+    constexpr int SUB_GROUP_SIZE_FAST = 16;                                                                \
+    constexpr uint32_t VEC_NUM_BYTES_FAST = (GROUP_SIZE) * sizeof(T) / 16;                                 \
+    constexpr bool use_fast = V2_USE_XE35_FP8(GROUP_SIZE, T, DST_DTYPE);                                   \
+    constexpr int THREADS_PER_SUBWARP = use_fast ? THREADS_PER_SUBWARP_FAST : THREADS_PER_SUBWARP_DEFAULT; \
+    constexpr int SUB_GROUP_SIZE_SEL = use_fast ? SUB_GROUP_SIZE_FAST : SUB_GROUP_SIZE_DEFAULT;            \
+    constexpr uint32_t VEC_NUM_BYTES_SEL = use_fast ? VEC_NUM_BYTES_FAST : VEC_NUM_BYTES_DEFAULT;          \
+    TORCH_CHECK(THREADS_PER_SUBWARP* VEC_NUM_BYTES_SEL == group_size * sizeof(T));                         \
+                                                                                                           \
+    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                           \
+    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                               \
+    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                               \
+                                                                                                           \
+    if (is_column_major) {                                                                                 \
+      if (scale_ue8m0) {                                                                                   \
+        if (fuse_silu_and_mul) {                                                                           \
+          if (masked_layout) {                                                                             \
+            LAUNCH_KERNEL_INNER(                                                                           \
+                MaskedLayoutScheduler,                                                                     \
+                GROUP_SIZE,                                                                                \
+                THREADS_PER_SUBWARP,                                                                       \
+                T,                                                                                         \
+                DST_DTYPE,                                                                                 \
+                uint32_t,                                                                                  \
+                true,                                                                                      \
+                true,                                                                                      \
+                true,                                                                                      \
+                uint32_t,                                                                                  \
+                SUB_GROUP_SIZE_SEL,                                                                        \
+                VEC_NUM_BYTES_SEL);                                                                        \
+          } else {                                                                                         \
+            LAUNCH_KERNEL_INNER(                                                                           \
+                NaiveScheduler,                                                                            \
+                GROUP_SIZE,                                                                                \
+                THREADS_PER_SUBWARP,                                                                       \
+                T,                                                                                         \
+                DST_DTYPE,                                                                                 \
+                uint32_t,                                                                                  \
+                true,                                                                                      \
+                true,                                                                                      \
+                true,                                                                                      \
+                uint32_t,                                                                                  \
+                SUB_GROUP_SIZE_SEL,                                                                        \
+                VEC_NUM_BYTES_SEL);                                                                        \
+          }                                                                                                \
+        } else {                                                                                           \
+          LAUNCH_KERNEL_INNER(                                                                             \
+              NaiveScheduler,                                                                              \
+              GROUP_SIZE,                                                                                  \
+              THREADS_PER_SUBWARP,                                                                         \
+              T,                                                                                           \
+              DST_DTYPE,                                                                                   \
+              uint32_t,                                                                                    \
+              true,                                                                                        \
+              true,                                                                                        \
+              false,                                                                                       \
+              uint32_t,                                                                                    \
+              SUB_GROUP_SIZE_SEL,                                                                          \
+              VEC_NUM_BYTES_SEL);                                                                          \
+        }                                                                                                  \
+      } else {                                                                                             \
+        LAUNCH_KERNEL_INNER(                                                                               \
+            NaiveScheduler,                                                                                \
+            GROUP_SIZE,                                                                                    \
+            THREADS_PER_SUBWARP,                                                                           \
+            T,                                                                                             \
+            DST_DTYPE,                                                                                     \
+            float,                                                                                         \
+            true,                                                                                          \
+            false,                                                                                         \
+            false,                                                                                         \
+            float,                                                                                         \
+            SUB_GROUP_SIZE_SEL,                                                                            \
+            VEC_NUM_BYTES_SEL);                                                                            \
+      }                                                                                                    \
+    } else if (scale_ue8m0) {                                                                              \
+      /* Plain row-major UE8M0: output_s is uint8 [tokens, K/group]; override */                           \
+      /* scale_packed_t=uint8_t so storage type matches the tensor. */                                     \
+      LAUNCH_KERNEL_INNER(                                                                                 \
+          NaiveScheduler,                                                                                  \
+          GROUP_SIZE,                                                                                      \
+          THREADS_PER_SUBWARP,                                                                             \
+          T,                                                                                               \
+          DST_DTYPE,                                                                                       \
+          uint8_t,                                                                                         \
+          false,                                                                                           \
+          true,                                                                                            \
+          false,                                                                                           \
+          uint8_t,                                                                                         \
+          SUB_GROUP_SIZE_SEL,                                                                              \
+          VEC_NUM_BYTES_SEL);                                                                              \
+    } else {                                                                                               \
+      LAUNCH_KERNEL_INNER(                                                                                 \
+          NaiveScheduler,                                                                                  \
+          GROUP_SIZE,                                                                                      \
+          THREADS_PER_SUBWARP,                                                                             \
+          T,                                                                                               \
+          DST_DTYPE,                                                                                       \
+          float,                                                                                           \
+          false,                                                                                           \
+          false,                                                                                           \
+          false,                                                                                           \
+          float,                                                                                           \
+          SUB_GROUP_SIZE_SEL,                                                                              \
+          VEC_NUM_BYTES_SEL);                                                                              \
+    }                                                                                                      \
   } while (0)
 
 #define LAUNCH_KERNEL_OUTER(...)                    \

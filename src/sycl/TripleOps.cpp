@@ -126,9 +126,9 @@ void silu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   int64_t num_group;
   int vec_size;
   get_config<T_to>(input, out, numel, dim, wg_size, num_group, vec_size);
-  // For large batches that otherwise use scalar loads, four elements per lane
-  // reduce the number of threads per row without changing other vector paths.
-  if (vec_size == 1 && num_group >= 8 * wg_size && dim % 4 == 0 && wg_size >= 256) {
+  // For large batches, four elements per lane reduce threads per row for
+  // scalar, two-element, and four-element paths. Preserve wider vector paths.
+  if (vec_size <= 4 && num_group >= 8 * wg_size && dim % 4 == 0 && wg_size >= 256) {
     vec_size = 4;
     wg_size = std::min<int64_t>(256, dim / vec_size);
   }

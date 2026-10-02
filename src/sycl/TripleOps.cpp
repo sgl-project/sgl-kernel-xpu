@@ -126,11 +126,14 @@ void silu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   int64_t num_group;
   int vec_size;
   get_config<T_to>(input, out, numel, dim, wg_size, num_group, vec_size);
-  // For large batches, four elements per lane reduce threads per row for
-  // scalar, two-element, and four-element paths. Preserve wider vector paths.
-  if (vec_size <= 4 && num_group >= 8 * wg_size && dim % 4 == 0 && wg_size >= 256) {
-    vec_size = 4;
-    wg_size = std::min<int64_t>(256, dim / vec_size);
+  // Increase vector width for large batches if the smaller workgroup needs at
+  // most two four-element vectors per lane. More passes hurt wide rows.
+  if (vec_size < 4 && num_group >= 8 * wg_size && dim % 4 == 0 && wg_size >= 256) {
+    const int64_t vec4_wg_size = std::min<int64_t>(256, dim / 4);
+    if (dim / 4 <= 2 * vec4_wg_size) {
+      vec_size = 4;
+      wg_size = vec4_wg_size;
+    }
   }
 
   using accscalar_t = at::opmath_type<T_to>;

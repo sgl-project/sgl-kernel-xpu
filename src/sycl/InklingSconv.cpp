@@ -18,6 +18,7 @@
 #include <optional>
 #include <sycl/sycl.hpp>
 #include <tuple>
+#include <type_traits>
 
 #include "SGLKernelPerf.h"
 #include "Utils.h"
@@ -28,7 +29,14 @@ namespace {
 constexpr int kPadSlotId = -1;
 constexpr int kThreads = 256;
 constexpr int kMetaThreads = 128;
-constexpr int kForwardBlockT = 4;
+constexpr int kForwardDecodeBlockT = 4;
+constexpr int kForwardPrefillBlockT = 16;
+constexpr int kForwardBf16Vec = 8;
+constexpr int kForwardBf16Threads = 384;
+constexpr int kForwardBf16BlockT = 4;
+constexpr int kForwardFp16Vec = 4;
+constexpr int kForwardFp16Threads = 512;
+constexpr int kForwardFp16BlockT = 8;
 constexpr int kUpdateCopyBytes = 16;
 constexpr int kUpdateCopyWords = kUpdateCopyBytes / static_cast<int>(sizeof(uint32_t));
 constexpr int kFusedW4FastVec = 4;
@@ -83,6 +91,35 @@ inline uint64_t pack4_from_floats_device(float const (&values)[Vec], int base) {
   return raw;
 }
 
+template <typename scalar_t>
+inline float vec_float_from_raw16_device(uint16_t value) {
+  if constexpr (std::is_same_v<scalar_t, c10::Half>) {
+    return static_cast<float>(sycl::bit_cast<sycl::half>(value));
+  } else {
+    return to_float_device(from_raw16_device<scalar_t>(value));
+  }
+}
+
+template <typename scalar_t>
+inline float vec_float_from_pack4_device(uint64_t raw, int lane) {
+  return vec_float_from_raw16_device<scalar_t>(static_cast<uint16_t>(raw >> (16 * lane)));
+}
+
+template <typename scalar_t, int Vec>
+inline uint64_t vec_pack4_from_floats_device(float const (&values)[Vec], int base) {
+  if constexpr (!std::is_same_v<scalar_t, c10::Half>) {
+    return pack4_from_floats_device<scalar_t>(values, base);
+  } else {
+    uint64_t raw = 0;
+#pragma unroll
+    for (int v = 0; v < 4; ++v) {
+      const auto value = static_cast<sycl::half>(values[base + v]);
+      raw |= static_cast<uint64_t>(sycl::bit_cast<uint16_t>(value)) << (16 * v);
+    }
+    return raw;
+  }
+}
+
 inline int64_t div_up_i64(int64_t x, int64_t y) {
   return (x + y - 1) / y;
 }
@@ -101,6 +138,7 @@ struct SconvForwardParams {
   int64_t T;
   int64_t D;
   int64_t W;
+  int64_t num_sequences;
   int64_t x_stride_t;
   int64_t x_stride_d;
   int64_t cache_stride_slot;
@@ -175,7 +213,7 @@ void launch_sconv_forward(sycl::queue& q, SconvForwardParams<scalar_t> const& pa
       sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
 }
 
-template <typename scalar_t, int W, bool UseSilu, bool UseResidual, bool IsDecode>
+template <typename scalar_t, int W, int BlockT, bool UseSilu, bool UseResidual, bool IsDecode, bool SingleSequence>
 struct SconvForwardBlockKernel {
   SconvForwardParams<scalar_t> p;
 
@@ -193,66 +231,119 @@ struct SconvForwardBlockKernel {
       weights[iw] = to_float_device(p.weight[d * p.weight_stride_d + weight_iw * p.weight_stride_w]);
     }
 
-    const int64_t t0 = tb * kForwardBlockT;
+    // Keep the causal window in registers. Consecutive tokens from the same
+    // packed sequence need only one new x load; the previous implementation
+    // reloaded all W overlapping taps for every output. A sequence boundary
+    // invalidates the window and reloads its prefix from the proper cache slot.
+    float taps[W];
+    int32_t previous_seq = -1;
+    int64_t single_bos = 0;
+    int64_t single_slot = 0;
+    float single_mask = 0.0f;
+    if constexpr (SingleSequence) {
+      single_bos = p.cu[0];
+      single_slot = p.safe_idx[0];
+      single_mask = (IsDecode || p.cache_mask[0]) ? 1.0f : 0.0f;
+    }
+    const int64_t t0 = tb * BlockT;
 #pragma unroll
-    for (int j = 0; j < kForwardBlockT; ++j) {
+    for (int j = 0; j < BlockT; ++j) {
       const int64_t t = t0 + j;
       if (t >= p.T) {
         return;
       }
 
-      const int32_t seq = p.si[t];
-      const int64_t bos = p.cu[seq];
-      const int64_t slot = p.safe_idx[seq];
-      const float mask = (IsDecode || p.cache_mask[seq * p.cache_mask_stride_seq]) ? 1.0f : 0.0f;
+      int32_t seq = 0;
+      int64_t bos = single_bos;
+      int64_t slot = single_slot;
+      float mask = single_mask;
+      if constexpr (!SingleSequence) {
+        seq = p.si[t];
+        bos = p.cu[seq];
+        slot = p.safe_idx[seq];
+        mask = (IsDecode || p.cache_mask[seq * p.cache_mask_stride_seq]) ? 1.0f : 0.0f;
+      }
+
+      if (j > 0 && (SingleSequence || seq == previous_seq)) {
+#pragma unroll
+        for (int iw = W - 1; iw > 0; --iw) {
+          taps[iw] = taps[iw - 1];
+        }
+        taps[0] = to_float_device(p.x[t * p.x_stride_t + d * p.x_stride_d]);
+      } else {
+#pragma unroll
+        for (int iw = 0; iw < W; ++iw) {
+          const int64_t shifted = t - iw;
+          taps[iw] = 0.0f;
+          if (shifted >= bos && shifted < p.T) {
+            taps[iw] = to_float_device(p.x[shifted * p.x_stride_t + d * p.x_stride_d]);
+          } else {
+            const int64_t prefix_pos = shifted - bos + (W - 1);
+            if (shifted < bos && prefix_pos >= 0 && prefix_pos < W - 1) {
+              taps[iw] =
+                  mask *
+                  to_float_device(
+                      p.cache[slot * p.cache_stride_slot + prefix_pos * p.cache_stride_w + d * p.cache_stride_d]);
+            }
+          }
+        }
+      }
+      previous_seq = seq;
 
       float acc = 0.0f;
 #pragma unroll
       for (int iw = 0; iw < W; ++iw) {
-        const int64_t shifted = t - iw;
-        float tap = 0.0f;
-        if (shifted >= bos && shifted < p.T) {
-          tap = to_float_device(p.x[shifted * p.x_stride_t + d * p.x_stride_d]);
-        } else {
-          const int64_t prefix_pos = shifted - bos + (W - 1);
-          if (shifted < bos && prefix_pos >= 0 && prefix_pos < W - 1) {
-            tap =
-                mask * to_float_device(
-                           p.cache[slot * p.cache_stride_slot + prefix_pos * p.cache_stride_w + d * p.cache_stride_d]);
-          }
-        }
-        acc += tap * weights[iw];
+        acc += taps[iw] * weights[iw];
       }
-
       if constexpr (UseSilu) {
         acc = acc / (1.0f + sycl::native::exp(-acc));
       }
       if constexpr (UseResidual) {
-        acc += to_float_device(p.x[t * p.x_stride_t + d * p.x_stride_d]);
+        acc += taps[0];
       }
       p.y[t * p.y_stride_t + d * p.y_stride_d] = from_float_device<scalar_t>(acc);
     }
   }
 };
 
-template <typename scalar_t, int W, bool UseSilu, bool UseResidual, bool IsDecode>
+template <typename scalar_t, int W, int BlockT, bool UseSilu, bool UseResidual, bool IsDecode, bool SingleSequence>
 void launch_sconv_forward_block(sycl::queue& q, SconvForwardParams<scalar_t> const& params) {
   if (params.T == 0 || params.D == 0) {
     return;
   }
   const int64_t channel_global = div_up_i64(params.D, kThreads) * kThreads;
-  const int64_t token_blocks = div_up_i64(params.T, kForwardBlockT);
-  SconvForwardBlockKernel<scalar_t, W, UseSilu, UseResidual, IsDecode> kernel{params};
-  q.parallel_for<SconvForwardBlockKernel<scalar_t, W, UseSilu, UseResidual, IsDecode>>(
+  const int64_t token_blocks = div_up_i64(params.T, BlockT);
+  SconvForwardBlockKernel<scalar_t, W, BlockT, UseSilu, UseResidual, IsDecode, SingleSequence> kernel{params};
+  q.parallel_for<SconvForwardBlockKernel<scalar_t, W, BlockT, UseSilu, UseResidual, IsDecode, SingleSequence>>(
       sycl::nd_range<2>(sycl::range<2>(channel_global, token_blocks), sycl::range<2>(kThreads, 1)), kernel);
+}
+
+template <typename scalar_t, int W, int BlockT, bool UseSilu, bool UseResidual, bool IsDecode>
+void launch_sconv_forward_block_sequence_selected(sycl::queue& q, SconvForwardParams<scalar_t> const& params) {
+  if (params.num_sequences == 1) {
+    launch_sconv_forward_block<scalar_t, W, BlockT, UseSilu, UseResidual, IsDecode, true>(q, params);
+  } else {
+    launch_sconv_forward_block<scalar_t, W, BlockT, UseSilu, UseResidual, IsDecode, false>(q, params);
+  }
+}
+
+template <typename scalar_t, int W, bool UseSilu, bool UseResidual, bool IsDecode>
+void launch_sconv_forward_block_size_selected(sycl::queue& q, SconvForwardParams<scalar_t> const& params) {
+  if (!IsDecode && params.T >= 256) {
+    launch_sconv_forward_block_sequence_selected<scalar_t, W, kForwardPrefillBlockT, UseSilu, UseResidual, IsDecode>(
+        q, params);
+  } else {
+    launch_sconv_forward_block_sequence_selected<scalar_t, W, kForwardDecodeBlockT, UseSilu, UseResidual, IsDecode>(
+        q, params);
+  }
 }
 
 template <typename scalar_t, int W, bool UseSilu, bool UseResidual>
 void launch_sconv_forward_block_decode_selected(sycl::queue& q, SconvForwardParams<scalar_t> const& params) {
   if (params.is_decode) {
-    launch_sconv_forward_block<scalar_t, W, UseSilu, UseResidual, true>(q, params);
+    launch_sconv_forward_block_size_selected<scalar_t, W, UseSilu, UseResidual, true>(q, params);
   } else {
-    launch_sconv_forward_block<scalar_t, W, UseSilu, UseResidual, false>(q, params);
+    launch_sconv_forward_block_size_selected<scalar_t, W, UseSilu, UseResidual, false>(q, params);
   }
 }
 
@@ -285,6 +376,164 @@ bool try_launch_sconv_forward_block(sycl::queue& q, SconvForwardParams<scalar_t>
     return true;
   }
   return false;
+}
+
+template <typename scalar_t, int Vec, int BlockT>
+struct SconvForwardW4VecKernel {
+  SconvForwardParams<scalar_t> p;
+
+  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<2> item) const {
+    const int64_t channel_block = static_cast<int64_t>(item.get_global_id(0));
+    const int64_t token_block = static_cast<int64_t>(item.get_global_id(1));
+    const int64_t channel_blocks = p.D / Vec;
+    if (channel_block >= channel_blocks) {
+      return;
+    }
+    const int64_t d0 = channel_block * Vec;
+    const int64_t t0 = token_block * BlockT;
+
+    float weights[4][Vec];
+#pragma unroll
+    for (int v = 0; v < Vec; ++v) {
+      const uint64_t raw = load_pack4_device(p.weight + (d0 + v) * p.weight_stride_d);
+#pragma unroll
+      for (int iw = 0; iw < 4; ++iw) {
+        const int weight_iw = p.weight_current_first ? iw : 3 - iw;
+        weights[iw][v] = vec_float_from_pack4_device<scalar_t>(raw, weight_iw);
+      }
+    }
+
+    const int64_t slot = p.safe_idx[0];
+    const bool use_cache = p.cache_mask[0];
+    constexpr bool kFloatTaps = std::is_same_v<scalar_t, c10::Half>;
+    uint64_t packed_taps[4][Vec / 4];
+    float float_taps[4][Vec];
+
+#pragma unroll
+    for (int j = 0; j < BlockT; ++j) {
+      const int64_t t = t0 + j;
+      if (t >= p.T) {
+        return;
+      }
+      if (j == 0) {
+#pragma unroll
+        for (int iw = 0; iw < 4; ++iw) {
+          const int64_t shifted = t - iw;
+#pragma unroll
+          for (int word = 0; word < Vec / 4; ++word) {
+            uint64_t raw = 0;
+            if (shifted >= 0) {
+              raw = load_pack4_device(p.x + shifted * p.x_stride_t + d0 + word * 4);
+            } else if (use_cache) {
+              const int64_t prefix = shifted + 3;
+              raw = load_pack4_device(p.cache + slot * p.cache_stride_slot + prefix * p.cache_stride_w + d0 + word * 4);
+            }
+            if constexpr (kFloatTaps) {
+#pragma unroll
+              for (int lane = 0; lane < 4; ++lane) {
+                float_taps[iw][word * 4 + lane] = vec_float_from_pack4_device<scalar_t>(raw, lane);
+              }
+            } else {
+              packed_taps[iw][word] = raw;
+            }
+          }
+        }
+      } else {
+#pragma unroll
+        for (int iw = 3; iw > 0; --iw) {
+          if constexpr (kFloatTaps) {
+#pragma unroll
+            for (int v = 0; v < Vec; ++v) {
+              float_taps[iw][v] = float_taps[iw - 1][v];
+            }
+          } else {
+#pragma unroll
+            for (int word = 0; word < Vec / 4; ++word) {
+              packed_taps[iw][word] = packed_taps[iw - 1][word];
+            }
+          }
+        }
+#pragma unroll
+        for (int word = 0; word < Vec / 4; ++word) {
+          const uint64_t raw = load_pack4_device(p.x + t * p.x_stride_t + d0 + word * 4);
+          if constexpr (kFloatTaps) {
+#pragma unroll
+            for (int lane = 0; lane < 4; ++lane) {
+              float_taps[0][word * 4 + lane] = vec_float_from_pack4_device<scalar_t>(raw, lane);
+            }
+          } else {
+            packed_taps[0][word] = raw;
+          }
+        }
+      }
+
+      float out[Vec];
+#pragma unroll
+      for (int v = 0; v < Vec; ++v) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int iw = 0; iw < 4; ++iw) {
+          float tap;
+          if constexpr (kFloatTaps) {
+            tap = float_taps[iw][v];
+          } else {
+            tap = vec_float_from_pack4_device<scalar_t>(packed_taps[iw][v / 4], v % 4);
+          }
+          acc += tap * weights[iw][v];
+        }
+        acc *= sycl::native::recip(1.0f + sycl::native::exp(-acc));
+        float residual;
+        if constexpr (kFloatTaps) {
+          residual = float_taps[0][v];
+        } else {
+          residual = vec_float_from_pack4_device<scalar_t>(packed_taps[0][v / 4], v % 4);
+        }
+        out[v] = acc + residual;
+      }
+#pragma unroll
+      for (int word = 0; word < Vec / 4; ++word) {
+        store_pack4_device(
+            p.y + t * p.y_stride_t + d0 + word * 4, vec_pack4_from_floats_device<scalar_t>(out, word * 4));
+      }
+    }
+  }
+};
+
+template <typename scalar_t, int Vec, int Threads, int BlockT>
+void launch_sconv_forward_w4_vec(sycl::queue& q, SconvForwardParams<scalar_t> const& params) {
+  const int64_t channel_blocks = params.D / Vec;
+  const int64_t channel_global = div_up_i64(channel_blocks, Threads) * Threads;
+  const int64_t token_blocks = div_up_i64(params.T, BlockT);
+  SconvForwardW4VecKernel<scalar_t, Vec, BlockT> kernel{params};
+  q.parallel_for<SconvForwardW4VecKernel<scalar_t, Vec, BlockT>>(
+      sycl::nd_range<2>(sycl::range<2>(channel_global, token_blocks), sycl::range<2>(Threads, 1)), kernel);
+}
+
+template <typename scalar_t>
+bool try_launch_sconv_forward_w4_vec(sycl::queue& q, SconvForwardParams<scalar_t> const& params) {
+  constexpr bool kBf16 = std::is_same_v<scalar_t, c10::BFloat16>;
+  constexpr bool kFp16 = std::is_same_v<scalar_t, c10::Half>;
+  constexpr int kVec = kBf16 ? kForwardBf16Vec : kForwardFp16Vec;
+  if constexpr (!kBf16 && !kFp16) {
+    return false;
+  } else {
+    if (params.W != 4 || params.is_decode || !params.use_silu || !params.use_residual || params.T < 256 ||
+        params.num_sequences != 1 || params.D % kVec != 0 || params.x_stride_d != 1 || params.cache_stride_d != 1 ||
+        params.y_stride_d != 1 || params.x_stride_t % 4 != 0 || params.cache_stride_slot % 4 != 0 ||
+        params.cache_stride_w % 4 != 0 || params.y_stride_t % 4 != 0 || params.weight_stride_d != 4 ||
+        params.weight_stride_w != 1 || reinterpret_cast<std::uintptr_t>(params.x) % alignof(uint64_t) != 0 ||
+        reinterpret_cast<std::uintptr_t>(params.cache) % alignof(uint64_t) != 0 ||
+        reinterpret_cast<std::uintptr_t>(params.weight) % alignof(uint64_t) != 0 ||
+        reinterpret_cast<std::uintptr_t>(params.y) % alignof(uint64_t) != 0) {
+      return false;
+    }
+    if constexpr (kBf16) {
+      launch_sconv_forward_w4_vec<scalar_t, kForwardBf16Vec, kForwardBf16Threads, kForwardBf16BlockT>(q, params);
+    } else {
+      launch_sconv_forward_w4_vec<scalar_t, kForwardFp16Vec, kForwardFp16Threads, kForwardFp16BlockT>(q, params);
+    }
+    return true;
+  }
 }
 
 template <typename scalar_t>
@@ -1709,6 +1958,7 @@ SGL_KERNEL_EXPORT at::Tensor inkling_sconv_forward(
             x.size(0),
             x.size(1),
             weight_layout.W,
+            safe_idx.numel(),
             x.stride(0),
             x.stride(1),
             sconv_cache.stride(0),
@@ -1723,7 +1973,8 @@ SGL_KERNEL_EXPORT at::Tensor inkling_sconv_forward(
             use_residual,
             is_decode,
             weight_layout.current_first};
-        if (!try_launch_sconv_forward_block<scalar_t>(queue, params)) {
+        if (!try_launch_sconv_forward_w4_vec<scalar_t>(queue, params) &&
+            !try_launch_sconv_forward_block<scalar_t>(queue, params)) {
           launch_sconv_forward<scalar_t>(queue, params);
         }
         return y;

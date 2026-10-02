@@ -132,6 +132,12 @@ from sgl_kernel.inkling_attn_prologue import (
     inkling_attn_prologue_extend,
     inkling_attn_prologue_verify,
 )
+from sgl_kernel.inkling_dense_mlp import (
+    inkling_down,
+    inkling_gate_up,
+    repack_inkling_down_weight,
+    repack_inkling_gate_up_weight,
+)
 from sgl_kernel.inkling_sconv import (
     causal_conv1d,
     fused_causal_conv1d_update_decode,

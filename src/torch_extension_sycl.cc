@@ -333,6 +333,22 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("merge_state", torch::kXPU, &merge_state);
 
   /*
+   * Inkling TP4 dense MLP
+   */
+  m.def("inkling_gate_up(Tensor input, Tensor packed_weight) -> Tensor");
+  m.impl("inkling_gate_up", torch::kXPU, &inkling_gate_up);
+  m.def(
+      "inkling_gate_up_out(Tensor input, Tensor packed_weight, "
+      "Tensor(a!) output) -> ()");
+  m.impl("inkling_gate_up_out", torch::kXPU, &inkling_gate_up_out);
+  m.def("inkling_down(Tensor input, Tensor packed_weight) -> Tensor");
+  m.impl("inkling_down", torch::kXPU, &inkling_down);
+  m.def(
+      "inkling_down_out(Tensor input, Tensor packed_weight, "
+      "Tensor(a!) output) -> ()");
+  m.impl("inkling_down_out", torch::kXPU, &inkling_down_out);
+
+  /*
    * Inkling short convolution
    */
   m.def(

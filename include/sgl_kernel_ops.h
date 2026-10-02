@@ -583,6 +583,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
+
+// Inkling TP4 dense MLP. packed_weight is a padded logical [K,N] view.
+torch::Tensor inkling_gate_up(const torch::Tensor& input, const torch::Tensor& packed_weight);
+void inkling_gate_up_out(const torch::Tensor& input, const torch::Tensor& packed_weight, torch::Tensor& output);
+torch::Tensor inkling_down(const torch::Tensor& input, const torch::Tensor& packed_weight);
+void inkling_down_out(const torch::Tensor& input, const torch::Tensor& packed_weight, torch::Tensor& output);
 void cutlass_scaled_fp4_mm(
     torch::Tensor& D,
     torch::Tensor const& A,

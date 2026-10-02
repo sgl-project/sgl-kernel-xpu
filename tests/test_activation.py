@@ -21,6 +21,32 @@ def test_fused_silu_mul(dim, batch_size, seq_len):
     torch.testing.assert_close(y_ref.cpu(), y.cpu(), rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "rows,width",
+    [
+        (2047, 256),
+        (2048, 256),
+        (4095, 512),
+        (4096, 512),
+        (4095, 768),
+        (4096, 768),
+        (6143, 768),
+        (6144, 768),
+        (6176, 772),
+        (8192, 1024),
+        (24576, 768),
+    ],
+)
+def test_fused_silu_mul_large_routed_batch(dtype, rows, width):
+    x = torch.randn(rows, 2 * width, dtype=dtype, device=device)
+    out = sgl_kernel.silu_and_mul(x)
+    ref = (torch.nn.functional.silu(x[:, :width].float()) * x[:, width:].float()).to(
+        dtype
+    )
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
 @pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])

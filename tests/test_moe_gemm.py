@@ -982,6 +982,29 @@ def test_moe_grouped_mm_nt_xe35_w4a16_mxfp4_op(
     )
 
 
+@pytest.mark.parametrize(
+    "rows,gemm_n,gemm_k",
+    [
+        (8, 192, 256),  # Small-M policy with an N tail.
+        (16, 192, 256),  # Medium-M policy, short K and narrow N.
+        (16, 320, 256),  # 32x256 short-K policy with an N tail.
+        (16, 320, 1056),  # Medium-M policy, long K.
+        (17, 320, 256),  # Existing 32-row policy past the 16-row boundary.
+        (32, 64, 256),  # Existing 32-row policy with narrow N.
+        (48, 128, 256),  # Split prefill dispatch on a non-Inkling shape.
+    ],
+)
+def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_generic_k32_dispatch(rows, gemm_n, gemm_k):
+    """Reference-check the policy boundaries shared by all BF16 MXFP4 K32 GEMMs."""
+    _check_mxfp4_grouped_mm(
+        num_tokens_per_expert=rows,
+        num_experts=3,
+        hidden_size=gemm_k,
+        intermediate_size=gemm_n // 2,
+        dtype=torch.bfloat16,
+    )
+
+
 @pytest.mark.parametrize("weight_dtype", [torch.int8, torch.uint8])
 @pytest.mark.parametrize("scale_dtype", [torch.uint8, torch.float8_e8m0fnu])
 def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_input_dtypes(weight_dtype, scale_dtype):
@@ -2134,6 +2157,118 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_ragged_production_tiles(
     )
 
     torch.testing.assert_close(actual.cpu(), expected, rtol=1e-1, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "gemm_n,gemm_k",
+    [
+        (1536, 6144),  # Inkling routed-MoE gate/up projection.
+        (6144, 768),  # Inkling routed-MoE down projection.
+    ],
+)
+def test_moe_grouped_mm_nt_xe20_w4a16_inkling_prefill_nonzero_reference(gemm_n, gemm_k):
+    """Reference-check the exact Inkling TP4 prefill dispatch.
+
+    The optimized production path splits 256 experts between two launches at
+    the 96/97-row boundary.  Full production weights are used so dispatch,
+    offsets, and launch geometry are real.  A deterministic subset of output
+    rows and columns is compared against FP32 matmul on independently
+    dequantized MXFP4 weights; checking the complete output for finite values
+    additionally catches experts skipped by either launch.
+    """
+    num_experts = 256
+    rows_per_expert = torch.full((num_experts,), 96, dtype=torch.int32)
+    rows_per_expert[:6] = torch.tensor([69, 95, 96, 97, 123, 96])
+    total_m = int(rows_per_expert.sum())
+    assert total_m == 4096 * 6
+
+    torch.manual_seed(20260923)
+    torch.xpu.manual_seed_all(20260923)
+    activations = (
+        torch.randn((total_m, gemm_k), device="xpu", dtype=torch.bfloat16) * 0.02
+    )
+    packed = torch.randint(
+        0,
+        256,
+        (num_experts, gemm_n, gemm_k // 2),
+        device="xpu",
+        dtype=torch.uint8,
+    )
+    scales = torch.randint(
+        121,
+        126,
+        (num_experts, gemm_n, gemm_k // MXFP4_BLOCK_SIZE),
+        device="xpu",
+        dtype=torch.uint8,
+    )
+    output = torch.full(
+        (total_m, gemm_n),
+        float("nan"),
+        device="xpu",
+        dtype=torch.bfloat16,
+    )
+
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w4a16(
+        output,
+        activations,
+        packed,
+        scales,
+        None,
+        None,
+        rows_per_expert.to("xpu"),
+        num_experts,
+        False,
+        MXFP4_BLOCK_SIZE,
+    )
+    torch.xpu.synchronize()
+    assert torch.isfinite(output).all()
+
+    column_ids = torch.tensor(
+        [0, 1, gemm_n // 4, gemm_n // 2, gemm_n - 2, gemm_n - 1],
+        dtype=torch.long,
+    )
+    row_offset = 0
+    max_abs_error = 0.0
+    mean_abs_error = 0.0
+    checked_values = 0
+    for expert_id, expert_rows in enumerate(rows_per_expert.tolist()):
+        if expert_id not in (0, 1, 2, 3, 4, 127, 255):
+            row_offset += expert_rows
+            continue
+
+        local_rows = sorted({0, expert_rows // 2, expert_rows - 1})
+        row_ids = torch.tensor(
+            [row_offset + local_row for local_row in local_rows], dtype=torch.long
+        )
+        packed_sample = packed[expert_id, column_ids].cpu()
+        scale_sample = scales[expert_id, column_ids].cpu()
+        weight_sample = _dequantize_weights_mxfp4(
+            packed_sample.unsqueeze(0),
+            scale_sample.unsqueeze(0),
+            dtype=torch.float32,
+        )[0]
+        expected = (
+            activations[row_ids.to("xpu")].cpu().float() @ weight_sample.transpose(0, 1)
+        ).to(torch.bfloat16)
+        actual = (
+            output.index_select(0, row_ids.to("xpu"))
+            .index_select(1, column_ids.to("xpu"))
+            .cpu()
+        )
+        error = (actual.float() - expected.float()).abs()
+        max_abs_error = max(max_abs_error, error.max().item())
+        mean_abs_error += error.sum().item()
+        checked_values += error.numel()
+        torch.testing.assert_close(actual, expected, rtol=1e-1, atol=1e-2)
+        row_offset += expert_rows
+
+    assert checked_values == 7 * 3 * len(column_ids)
+    mean_abs_error /= checked_values
+    print(
+        f"Inkling E=256 M={total_m} N={gemm_n} K={gemm_k}: "
+        f"checked={checked_values}, max_abs={max_abs_error:.6g}, "
+        f"mean_abs={mean_abs_error:.6g}"
+    )
 
 
 if __name__ == "__main__":

@@ -37,12 +37,13 @@
 
 #include <cstdint>
 #include <sycl/sycl.hpp>
+#include <type_traits>
 #include <unordered_map>
 
 #include "SGLKernelPerf.h"
 #include "sgl_kernel_export.h"
 #include "sycl/Utils.h"
-#include "sycl/kernels/moe/xe20/w4a16_launch_policy.hpp"
+#include "sycl/kernels/moe/xe20/inkling_routed_moe_launch_policy.hpp"
 #ifdef USE_MOE_JIT
 #include "jit/moe_jit.h"
 #endif
@@ -96,6 +97,13 @@ DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_128)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_128_skip)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_256)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_256_skip)
+DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_m_8_n_64, uint8_t, cutlass::bfloat16_t)
+DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_m_16_n_64, uint8_t, cutlass::bfloat16_t)
+DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_down_m_32_n_256, uint8_t, cutlass::bfloat16_t)
+DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_gate_prefill_low, uint8_t, cutlass::bfloat16_t)
+DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_gate_prefill_high, uint8_t, cutlass::bfloat16_t)
+DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_down_prefill_low, uint8_t, cutlass::bfloat16_t)
+DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_down_prefill_high, uint8_t, cutlass::bfloat16_t)
 
 #undef DECLARE_W4A16_POLICY
 #undef DECLARE_W4A16_EXTERN
@@ -150,6 +158,12 @@ int select_w4a16_policy_id(int avg_m, int gemm_n, int gemm_k) {
     return want_nskip(gemm_n, 256) ? 6 : 5;
   }
   return want_nskip(gemm_n, 128) ? 4 : 3;
+}
+
+int select_mxfp4_bf16_policy_id(int avg_m, int gemm_n, int gemm_k) {
+  if (avg_m <= 8) return 7;
+  if (avg_m <= 16) return gemm_k <= kW4A16ShortK && gemm_n >= 256 ? 9 : 8;
+  return select_w4a16_policy_id(avg_m, gemm_n, gemm_k);
 }
 
 }  // namespace
@@ -260,7 +274,18 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   // Avoid a separate four-byte memset launch, which is material for decode.
 
   const int avg_m = total_m / static_cast<int>(n_experts);
+  // These launch policies apply to the MXFP4/BF16 K32 quantization family,
+  // independently of a particular model or benchmark matrix size.
+#ifdef USE_MOE_JIT
+  // The JIT registry contains the seven original policies. Keep its dispatch
+  // on those IDs until the specialized policies and split launch are wired in.
   const int policy_id = select_w4a16_policy_id(avg_m, gemm_n, gemm_k);
+#else
+  const bool use_mxfp4_bf16_policy =
+      !is_int4 && activations.scalar_type() == at::ScalarType::BFloat16 && group_size == 32;
+  const int policy_id = use_mxfp4_bf16_policy ? select_mxfp4_bf16_policy_id(avg_m, gemm_n, gemm_k)
+                                              : select_w4a16_policy_id(avg_m, gemm_n, gemm_k);
+#endif
   const bool is_fp16_act = activations.scalar_type() == at::ScalarType::Half;
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
@@ -276,105 +301,80 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   SGL_KERNEL_PERF_SCOPE("moe_grouped_mm_nt_xe20_w4a16", queue, a_bytes + w_bytes + s_bytes + out_bytes, flops);
 #endif
 
-#define LAUNCH_W4A16(Policy)                                                                  \
-  do {                                                                                        \
-    if (is_int4) {                                                                            \
-      if (is_fp16_act) {                                                                      \
-        moe_w4a16::w4a16_launch<moe_w4a16::Policy, cutlass::half_t, cutlass::half_t>(         \
-            queue,                                                                            \
-            activations.data_ptr(),                                                           \
-            packed_weights.data_ptr(),                                                        \
-            scales.data_ptr(),                                                                \
-            zeros_ptr,                                                                        \
-            bias_ptr,                                                                         \
-            output.data_ptr(),                                                                \
-            gemm_n,                                                                           \
-            gemm_k,                                                                           \
-            rows_per_expert.data_ptr<int>(),                                                  \
-            total_m,                                                                          \
-            static_cast<int>(n_experts),                                                      \
-            static_cast<int>(group_size),                                                     \
-            atomic_buffer.data_ptr<int>());                                                   \
-      } else {                                                                                \
-        moe_w4a16::w4a16_launch<moe_w4a16::Policy, cutlass::bfloat16_t, cutlass::bfloat16_t>( \
-            queue,                                                                            \
-            activations.data_ptr(),                                                           \
-            packed_weights.data_ptr(),                                                        \
-            scales.data_ptr(),                                                                \
-            zeros_ptr,                                                                        \
-            bias_ptr,                                                                         \
-            output.data_ptr(),                                                                \
-            gemm_n,                                                                           \
-            gemm_k,                                                                           \
-            rows_per_expert.data_ptr<int>(),                                                  \
-            total_m,                                                                          \
-            static_cast<int>(n_experts),                                                      \
-            static_cast<int>(group_size),                                                     \
-            atomic_buffer.data_ptr<int>());                                                   \
-      }                                                                                       \
-    } else {                                                                                  \
-      if (is_fp16_act) {                                                                      \
-        moe_w4a16::w4a16_launch<moe_w4a16::Policy, uint8_t, cutlass::half_t>(                 \
-            queue,                                                                            \
-            activations.data_ptr(),                                                           \
-            packed_weights.data_ptr(),                                                        \
-            scales.data_ptr(),                                                                \
-            zeros_ptr,                                                                        \
-            bias_ptr,                                                                         \
-            output.data_ptr(),                                                                \
-            gemm_n,                                                                           \
-            gemm_k,                                                                           \
-            rows_per_expert.data_ptr<int>(),                                                  \
-            total_m,                                                                          \
-            static_cast<int>(n_experts),                                                      \
-            static_cast<int>(group_size),                                                     \
-            atomic_buffer.data_ptr<int>());                                                   \
-      } else {                                                                                \
-        moe_w4a16::w4a16_launch<moe_w4a16::Policy, uint8_t, cutlass::bfloat16_t>(             \
-            queue,                                                                            \
-            activations.data_ptr(),                                                           \
-            packed_weights.data_ptr(),                                                        \
-            scales.data_ptr(),                                                                \
-            zeros_ptr,                                                                        \
-            bias_ptr,                                                                         \
-            output.data_ptr(),                                                                \
-            gemm_n,                                                                           \
-            gemm_k,                                                                           \
-            rows_per_expert.data_ptr<int>(),                                                  \
-            total_m,                                                                          \
-            static_cast<int>(n_experts),                                                      \
-            static_cast<int>(group_size),                                                     \
-            atomic_buffer.data_ptr<int>());                                                   \
-      }                                                                                       \
-    }                                                                                         \
-  } while (0)
-
-#define DISPATCH_W4A16_POLICY()                            \
-  do {                                                     \
-    switch (policy_id) {                                   \
-      case 0:                                              \
-        LAUNCH_W4A16(w4a16_launch_policy_m_8_n_64);        \
-        break;                                             \
-      case 1:                                              \
-        LAUNCH_W4A16(w4a16_launch_policy_m_16_n_64);       \
-        break;                                             \
-      case 2:                                              \
-        LAUNCH_W4A16(w4a16_launch_policy_m_32_n_64);       \
-        break;                                             \
-      case 3:                                              \
-        LAUNCH_W4A16(w4a16_launch_policy_m_64_n_128);      \
-        break;                                             \
-      case 4:                                              \
-        LAUNCH_W4A16(w4a16_launch_policy_m_64_n_128_skip); \
-        break;                                             \
-      case 5:                                              \
-        LAUNCH_W4A16(w4a16_launch_policy_m_64_n_256);      \
-        break;                                             \
-      case 6:                                              \
-        LAUNCH_W4A16(w4a16_launch_policy_m_64_n_256_skip); \
-        break;                                             \
-    }                                                      \
-  } while (0)
+#ifndef USE_MOE_JIT
+  auto launch_typed = [&](auto policy_tag, auto scale_tag, auto activation_tag) {
+    using Policy = typename decltype(policy_tag)::type;
+    using Scale = typename decltype(scale_tag)::type;
+    using Activation = typename decltype(activation_tag)::type;
+    moe_w4a16::w4a16_launch<Policy, Scale, Activation>(
+        queue,
+        activations.data_ptr(),
+        packed_weights.data_ptr(),
+        scales.data_ptr(),
+        zeros_ptr,
+        bias_ptr,
+        output.data_ptr(),
+        gemm_n,
+        gemm_k,
+        rows_per_expert.data_ptr<int>(),
+        total_m,
+        static_cast<int>(n_experts),
+        static_cast<int>(group_size),
+        atomic_buffer.data_ptr<int>());
+  };
+  auto launch_regular = [&](auto policy_tag) {
+    if (is_int4) {
+      if (is_fp16_act) {
+        launch_typed(policy_tag, std::type_identity<cutlass::half_t>{}, std::type_identity<cutlass::half_t>{});
+      } else {
+        launch_typed(policy_tag, std::type_identity<cutlass::bfloat16_t>{}, std::type_identity<cutlass::bfloat16_t>{});
+      }
+    } else if (is_fp16_act) {
+      launch_typed(policy_tag, std::type_identity<uint8_t>{}, std::type_identity<cutlass::half_t>{});
+    } else {
+      launch_typed(policy_tag, std::type_identity<uint8_t>{}, std::type_identity<cutlass::bfloat16_t>{});
+    }
+  };
+  auto launch_mxfp4_bf16 = [&](auto policy_tag) {
+    launch_typed(policy_tag, std::type_identity<uint8_t>{}, std::type_identity<cutlass::bfloat16_t>{});
+  };
+  auto dispatch_policy = [&]() {
+    switch (policy_id) {
+      case 0:
+        launch_regular(std::type_identity<moe_w4a16::w4a16_launch_policy_m_8_n_64>{});
+        break;
+      case 1:
+        launch_regular(std::type_identity<moe_w4a16::w4a16_launch_policy_m_16_n_64>{});
+        break;
+      case 2:
+        launch_regular(std::type_identity<moe_w4a16::w4a16_launch_policy_m_32_n_64>{});
+        break;
+      case 3:
+        launch_regular(std::type_identity<moe_w4a16::w4a16_launch_policy_m_64_n_128>{});
+        break;
+      case 4:
+        launch_regular(std::type_identity<moe_w4a16::w4a16_launch_policy_m_64_n_128_skip>{});
+        break;
+      case 5:
+        launch_regular(std::type_identity<moe_w4a16::w4a16_launch_policy_m_64_n_256>{});
+        break;
+      case 6:
+        launch_regular(std::type_identity<moe_w4a16::w4a16_launch_policy_m_64_n_256_skip>{});
+        break;
+      case 7:
+        launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_m_8_n_64>{});
+        break;
+      case 8:
+        launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_m_16_n_64>{});
+        break;
+      case 9:
+        launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_down_m_32_n_256>{});
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported W4A16 launch policy");
+    }
+  };
+#endif
 
 #ifdef USE_MOE_JIT
   {
@@ -403,11 +403,16 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
         jit_err);
   }
 #else
-  DISPATCH_W4A16_POLICY();
+  if (use_mxfp4_bf16_policy && avg_m > 32 && gemm_k <= kW4A16ShortK && gemm_n >= 128) {
+    launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_down_prefill_low>{});
+    launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_down_prefill_high>{});
+  } else if (use_mxfp4_bf16_policy && avg_m > 32 && gemm_k > kW4A16ShortK && gemm_n >= 256) {
+    launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_gate_prefill_low>{});
+    launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_gate_prefill_high>{});
+  } else {
+    dispatch_policy();
+  }
 #endif
-
-#undef DISPATCH_W4A16_POLICY
-#undef LAUNCH_W4A16
 }
 
 #undef SYCL_INTEL_TARGET

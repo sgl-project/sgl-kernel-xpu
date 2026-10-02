@@ -20,6 +20,25 @@ class w4a16_launch_policy : public KernelPolicy {
   static constexpr bool SkipPaddedN = SkipPaddedN_;
 };
 
+template <class Policy, int MinExpertRows_, int MaxExpertRows_ = 2147483647>
+class w4a16_expert_row_range_policy : public Policy {
+ public:
+  static constexpr int MinExpertRows = MinExpertRows_;
+  static constexpr int MaxExpertRows = MaxExpertRows_;
+};
+
+template <class Policy>
+struct w4a16_expert_row_range {
+  static constexpr int Min = 0;
+  static constexpr int Max = 2147483647;
+};
+
+template <class Policy, int MinExpertRows_, int MaxExpertRows_>
+struct w4a16_expert_row_range<w4a16_expert_row_range_policy<Policy, MinExpertRows_, MaxExpertRows_>> {
+  static constexpr int Min = MinExpertRows_;
+  static constexpr int Max = MaxExpertRows_;
+};
+
 // Decode-size tiles use the shallow prefetch that fmha-cri measures for the
 // small-M band.  The 32-row policy retains its imported split-barrier trait.
 using w4a16_launch_policy_m_8_n_64 = w4a16_launch_policy<w4a16_policy_m_8_n_64, 1, 3, false, false>;

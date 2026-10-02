@@ -28,6 +28,8 @@ namespace {
 constexpr int64_t kPadSlotId = -1;
 constexpr int64_t kHeadDim = 128;
 constexpr int64_t kThreads = 128;
+constexpr int64_t kHeadSubGroup = 16;
+constexpr int64_t kValuesPerLane = kHeadDim / kHeadSubGroup;
 
 template <typename scalar_t>
 inline float round_to_scalar_float(float value) {
@@ -572,31 +574,110 @@ struct AttnPrologueDecodeKernel {
   }
 };
 
+// Prefill is large enough to expose one subgroup per (token, head).  The
+// original scalar path assigned a whole 128-value head to one work-item,
+// serializing both convolution loads and the RMSNorm reduction.  Splitting
+// each head over a 16-lane subgroup gives every lane eight adjacent values,
+// preserves coalescing, and keeps the reduction in registers.
 template <typename scalar_t>
-struct AttnPrologueExtendKernel {
+struct AttnPrologueExtendHeadKernel {
   AttnPrologueExtendParams<scalar_t> p;
 
-  void operator()(sycl::nd_item<1> item) const {
-    const int64_t linear = static_cast<int64_t>(item.get_global_linear_id());
+  [[sycl::reqd_sub_group_size(kHeadSubGroup)]] void operator()(sycl::nd_item<1> item) const {
+    const int64_t head_linear = static_cast<int64_t>(item.get_group_linear_id());
+    const int64_t lane = static_cast<int64_t>(item.get_local_linear_id());
     const int64_t hq = p.dq / kHeadDim;
     const int64_t hkv = p.dkv / kHeadDim;
     const int64_t roles = hq + 2 * hkv;
-    const int64_t total = p.T * roles;
-    if (linear >= total) {
+    const int64_t t = head_linear / roles;
+    if (t >= p.T) {
       return;
     }
-    const int64_t t = linear / roles;
-    const int64_t role = linear - t * roles;
+    const int64_t role = head_linear - t * roles;
+    const int64_t base_d = (role < hq ? role : (role - hq) % hkv) * kHeadDim;
+    const int64_t lane_d = base_d + lane * kValuesPerLane;
+
     if (role < hq) {
-      compute_q_head<scalar_t>(p, t, role);
+      float x[kValuesPerLane];
+      float ss = 0.0f;
+#pragma unroll
+      for (int64_t i = 0; i < kValuesPerLane; ++i) {
+        x[i] = static_cast<float>(p.qkvr[t * p.qkvr_stride_t + p.q_off + lane_d + i]);
+        ss += x[i] * x[i];
+      }
+      ss = sycl::reduce_over_group(item.get_sub_group(), ss, sycl::plus<float>());
+      const float inv = sycl::rsqrt(ss / static_cast<float>(kHeadDim) + p.eps);
+#pragma unroll
+      for (int64_t i = 0; i < kValuesPerLane; ++i) {
+        const int64_t d = lane_d + i;
+        p.q_out[t * p.dq + d] = static_cast<scalar_t>(x[i] * inv * static_cast<float>(p.q_gamma[d % kHeadDim]));
+      }
       return;
     }
+
     const int64_t kv_role = role - hq;
     const bool is_k = kv_role < hkv;
-    const int64_t head = is_k ? kv_role : kv_role - hkv;
     const int64_t seq = static_cast<int64_t>(p.si[t]);
     const int64_t bos = p.cu[seq];
-    compute_kv_head_from_prefix<false, scalar_t>(p, t, seq, bos, head, is_k);
+    const int32_t ci = p.cache_indices[seq];
+    const bool valid = ci != kPadSlotId;
+    const int64_t slot = valid ? static_cast<int64_t>(ci) : 0;
+    const float cache_multiplier = (valid && p.cache_mask[seq]) ? 1.0f : 0.0f;
+    const auto* cache = is_k ? p.k_cache : p.v_cache;
+    const auto* weight = is_k ? p.k_weight : p.v_weight;
+    const auto& layout = is_k ? p.k_layout : p.v_layout;
+    const int64_t x_off = is_k ? p.k_off : p.v_off;
+    auto* out = is_k ? p.k_out : p.v_out;
+
+    float y[kValuesPerLane];
+    float ss = 0.0f;
+#pragma unroll
+    for (int64_t i = 0; i < kValuesPerLane; ++i) {
+      const int64_t d = lane_d + i;
+      const float acc = verify_or_extend_conv_value(
+          p.qkvr,
+          cache,
+          weight,
+          layout,
+          t,
+          bos,
+          d,
+          d,
+          slot,
+          cache_multiplier,
+          p.qkvr_stride_t,
+          x_off,
+          p.cache_stride_slot,
+          p.cache_stride_w,
+          p.use_silu,
+          p.use_residual);
+      y[i] = is_k ? round_to_scalar_float<scalar_t>(acc) : acc;
+      if (is_k) {
+        ss += y[i] * y[i];
+      }
+    }
+    if (is_k) {
+      ss = sycl::reduce_over_group(item.get_sub_group(), ss, sycl::plus<float>());
+    }
+    const float inv = is_k ? sycl::rsqrt(ss / static_cast<float>(kHeadDim) + p.eps) : 1.0f;
+#pragma unroll
+    for (int64_t i = 0; i < kValuesPerLane; ++i) {
+      const int64_t d = lane_d + i;
+      const float value = is_k ? y[i] * inv * static_cast<float>(p.k_gamma[d % kHeadDim]) : y[i];
+      out[t * p.dkv + d] = static_cast<scalar_t>(value);
+    }
+
+    if (p.do_store) {
+      const int64_t kv_slot = p.loc[t * p.loc_stride];
+      if (kv_slot >= 0) {
+        auto* buf = is_k ? p.k_buf : p.v_buf;
+#pragma unroll
+        for (int64_t i = 0; i < kValuesPerLane; ++i) {
+          const int64_t d = lane_d + i;
+          buf[kv_slot * p.kv_buf_stride + d] = out[t * p.dkv + d];
+        }
+      }
+    }
   }
 };
 
@@ -688,9 +769,9 @@ void launch_extend(sycl::queue& q, AttnPrologueExtendParams<scalar_t> const& par
   const int64_t roles = params.dq / kHeadDim + 2 * (params.dkv / kHeadDim);
   const int64_t total = params.T * roles;
   if (total != 0) {
-    const int64_t global = div_up_i64(total, kThreads) * kThreads;
-    AttnPrologueExtendKernel<scalar_t> kernel{params};
-    sycl_kernel_submit(global, kThreads, q, kernel);
+    const int64_t global = total * kHeadSubGroup;
+    AttnPrologueExtendHeadKernel<scalar_t> kernel{params};
+    sycl_kernel_submit(global, kHeadSubGroup, q, kernel);
   }
 
   if (!params.do_cache_update) {

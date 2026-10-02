@@ -152,6 +152,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("biased_topk", torch::kXPU, &at::native::xpu::biased_topk);
 
   m.def(
+      "inkling_vocab_parallel_embedding(Tensor(a!) out, Tensor ids, Tensor weight, "
+      "int vocab_start, int vocab_end) -> ()");
+  m.impl("inkling_vocab_parallel_embedding", torch::kXPU, &inkling_vocab_parallel_embedding);
+  m.def(
       "rotary_embedding(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
   m.impl("rotary_embedding", torch::kXPU, &at::native::xpu::rotary_embedding);

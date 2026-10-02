@@ -271,6 +271,8 @@ void biased_topk(
     bool apply_routed_scaling_factor_on_output);
 }  // namespace at::native::xpu
 
+void inkling_vocab_parallel_embedding(
+    at::Tensor& out, const at::Tensor& ids, const at::Tensor& weight, int64_t vocab_start, int64_t vocab_end);
 /*
  * From csrc/kvcacheio — KV cache scatter/gather transfer kernels
  */

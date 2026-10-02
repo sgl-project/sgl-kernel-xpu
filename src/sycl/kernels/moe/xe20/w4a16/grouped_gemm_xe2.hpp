@@ -135,8 +135,11 @@ CUTE_DEVICE void MoEGEMM(
   for (int i = 0; i < num_experts; ++i) {
     int gemm_m = rows_per_expert[i];
     int cumsum_rows_for_experts = pre_rows + gemm_m;
-    const bool selected = gemm_m >= MinExpertRows && gemm_m <= MaxExpertRows;
-    int cumsum_tiles_for_experts = (selected ? (gemm_m + wg_tile_m - 1) / wg_tile_m : 0) + pre_tiles;
+    int expert_tiles = (gemm_m + wg_tile_m - 1) / wg_tile_m;
+    if constexpr (MinExpertRows > 0 || MaxExpertRows < 2147483647) {
+      if (gemm_m < MinExpertRows || gemm_m > MaxExpertRows) expert_tiles = 0;
+    }
+    int cumsum_tiles_for_experts = expert_tiles + pre_tiles;
 
     if (group_m_id >= cumsum_tiles_for_experts) {
       pre_rows = cumsum_rows_for_experts;

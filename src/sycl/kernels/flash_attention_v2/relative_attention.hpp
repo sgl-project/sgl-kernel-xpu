@@ -10,11 +10,19 @@
 
 namespace flash_attention_v2::relative_attention {
 
-inline constexpr int kQTile = 256;
-inline constexpr int kKTile = 32;
+inline constexpr int kLocalQTile = 64;
+inline constexpr int kLocalKTile = 64;
+inline constexpr int kGlobalQTile = 256;
+inline constexpr int kGlobalKTile = 32;
+inline constexpr int kQTile = kGlobalQTile;
+inline constexpr int kKTile = kGlobalKTile;
+
+inline constexpr int padded_cols(int extent, int q_tile, int k_tile) {
+  return cutlass::fmha::collective::rel_bias_padded_cols(extent, q_tile, k_tile);
+}
 
 inline constexpr int padded_cols(int extent) {
-  return cutlass::fmha::collective::rel_bias_padded_cols(extent, kQTile, kKTile);
+  return padded_cols(extent, kQTile, kKTile);
 }
 
 inline constexpr int decode_padded_cols(int extent, int k_tile) {

@@ -51,11 +51,16 @@
 
 using namespace cute;
 namespace prefill {
-inline constexpr int kRelBiasQTile = flash_attention_v2::relative_attention::kQTile;
-inline constexpr int kRelBiasKTile = flash_attention_v2::relative_attention::kKTile;
+inline constexpr int kRelBiasLocalQTile = flash_attention_v2::relative_attention::kLocalQTile;
+inline constexpr int kRelBiasLocalKTile = flash_attention_v2::relative_attention::kLocalKTile;
+inline constexpr int kRelBiasGlobalQTile = flash_attention_v2::relative_attention::kGlobalQTile;
+inline constexpr int kRelBiasGlobalKTile = flash_attention_v2::relative_attention::kGlobalKTile;
 
-inline constexpr int rel_bias_padded_cols(int rel_extent) {
-  return flash_attention_v2::relative_attention::padded_cols(rel_extent);
+inline constexpr int rel_bias_padded_cols(int rel_extent, bool is_local) {
+  return flash_attention_v2::relative_attention::padded_cols(
+      rel_extent,
+      is_local ? kRelBiasLocalQTile : kRelBiasGlobalQTile,
+      is_local ? kRelBiasLocalKTile : kRelBiasGlobalKTile);
 }
 
 struct Arguments {

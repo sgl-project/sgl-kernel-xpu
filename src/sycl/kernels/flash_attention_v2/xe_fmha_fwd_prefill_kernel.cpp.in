@@ -156,18 +156,24 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
     TORCH_CHECK(params.dv == 128, "relative attention requires head_dim_v == 128");
     TORCH_CHECK(!params.is_e4m3 && !params.is_e5m2, "relative attention does not support fp8 KV cache");
     TORCH_CHECK(
-        params.rel_bias_head_stride == prefill::rel_bias_padded_cols(params.rel_bias_extent),
+        params.rel_bias_head_stride == prefill::rel_bias_padded_cols(params.rel_bias_extent, params.is_local),
         "relative attention expects a sheared bias with ",
-        prefill::rel_bias_padded_cols(params.rel_bias_extent),
+        prefill::rel_bias_padded_cols(params.rel_bias_extent, params.is_local),
         " columns");
-    using RelTileShapeQK = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<prefill::kRelBiasKTile>, cute::_32>;
-    using RelTileShapePV = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::_32, cute::Int<32>>;
-    using RelTileShapeOutput = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<128>>;
-    using RelSubgroupLayoutQK =
-        cute::Layout<cute::Shape<cute::Int<16>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
         using Element = @ELEM_TYPE@;
+        constexpr int RelQTile = LocalMask ? prefill::kRelBiasLocalQTile : prefill::kRelBiasGlobalQTile;
+        constexpr int RelKTile = LocalMask ? prefill::kRelBiasLocalKTile : prefill::kRelBiasGlobalKTile;
+        constexpr int RelSubgroups = LocalMask ? 8 : 16;
+        using RelTileShapeQK =
+            cute::Shape<cute::Int<RelQTile>, cute::Int<RelKTile>, cute::_32>;
+        using RelTileShapePV =
+            cute::Shape<cute::Int<RelQTile>, cute::_32, cute::Int<RelKTile>>;
+        using RelTileShapeOutput = cute::Shape<cute::Int<RelQTile>, cute::Int<128>>;
+        using RelSubgroupLayoutQK = cute::Layout<
+            cute::Shape<cute::Int<RelSubgroups>, cute::_1, cute::_1>,
+            cute::Stride<cute::_1, cute::_1, cute::_1>>;
         // softcap+rel_bias is host-rejected (runner TORCH_CHECK); Softcap=false only.
         constexpr bool Softcap = false;
         FMHAConfig<

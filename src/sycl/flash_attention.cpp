@@ -75,6 +75,137 @@ get_per_tensor_descale_ptr(const at::Tensor& descale, const at::Tensor& ref, con
   return descale.data_ptr<float>();
 }
 
+template <typename Element, int QTile, int KTile, int ElementsPerItem = 8>
+struct PrefillShearBiasBatchOneKernel {
+  const Element* input;
+  Element* output;
+  const int* cu_q;
+  const int* cache_lengths;
+  int heads;
+  int max_seqlen_k;
+  int cols;
+  int extent;
+  int64_t token_stride;
+  int64_t head_stride;
+
+  void operator()(sycl::nd_item<3> item) const {
+    const int q_idx = item.get_global_id(0);
+    const int h = item.get_global_id(1);
+    const int rel_first = item.get_global_id(2) * ElementsPerItem;
+    const int q_len = cu_q[1] - cu_q[0];
+    const int k_len = cache_lengths[0];
+    if (q_idx >= q_len || k_len > max_seqlen_k) return;
+
+    const int row_kv = k_len - q_len + q_idx;
+    const int row_kv_first = row_kv - q_idx % QTile;
+    const int col_origin = cutlass::fmha::collective::rel_bias_col_origin(row_kv_first, extent, KTile);
+    const int q_global = cu_q[0] + q_idx;
+    const int64_t output_base = (q_global * heads + h) * cols;
+    const int64_t input_base = q_global * token_stride + h * head_stride;
+    const int output_last = row_kv - col_origin - rel_first;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < ElementsPerItem; ++i) {
+      const int rel = rel_first + i;
+      if (rel >= extent) return;
+      output[output_base + output_last - i] = input[input_base + rel];
+    }
+  }
+};
+
+template <typename Element, int QTile, int KTile, int ElementsPerItem = 8>
+struct PrefillShearBiasKernel {
+  const Element* input;
+  Element* output;
+  const int* cu_q;
+  const int* cache_lengths;
+  int heads;
+  int max_seqlen_k;
+  int cols;
+  int extent;
+  int64_t token_stride;
+  int64_t head_stride;
+
+  void operator()(sycl::nd_item<3> item) const {
+    const int b = item.get_global_id(0);
+    const int qh = item.get_global_id(1);
+    const int q_idx = qh / heads;
+    const int h = qh - q_idx * heads;
+    const int rel_first = item.get_global_id(2) * ElementsPerItem;
+    const int q_len = cu_q[b + 1] - cu_q[b];
+    const int k_len = cache_lengths[b];
+    if (q_idx >= q_len || k_len > max_seqlen_k) return;
+
+    const int row_kv = k_len - q_len + q_idx;
+    const int row_kv_first = row_kv - q_idx % QTile;
+    const int col_origin = cutlass::fmha::collective::rel_bias_col_origin(row_kv_first, extent, KTile);
+    const int q_global = cu_q[b] + q_idx;
+    const int64_t output_base = (q_global * heads + h) * cols;
+    const int64_t input_base = q_global * token_stride + h * head_stride;
+    const int output_last = row_kv - col_origin - rel_first;
+    CUTLASS_PRAGMA_UNROLL
+    for (int i = 0; i < ElementsPerItem; ++i) {
+      const int rel = rel_first + i;
+      if (rel >= extent) return;
+      output[output_base + output_last - i] = input[input_base + rel];
+    }
+  }
+};
+
+template <typename Element, int QTile, int KTile>
+at::Tensor prepare_prefill_relative_bias(
+    const at::Tensor& rel_logits,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& cache_seqlens,
+    int max_seqlen_q,
+    int max_seqlen_k) {
+  static_assert(sizeof(Element) == sizeof(uint16_t));
+  static constexpr int kElementsPerItem = 4;
+  const int extent = rel_logits.size(-1);
+  const int cols = flash_attention_v2::relative_attention::padded_cols(extent, QTile, KTile);
+  auto bias = at::zeros({rel_logits.size(0), rel_logits.size(1), cols}, rel_logits.options());
+  auto queue = c10::xpu::getCurrentXPUStream().queue();
+  const int heads = rel_logits.size(1);
+  const int batch = cu_seqlens_q.size(0) - 1;
+
+  const auto* input = rel_logits.data_ptr<Element>();
+  auto* output = bias.data_ptr<Element>();
+  const auto* cu_q = cu_seqlens_q.data_ptr<int>();
+  const auto* cache_lengths = cache_seqlens.data_ptr<int>();
+  const auto rel_chunks = (extent + kElementsPerItem - 1) / kElementsPerItem;
+  const int workgroup_size = rel_chunks <= 64 ? 64 : rel_chunks <= 128 ? 128 : 256;
+  const auto rel_global = (rel_chunks + workgroup_size - 1) / workgroup_size * workgroup_size;
+  if (batch == 1) {
+    PrefillShearBiasBatchOneKernel<Element, QTile, KTile, kElementsPerItem> kernel{
+        input,
+        output,
+        cu_q,
+        cache_lengths,
+        heads,
+        max_seqlen_k,
+        cols,
+        extent,
+        rel_logits.stride(0),
+        rel_logits.stride(1)};
+    sycl_kernel_submit(
+        sycl::range<3>(max_seqlen_q, heads, rel_global), sycl::range<3>(1, 1, workgroup_size), queue, kernel);
+  } else {
+    PrefillShearBiasKernel<Element, QTile, KTile, kElementsPerItem> kernel{
+        input,
+        output,
+        cu_q,
+        cache_lengths,
+        heads,
+        max_seqlen_k,
+        cols,
+        extent,
+        rel_logits.stride(0),
+        rel_logits.stride(1)};
+    sycl_kernel_submit(
+        sycl::range<3>(batch, max_seqlen_q * heads, rel_global), sycl::range<3>(1, 1, workgroup_size), queue, kernel);
+  }
+  return bias;
+}
+
 }  // namespace
 
 namespace decode {
@@ -1097,6 +1228,7 @@ void mha_fwd(
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
   if (rel_bias_.has_value()) {
     TORCH_CHECK(!softmax_lse.has_value(), "relative attention does not support softmax LSE");
+    TORCH_CHECK(softcap <= 0.f, "softcap combined with relative attention bias is not supported on XPU");
     const at::Tensor& rel_bias = rel_bias_.value();
     TORCH_CHECK(head_size == 128 && head_size_v == 128, "relative attention requires head_dim=head_dim_v=128");
     TORCH_CHECK(!is_fp8_kv, "relative attention does not support fp8 KV cache");
@@ -1175,12 +1307,30 @@ void mha_fwd(
   at::Tensor sheared_rel_bias;
   if (rel_bias_.has_value()) {
     const at::Tensor& rel_bias = rel_bias_.value();
+    const bool is_local =
+        (window_size_left >= 0 || window_size_right >= 0) && !(window_size_left < 0 && window_size_right == 0);
     if (q.scalar_type() == at::ScalarType::BFloat16) {
-      sheared_rel_bias = flash_attention_v2::relative_attention::prepare_bias<at::BFloat16>(
-          rel_bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k);
+      sheared_rel_bias = is_local ? prepare_prefill_relative_bias<
+                                        at::BFloat16,
+                                        flash_attention_v2::relative_attention::kLocalQTile,
+                                        flash_attention_v2::relative_attention::kLocalKTile>(
+                                        rel_bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+                                  : prepare_prefill_relative_bias<
+                                        at::BFloat16,
+                                        flash_attention_v2::relative_attention::kGlobalQTile,
+                                        flash_attention_v2::relative_attention::kGlobalKTile>(
+                                        rel_bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k);
     } else {
-      sheared_rel_bias = flash_attention_v2::relative_attention::prepare_bias<at::Half>(
-          rel_bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k);
+      sheared_rel_bias = is_local ? prepare_prefill_relative_bias<
+                                        at::Half,
+                                        flash_attention_v2::relative_attention::kLocalQTile,
+                                        flash_attention_v2::relative_attention::kLocalKTile>(
+                                        rel_bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k)
+                                  : prepare_prefill_relative_bias<
+                                        at::Half,
+                                        flash_attention_v2::relative_attention::kGlobalQTile,
+                                        flash_attention_v2::relative_attention::kGlobalKTile>(
+                                        rel_bias, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k);
     }
     params.rel_bias_ptr = sheared_rel_bias.data_ptr();
     params.rel_bias_token_stride = sheared_rel_bias.stride(0);

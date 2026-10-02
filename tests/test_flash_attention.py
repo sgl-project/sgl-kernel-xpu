@@ -2718,42 +2718,52 @@ def test_flash_attn_with_kvcache_out_buffer():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize(
-    "causal,seqlens_q,seqlens_k,extent,num_heads,num_heads_k",
+    "causal,seqlens_q,seqlens_k,extent,num_heads,num_heads_k,window_left",
     [
-        (False, [1], [1], 1, 8, 8),
-        (True, [1], [31], 1, 8, 2),
-        (False, [31], [33], 8, 8, 2),
-        (False, [30], [62], 30, 8, 2),
-        (True, [31], [63], 31, 8, 2),
-        (False, [32], [64], 32, 8, 2),
-        (True, [33], [65], 33, 8, 2),
-        (True, [34], [66], 34, 8, 2),
-        (True, [32], [128], 31, 8, 2),
-        (False, [33], [129], 33, 8, 2),
-        (True, [63], [127], 63, 8, 2),
-        (False, [64], [128], 64, 8, 2),
-        (True, [65], [129], 65, 8, 2),
-        (False, [127], [191], 127, 8, 2),
-        (True, [128], [192], 128, 8, 2),
-        (False, [129], [193], 129, 8, 2),
-        (True, [126], [254], 126, 8, 2),
-        (False, [130], [258], 130, 8, 2),
-        (True, [254], [510], 254, 8, 2),
-        (True, [127], [255], 32, 8, 2),
-        (False, [128], [256], 255, 8, 8),
-        (True, [129], [257], 256, 8, 2),
-        (False, [258], [514], 258, 8, 2),
-        (False, [255], [511], 256, 16, 2),
-        (True, [256], [512], 257, 16, 1),
-        (False, [257], [513], 511, 8, 2),
-        (False, [35, 17], [129, 97], 33, 8, 2),
-        (True, [1, 33], [65, 191], 96, 8, 2),
-        (True, [31, 257], [127, 513], 257, 8, 2),
-        (False, [257, 513], [1025, 2049], 512, 8, 2),
+        (False, [1], [1], 1, 8, 8, -1),
+        (True, [1], [31], 1, 8, 2, -1),
+        (False, [31], [33], 8, 8, 2, -1),
+        (False, [30], [62], 30, 8, 2, -1),
+        (True, [31], [63], 31, 8, 2, -1),
+        (False, [32], [64], 32, 8, 2, -1),
+        (True, [33], [65], 33, 8, 2, -1),
+        (True, [34], [66], 34, 8, 2, -1),
+        (True, [32], [128], 31, 8, 2, -1),
+        (False, [33], [129], 33, 8, 2, -1),
+        (True, [63], [127], 63, 8, 2, -1),
+        (False, [64], [128], 64, 8, 2, -1),
+        (True, [65], [129], 65, 8, 2, -1),
+        (False, [127], [191], 127, 8, 2, -1),
+        (True, [128], [192], 128, 8, 2, -1),
+        (False, [129], [193], 129, 8, 2, -1),
+        (True, [126], [254], 126, 8, 2, -1),
+        (False, [130], [258], 130, 8, 2, -1),
+        (True, [254], [510], 254, 8, 2, -1),
+        (True, [127], [255], 32, 8, 2, -1),
+        (False, [128], [256], 255, 8, 8, -1),
+        (True, [129], [257], 256, 8, 2, -1),
+        (False, [258], [514], 258, 8, 2, -1),
+        (False, [255], [511], 256, 16, 2, -1),
+        (True, [256], [512], 257, 16, 1, -1),
+        (False, [257], [513], 511, 8, 2, -1),
+        (False, [35, 17], [129, 97], 33, 8, 2, -1),
+        (True, [1, 33], [65, 191], 96, 8, 2, -1),
+        (True, [31, 257], [127, 513], 257, 8, 2, -1),
+        (False, [257, 513], [1025, 2049], 512, 8, 2, -1),
+        (True, [257], [513], 513, 16, 4, 511),
+        (True, [257], [1025], 1025, 16, 2, -1),
     ],
 )
 def test_relative_attention(
-    dtype, page_size, causal, seqlens_q, seqlens_k, extent, num_heads, num_heads_k
+    dtype,
+    page_size,
+    causal,
+    seqlens_q,
+    seqlens_k,
+    extent,
+    num_heads,
+    num_heads_k,
+    window_left,
 ):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
@@ -2829,6 +2839,12 @@ def test_relative_attention(
             scores.masked_fill_(
                 torch.arange(k_len).unsqueeze(0) > q_rows, float("-inf")
             )
+        if window_left >= 0:
+            q_rows = torch.arange(q_len).unsqueeze(1) + k_len - q_len
+            scores.masked_fill_(
+                torch.arange(k_len).unsqueeze(0) < q_rows - window_left,
+                float("-inf"),
+            )
         reference[q_start : q_start + q_len] = torch.einsum(
             "hqk,khd->qhd", torch.softmax(scores, dim=-1), v_seq
         ).to(dtype)
@@ -2849,6 +2865,7 @@ def test_relative_attention(
         max_seqlen_q=max(seqlens_q),
         max_seqlen_k=max(seqlens_k),
         causal=causal,
+        window_size=(window_left, 0) if window_left >= 0 else (-1, -1),
         rel_bias=table.to(dtype).to(device).unsqueeze(0).repeat(sum(seqlens_q), 1, 1),
     )
     torch.xpu.synchronize()
@@ -2858,6 +2875,28 @@ def test_relative_attention(
         rtol=0,
         atol=1e-2 if dtype == torch.bfloat16 else 1e-3,
     )
+    if seqlens_q == [31] and seqlens_k == [33]:
+        with pytest.raises(
+            RuntimeError,
+            match="softcap combined with relative attention bias is not supported on XPU",
+        ):
+            flash_attn_with_kvcache(
+                q.to(device),
+                k_cache,
+                v_cache,
+                cache_seqlens=torch.tensor(seqlens_k, dtype=torch.int32, device=device),
+                page_table=page_table,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max(seqlens_q),
+                max_seqlen_k=max(seqlens_k),
+                causal=causal,
+                window_size=(-1, -1),
+                softcap=1.0,
+                rel_bias=table.to(dtype)
+                .to(device)
+                .unsqueeze(0)
+                .repeat(sum(seqlens_q), 1, 1),
+            )
 
 
 @pytest.mark.skipif(

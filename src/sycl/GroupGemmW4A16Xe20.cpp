@@ -403,10 +403,16 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
         jit_err);
   }
 #else
-  if (use_mxfp4_bf16_policy && avg_m > 32 && gemm_k <= kW4A16ShortK && gemm_n >= 128) {
+  // Splitting adds a second launch and 48-row tiles hurt when most experts
+  // fit in one 64-row tile. At 40G MACs the added launch is small relative to
+  // device work; 80 average rows require at least two 64-row tiles.
+  constexpr int64_t kSplitPrefillMinMacs = 40'000'000'000LL;
+  const int64_t macs = static_cast<int64_t>(total_m) * gemm_n * gemm_k;
+  const bool use_split_prefill = use_mxfp4_bf16_policy && avg_m >= 80 && macs >= kSplitPrefillMinMacs;
+  if (use_split_prefill && gemm_k <= kW4A16ShortK && gemm_n >= 128) {
     launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_down_prefill_low>{});
     launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_down_prefill_high>{});
-  } else if (use_mxfp4_bf16_policy && avg_m > 32 && gemm_k > kW4A16ShortK && gemm_n >= 256) {
+  } else if (use_split_prefill && gemm_k > kW4A16ShortK && gemm_n >= 256) {
     launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_gate_prefill_low>{});
     launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_gate_prefill_high>{});
   } else {

@@ -991,7 +991,7 @@ def test_moe_grouped_mm_nt_xe35_w4a16_mxfp4_op(
         (16, 320, 1056),  # Medium-M policy, long K.
         (17, 320, 256),  # Existing 32-row policy past the 16-row boundary.
         (32, 64, 256),  # Existing 32-row policy with narrow N.
-        (48, 128, 256),  # Split prefill dispatch on a non-Inkling shape.
+        (48, 128, 256),  # Single-launch prefill for a small expert set.
     ],
 )
 def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_generic_k32_dispatch(rows, gemm_n, gemm_k):
@@ -1001,6 +1001,18 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_generic_k32_dispatch(rows, gemm_n, g
         num_experts=3,
         hidden_size=gemm_k,
         intermediate_size=gemm_n // 2,
+        dtype=torch.bfloat16,
+    )
+
+
+@pytest.mark.parametrize("num_experts", [127, 128])
+def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_generic_expert_counts(num_experts):
+    """Keep larger non-Inkling expert sets on the accurate generic path."""
+    _check_mxfp4_grouped_mm(
+        num_tokens_per_expert=48,
+        num_experts=num_experts,
+        hidden_size=256,
+        intermediate_size=64,
         dtype=torch.bfloat16,
     )
 

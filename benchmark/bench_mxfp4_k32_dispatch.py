@@ -11,7 +11,7 @@ import statistics
 import sgl_kernel  # noqa: F401
 import torch
 
-EXPERTS = 16
+DEFAULT_EXPERTS = 16
 SEED = 20260923
 CASES = {
     "m8_tail": (8, 192, 256),
@@ -21,29 +21,40 @@ CASES = {
     "m17_boundary": (17, 320, 256),
     "m32_narrow": (32, 64, 256),
     "m48_prefill": (48, 128, 256),
+    "m48_midlow": (48, 512, 512),
+    "m48_midhigh": (48, 1536, 512),
+    "m48_midborder": (48, 2048, 512),
+    "m48_longborder": (48, 256, 4096),
+    "m48_below_work": (48, 4096, 768),
+    "m48_above_work": (48, 5504, 768),
+    "m48_down": (48, 6144, 768),
+    "m64_down": (64, 6144, 768),
+    "m79_down": (79, 6144, 768),
+    "m80_down": (80, 6144, 768),
+    "m96_down": (96, 6144, 768),
 }
 
 
-def make_case(rows: int, gemm_n: int, gemm_k: int):
+def make_case(experts: int, rows: int, gemm_n: int, gemm_k: int):
     torch.manual_seed(SEED)
     torch.xpu.manual_seed_all(SEED)
-    total_m = EXPERTS * rows
+    total_m = experts * rows
     activations = torch.randn((total_m, gemm_k), device="xpu", dtype=torch.bfloat16)
     weights = torch.randint(
         0,
         256,
-        (EXPERTS, gemm_n, gemm_k // 2),
+        (experts, gemm_n, gemm_k // 2),
         device="xpu",
         dtype=torch.uint8,
     )
     scales = torch.randint(
         121,
         126,
-        (EXPERTS, gemm_n, gemm_k // 32),
+        (experts, gemm_n, gemm_k // 32),
         device="xpu",
         dtype=torch.uint8,
     )
-    expert_rows = torch.full((EXPERTS,), rows, device="xpu", dtype=torch.int32)
+    expert_rows = torch.full((experts,), rows, device="xpu", dtype=torch.int32)
     output = torch.empty((total_m, gemm_n), device="xpu", dtype=torch.bfloat16)
 
     def run() -> None:
@@ -55,7 +66,7 @@ def make_case(rows: int, gemm_n: int, gemm_k: int):
             None,
             None,
             expert_rows,
-            EXPERTS,
+            experts,
             False,
             32,
         )
@@ -86,19 +97,20 @@ def percentile(samples: list[float], fraction: float) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=(*CASES, "all"), default="all")
+    parser.add_argument("--experts", type=int, default=DEFAULT_EXPERTS)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=100)
     args = parser.parse_args()
-    if args.warmup < 0 or args.repeat < 1:
-        parser.error("--warmup must be non-negative and --repeat must be positive")
+    if args.warmup < 0 or args.repeat < 1 or args.experts < 1:
+        parser.error("warmup must be non-negative; repeat and experts must be positive")
 
     cases = CASES.items() if args.case == "all" else [(args.case, CASES[args.case])]
     for name, (rows, gemm_n, gemm_k) in cases:
-        run, output = make_case(rows, gemm_n, gemm_k)
+        run, output = make_case(args.experts, rows, gemm_n, gemm_k)
         samples = measure(run, args.warmup, args.repeat)
         assert bool(torch.isfinite(output).all()), f"{name}: non-finite output"
         print(
-            f"{name}: E={EXPERTS} rows/expert={rows} N={gemm_n} K={gemm_k} "
+            f"{name}: E={args.experts} rows/expert={rows} N={gemm_n} K={gemm_k} "
             f"dtype=bf16 quant=mxfp4_k32 "
             f"p20={percentile(samples, 0.2):.4f} "
             f"p50={statistics.median(samples):.4f} "

@@ -7,8 +7,9 @@ import triton
 from sgl_kernel import fused_add_rmsnorm, rmsnorm
 from sgl_kernel.inkling_sconv import causal_conv1d
 
-HBM_GBPS = 350.0
-PEAK_TOPS = 50.0
+# BMG peak rates used for the reported roofline.
+HBM_GBPS = 450.0
+PEAK_TOPS = 100.0
 
 
 def _dtype(name: str) -> torch.dtype:

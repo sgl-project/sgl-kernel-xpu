@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "SGLKernelPerf.h"
+#include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 #include "sycl/kernels/inkling_moe_gate/inkling_moe_gate_projection.hpp"
@@ -185,9 +186,7 @@ void launch_topk(sycl::queue& queue, const TopKParams& params) {
   const int64_t groups = (params.tokens + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup;
   const sycl::range<1> local(kRowsPerWorkgroup * kSubgroupSize);
   const sycl::range<1> global(groups * kRowsPerWorkgroup * kSubgroupSize);
-  queue.submit([&](sycl::handler& handler) {
-    handler.parallel_for(sycl::nd_range<1>(global, local), InklingGateTopKKernel<T, Packed>(params));
-  });
+  sycl_kernel_submit(global, local, queue, InklingGateTopKKernel<T, Packed>(params));
 }
 
 template <bool Packed>

@@ -8,7 +8,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("activation", [None, "silu"])
 @pytest.mark.parametrize("use_residual", [False, True])
 def test_forward_decode_matches_fused_decode(dtype, activation, use_residual):
@@ -53,8 +53,11 @@ def test_forward_decode_matches_fused_decode(dtype, activation, use_residual):
     assert_close(forward, fused.detach().cpu().float(), dtype)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("W,D", [(3, 7), (4, 8)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "W,D",
+    [(3, 7), (4, 8), (4, 512), (4, 520), (4, 513)],
+)
 @pytest.mark.parametrize("activation", [None, "silu"])
 @pytest.mark.parametrize("use_residual", [False, True])
 def test_fused_decode_update_matches_inkling_pr_semantics(

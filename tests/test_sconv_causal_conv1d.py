@@ -117,10 +117,13 @@ def test_causal_conv1d_rolling_window_boundaries_and_tails(dtype, lengths, D):
     "T,D",
     [
         (255, 32),  # Below the prefill specialization threshold.
-        (256, 32),  # First shape eligible for the packed path.
-        (257, 32),  # One-token tail.
+        (256, 32),  # Small channels use the block path.
+        (257, 32),  # One-token tail on the block path.
+        (255, 40),  # D=40 still uses the block path below T=256.
+        (256, 40),  # First shape eligible for the packed path.
+        (257, 40),  # One-token tail on the packed path.
         (259, 40),  # Tail with several channel groups.
-        (260, 36),  # BF16 uses the block path; FP16 can use the packed path.
+        (260, 36),  # Both dtypes use the block path below D=40.
         (256, 34),  # Both dtypes fall back for unaligned channels.
     ],
 )
@@ -164,12 +167,13 @@ def test_causal_conv1d_vector_prefill_tail(dtype, T, D):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_causal_conv1d_inkling_prefill_shape(dtype):
-    """Exercise the production single-sequence specialization at M4096/H6144."""
+@pytest.mark.parametrize("D", [32, 40, 6144])
+def test_causal_conv1d_inkling_prefill_shape(dtype, D):
+    """Exercise long single-sequence prefills around the vector D boundary."""
     from sgl_kernel.inkling_sconv import causal_conv1d
 
     torch.manual_seed(2)
-    T, D, W = 4096, 6144, 4
+    T, W = 4096, 4
     x = rand((T, D), dtype)
     weight = rand((D, W), dtype, scale=0.2)
     cache = rand((1, W - 1, D), dtype, scale=0.1)
@@ -190,7 +194,7 @@ def test_causal_conv1d_inkling_prefill_shape(dtype):
         use_residual=True,
     )
 
-    # A vectorized FP32 reference makes checking every production output
+    # A vectorized FP32 reference makes checking every output
     # practical, including cache-prefixed rows and every tail/channel tile.
     x_float = x.float()
     weight_float = weight.float()

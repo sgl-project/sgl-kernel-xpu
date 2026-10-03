@@ -62,3 +62,26 @@ def test_inkling_vocab_parallel_embedding_large_int64_ids():
         (torch.zeros_like(weight[0]), weight[0], weight[2], torch.zeros_like(weight[0]))
     )
     torch.testing.assert_close(output, reference, rtol=0, atol=0)
+
+
+def test_inkling_vocab_parallel_embedding_extreme_int64_ids():
+    weight = torch.randn((3, 7), dtype=torch.float16, device="xpu")
+    ids = torch.tensor(
+        [torch.iinfo(torch.int64).min, -1, 0, 1, 2, 3, torch.iinfo(torch.int64).max],
+        dtype=torch.int64,
+        device="xpu",
+    )
+    output = torch.empty((ids.numel(), 7), dtype=weight.dtype, device="xpu")
+    torch.ops.sgl_kernel.inkling_vocab_parallel_embedding(output, ids, weight, 0, 3)
+    reference = torch.stack(
+        (
+            torch.zeros_like(weight[0]),
+            torch.zeros_like(weight[0]),
+            weight[0],
+            weight[1],
+            weight[2],
+            torch.zeros_like(weight[0]),
+            torch.zeros_like(weight[0]),
+        )
+    )
+    torch.testing.assert_close(output, reference, rtol=0, atol=0)

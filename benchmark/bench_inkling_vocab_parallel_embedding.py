@@ -1,5 +1,5 @@
+import argparse
 import hashlib
-import os
 import statistics
 
 import sgl_kernel  # noqa: F401
@@ -7,19 +7,25 @@ import torch
 
 torch.manual_seed(20260929)
 device = "xpu"
-tokens = 4096
-hidden = 6144
-start = int(os.getenv("BENCH_VOCAB_START", "0"))
-mode = os.getenv("BENCH_MODE", "both")
-if mode not in ("both", "baseline"):
-    raise ValueError("BENCH_MODE must be both or baseline")
-vocab = 50256
-weight = torch.randn((vocab, hidden), dtype=torch.bfloat16, device=device)
+parser = argparse.ArgumentParser()
+parser.add_argument("--tokens", type=int, default=4096)
+parser.add_argument("--hidden", type=int, default=6144)
+parser.add_argument("--vocab", type=int, default=50256)
+parser.add_argument("--start", type=int, default=0)
+parser.add_argument("--dtype", choices=("fp16", "bf16"), default="bf16")
+parser.add_argument("--repeats", type=int, default=100)
+args = parser.parse_args()
+if min(args.tokens, args.hidden, args.vocab, args.repeats) <= 0:
+    parser.error("tokens, hidden, vocab, and repeats must be positive")
+tokens, hidden, vocab, start = args.tokens, args.hidden, args.vocab, args.start
+dtype = torch.float16 if args.dtype == "fp16" else torch.bfloat16
+weight = torch.randn((vocab, hidden), dtype=dtype, device=device)
 ids = torch.arange(1024, 1024 + tokens, dtype=torch.int64, device=device)
-ids[:4] = torch.tensor(
-    [start - 1, start, start + vocab - 1, start + vocab], device=device
+ids[: min(tokens, 4)] = torch.tensor(
+    [start, start - 1, start + vocab - 1, start + vocab][: min(tokens, 4)],
+    device=device,
 )
-output = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=device)
+output = torch.empty((tokens, hidden), dtype=dtype, device=device)
 
 
 def baseline():
@@ -37,26 +43,23 @@ def candidate():
 
 
 ref = baseline()
-if mode == "both":
-    got = candidate()
-    torch.xpu.synchronize()
-    assert torch.equal(ref, got), f"mismatches={(ref != got).sum().item()}"
-    digest = hashlib.sha256(got.cpu().view(torch.int16).numpy().tobytes()).hexdigest()
-    print(f"shape={tokens}x{hidden} exact=True sha256={digest}")
-else:
-    print(f"shape={tokens}x{hidden} mode=baseline")
+got = candidate()
+torch.xpu.synchronize()
+assert torch.equal(ref, got), f"mismatches={(ref != got).sum().item()}"
+digest = hashlib.sha256(got.cpu().view(torch.int16).numpy().tobytes()).hexdigest()
+print(
+    f"shape={tokens}x{hidden} vocab={vocab} dtype={args.dtype} "
+    f"exact=True sha256={digest}"
+)
 
 for _ in range(20):
     baseline()
-    if mode == "both":
-        candidate()
+    candidate()
 torch.xpu.synchronize()
 functions = (("baseline", baseline), ("candidate", candidate))
-if mode == "baseline":
-    functions = functions[:1]
 for label, fn in functions:
     times = []
-    for _ in range(int(os.getenv("BENCH_REPEATS", "100"))):
+    for _ in range(args.repeats):
         begin = torch.xpu.Event(enable_timing=True)
         end = torch.xpu.Event(enable_timing=True)
         begin.record()

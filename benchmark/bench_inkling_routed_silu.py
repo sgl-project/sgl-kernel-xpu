@@ -33,7 +33,9 @@ def main():
         torch.ops.sgl_kernel.silu_and_mul(out, inp)
 
     run()
-    torch.testing.assert_close(out, reference, rtol=2e-2, atol=2e-2)
+    # Matches the corresponding CUDA activation correctness ceiling for BF16.
+    tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(out, reference, rtol=tolerance, atol=tolerance)
     max_abs = (out.float() - reference.float()).abs().max().item()
     output_sha256 = hashlib.sha256(
         out.cpu().view(torch.int16).numpy().tobytes()

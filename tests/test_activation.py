@@ -46,7 +46,10 @@ def test_fused_silu_mul_large_routed_batch(dtype, rows, width):
     ref = (torch.nn.functional.silu(x[:, :width].float()) * x[:, width:].float()).to(
         dtype
     )
-    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+    # CUDA activation/test_activation.py uses 1e-2 for BF16. One BF16 ULP
+    # exceeds 5e-3 for some values even with float accumulation.
+    tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-3
+    torch.testing.assert_close(out, ref, rtol=tolerance, atol=tolerance)
 
 
 @pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])

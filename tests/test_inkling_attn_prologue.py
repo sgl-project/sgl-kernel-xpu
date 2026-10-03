@@ -15,9 +15,9 @@ def rand(shape, dtype, scale=1.0):
 
 def tol(dtype):
     if dtype is torch.bfloat16:
-        return 1.0e-2, 1.0e-2
+        return 5.0e-3, 5.0e-3
     if dtype is torch.float16:
-        return 3.0e-3, 3.0e-3
+        return 1.0e-3, 1.0e-3
     return 1.0e-4, 1.0e-4
 
 
@@ -421,7 +421,7 @@ def test_attn_prologue_decode_updates_cache_and_store(dtype, dq, dkv):
     torch.testing.assert_close(v_buf.cpu(), expected_v_buf, check_dtype=False)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("dq,dkv", [(128, 128), (384, 256)])
 def test_attn_prologue_extend_updates_cache_and_track(dtype, dq, dkv):
     from sgl_kernel.inkling_attn_prologue import inkling_attn_prologue_extend

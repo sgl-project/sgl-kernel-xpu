@@ -30,6 +30,7 @@ constexpr int64_t kHeadDim = 128;
 constexpr int64_t kThreads = 128;
 constexpr int64_t kHeadSubGroup = 16;
 constexpr int64_t kValuesPerLane = kHeadDim / kHeadSubGroup;
+constexpr int64_t kMaxSubGroupConvWidth = 8;
 
 template <typename scalar_t>
 inline float round_to_scalar_float(float value) {
@@ -574,11 +575,35 @@ struct AttnPrologueDecodeKernel {
   }
 };
 
-// Prefill is large enough to expose one subgroup per (token, head).  The
-// original scalar path assigned a whole 128-value head to one work-item,
-// serializing both convolution loads and the RMSNorm reduction.  Splitting
-// each head over a 16-lane subgroup gives every lane eight adjacent values,
-// preserves coalescing, and keeps the reduction in registers.
+template <typename scalar_t>
+struct AttnPrologueExtendScalarKernel {
+  AttnPrologueExtendParams<scalar_t> p;
+
+  void operator()(sycl::nd_item<1> item) const {
+    const int64_t linear = static_cast<int64_t>(item.get_global_linear_id());
+    const int64_t hq = p.dq / kHeadDim;
+    const int64_t hkv = p.dkv / kHeadDim;
+    const int64_t roles = hq + 2 * hkv;
+    if (linear >= p.T * roles) {
+      return;
+    }
+    const int64_t t = linear / roles;
+    const int64_t role = linear - t * roles;
+    if (role < hq) {
+      compute_q_head<scalar_t>(p, t, role);
+      return;
+    }
+    const int64_t kv_role = role - hq;
+    const bool is_k = kv_role < hkv;
+    const int64_t head = is_k ? kv_role : kv_role - hkv;
+    const int64_t seq = static_cast<int64_t>(p.si[t]);
+    compute_kv_head_from_prefix<false, scalar_t>(p, t, seq, p.cu[seq], head, is_k);
+  }
+};
+
+// A subgroup per (token, head) parallelizes convolution and RMSNorm. GPU6
+// measurements covered widths 2, 3, 4, and 8 across token counts. The scalar
+// path retains support for wider windows. Each lane owns eight adjacent values.
 template <typename scalar_t>
 struct AttnPrologueExtendHeadKernel {
   AttnPrologueExtendParams<scalar_t> p;
@@ -769,9 +794,16 @@ void launch_extend(sycl::queue& q, AttnPrologueExtendParams<scalar_t> const& par
   const int64_t roles = params.dq / kHeadDim + 2 * (params.dkv / kHeadDim);
   const int64_t total = params.T * roles;
   if (total != 0) {
-    const int64_t global = total * kHeadSubGroup;
-    AttnPrologueExtendHeadKernel<scalar_t> kernel{params};
-    sycl_kernel_submit(global, kHeadSubGroup, q, kernel);
+    if (params.k_layout.W >= 2 && params.k_layout.W <= kMaxSubGroupConvWidth && params.v_layout.W >= 2 &&
+        params.v_layout.W <= kMaxSubGroupConvWidth) {
+      const int64_t global = total * kHeadSubGroup;
+      AttnPrologueExtendHeadKernel<scalar_t> kernel{params};
+      sycl_kernel_submit(global, kHeadSubGroup, q, kernel);
+    } else {
+      const int64_t global = div_up_i64(total, kThreads) * kThreads;
+      AttnPrologueExtendScalarKernel<scalar_t> kernel{params};
+      sycl_kernel_submit(global, kThreads, q, kernel);
+    }
   }
 
   if (!params.do_cache_update) {

@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
+#include "SYCLHelpers.h"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -58,12 +59,12 @@ void launch_embedding(
   auto* out_words = reinterpret_cast<Word*>(out.data_ptr());
   const auto* id_data = ids.data_ptr<Index>();
   const auto* weight_words = reinterpret_cast<const Word*>(weight.data_ptr());
-  queue.submit([&](sycl::handler& handler) {
-    handler.parallel_for<InklingVocabParallelEmbeddingKernel<Index, Word>>(
-        sycl::nd_range<1>(sycl::range<1>(ids.size(0) * kWorkgroupSize), sycl::range<1>(kWorkgroupSize)),
-        InklingVocabParallelEmbeddingKernel<Index, Word>(
-            out_words, id_data, weight_words, width, vocab_start, vocab_end));
-  });
+  sycl_kernel_submit(
+      ids.size(0) * kWorkgroupSize,
+      kWorkgroupSize,
+      queue,
+      InklingVocabParallelEmbeddingKernel<Index, Word>(
+          out_words, id_data, weight_words, width, vocab_start, vocab_end));
 }
 
 template <typename Index>

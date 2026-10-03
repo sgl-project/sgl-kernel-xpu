@@ -2873,6 +2873,8 @@ def test_relative_attention(
         out.cpu().float(),
         reference.float(),
         rtol=0,
+        # BF16 output rounding reaches 0.0078125 in the causal 128/192 case.
+        # CUDA SGLang's relative-bias reference test permits max error < 1e-2.
         atol=1e-2 if dtype == torch.bfloat16 else 1e-3,
     )
     if seqlens_q == [31] and seqlens_k == [33]:

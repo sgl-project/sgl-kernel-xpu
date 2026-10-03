@@ -102,11 +102,6 @@ def main():
         global_gqa.run()
 
     results["reduced_six_layers"] = measure(reduced_six_layers, args.warmup, args.rep)
-    measured = results["reduced_six_layers"]["median_ms"]
-    results["reduced_six_layers"]["lmproj_ms"] = 4.517
-    results["reduced_six_layers"]["lmproj_efficiency_pct"] = 451.7 / measured
-    results["reduced_six_layers"]["target_ms"] = 7.53
-    results["reduced_six_layers"]["target_met"] = measured <= 7.53
 
     if args.tails:
         tail_local = make_case("tail_local_swa", 4093, 16, 4, 513, (511, 0), dtype)

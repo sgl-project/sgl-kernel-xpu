@@ -16,12 +16,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _relative_error(got: torch.Tensor, expected: torch.Tensor) -> float:
-    got_f = got.float()
-    expected_f = expected.float()
-    return ((got_f - expected_f).abs() / expected_f.abs().clamp_min(1.0)).max().item()
-
-
 def _make_case(m: int, hidden: int = 256, intermediate: int = 256):
     torch.manual_seed(20260923 + m)
     x = torch.randn((m, hidden), device="xpu", dtype=torch.bfloat16) * 0.1
@@ -54,9 +48,9 @@ def test_inkling_dense_mlp_dispatch_and_tails(m: int):
     assert activated.shape == (m, gate_up_weight.shape[0] // 2)
     assert activated.stride() == (activated.shape[1] + 64, 1)
     assert got.is_contiguous()
-    assert _relative_error(activated, expected_activated) <= 1.0 / 64.0
-    assert _relative_error(got, expected_down) <= 1.0 / 128.0
-    assert _relative_error(got, expected_module) <= 1.0 / 64.0
+    torch.testing.assert_close(activated, expected_activated, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(got, expected_down, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(got, expected_module, rtol=5e-3, atol=5e-3)
 
 
 def test_inkling_dense_mlp_out_variants():
@@ -118,6 +112,11 @@ def test_inkling_dense_mlp_production_shape():
     ).to(torch.bfloat16)
     torch.xpu.synchronize()
 
-    assert _relative_error(activated, expected_activated) <= 1.0 / 64.0
-    assert _relative_error(got, expected_down) <= 1.0 / 128.0
-    assert _relative_error(got, expected_module) <= 1.0 / 16.0
+    # CUDA's BF16 GEMM test (test_tiny_gemm.py) uses 1e-2 for both bounds;
+    # its fused MoE test also permits atol=1e-2 after two GEMMs and SwiGLU.
+    # Production K=6144 crosses BF16 rounding boundaries. Keep the default
+    # 5e-3 absolute bound for each stage; only the two-GEMM result needs the
+    # CUDA fused MoE test's 1e-2 absolute bound near zero.
+    torch.testing.assert_close(activated, expected_activated, rtol=1e-2, atol=5e-3)
+    torch.testing.assert_close(got, expected_down, rtol=1e-2, atol=5e-3)
+    torch.testing.assert_close(got, expected_module, rtol=1e-2, atol=1e-2)

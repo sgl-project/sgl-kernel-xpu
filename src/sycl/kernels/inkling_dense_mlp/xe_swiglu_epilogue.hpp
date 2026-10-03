@@ -189,6 +189,7 @@ class XeSwiGluGateUpEpilogue {
 
     ActivationFn_<ElementCompute> activation;
     NumericConverter<ElementD, ElementCompute, ThreadEpilogueOp::RoundStyle> convert_output;
+    NumericConverter<ElementD, ElementCompute, ThreadEpilogueOp::RoundStyle> convert_projection;
 
     CUTLASS_PRAGMA_UNROLL
     for (int epilogue_m = 0; epilogue_m < kEpilogueTilesM; ++epilogue_m) {
@@ -199,8 +200,12 @@ class XeSwiGluGateUpEpilogue {
           const int accumulator_n = 2 * (epilogue_n * kOutBlocksPerStore + block);
           CUTLASS_PRAGMA_UNROLL
           for (int epilogue_v = 0; epilogue_v < kFragmentSize; ++epilogue_v) {
-            const ElementCompute gate = ElementCompute(accumulators(epilogue_v, epilogue_m, accumulator_n));
-            const ElementCompute up = ElementCompute(accumulators(epilogue_v, epilogue_m, accumulator_n + 1));
+            // The unfused model path materializes each projection in BF16
+            // before SwiGLU. Preserve that rounding when fusing the epilogue.
+            const ElementCompute gate =
+                ElementCompute(convert_projection(accumulators(epilogue_v, epilogue_m, accumulator_n)));
+            const ElementCompute up =
+                ElementCompute(convert_projection(accumulators(epilogue_v, epilogue_m, accumulator_n + 1)));
             thread_register_d_wi(epilogue_v, _0{}, block) = convert_output(activation(gate, up));
           }
         }

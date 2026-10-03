@@ -21,6 +21,7 @@
 #include <type_traits>
 
 #include "SGLKernelPerf.h"
+#include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
@@ -209,8 +210,7 @@ void launch_sconv_forward(sycl::queue& q, SconvForwardParams<scalar_t> const& pa
   }
   const int64_t global = div_up_i64(total, kThreads) * kThreads;
   SconvForwardKernel<scalar_t> kernel{params};
-  q.parallel_for<SconvForwardKernel<scalar_t>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
 }
 
 template <typename scalar_t, int W, int BlockT, bool UseSilu, bool UseResidual, bool IsDecode, bool SingleSequence>
@@ -314,8 +314,7 @@ void launch_sconv_forward_block(sycl::queue& q, SconvForwardParams<scalar_t> con
   const int64_t channel_global = div_up_i64(params.D, kThreads) * kThreads;
   const int64_t token_blocks = div_up_i64(params.T, BlockT);
   SconvForwardBlockKernel<scalar_t, W, BlockT, UseSilu, UseResidual, IsDecode, SingleSequence> kernel{params};
-  q.parallel_for<SconvForwardBlockKernel<scalar_t, W, BlockT, UseSilu, UseResidual, IsDecode, SingleSequence>>(
-      sycl::nd_range<2>(sycl::range<2>(channel_global, token_blocks), sycl::range<2>(kThreads, 1)), kernel);
+  sycl_kernel_submit(sycl::range<2>(channel_global, token_blocks), sycl::range<2>(kThreads, 1), q, kernel);
 }
 
 template <typename scalar_t, int W, int BlockT, bool UseSilu, bool UseResidual, bool IsDecode>
@@ -505,8 +504,7 @@ void launch_sconv_forward_w4_vec(sycl::queue& q, SconvForwardParams<scalar_t> co
   const int64_t channel_global = div_up_i64(channel_blocks, Threads) * Threads;
   const int64_t token_blocks = div_up_i64(params.T, BlockT);
   SconvForwardW4VecKernel<scalar_t, Vec, BlockT> kernel{params};
-  q.parallel_for<SconvForwardW4VecKernel<scalar_t, Vec, BlockT>>(
-      sycl::nd_range<2>(sycl::range<2>(channel_global, token_blocks), sycl::range<2>(Threads, 1)), kernel);
+  sycl_kernel_submit(sycl::range<2>(channel_global, token_blocks), sycl::range<2>(Threads, 1), q, kernel);
 }
 
 template <typename scalar_t>
@@ -598,8 +596,7 @@ void launch_update_sconv_cache_scalar(sycl::queue& q, UpdateSconvCacheParams<sca
   }
   const int64_t global = div_up_i64(total, kThreads) * kThreads;
   UpdateSconvCacheKernel<scalar_t> kernel{params};
-  q.parallel_for<UpdateSconvCacheKernel<scalar_t>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
 }
 
 template <typename scalar_t, int StaticW1>
@@ -698,8 +695,7 @@ bool launch_update_sconv_cache_packed_static(sycl::queue& q, UpdateSconvCachePar
   const int64_t total_lanes = params.B * lanes_per_batch;
   const int64_t global = div_up_i64(total_lanes, kThreads) * kThreads;
   UpdateSconvCachePackedKernel<scalar_t, StaticW1> kernel{params, lanes_per_batch, vec_count, pack_elems};
-  q.parallel_for<UpdateSconvCachePackedKernel<scalar_t, StaticW1>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
   return true;
 }
 
@@ -829,8 +825,7 @@ void launch_fused_decode_update(sycl::queue& q, FusedDecodeUpdateParams<scalar_t
   }
   const int64_t global = div_up_i64(total, kThreads) * kThreads;
   FusedDecodeUpdateKernel<scalar_t> kernel{params};
-  q.parallel_for<FusedDecodeUpdateKernel<scalar_t>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
 }
 
 template <typename scalar_t, int Vec, bool UseSilu, bool UseResidual, bool DoTrack>
@@ -951,8 +946,7 @@ void launch_fused_decode_update_w4_packed(sycl::queue& q, FusedDecodeUpdateParam
   }
   const int64_t global = div_up_i64(total, kThreads) * kThreads;
   FusedDecodeUpdateW4PackedKernel<scalar_t, Vec, UseSilu, UseResidual, DoTrack> kernel{params};
-  q.parallel_for<FusedDecodeUpdateW4PackedKernel<scalar_t, Vec, UseSilu, UseResidual, DoTrack>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
 }
 
 template <typename scalar_t, int Vec, bool UseSilu, bool UseResidual>
@@ -1077,8 +1071,7 @@ void launch_gather_scatter_scalar(sycl::queue& q, GatherScatterParams<scalar_t> 
   }
   const int64_t global = div_up_i64(total, kThreads) * kThreads;
   GatherScatterKernel<scalar_t> kernel{params};
-  q.parallel_for<GatherScatterKernel<scalar_t>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
 }
 
 template <typename scalar_t, int StaticW1>
@@ -1155,8 +1148,7 @@ bool launch_gather_scatter_packed_static(sycl::queue& q, GatherScatterParams<sca
   const int64_t total_lanes = params.B * lanes_per_batch;
   const int64_t global = div_up_i64(total_lanes, kThreads) * kThreads;
   GatherScatterPackedKernel<scalar_t, StaticW1> kernel{params, lanes_per_batch, vec_count, pack_elems};
-  q.parallel_for<GatherScatterPackedKernel<scalar_t, StaticW1>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
   return true;
 }
 
@@ -1259,8 +1251,7 @@ void launch_draft_extend_scalar(sycl::queue& q, DraftExtendParams<scalar_t> cons
   }
   const int64_t global = div_up_i64(total, kThreads) * kThreads;
   DraftExtendKernel<scalar_t> kernel{params};
-  q.parallel_for<DraftExtendKernel<scalar_t>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
 }
 
 template <typename scalar_t, int StaticW1, bool DoTrack>
@@ -1418,8 +1409,7 @@ bool launch_draft_extend_packed_static(sycl::queue& q, DraftExtendParams<scalar_
   const int64_t total_lanes = params.B * lanes_per_batch;
   const int64_t global = div_up_i64(total_lanes, kThreads) * kThreads;
   DraftExtendPackedKernel<scalar_t, StaticW1, DoTrack> kernel{params, lanes_per_batch, vec_count, pack_elems};
-  q.parallel_for<DraftExtendPackedKernel<scalar_t, StaticW1, DoTrack>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
   return true;
 }
 
@@ -1493,7 +1483,7 @@ void launch_decode_metadata(sycl::queue& q, DecodeMetadataParams const& params) 
   const int64_t total = params.B + 1;
   const int64_t global = div_up_i64(total, kMetaThreads) * kMetaThreads;
   DecodeMetadataKernel kernel{params};
-  q.parallel_for<DecodeMetadataKernel>(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kMetaThreads)), kernel);
+  sycl_kernel_submit(global, kMetaThreads, q, kernel);
 }
 
 enum HisMode {
@@ -1590,9 +1580,7 @@ void launch_extend_metadata(sycl::queue& q, ExtendMetadataParams const& params) 
     return;
   }
   ExtendMetadataKernel kernel{params};
-  q.parallel_for<ExtendMetadataKernel>(
-      sycl::nd_range<1>(sycl::range<1>(static_cast<std::size_t>(groups * kMetaThreads)), sycl::range<1>(kMetaThreads)),
-      kernel);
+  sycl_kernel_submit(groups * kMetaThreads, kMetaThreads, q, kernel);
 }
 
 struct TrackIndicesParams {
@@ -1637,7 +1625,7 @@ void launch_track_indices(sycl::queue& q, TrackIndicesParams const& params) {
   }
   const int64_t global = div_up_i64(total, kThreads) * kThreads;
   TrackIndicesKernel kernel{params};
-  q.parallel_for<TrackIndicesKernel>(sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
 }
 
 template <typename scalar_t>
@@ -1703,8 +1691,7 @@ void launch_save_windows_scalar(sycl::queue& q, SaveWindowsParams<scalar_t> cons
   }
   const int64_t global = div_up_i64(total, kThreads) * kThreads;
   SaveWindowsKernel<scalar_t> kernel{params};
-  q.parallel_for<SaveWindowsKernel<scalar_t>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
 }
 
 template <typename scalar_t, int StaticW1>
@@ -1799,8 +1786,7 @@ bool launch_save_windows_packed_static(sycl::queue& q, SaveWindowsParams<scalar_
   const int64_t total_lanes = params.B * params.draft_tokens * width * lanes_per_row;
   const int64_t global = div_up_i64(total_lanes, kThreads) * kThreads;
   SaveWindowsPackedKernel<scalar_t, StaticW1> kernel{params, lanes_per_row, vec_count, pack_elems};
-  q.parallel_for<SaveWindowsPackedKernel<scalar_t, StaticW1>>(
-      sycl::nd_range<1>(sycl::range<1>(global), sycl::range<1>(kThreads)), kernel);
+  sycl_kernel_submit(global, kThreads, q, kernel);
   return true;
 }
 

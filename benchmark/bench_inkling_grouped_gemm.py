@@ -257,10 +257,10 @@ def check_or_save_reference(
             raise AssertionError(
                 f"reference metadata mismatch: {expected.get('metadata')} != {metadata}"
             )
-        torch.testing.assert_close(actual, expected["output"], rtol=1e-1, atol=1e-2)
+        torch.testing.assert_close(actual, expected["output"], rtol=5e-3, atol=5e-3)
         error = (actual.float() - expected["output"].float()).abs()
         print(
-            "correctness: finite=True reference_match=True rtol=0.1 atol=0.01 "
+            "correctness: finite=True reference_match=True rtol=0.005 atol=0.005 "
             f"max_abs_error={error.max().item():.6g} "
             f"mean_abs_error={error.mean().item():.6g}"
         )

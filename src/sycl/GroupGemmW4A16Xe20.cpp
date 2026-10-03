@@ -97,11 +97,6 @@ DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_128)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_128_skip)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_256)
 DECLARE_W4A16_POLICY(w4a16_launch_policy_m_64_n_256_skip)
-DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_m_8_n_64, uint8_t, cutlass::bfloat16_t)
-DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_m_16_n_64, uint8_t, cutlass::bfloat16_t)
-DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_down_m_32_n_256, uint8_t, cutlass::bfloat16_t)
-DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_gate_prefill_low, uint8_t, cutlass::bfloat16_t)
-DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_gate_prefill_high, uint8_t, cutlass::bfloat16_t)
 DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_down_prefill_low, uint8_t, cutlass::bfloat16_t)
 DECLARE_W4A16_EXTERN(w4a16_launch_policy_inkling_down_prefill_high, uint8_t, cutlass::bfloat16_t)
 
@@ -158,12 +153,6 @@ int select_w4a16_policy_id(int avg_m, int gemm_n, int gemm_k) {
     return want_nskip(gemm_n, 256) ? 6 : 5;
   }
   return want_nskip(gemm_n, 128) ? 4 : 3;
-}
-
-int select_mxfp4_bf16_policy_id(int avg_m, int gemm_n, int gemm_k) {
-  if (avg_m <= 8) return 7;
-  if (avg_m <= 16) return gemm_k <= kW4A16ShortK && gemm_n >= 256 ? 9 : 8;
-  return select_w4a16_policy_id(avg_m, gemm_n, gemm_k);
 }
 
 }  // namespace
@@ -274,18 +263,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   // Avoid a separate four-byte memset launch, which is material for decode.
 
   const int avg_m = total_m / static_cast<int>(n_experts);
-  // These launch policies apply to the MXFP4/BF16 K32 quantization family,
-  // independently of a particular model or benchmark matrix size.
-#ifdef USE_MOE_JIT
-  // The JIT registry contains the seven original policies. Keep its dispatch
-  // on those IDs until the specialized policies and split launch are wired in.
   const int policy_id = select_w4a16_policy_id(avg_m, gemm_n, gemm_k);
-#else
-  const bool use_mxfp4_bf16_policy =
-      !is_int4 && activations.scalar_type() == at::ScalarType::BFloat16 && group_size == 32;
-  const int policy_id = use_mxfp4_bf16_policy ? select_mxfp4_bf16_policy_id(avg_m, gemm_n, gemm_k)
-                                              : select_w4a16_policy_id(avg_m, gemm_n, gemm_k);
-#endif
   const bool is_fp16_act = activations.scalar_type() == at::ScalarType::Half;
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
@@ -361,15 +339,6 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
       case 6:
         launch_regular(std::type_identity<moe_w4a16::w4a16_launch_policy_m_64_n_256_skip>{});
         break;
-      case 7:
-        launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_m_8_n_64>{});
-        break;
-      case 8:
-        launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_m_16_n_64>{});
-        break;
-      case 9:
-        launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_down_m_32_n_256>{});
-        break;
       default:
         TORCH_CHECK(false, "Unsupported W4A16 launch policy");
     }
@@ -403,18 +372,18 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
         jit_err);
   }
 #else
-  // Splitting adds a second launch and 48-row tiles hurt when most experts
-  // fit in one 64-row tile. At 40G MACs the added launch is small relative to
-  // device work; 80 average rows require at least two 64-row tiles.
+  const bool use_mxfp4_bf16_policy =
+      !is_int4 && activations.scalar_type() == at::ScalarType::BFloat16 && group_size == 32;
+  // Split short-K down projection only for sufficiently large workloads.
+  // Gate/up showed no measured gain from splitting.
+  // At 40G MACs the added launch is small relative to device work; 80
+  // average rows require at least two 64-row tiles.
   constexpr int64_t kSplitPrefillMinMacs = 40'000'000'000LL;
   const int64_t macs = static_cast<int64_t>(total_m) * gemm_n * gemm_k;
   const bool use_split_prefill = use_mxfp4_bf16_policy && avg_m >= 80 && macs >= kSplitPrefillMinMacs;
   if (use_split_prefill && gemm_k <= kW4A16ShortK && gemm_n >= 128) {
     launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_down_prefill_low>{});
     launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_down_prefill_high>{});
-  } else if (use_split_prefill && gemm_k > kW4A16ShortK && gemm_n >= 256) {
-    launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_gate_prefill_low>{});
-    launch_mxfp4_bf16(std::type_identity<moe_w4a16::w4a16_launch_policy_inkling_gate_prefill_high>{});
   } else {
     dispatch_policy();
   }

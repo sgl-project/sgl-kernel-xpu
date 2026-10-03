@@ -921,8 +921,12 @@ def _check_mxfp4_grouped_mm(
 
     launch(inputs, num_experts)
 
+    tolerance = 1e-3 if dtype == torch.float16 else 5e-3
     torch.testing.assert_close(
-        inputs["output_reference"], inputs["output_mxfp4"], rtol=1e-1, atol=1e-2
+        inputs["output_reference"],
+        inputs["output_mxfp4"],
+        rtol=tolerance,
+        atol=tolerance,
     )
 
 
@@ -2168,7 +2172,8 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_ragged_production_tiles(
         MXFP4_BLOCK_SIZE,
     )
 
-    torch.testing.assert_close(actual.cpu(), expected, rtol=1e-1, atol=1e-2)
+    tolerance = 1e-3 if dtype == torch.float16 else 5e-3
+    torch.testing.assert_close(actual.cpu(), expected, rtol=tolerance, atol=tolerance)
 
 
 @pytest.mark.parametrize(
@@ -2181,8 +2186,8 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_ragged_production_tiles(
 def test_moe_grouped_mm_nt_xe20_w4a16_inkling_prefill_nonzero_reference(gemm_n, gemm_k):
     """Reference-check the exact Inkling TP4 prefill dispatch.
 
-    The optimized production path splits 256 experts between two launches at
-    the 96/97-row boundary.  Full production weights are used so dispatch,
+    The down projection splits 256 experts between two launches at the
+    96/97-row boundary. Full production weights are used so dispatch,
     offsets, and launch geometry are real.  A deterministic subset of output
     rows and columns is compared against FP32 matmul on independently
     dequantized MXFP4 weights; checking the complete output for finite values
@@ -2271,7 +2276,7 @@ def test_moe_grouped_mm_nt_xe20_w4a16_inkling_prefill_nonzero_reference(gemm_n, 
         max_abs_error = max(max_abs_error, error.max().item())
         mean_abs_error += error.sum().item()
         checked_values += error.numel()
-        torch.testing.assert_close(actual, expected, rtol=1e-1, atol=1e-2)
+        torch.testing.assert_close(actual, expected, rtol=5e-3, atol=5e-3)
         row_offset += expert_rows
 
     assert checked_values == 7 * 3 * len(column_ids)

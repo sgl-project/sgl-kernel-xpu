@@ -9,6 +9,15 @@ ACTIVE = ROUTED + SHARED
 PADDED = 264
 TOPK = 6
 
+
+def _tolerance(dtype):
+    if dtype == torch.bfloat16:
+        return 5e-3
+    if dtype == torch.float16:
+        return 1e-3
+    return 2e-4
+
+
 pytestmark = pytest.mark.skipif(
     not hasattr(torch, "xpu") or not torch.xpu.is_available(),
     reason="Inkling MoE gate tests require XPU",
@@ -37,7 +46,7 @@ def _unpack_routes(packed):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("tokens", [1, 3, 17, 127])
+@pytest.mark.parametrize("tokens", [0, 1, 3, 17, 127, 512, 513])
 def test_projection_matches_fp32_mm(dtype, tokens):
     torch.manual_seed(tokens)
     x = (torch.randn(tokens, HIDDEN, device="xpu") * 0.05).to(dtype)
@@ -46,7 +55,15 @@ def test_projection_matches_fp32_mm(dtype, tokens):
     expected = torch.mm(x, weight.T, out_dtype=torch.float32)[:, :ACTIVE]
     assert actual.shape == (tokens, ACTIVE)
     assert actual.stride() == (PADDED, 1)
-    torch.testing.assert_close(actual, expected, rtol=3e-3, atol=3e-3)
+    tolerance = _tolerance(dtype)
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+def test_projection_rejects_incorrect_padding():
+    x = torch.zeros(1, HIDDEN, device="xpu", dtype=torch.bfloat16)
+    weight = torch.zeros(ACTIVE, HIDDEN, device="xpu", dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="weight must have shape"):
+        inkling_moe_gate_projection(x, weight)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -56,7 +73,8 @@ def test_projection_production_shape(dtype):
     weight = (torch.randn(PADDED, HIDDEN, device="xpu") * 0.02).to(dtype)
     actual = inkling_moe_gate_projection(x, weight)
     expected = torch.mm(x, weight.T, out_dtype=torch.float32)[:, :ACTIVE]
-    torch.testing.assert_close(actual, expected, rtol=3e-3, atol=3e-3)
+    tolerance = _tolerance(dtype)
+    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
@@ -84,11 +102,14 @@ def test_topk_matches_reference(dtype, tokens, padded_stride, packed):
     )
     if packed:
         routed, indices = _unpack_routes(packed_routes)
-        torch.testing.assert_close(routed, ref_routed, rtol=8e-3, atol=2e-2)
+        reference_packed = ref_routed.to(torch.bfloat16).float()
+        torch.testing.assert_close(routed, reference_packed, rtol=5e-3, atol=5e-3)
     else:
-        torch.testing.assert_close(routed, ref_routed, rtol=2e-4, atol=2e-4)
+        tolerance = _tolerance(dtype)
+        torch.testing.assert_close(routed, ref_routed, rtol=tolerance, atol=tolerance)
     torch.testing.assert_close(indices, ref_indices, rtol=0, atol=0)
-    torch.testing.assert_close(shared, ref_shared, rtol=2e-4, atol=2e-4)
+    tolerance = _tolerance(dtype)
+    torch.testing.assert_close(shared, ref_shared, rtol=tolerance, atol=tolerance)
 
 
 def test_topk_ties_choose_lower_expert_id():

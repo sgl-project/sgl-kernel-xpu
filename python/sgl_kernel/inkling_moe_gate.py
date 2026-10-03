@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import torch
 
+# Device timings favor torch.mm for both dtypes through 512 tokens.
+_PROJECTION_MM_MAX_TOKENS = 512
+
 
 def inkling_moe_gate_projection(
     input: torch.Tensor,
@@ -15,6 +18,23 @@ def inkling_moe_gate_projection(
     ``[264, 6144]`` parameter. The returned ``[tokens, 258]`` view keeps a
     physical row stride of 264 for the top-k kernel.
     """
+    if input.dim() == 2 and input.size(0) <= _PROJECTION_MM_MAX_TOKENS:
+        if input.size(1) != 6144:
+            raise RuntimeError("input must have shape [tokens, 6144]")
+        if weight.shape != (264, 6144):
+            raise RuntimeError("weight must have shape [264, 6144]")
+        if (
+            input.dtype not in (torch.bfloat16, torch.float16)
+            or weight.dtype != input.dtype
+        ):
+            raise RuntimeError(
+                "input and weight must have matching bfloat16 or float16 dtype"
+            )
+        if input.device.type != "xpu" or weight.device != input.device:
+            raise RuntimeError("input and weight must be on the same XPU device")
+        if not input.is_contiguous() or not weight.is_contiguous():
+            raise RuntimeError("input and weight must be contiguous")
+        return torch.mm(input, weight.T, out_dtype=torch.float32)[:, :258]
     return torch.ops.sgl_kernel.inkling_moe_gate_projection.default(input, weight)
 
 

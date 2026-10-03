@@ -15,7 +15,7 @@ def rand(shape, dtype, scale=1.0):
 
 def tol(dtype):
     if dtype is torch.bfloat16:
-        return 3.0e-2, 3.0e-2
+        return 1.0e-2, 1.0e-2
     if dtype is torch.float16:
         return 3.0e-3, 3.0e-3
     return 1.0e-4, 1.0e-4

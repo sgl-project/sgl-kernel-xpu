@@ -117,7 +117,7 @@ def main() -> None:
         for name, got, ref in zip(("q", "k", "v"), actual, expected):
             diff = (got.float() - ref.float()).abs()
             torch.testing.assert_close(
-                got.float(), ref.float(), atol=3.0e-2, rtol=3.0e-2
+                got.float(), ref.float(), atol=1.0e-2, rtol=1.0e-2
             )
             print(
                 f"{name}: max_abs={diff.max().item():.8f} "
@@ -126,14 +126,14 @@ def main() -> None:
         torch.testing.assert_close(
             x["k_buf"].view(-1, x["dkv"]).float(),
             expected[1].float(),
-            atol=3.0e-2,
-            rtol=3.0e-2,
+            atol=1.0e-2,
+            rtol=1.0e-2,
         )
         torch.testing.assert_close(
             x["v_buf"].view(-1, x["dkv"]).float(),
             expected[2].float(),
-            atol=3.0e-2,
-            rtol=3.0e-2,
+            atol=1.0e-2,
+            rtol=1.0e-2,
         )
         print("kv_store: matches non-zero reference")
         torch.testing.assert_close(

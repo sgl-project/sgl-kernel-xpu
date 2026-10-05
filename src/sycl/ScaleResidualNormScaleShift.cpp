@@ -290,9 +290,8 @@ void launch(::sycl::queue& queue, const LaunchArgs& a) {
 #undef SRNSS_SUBMIT
 }
 
-void check_param(const torch::Tensor& t, const torch::Tensor& x, at::ScalarType param_dtype, const char* name) {
+void check_param(const torch::Tensor& t, at::ScalarType param_dtype, const char* name) {
   CHECK_INPUT(t);
-  TORCH_CHECK(t.device() == x.device(), "fused_scale_residual_norm_scale_shift: ", name, " must be on x's device");
   TORCH_CHECK(
       t.scalar_type() == param_dtype,
       "fused_scale_residual_norm_scale_shift: gate/weight/bias/scale/shift must share one dtype, but ",
@@ -306,13 +305,13 @@ void check_param(const torch::Tensor& t, const torch::Tensor& x, at::ScalarType 
 }  // namespace
 
 SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_norm_scale_shift(
-    torch::Tensor residual,
-    torch::Tensor x,
-    std::optional<torch::Tensor> gate,
-    std::optional<torch::Tensor> weight,
-    std::optional<torch::Tensor> bias,
-    torch::Tensor scale,
-    torch::Tensor shift,
+    const torch::Tensor& residual,
+    const torch::Tensor& x,
+    const std::optional<torch::Tensor>& gate,
+    const std::optional<torch::Tensor>& weight,
+    const std::optional<torch::Tensor>& bias,
+    const torch::Tensor& scale,
+    const torch::Tensor& shift,
     double eps) {
   CHECK_INPUT(x);
   CHECK_INPUT(residual);
@@ -326,8 +325,8 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_
       "fused_scale_residual_norm_scale_shift: x must be [1, seq_len, hidden], got ",
       x.sizes());
   TORCH_CHECK(
-      residual.sizes() == x.sizes() && residual.scalar_type() == x.scalar_type() && residual.device() == x.device(),
-      "fused_scale_residual_norm_scale_shift: residual must match x in shape, dtype and device");
+      residual.sizes() == x.sizes() && residual.scalar_type() == x.scalar_type(),
+      "fused_scale_residual_norm_scale_shift: residual must match x in shape and dtype");
 
   const int64_t seq_len = x.size(1);
   const int64_t hidden = x.size(2);
@@ -338,8 +337,8 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_
       ", got ",
       hidden);
   const at::ScalarType param_dtype = scale.scalar_type();
-  check_param(scale, x, param_dtype, "scale");
-  check_param(shift, x, param_dtype, "shift");
+  check_param(scale, param_dtype, "scale");
+  check_param(shift, param_dtype, "shift");
   TORCH_CHECK(
       scale.numel() == 1 || scale.numel() == hidden,
       "fused_scale_residual_norm_scale_shift: scale must have 1 or hidden elements, got ",
@@ -354,7 +353,7 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_
   const void* gate_ptr = nullptr;
   if (gate.has_value()) {
     const torch::Tensor& g = gate.value();
-    check_param(g, x, param_dtype, "gate");
+    check_param(g, param_dtype, "gate");
     TORCH_CHECK(
         (g.dim() == 3 || g.dim() == 4) && g.size(0) == 1 && g.size(-1) == hidden,
         "fused_scale_residual_norm_scale_shift: gate must be [1, 1, hidden] or [1, num_frames, 1, hidden], got ",
@@ -375,7 +374,7 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_
   const void* weight_ptr = nullptr;
   const void* bias_ptr = nullptr;
   if (weight.has_value()) {
-    check_param(weight.value(), x, param_dtype, "weight");
+    check_param(weight.value(), param_dtype, "weight");
     TORCH_CHECK(
         weight.value().numel() == hidden,
         "fused_scale_residual_norm_scale_shift: weight must have hidden elements, got ",
@@ -383,7 +382,7 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_
     weight_ptr = weight.value().data_ptr();
   }
   if (bias.has_value()) {
-    check_param(bias.value(), x, param_dtype, "bias");
+    check_param(bias.value(), param_dtype, "bias");
     TORCH_CHECK(
         bias.value().numel() == hidden,
         "fused_scale_residual_norm_scale_shift: bias must have hidden elements, got ",

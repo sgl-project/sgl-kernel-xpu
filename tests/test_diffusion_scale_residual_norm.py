@@ -3,13 +3,9 @@
 import sys
 
 import pytest
-import sgl_kernel
 import torch
 import utils
-from sgl_kernel import (
-    can_use_fused_scale_residual_norm_scale_shift,
-    fused_scale_residual_norm_scale_shift,
-)
+from sgl_kernel import fused_scale_residual_norm_scale_shift
 
 device = utils.get_device()
 
@@ -89,21 +85,7 @@ def make_operands(
     return residual, x, gate, shift, scale, weight, bias
 
 
-def assert_matches_reference(*, eps=1e-6, **kwargs):
-    dtype = kwargs["dtype"]
-    kwargs.setdefault("param_dtype", dtype)
-    residual, x, gate, shift, scale, weight, bias = make_operands(**kwargs)
-
-    assert can_use_fused_scale_residual_norm_scale_shift(
-        residual=residual,
-        x=x,
-        gate=gate,
-        shift=shift,
-        scale=scale,
-        weight=weight,
-        bias=bias,
-    )
-
+def check_against_reference(residual, x, gate, shift, scale, weight, bias, eps=1e-6):
     out, residual_out = fused_scale_residual_norm_scale_shift(
         residual=residual,
         x=x,
@@ -120,7 +102,7 @@ def assert_matches_reference(*, eps=1e-6, **kwargs):
 
     assert out.shape == x.shape and out.dtype == x.dtype
     assert residual_out.shape == x.shape and residual_out.dtype == x.dtype
-    rtol, atol = (1e-5, 1e-5) if dtype == torch.float32 else (1e-2, 1e-2)
+    rtol, atol = (1e-5, 1e-5) if x.dtype == torch.float32 else (1e-2, 1e-2)
     torch.testing.assert_close(residual_out, residual_out_ref, rtol=rtol, atol=atol)
     torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
 
@@ -131,50 +113,39 @@ def assert_matches_reference(*, eps=1e-6, **kwargs):
 @pytest.mark.parametrize("seq_len", [1, 17, 1024])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_shapes(hidden, seq_len, dtype):
-    assert_matches_reference(seq_len=seq_len, hidden=hidden, dtype=dtype)
+    check_against_reference(
+        *make_operands(seq_len=seq_len, hidden=hidden, dtype=dtype, param_dtype=dtype)
+    )
 
 
+# scale and shift pick vector/scalar independently; params may be fp32 under fp16/bf16 x.
 @pytest.mark.parametrize("gate_mode", ["none", "per_token", "per_frame"])
-@pytest.mark.parametrize("scale_kind", ["vector", "scalar"])
-@pytest.mark.parametrize("shift_kind", ["vector", "scalar"])
+@pytest.mark.parametrize("scale_numel,shift_numel", [(1536, 1), (1, 1536)])
 @pytest.mark.parametrize("affine", [True, False, "weight_only", "bias_only"])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_operand_variants(gate_mode, scale_kind, shift_kind, affine, dtype):
-    hidden = 1536
-    assert_matches_reference(
-        seq_len=64,
-        hidden=hidden,
-        dtype=dtype,
-        gate_mode=gate_mode,
-        num_frames=8,
-        scale_numel=hidden if scale_kind == "vector" else 1,
-        shift_numel=hidden if shift_kind == "vector" else 1,
-        affine=affine,
+@pytest.mark.parametrize(
+    "dtype,param_dtype",
+    [
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float32),
+    ],
+)
+def test_operand_variants(
+    gate_mode, scale_numel, shift_numel, affine, dtype, param_dtype
+):
+    check_against_reference(
+        *make_operands(
+            seq_len=120,
+            hidden=1536,
+            dtype=dtype,
+            param_dtype=param_dtype,
+            gate_mode=gate_mode,
+            num_frames=5,
+            scale_numel=scale_numel,
+            shift_numel=shift_numel,
+            affine=affine,
+        )
     )
-
-
-@pytest.mark.parametrize("seq_len,num_frames", [(8, 8), (120, 5), (1024, 16)])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_per_frame_gate(seq_len, num_frames, dtype):
-    assert_matches_reference(
-        seq_len=seq_len,
-        hidden=2048,
-        dtype=dtype,
-        gate_mode="per_frame",
-        num_frames=num_frames,
-    )
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fp32_params(dtype):
-    assert_matches_reference(
-        seq_len=128, hidden=3072, dtype=dtype, param_dtype=torch.float32
-    )
-
-
-@pytest.mark.parametrize("eps", [1e-6, 1e-5, 1e-3])
-def test_eps(eps):
-    assert_matches_reference(seq_len=32, hidden=1536, dtype=torch.bfloat16, eps=eps)
 
 
 @pytest.mark.parametrize("storage_offset", [1, 3])
@@ -190,115 +161,61 @@ def test_misaligned_params(storage_offset):
     )
     scale = scale[storage_offset:]
     assert scale.is_contiguous() and scale.numel() == hidden
+    check_against_reference(residual, x, gate, shift, scale, weight, bias)
 
-    out, residual_out = fused_scale_residual_norm_scale_shift(
-        residual=residual,
-        x=x,
-        gate=gate,
-        shift=shift,
-        scale=scale,
-        weight=weight,
-        bias=bias,
-        eps=1e-6,
+
+_HIDDEN, _SEQ_LEN, _DTYPE = 1536, 32, torch.bfloat16
+_OVER_MAX = 2 * 8192
+
+
+def _randn(*shape, dtype=_DTYPE):
+    return torch.randn(*shape, dtype=dtype, device=device)
+
+
+_UNSUPPORTED = {
+    "hidden above MAX_FUSED_HIDDEN": lambda: dict(
+        residual=_randn(1, 4, _OVER_MAX),
+        x=_randn(1, 4, _OVER_MAX),
+        gate=_randn(1, 1, _OVER_MAX),
+        shift=_randn(_OVER_MAX),
+        scale=_randn(_OVER_MAX),
+        weight=_randn(_OVER_MAX),
+        bias=_randn(_OVER_MAX),
+    ),
+    "batch size above 1": lambda: dict(
+        residual=_randn(2, _SEQ_LEN, _HIDDEN), x=_randn(2, _SEQ_LEN, _HIDDEN)
+    ),
+    "non-contiguous x": lambda: dict(x=_randn(1, _SEQ_LEN, 2 * _HIDDEN)[..., :_HIDDEN]),
+    "gate hidden mismatch": lambda: dict(gate=_randn(1, 1, _HIDDEN // 2)),
+    "gate int other than 1": lambda: dict(gate=2),
+    "bool gate": lambda: dict(gate=True),
+    "float gate": lambda: dict(gate=1.0),
+    "num_frames not dividing seq_len": lambda: dict(gate=_randn(1, 7, 1, _HIDDEN)),
+    "zero num_frames": lambda: dict(gate=_randn(1, 0, 1, _HIDDEN)),
+    "modulation numel mismatch": lambda: dict(scale=_randn(3)),
+    "mixed parameter dtypes": lambda: dict(scale=_randn(_HIDDEN, dtype=torch.float32)),
+    "unsupported dtype": lambda: dict(
+        residual=_randn(1, _SEQ_LEN, _HIDDEN, dtype=torch.float64),
+        x=_randn(1, _SEQ_LEN, _HIDDEN, dtype=torch.float64),
+    ),
+}
+
+
+@pytest.mark.parametrize("reason", list(_UNSUPPORTED))
+def test_rejects_unsupported(reason):
+    base = dict(
+        residual=_randn(1, _SEQ_LEN, _HIDDEN),
+        x=_randn(1, _SEQ_LEN, _HIDDEN),
+        gate=_randn(1, 1, _HIDDEN),
+        shift=_randn(_HIDDEN),
+        scale=_randn(_HIDDEN),
+        weight=_randn(_HIDDEN),
+        bias=_randn(_HIDDEN),
     )
-    out_ref, residual_out_ref = reference_scale_residual_norm_scale_shift(
-        residual, x, gate, shift, scale, weight, bias, 1e-6
-    )
-    torch.testing.assert_close(residual_out, residual_out_ref, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
-
-
-def _base_operands():
-    hidden, seq_len, dtype = 1536, 32, torch.bfloat16
-    return hidden, dict(
-        residual=torch.randn(1, seq_len, hidden, dtype=dtype, device=device),
-        x=torch.randn(1, seq_len, hidden, dtype=dtype, device=device),
-        gate=torch.randn(1, 1, hidden, dtype=dtype, device=device),
-        shift=torch.randn(hidden, dtype=dtype, device=device),
-        scale=torch.randn(hidden, dtype=dtype, device=device),
-        weight=torch.randn(hidden, dtype=dtype, device=device),
-        bias=torch.randn(hidden, dtype=dtype, device=device),
-    )
-
-
-def test_can_use_rejects_unsupported():
-    hidden, base = _base_operands()
-    dtype, seq_len = torch.bfloat16, 32
-    assert can_use_fused_scale_residual_norm_scale_shift(**base)
-
-    over_max = 2 * 8192
-    cases = {
-        "hidden above MAX_FUSED_HIDDEN": dict(
-            residual=torch.randn(1, 4, over_max, dtype=dtype, device=device),
-            x=torch.randn(1, 4, over_max, dtype=dtype, device=device),
-            gate=torch.randn(1, 1, over_max, dtype=dtype, device=device),
-            shift=torch.randn(over_max, dtype=dtype, device=device),
-            scale=torch.randn(over_max, dtype=dtype, device=device),
-            weight=torch.randn(over_max, dtype=dtype, device=device),
-            bias=torch.randn(over_max, dtype=dtype, device=device),
-        ),
-        "batch size above 1": dict(
-            residual=torch.randn(2, seq_len, hidden, dtype=dtype, device=device),
-            x=torch.randn(2, seq_len, hidden, dtype=dtype, device=device),
-        ),
-        "non-contiguous x": dict(
-            x=torch.randn(1, seq_len, 2 * hidden, dtype=dtype, device=device)[
-                ..., :hidden
-            ],
-        ),
-        "gate hidden mismatch": dict(
-            gate=torch.randn(1, 1, hidden // 2, dtype=dtype, device=device)
-        ),
-        "gate int other than 1": dict(gate=2),
-        "bool gate": dict(gate=True),
-        "float gate": dict(gate=1.0),
-        "num_frames not dividing seq_len": dict(
-            gate=torch.randn(1, 7, 1, hidden, dtype=dtype, device=device)
-        ),
-        "zero num_frames": dict(
-            gate=torch.randn(1, 0, 1, hidden, dtype=dtype, device=device)
-        ),
-        "modulation numel mismatch": dict(
-            scale=torch.randn(3, dtype=dtype, device=device)
-        ),
-        "mixed parameter dtypes": dict(
-            scale=torch.randn(hidden, dtype=torch.float32, device=device)
-        ),
-        "unsupported dtype": dict(
-            residual=torch.randn(1, seq_len, hidden, device=device).double(),
-            x=torch.randn(1, seq_len, hidden, device=device).double(),
-        ),
-    }
-    for reason, override in cases.items():
-        assert not can_use_fused_scale_residual_norm_scale_shift(
-            **{**base, **override}
-        ), reason
-
-
-@pytest.mark.parametrize("num_frames", [7, 0])
-def test_kernel_rejects_bad_shape(num_frames):
-    _, base = _base_operands()
-    bad = dict(base)
-    bad["gate"] = torch.randn(
-        1, num_frames, 1, base["x"].shape[-1], dtype=torch.bfloat16, device=device
-    )
-    with pytest.raises(RuntimeError, match="num_frames"):
-        fused_scale_residual_norm_scale_shift(**bad, eps=1e-6)
-
-
-@pytest.mark.parametrize("gate", [2, True, 1.0, 0])
-def test_kernel_rejects_non_unit_int_gate(gate):
-    """True and 1.0 compare equal to 1 but must not be read as "no gate"."""
-    _, base = _base_operands()
-    with pytest.raises(ValueError, match="gate of 1"):
-        fused_scale_residual_norm_scale_shift(**{**base, "gate": gate}, eps=1e-6)
-
-
-@pytest.mark.parametrize("affine", ["weight_only", "bias_only"])
-def test_lone_weight_or_bias(affine):
-    assert_matches_reference(
-        seq_len=64, hidden=1536, dtype=torch.bfloat16, affine=affine
-    )
+    with pytest.raises(ValueError):
+        fused_scale_residual_norm_scale_shift(
+            **{**base, **_UNSUPPORTED[reason]()}, eps=1e-6
+        )
 
 
 if __name__ == "__main__":

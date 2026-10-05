@@ -553,6 +553,44 @@ void launch_vectorized_rmsnorm_no_rstd_kernel(Norm& norm, const NormConfig& conf
 #undef DISPATCH_RMSNORM_NO_RSTD_VEC
 }
 
+// Launch for contiguous rows built with NormConfig(FastRowTag): NormFastParams makes every inner
+// size/stride a compile-time constant, so compute_row_offset folds its integer div/mod (Xe has no
+// hardware divide) to row * batch_stride. 1, 2, 4 or 8 passes per row are instantiated; any other
+// count takes the general launcher.
+template <typename scalar_t, typename weight_t, int vec_size, typename Norm>
+void launch_fast_rmsnorm_no_rstd_kernel(Norm& norm, const NormConfig& config) {
+  const int iters = (config.WGPlane + config.workgroup_size * vec_size - 1) / (config.workgroup_size * vec_size);
+  auto launch = [&](auto iters_tag) {
+    using KernelFunctor = RMSNormNoRstdKernelFunctor<
+        scalar_t,
+        weight_t,
+        vec_size,
+        decltype(iters_tag)::value,
+        Norm,
+        /*cache_inputs=*/true,
+        uint32_t,
+        NormFastParams>;
+    const NormFastParams fast_config{
+        config.Plane, config.workgroup_size, config.input_batch_stride, config.output_batch_stride};
+    const sycl::range<1> local_range{static_cast<size_t>(config.workgroup_size)};
+    const sycl::range<1> global_range{
+        static_cast<size_t>(config.workgroup_num) * static_cast<size_t>(config.workgroup_size)};
+    sycl_kernel_submit(
+        global_range, local_range, at::xpu::getCurrentXPUStream().queue(), KernelFunctor(norm, fast_config));
+  };
+  if (iters == 1) {
+    launch(std::integral_constant<int, 1>{});
+  } else if (iters == 2) {
+    launch(std::integral_constant<int, 2>{});
+  } else if (iters == 4) {
+    launch(std::integral_constant<int, 4>{});
+  } else if (iters == 8) {
+    launch(std::integral_constant<int, 8>{});
+  } else {
+    launch_vectorized_rmsnorm_no_rstd_kernel<scalar_t, weight_t>(norm, config);
+  }
+}
+
 template <typename scalar_t, typename weight_t>
 void RMSNormKernelImplInternal(
     const Tensor& X,
@@ -603,6 +641,28 @@ void FusedAddRMSNormKernelImplInternal(
   scalar_t* residual_data = residual.data_ptr<scalar_t>();
   AddRMSNormNoRstdForward<scalar_t, weight_t> add_rms_norm_no_rstd_forward(
       X_data, X_data, gemma_data, eps, residual_data);
+
+  // A 2-byte dtype with a same-dtype weight whose rows split into full 16-byte vectors takes the
+  // fast launch: FastRowTag caches the workgroup-sizing device properties (this op is host-bound
+  // at decode sizes) and NormFastParams drops the per-row div/mod.
+  if constexpr (std::is_same_v<scalar_t, weight_t> && sizeof(scalar_t) == 2) {
+    // Alignment is tested directly: get_update_vec_size() looks up device properties once per
+    // pointer, which cost 0.44 us per call here (9% of a decode-size call on Arc Pro B60).
+    constexpr std::uintptr_t kAlignBytes = 16;
+    constexpr int kVec = kAlignBytes / sizeof(scalar_t);
+    const auto aligned = [](const void* p) { return reinterpret_cast<std::uintptr_t>(p) % kAlignBytes == 0; };
+    if (N % kVec == 0 && aligned(X_data) && aligned(gemma_data) && aligned(residual_data)) {
+      const NormConfig config(
+          NormConfig::FastRowTag{},
+          static_cast<int>(M),
+          static_cast<int>(N),
+          static_cast<int>(sizeof(scalar_t)),
+          kVec,
+          static_cast<int>(N));
+      launch_fast_rmsnorm_no_rstd_kernel<scalar_t, weight_t, kVec>(add_rms_norm_no_rstd_forward, config);
+      return;
+    }
+  }
 
   auto config = NormConfig(
       M,
@@ -780,81 +840,15 @@ fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor wei
   TORCH_CHECK(input.is_contiguous(), "fused_add_rmsnorm: input must be contiguous");
   TORCH_CHECK(residual.is_contiguous(), "fused_add_rmsnorm: residual must be contiguous");
 
-  // Fast path for contiguous 2D/3D/4D inputs of a 2-byte dtype with 16B-aligned pointers. Anything
-  // it rejects, including a strided or off-device weight, takes the general path below, which
-  // validates and reports it. Each accessor is read once: this path is host-bound at decode sizes.
-  const auto isz = input.sizes();
-  const auto rsz = residual.sizes();
-  const auto wsz = weight.sizes();
-  const auto st = input.scalar_type();
-  if (isz.size() >= 2 && isz.size() <= 4 && isz == rsz && wsz.size() == 1 && isz.back() == wsz[0] &&
-      (st == at::ScalarType::BFloat16 || st == at::ScalarType::Half) && weight.scalar_type() == st &&
-      weight.is_contiguous() && weight.device() == input.device()) {
-    constexpr std::uintptr_t kAlignBytes = 16;
-    constexpr int kVec = kAlignBytes / 2;  // the guard admits 2-byte dtypes only
-    const int64_t N2 = isz.back(), M2 = input.numel() / N2;
-    const auto req = kAlignBytes;
-    const auto ip = reinterpret_cast<std::uintptr_t>(input.data_ptr());
-    const auto rp = reinterpret_cast<std::uintptr_t>(residual.data_ptr());
-    const auto wp = reinterpret_cast<std::uintptr_t>(weight.data_ptr());
-    if (N2 % kVec == 0 && ip % req == 0 && rp % req == 0 && wp % req == 0) {
-      // The guard makes weight dtype equal input dtype, so one dispatch covers both.
-      SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, st, "FusedAddRMSNormFast", [&]() {
-        using weight_t = scalar_t;
-        auto* X_data = input.data_ptr<scalar_t>();
-        auto* gemma_data = weight.data_ptr<weight_t>();
-        auto* residual_data = residual.data_ptr<scalar_t>();
-        AddRMSNormNoRstdForward<scalar_t, weight_t> fwd(
-            X_data, X_data, gemma_data, static_cast<acc_type<scalar_t>>(eps), residual_data);
-        auto cfg = NormConfig(
-            NormConfig::FastRowTag{},
-            static_cast<int>(M2),
-            static_cast<int>(N2),
-            static_cast<int>(sizeof(scalar_t)),
-            kVec,
-            static_cast<int>(N2));
-        const int iters_fast = (static_cast<int>(N2) + cfg.workgroup_size * kVec - 1) / (cfg.workgroup_size * kVec);
-        // 1, 2, 4 or 8 passes per row use NormFastParams; any other count takes the general launcher.
-        auto launch_fast = [&](auto iters_tag) {
-          constexpr int kIters = decltype(iters_tag)::value;
-          const NormFastParams fast_cfg{
-              static_cast<int>(N2), cfg.workgroup_size, static_cast<int>(N2), static_cast<int>(N2)};
-          using KF = RMSNormNoRstdKernelFunctor<
-              scalar_t,
-              weight_t,
-              kVec,
-              kIters,
-              AddRMSNormNoRstdForward<scalar_t, weight_t>,
-              /*cache_inputs=*/true,
-              uint32_t,
-              NormFastParams>;
-          const sycl::range<1> local_range{static_cast<size_t>(cfg.workgroup_size)};
-          const sycl::range<1> global_range{
-              static_cast<size_t>(cfg.workgroup_num) * static_cast<size_t>(cfg.workgroup_size)};
-          sycl_kernel_submit(global_range, local_range, at::xpu::getCurrentXPUStream().queue(), KF(fwd, fast_cfg));
-        };
-        if (iters_fast == 1) {
-          launch_fast(std::integral_constant<int, 1>{});
-        } else if (iters_fast == 2) {
-          launch_fast(std::integral_constant<int, 2>{});
-        } else if (iters_fast == 4) {
-          launch_fast(std::integral_constant<int, 4>{});
-        } else if (iters_fast == 8) {
-          launch_fast(std::integral_constant<int, 8>{});
-        } else {
-          launch_vectorized_rmsnorm_no_rstd_kernel<scalar_t, weight_t>(fwd, cfg);
-        }
-      });
-      return;
-    }
-  }
+  TORCH_CHECK(
+      residual.sizes() == input.sizes(),
+      "fused_add_rmsnorm: residual shape ",
+      residual.sizes(),
+      " must match input shape ",
+      input.sizes());
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
   auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
-
-  // Flatten leading dimensions to 2D for the kernel
-  Tensor input_ = flatten_to_2d(input, M, N);
-  Tensor residual_ = flatten_to_2d(residual, M, N);
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
@@ -862,12 +856,13 @@ fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor wei
   timer.start();
 #endif
 
+  // input and residual are contiguous and the same shape, so the kernel indexes them as M rows of N.
   SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
+      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
         SYCL_DISPATCH_WEIGHT_TYPES(
             at::ScalarType::Half, at::ScalarType::BFloat16, weight.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
               FusedAddRMSNormKernelImplInternal<scalar_t, weight_t>(
-                  input_, weight, M, N, static_cast<acc_type<scalar_t>>(eps), residual_);
+                  input, weight, M, N, static_cast<acc_type<scalar_t>>(eps), residual);
             });
       });
 
@@ -879,8 +874,8 @@ fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor wei
   const double flops = 5.0 * static_cast<double>(M) * static_cast<double>(N);
   const double tflops = elapsed_s > 0.0 ? (flops * 1e-12) / elapsed_s : 0.0;
 
-  const double in_elem = static_cast<double>(input_.element_size());
-  const double res_elem = static_cast<double>(residual_.element_size());
+  const double in_elem = static_cast<double>(input.element_size());
+  const double res_elem = static_cast<double>(residual.element_size());
   const double w_elem = static_cast<double>(weight.element_size());
   // read input, read+write residual, write normalized output back to input, read weight.
   const double bytes = 2.0 * static_cast<double>(M) * static_cast<double>(N) * in_elem +

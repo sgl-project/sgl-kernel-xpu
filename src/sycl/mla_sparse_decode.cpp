@@ -62,16 +62,11 @@ namespace {
 // token and is named for the value it switches on (like DISPATCH_MLA_SPARSE_DTYPE):
 //
 //   DISPATCH_MLA_SPARSE_DTYPE_2STAGE -> ELEM  (in_dtype; bf16 only)
-//     DISPATCH_MLA_SPARSE_D_QK       -> D_QK  (q.size(3); 512 only for decode)
+//     DISPATCH_MLA_SPARSE_D_QK       -> D_QK  (q.size(3); 512/576 for decode)
 //       DISPATCH_MLA_SPARSE_B_H      -> B_H   (select_b_h(h_q); 8/16/32/64)
 //         DISPATCH_MLA_SPARSE_SINK   -> SINK  (attn_sink.has_value(); 0/1)
 //           DISPATCH_MLA_SPARSE_LAUNCH_2STAGE -> the generated launcher call
 //
-// The switches are load-bearing, not stylistic: the leaf pastes these four tokens into
-// the launcher's name, so each value must be a literal before it is reached. Full
-// expansion is 1 D_QK x 4 B_H x 2 SINK = 8 call sites, which is exactly the symbol set
-// MlaSparseDecodeXe20.cmake generates and mla_sparse_decode_dispatch.hpp declares --
-// the three must stay in lockstep or the TU fails to link.
 #define DISPATCH_MLA_SPARSE_LAUNCH_2STAGE(ELEM, D_QK, B_H, SINK)                       \
   mla_sparse_decode::launch_mla_sparse_decode_2stage_##ELEM##_##D_QK##_##B_H##_##SINK( \
       out,                                                                             \
@@ -98,11 +93,6 @@ namespace {
     }                                                        \
   } while (0)
 
-// Resolve the head-block size B_H (the number of query heads packed into one Stage-2
-// tile) for this h_q, threading the already-resolved D_QK through untouched.
-// sparse_mla_decode_select_b_h returns an int, which cannot be pasted into a symbol
-// name -- this switch is what turns it into one of four literal call sites. Its
-// default arm and that function's fallthrough must agree on 64.
 #define DISPATCH_MLA_SPARSE_B_H(ELEM, D_QK)                               \
   do {                                                                    \
     switch (mla_sparse_decode::sparse_mla_decode_select_b_h(q.size(2))) { \
@@ -121,24 +111,20 @@ namespace {
     }                                                                     \
   } while (0)
 
-// Decode currently only supports d_qk == 512; resolve the runtime value to the
-// compile-time D_QK launcher variant, then dispatch B_H. Structured as a switch (like
-// the prefill path's {512, 576}) so a second d_qk can be added without reshaping the
-// dispatch -- add a case here + the D_QK to MlaSparseDecodeXe20.cmake / the dispatch
-// header declarations.
-#define DISPATCH_MLA_SPARSE_D_QK(ELEM)                                                               \
-  do {                                                                                               \
-    switch (q.size(3)) {                                                                             \
-      case 512:                                                                                      \
-        DISPATCH_MLA_SPARSE_B_H(ELEM, 512);                                                          \
-        break;                                                                                       \
-      default:                                                                                       \
-        TORCH_CHECK(false, "Unsupported d_qk for Sparse MLA decode (must be 512), got ", q.size(3)); \
-    }                                                                                                \
+#define DISPATCH_MLA_SPARSE_D_QK(ELEM)                                                                      \
+  do {                                                                                                      \
+    switch (q.size(3)) {                                                                                    \
+      case 512:                                                                                             \
+        DISPATCH_MLA_SPARSE_B_H(ELEM, 512);                                                                 \
+        break;                                                                                              \
+      case 576:                                                                                             \
+        DISPATCH_MLA_SPARSE_B_H(ELEM, 576);                                                                 \
+        break;                                                                                              \
+      default:                                                                                              \
+        TORCH_CHECK(false, "Unsupported d_qk for Sparse MLA decode (must be 512 or 576), got ", q.size(3)); \
+    }                                                                                                       \
   } while (0)
 
-// bf16 only for now: the 2-stage Stage-2 QK DPAS is bf16 (K/V are the gathered bf16
-// latent).
 #define DISPATCH_MLA_SPARSE_DTYPE_2STAGE()                                                      \
   do {                                                                                          \
     switch (in_dtype) {                                                                         \
@@ -185,13 +171,39 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
       "indices must have shape [B, 1, topk]");
   TORCH_CHECK(k_cache.dim() == 4 && k_cache.size(2) == 1, "k_cache must have shape [num_pages, page_size, 1, D]");
   TORCH_CHECK(
-      k_cache.scalar_type() == at::ScalarType::Float8_e4m3fn && k_cache.size(3) == 584,
-      "k_cache must use the DeepSeek V4 FP8 packed layout: dtype=float8_e4m3fn, last_dim=584");
+      k_cache.scalar_type() == at::ScalarType::Float8_e4m3fn,
+      "k_cache must use an FP8 packed layout: dtype=float8_e4m3fn, got ",
+      k_cache.scalar_type());
+  const int d_qk = static_cast<int>(q.size(3));
+  const int expected_head_bytes = mla_sparse_decode::sparse_mla_decode_fp8_head_bytes(d_qk);
+  TORCH_CHECK(expected_head_bytes != 0, "Unsupported d_qk for Sparse MLA decode (must be 512 or 576), got ", d_qk);
+  TORCH_CHECK(
+      k_cache.size(3) == expected_head_bytes,
+      "k_cache last_dim must match the packed FP8 layout for this d_qk: d_qk=",
+      d_qk,
+      " requires last_dim=",
+      expected_head_bytes,
+      " (512 -> 584 for DeepSeek V4, 576 -> 656 for DeepSeek V3.2 / GLM-DSA), got ",
+      k_cache.size(3));
   TORCH_CHECK((q.size(2) % 8) == 0, "num_heads must be a multiple of 8 (kernel fuses 8 heads per workgroup)");
   TORCH_CHECK(
       (!extra_k_cache.has_value() && !extra_indices.has_value()) ||
           (extra_k_cache.has_value() && extra_indices.has_value()),
       "extra_k_cache and extra_indices must be provided together");
+
+  if (extra_k_cache.has_value()) {
+    const auto& ekv = extra_k_cache.value();
+    TORCH_CHECK(
+        ekv.dim() == 4 && ekv.size(2) == 1, "extra_k_cache must have shape [num_extra_pages, extra_page_size, 1, D]");
+    TORCH_CHECK(
+        ekv.scalar_type() == at::ScalarType::Float8_e4m3fn && ekv.size(3) == expected_head_bytes,
+        "extra_k_cache must use the same packed FP8 layout as k_cache (dtype=float8_e4m3fn, last_dim=",
+        expected_head_bytes,
+        "), got dtype=",
+        ekv.scalar_type(),
+        " last_dim=",
+        ekv.size(3));
+  }
   TORCH_CHECK(in_dtype == at::ScalarType::BFloat16, "Unsupported input data type for Sparse MLA decode");
   TORCH_CHECK(head_dim_v == 512, "head_dim_v must be 512 for DeepSeek V4 MLA");
 
@@ -199,16 +211,16 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
   // Decode: batch B, 1 query per row, topk selected KV rows. QK + PV over topk keys.
   const int64_t B = q.size(0);
   const int64_t H = q.size(2);
-  const int64_t d_qk = q.size(3);
+  const int64_t qk_dim = static_cast<int64_t>(d_qk);
   const int64_t topk = indices.size(2);
   const int64_t extra_topk = extra_indices.has_value() ? extra_indices->size(2) : 0;
   const double total_topk = static_cast<double>(topk) + static_cast<double>(extra_topk);
   const double flops =
-      2.0 * static_cast<double>(B) * static_cast<double>(H) * total_topk * static_cast<double>(d_qk) +
+      2.0 * static_cast<double>(B) * static_cast<double>(H) * total_topk * static_cast<double>(qk_dim) +
       2.0 * static_cast<double>(B) * static_cast<double>(H) * total_topk * static_cast<double>(head_dim_v);
   // KV cache is packed fp8 (1 byte/elem + 4 bytes/row scale) — approximate with 1 byte/elem.
   const double bytes = static_cast<double>(q.numel()) * static_cast<double>(q.element_size()) +
-                       static_cast<double>(B) * total_topk * static_cast<double>(d_qk) * 1.0 +
+                       static_cast<double>(B) * total_topk * static_cast<double>(qk_dim) * 1.0 +
                        static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
   SGL_KERNEL_PERF_SCOPE("flash_mla_sparse_decode", profiling_queue, bytes, flops);
@@ -220,7 +232,6 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
 // the compile-time A/B toggle stays authoritative on both paths.
 #if defined(USE_MLA_JIT) && SGLANG_USE_SPARSE_MLA_2STAGE
   {
-    const int d_qk = static_cast<int>(q.size(3));
     const int b_h = mla_sparse_decode::sparse_mla_decode_select_b_h(q.size(2));
     std::string jit_err;
     TORCH_CHECK(
@@ -254,6 +265,12 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
 #error \
     "Fused sparse MLA decode selected (SGLANG_USE_SPARSE_MLA_2STAGE=0) but the fused kernel was not built. Reconfigure with -DUSE_MLA_SPARSE_FUSED=ON (or USE_MLA_SPARSE_FUSED=1)."
 #endif
+  TORCH_CHECK(
+      d_qk == 512,
+      "The fused sparse MLA decode path (SGLANG_USE_SPARSE_MLA_2STAGE=0) supports only "
+      "d_qk=512 with the 584-byte DeepSeek V4 KV layout; d_qk=",
+      d_qk,
+      " requires the two-stage path. Rebuild with SGLANG_USE_SPARSE_MLA_2STAGE=1.");
   DISPATCH_MLA_SPARSE_DTYPE();
 #endif
 #endif

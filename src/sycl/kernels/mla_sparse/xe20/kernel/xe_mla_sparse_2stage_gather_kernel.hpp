@@ -4,21 +4,7 @@
  **************************************************************************************************/
 /*!
   \file
-  \brief Two-stage sparse MLA Stage 1 gather kernel for DeepSeek V4 (decode + prefill).
-
-  SparseGatherKernel<D_QK, SourcePolicy>: subgroup-coalesced gather of the indexed
-  KV rows into a dense [b, s_q, gathered_topk, D_QK] bf16 tile + an int valid mask.
-  The work-group grid, the gathered-tile / valid-mask tensor views, the per-subgroup
-  topk-column loop, and the valid-mask write are shared; the *source* of each token --
-  how a KV row is located and materialized into bf16 -- is a policy so decode and
-  prefill reuse one skeleton:
-
-    - DecodeFp8PagedSource  : reads a *packed fp8 paged* KV cache and dequantizes
-        (per-64 e8m0 scales; nope fp8 + rope bf16 -> 512-dim bf16), concatenating a
-        primary + extra pool.
-    - PrefillDenseBf16Source: reads a dense *bf16 unpaged* KV source and does a plain
-        D_QK-wide copy (D_QK is 512 or 576): no fp8 decode, no scale section, no extra
-        pool, no paging.
+  \brief Two-stage sparse MLA Stage 1 gather kernel (decode + prefill).
 */
 
 #pragma once
@@ -51,10 +37,8 @@ CUTLASS_DEVICE bool is_packed_aligned(const void* src, const void* dst) {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 template <int D_QK>
 struct DecodeFp8PagedSource {
-  // The Stage-1 params this source reads. Stage 1 is a standalone kernel: these are
-  // its complete Params, independent of the Stage-2 dense params (the two stages
-  // share only the gathered-KV HBM buffers named in both).
   using GatherParams = DecodeGather2StageParams;
+  using Layout = SparseMlaFp8KvLayout<D_QK>;
 
   static constexpr int SUBGROUP_SIZE = intel::sg_size;
   static constexpr int FP8_VALUES_PER_PACK = 8;
@@ -62,19 +46,14 @@ struct DecodeFp8PagedSource {
   using PackedElement = uint64_t;
   using PackedOut = intel::ushort8;
 
-  static_assert(D_QK == 512, "packed fp8 sparse decode currently supports logical D_QK=512");
+  static_assert(D_QK == 512 || D_QK == 576, "packed fp8 sparse decode supports logical D_QK in {512, 576}");
   static_assert(D_QK % SUBGROUP_SIZE == 0, "D_QK must be divisible by SUBGROUP_SIZE");
   static_assert(
-      D_QK == SPARSE_MLA_FP8_NOPE_BYTES + SPARSE_MLA_FP8_ROPE_DIM,
-      "logical D_QK must match packed fp8 NoPE + RoPE dimensions");
+      D_QK == Layout::NOPE_DIM + Layout::ROPE_DIM, "logical D_QK must match packed fp8 NoPE + RoPE dimensions");
   static_assert(
-      SPARSE_MLA_FP8_NOPE_BYTES % FP8_VALUES_PER_PACK == 0, "NoPE fp8 bytes must be divisible by the packed fp8 width");
+      Layout::NOPE_DIM % FP8_VALUES_PER_PACK == 0, "NoPE fp8 bytes must be divisible by the packed fp8 width");
   static_assert(
-      SPARSE_MLA_FP8_ROPE_DIM % BF16_VALUES_PER_PACK == 0,
-      "RoPE bf16 values must be divisible by the packed bf16 width");
-  static_assert(
-      SPARSE_MLA_FP8_NOPE_BYTES / 64 == SPARSE_MLA_FP8_SCALE_BYTES_PER_TOKEN - 1,
-      "only the first seven scale bytes are valid for 448 NoPE values");
+      Layout::ROPE_DIM % BF16_VALUES_PER_PACK == 0, "RoPE bf16 values must be divisible by the packed bf16 width");
   static_assert(sizeof(PackedElement) == FP8_VALUES_PER_PACK, "PackedElement must cover one fp8 lane chunk");
   static_assert(
       sizeof(PackedElement) == sizeof(cutlass::bfloat16_t) * BF16_VALUES_PER_PACK,
@@ -83,22 +62,20 @@ struct DecodeFp8PagedSource {
       sizeof(PackedOut) == sizeof(cutlass::bfloat16_t) * FP8_VALUES_PER_PACK,
       "PackedOut must hold every bf16 one fp8 pack dequantizes to");
   static_assert(
-      SPARSE_MLA_FP8_SCALE_BYTES_PER_TOKEN == sizeof(PackedElement),
-      "the e8m0 scale section must be exactly one packed load");
+      Layout::SCALES_ARE_FP32 || Layout::SCALE_BYTES == sizeof(PackedElement),
+      "the UE8M0 scale section must be exactly one packed load");
   static_assert(
-      SPARSE_MLA_FP8_DATA_BYTES_PER_TOKEN % sizeof(PackedElement) == 0 &&
-          SPARSE_MLA_FP8_NOPE_BYTES % sizeof(PackedElement) == 0,
-      "scales inherit nope's alignment only if both section offsets are packed multiples");
+      Layout::TOKEN_STRIDE_BYTES % sizeof(PackedElement) == 0 && Layout::NOPE_DIM % sizeof(PackedElement) == 0 &&
+          Layout::SCALE_BYTES % sizeof(PackedElement) == 0 && Layout::SCALE_BYTE_OFFSET % sizeof(PackedElement) == 0,
+      "scales inherit the cache base alignment only if every section offset is a packed multiple");
   static constexpr int NUM_VALS_PER_THREAD = D_QK / SUBGROUP_SIZE;
-  // Chunk counts once each section is viewed as PackedElements, and where the RoPE
-  // section starts in the destination row's PackedElement view.
-  static constexpr int NOPE_PACKS = SPARSE_MLA_FP8_NOPE_BYTES / FP8_VALUES_PER_PACK;
-  static constexpr int ROPE_PACKS = SPARSE_MLA_FP8_ROPE_DIM / BF16_VALUES_PER_PACK;
-  static constexpr int ROPE_PACK_BASE = SPARSE_MLA_FP8_NOPE_BYTES / BF16_VALUES_PER_PACK;
+  static constexpr int NOPE_PACKS = Layout::NOPE_DIM / FP8_VALUES_PER_PACK;
+  static constexpr int ROPE_PACKS = Layout::ROPE_DIM / BF16_VALUES_PER_PACK;
+  static constexpr int ROPE_PACK_BASE = Layout::NOPE_DIM / BF16_VALUES_PER_PACK;
   static constexpr int NOPE_ITERS = cute::ceil_div(NOPE_PACKS, SUBGROUP_SIZE);
   static constexpr int ROPE_ITERS = cute::ceil_div(ROPE_PACKS, SUBGROUP_SIZE);
   static_assert(
-      NOPE_PACKS * sizeof(PackedOut) == SPARSE_MLA_FP8_NOPE_BYTES * sizeof(cutlass::bfloat16_t),
+      NOPE_PACKS * sizeof(PackedOut) == Layout::NOPE_DIM * sizeof(cutlass::bfloat16_t),
       "the NoPE PackedOut chunks must tile the destination row's NoPE region exactly");
 
   // Per-(batch, seq) invariants hoisted out of the topk-column loop: the two pools'
@@ -115,9 +92,14 @@ struct DecodeFp8PagedSource {
   // sections. Null (rather than offset-from-null) for an invalid token, so the
   // pointer arithmetic below never runs off a null base.
   struct TokenRecord {
-    const uint8_t* nope;              // [SPARSE_MLA_FP8_NOPE_BYTES] fp8 e4m3 bytes
-    const cutlass::bfloat16_t* rope;  // [SPARSE_MLA_FP8_ROPE_DIM] bf16
-    const uint8_t* scales;            // [SPARSE_MLA_FP8_SCALE_BYTES_PER_TOKEN] e8m0
+    const uint8_t* nope;              // [Layout::NOPE_DIM] fp8 e4m3 bytes
+    const cutlass::bfloat16_t* rope;  // [Layout::ROPE_DIM] bf16
+    const uint8_t* scales;            // [Layout::SCALE_BYTES]: UE8M0 bytes or fp32, per Layout
+  };
+
+  struct ScaleSet {
+    float v[Layout::NUM_SCALES];
+    PackedElement word;
   };
 
   CUTLASS_DEVICE
@@ -147,17 +129,48 @@ struct DecodeFp8PagedSource {
 
   CUTLASS_DEVICE
   static auto make_nope_view(const uint8_t* nope) {
-    return make_tensor(make_gmem_ptr(nope), make_layout(Shape<Int<SPARSE_MLA_FP8_NOPE_BYTES>>{}, Stride<_1>{}));
+    return make_tensor(make_gmem_ptr(nope), make_layout(Shape<Int<Layout::NOPE_DIM>>{}, Stride<_1>{}));
   }
 
   CUTLASS_DEVICE
   static auto make_rope_view(const cutlass::bfloat16_t* rope) {
-    return make_tensor(make_gmem_ptr(rope), make_layout(Shape<Int<SPARSE_MLA_FP8_ROPE_DIM>>{}, Stride<_1>{}));
+    return make_tensor(make_gmem_ptr(rope), make_layout(Shape<Int<Layout::ROPE_DIM>>{}, Stride<_1>{}));
   }
 
   CUTLASS_DEVICE
   static float e8m0_to_float(uint8_t scale_byte) {
     return sycl::native::exp2(static_cast<float>(static_cast<int>(scale_byte) - 127));
+  }
+
+  // One token's scale section -> floats, shared by the packed and scalar row paths.
+  //
+  // The typed loads here are safe on both: the packed/scalar choice is driven by the
+  // *destination* row pointer, whereas the scale section's alignment follows from the
+  // cache base plus the compile-time section offsets asserted above, so it holds
+  // either way.
+  CUTLASS_DEVICE
+  static ScaleSet load_scales(const uint8_t* scales, bool valid_token) {
+    ScaleSet s;
+    if constexpr (Layout::SCALES_ARE_FP32) {
+      // DSv3.2 / GLM-DSA: NUM_SCALES fp32 values inline at Layout::SCALE_BYTE_OFFSET.
+      const float* scale_f32 = reinterpret_cast<const float*>(scales);
+      CUTE_UNROLL
+      for (int i = 0; i < Layout::NUM_SCALES; ++i) {
+        s.v[i] = valid_token ? scale_f32[i] : 0.0f;
+      }
+    } else {
+      s.word = valid_token ? *reinterpret_cast<const PackedElement*>(scales) : PackedElement(0);
+    }
+    return s;
+  }
+
+  CUTLASS_DEVICE
+  static float scale_for_group(ScaleSet const& scales, int group) {
+    if constexpr (Layout::SCALES_ARE_FP32) {
+      return scales.v[group];
+    } else {
+      return e8m0_to_float(static_cast<uint8_t>(scales.word >> (8 * group)));
+    }
   }
 
   CUTLASS_DEVICE
@@ -172,17 +185,18 @@ struct DecodeFp8PagedSource {
   store_dequantized_token_scalar(TensorGRow&& gRow, TokenRecord const& token, bool valid_token, int lane_id) {
     auto sNope = make_nope_view(token.nope);
     auto sRope = make_rope_view(token.rope);
+    const ScaleSet scales = load_scales(token.scales, valid_token);
 
     CUTE_UNROLL
     for (int n = 0; n < NUM_VALS_PER_THREAD; ++n) {
       const int dim_idx = n * SUBGROUP_SIZE + lane_id;
       cutlass::bfloat16_t kv_val = cutlass::bfloat16_t(0.0f);
-      if (valid_token && dim_idx < SPARSE_MLA_FP8_NOPE_BYTES) {
-        const float scale = e8m0_to_float(token.scales[dim_idx / 64]);
+      if (valid_token && dim_idx < Layout::NOPE_DIM) {
+        const float scale = scale_for_group(scales, dim_idx / Layout::QUANT_GROUP);
         const auto fp8_val = cutlass::float_e4m3_t::bitcast(sNope(dim_idx));
         kv_val = cutlass::bfloat16_t(static_cast<float>(fp8_val) * scale);
       } else if (valid_token) {
-        kv_val = sRope(dim_idx - SPARSE_MLA_FP8_NOPE_BYTES);
+        kv_val = sRope(dim_idx - Layout::NOPE_DIM);
       }
       gRow(dim_idx) = kv_val;
     }
@@ -191,14 +205,14 @@ struct DecodeFp8PagedSource {
   // NoPE conversion and store, from already-loaded registers.
   template <class TensorGOut>
   CUTLASS_DEVICE static void dequantize_and_store_nope(
-      TensorGOut&& gOut, PackedElement const (&packed_fp8)[NOPE_ITERS], PackedElement scale_word, int lane_id) {
+      TensorGOut&& gOut, PackedElement const (&packed_fp8)[NOPE_ITERS], ScaleSet const& scales, int lane_id) {
     CUTE_UNROLL
     for (int u = 0; u < NOPE_ITERS; ++u) {
       const int i = lane_id + u * SUBGROUP_SIZE;
       if (i >= NOPE_PACKS) {
         continue;
       }
-      const float scale = e8m0_to_float(uint8_t(scale_word >> (8 * ((i * FP8_VALUES_PER_PACK) / 64))));
+      const float scale = scale_for_group(scales, (i * FP8_VALUES_PER_PACK) / Layout::QUANT_GROUP);
       PackedOut out;
       CUTE_UNROLL
       for (int vec_offset = 0; vec_offset < FP8_VALUES_PER_PACK; ++vec_offset) {
@@ -216,11 +230,10 @@ struct DecodeFp8PagedSource {
   store_dequantized_token_packed(TensorGRow&& gRow, TokenRecord const& token, bool valid_token, int lane_id) {
     auto gPacked = recast<PackedElement>(gRow);                      // (D_QK / BF16_VALUES_PER_PACK)
     auto gOut = recast<PackedOut>(gRow);                             // (D_QK / FP8_VALUES_PER_PACK)
-    auto sNope = recast<PackedElement>(make_nope_view(token.nope));  // (NOPE_BYTES / FP8_VALUES_PER_PACK)
+    auto sNope = recast<PackedElement>(make_nope_view(token.nope));  // (NOPE_DIM / FP8_VALUES_PER_PACK)
     auto sRope = recast<PackedElement>(make_rope_view(token.rope));  // (ROPE_DIM / BF16_VALUES_PER_PACK)
 
-    const PackedElement scale_word =
-        valid_token ? *reinterpret_cast<const PackedElement*>(token.scales) : PackedElement(0);
+    const ScaleSet scales = load_scales(token.scales, valid_token);
 
     PackedElement packed_nope[NOPE_ITERS];
     CUTE_UNROLL
@@ -236,7 +249,7 @@ struct DecodeFp8PagedSource {
     }
 
     // Dequantize and store the NoPE portion of the token.
-    dequantize_and_store_nope(gOut, packed_nope, scale_word, lane_id);
+    dequantize_and_store_nope(gOut, packed_nope, scales, lane_id);
 
     // RoPE: already bf16 -- a straight packed copy into the tail of the row, from the
     // registers staged above.
@@ -255,17 +268,24 @@ struct DecodeFp8PagedSource {
       int token_idx,
       cutlass::FastDivmod const& active_page_block_divmod,
       int active_stride_kv_block) {
-    const int active_page_block_size = active_page_block_divmod.divisor;
     int block_idx, rel_idx;
     active_page_block_divmod(block_idx, rel_idx, token_idx);
     const uint8_t* block = active_kv + block_idx * active_stride_kv_block;
-    const uint8_t* record = block + rel_idx * SPARSE_MLA_FP8_DATA_BYTES_PER_TOKEN;
+    const uint8_t* record = block + rel_idx * Layout::TOKEN_STRIDE_BYTES;
 
     TokenRecord token;
     token.nope = record;
-    token.rope = reinterpret_cast<const cutlass::bfloat16_t*>(record + SPARSE_MLA_FP8_NOPE_BYTES);
-    token.scales = block + active_page_block_size * SPARSE_MLA_FP8_DATA_BYTES_PER_TOKEN +
-                   rel_idx * SPARSE_MLA_FP8_SCALE_BYTES_PER_TOKEN;
+    token.rope = reinterpret_cast<const cutlass::bfloat16_t*>(record + Layout::ROPE_BYTE_OFFSET);
+    if constexpr (Layout::SCALES_INLINE) {
+      // DSv3.2 / GLM-DSA: the record is self-contained -- scales sit between NoPE and
+      // RoPE, so the page needs no second section and page_block_size is not read here.
+      token.scales = record + Layout::SCALE_BYTE_OFFSET;
+    } else {
+      // DSv4: scales live in a page-END section that starts after all page_block_size
+      // data records, indexed by the same in-page token offset.
+      token.scales =
+          block + active_page_block_divmod.divisor * Layout::TOKEN_STRIDE_BYTES + rel_idx * Layout::SCALE_BYTES;
+    }
     return token;
   }
 

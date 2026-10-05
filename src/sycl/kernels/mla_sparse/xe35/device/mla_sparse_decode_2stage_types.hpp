@@ -62,7 +62,18 @@
   in its own TU, so the CUTLASS codegen for one variant lands in a separate object file
   (build OOM guard preserved -- one variant per file). The op (mla_sparse_decode.cpp)
   dispatches dtype, then D_QK, then B_H, then the runtime attn_sink flag, mirroring the
-  fused path's dtype-then-page-size dispatch. Decode is always D_QK == 512.
+  fused path's dtype-then-page-size dispatch.
+
+  Decode supports the same D_QK pair as prefill, {512, 576}, but unlike prefill (dense
+  bf16 KV) D_QK here also selects the packed fp8 KV cache byte layout, because the two
+  are 1:1 in production -- see SparseMlaFp8KvLayout in xe_mla_sparse_2stage_common.hpp:
+    512 -> DeepSeek V4,             584 B/token, 448 fp8 nope + page-end UE8M0 scales
+    576 -> DeepSeek V3.2 / GLM-DSA, 656 B/token, 512 fp8 nope + inline fp32 scales
+  d_v stays 512 in both. At D_QK=576 the gathered row is [512 nope | 64 rope] and V is
+  its first-512 sub-view (nope only); at D_QK=512 the row is [448 nope | 64 rope] and V
+  spans it entirely. Only Stage 1 differs between the two -- the Stage-2 dense kernel,
+  its collectives and the tile scheduler are already D_QK-generic (prefill instantiates
+  them at 576 today).
 
   This is an ALTERNATIVE to the fused sparse MLA decode path in
   kernels/mla_sparse/{collective,kernel,device}/. It is selected at compile time via
@@ -72,7 +83,7 @@
 #pragma once
 
 #ifndef SYCL_INTEL_TARGET
-#define SYCL_INTEL_TARGET 20
+#define SYCL_INTEL_TARGET 35
 #endif
 
 #include <ATen/ATen.h>
@@ -105,6 +116,11 @@
 #include "sycl/kernels/mla_sparse/xe35/kernel/xe_mla_sparse_2stage_gather_kernel.hpp"
 // Optional third stage, instantiated only when the config's IS_SPLIT_KV is true.
 #include "sycl/kernels/mla_sparse/xe35/kernel/xe_mla_sparse_2stage_reduce_split_kv.hpp"
+// Host-only: sparse_mla_decode_fp8_head_bytes, the k_cache-width mirror that
+// runMlaSparse2Stage static_asserts against SparseMlaFp8KvLayout. Including it here also
+// puts the generated launchers' declarations in scope of their definitions, so a
+// signature mismatch is a compile error rather than a link error.
+#include "sycl/kernels/mla_sparse/xe35/device/mla_sparse_decode_dispatch.hpp"
 
 namespace cutlass::flash_attention::kernel {
 
@@ -242,15 +258,15 @@ template <typename T>
 inline typename T::Fmla::Arguments args_from_options_2stage(
     at::Tensor& out,                                     // [B, 1, H, head_dim_v]
     at::Tensor& lse_out,                                 // [B, H, 1] (contiguous [B,1,H])
-    const at::Tensor& q,                                 // [B, 1, H, D_qk=512]
-    const at::Tensor& k_cache,                           // [num_pages, page_size, 1, 584] fp8 packed
+    const at::Tensor& q,                                 // [B, 1, H, D_qk] (512 or 576)
+    const at::Tensor& k_cache,                           // [num_pages, page_size, 1, 584|656] fp8 packed
     const at::Tensor& indices,                           // [B, 1, topk]
     const std::optional<at::Tensor>& topk_length,        // [B] or nullopt
-    const std::optional<at::Tensor>& extra_k_cache,      // [num_ext_pg, ep, 1, 584] or nullopt
+    const std::optional<at::Tensor>& extra_k_cache,      // [num_ext_pg, ep, 1, 584|656] or nullopt
     const std::optional<at::Tensor>& extra_indices,      // [B, 1, extra_topk] or nullopt
     const std::optional<at::Tensor>& extra_topk_length,  // [B] or nullopt
     const std::optional<at::Tensor>& attn_sink,          // [H] or nullopt
-    const at::Tensor& gathered_k,                        // [chunk_b, 1, gathered_topk, 512] bf16 workspace
+    const at::Tensor& gathered_k,                        // [chunk_b, 1, gathered_topk, d_qk] bf16 workspace
     const at::Tensor& gathered_valid_mask,               // [chunk_b, 1, gathered_topk] int workspace
     double sm_scale,
     int64_t head_dim_v,
@@ -588,19 +604,40 @@ template <typename Element, int D_QK, int B_H, bool HAS_ATTN_SINK>
 inline void runMlaSparse2Stage(
     at::Tensor& out,                                     // [B, 1, H, head_dim_v]
     at::Tensor& lse_out,                                 // [B, H, 1] (contiguous [B,1,H])
-    const at::Tensor& q,                                 // [B, 1, H, D_qk=512]
-    const at::Tensor& k_cache,                           // [num_pages, page_size, 1, 584] fp8 packed
+    const at::Tensor& q,                                 // [B, 1, H, D_qk] (512 or 576)
+    const at::Tensor& k_cache,                           // [num_pages, page_size, 1, 584|656] fp8 packed
     const at::Tensor& indices,                           // [B, 1, topk]
     const std::optional<at::Tensor>& topk_length,        // [B] or nullopt
-    const std::optional<at::Tensor>& extra_k_cache,      // [num_ext_pg, ep, 1, 584] or nullopt
+    const std::optional<at::Tensor>& extra_k_cache,      // [num_ext_pg, ep, 1, 584|656] or nullopt
     const std::optional<at::Tensor>& extra_indices,      // [B, 1, extra_topk] or nullopt
     const std::optional<at::Tensor>& extra_topk_length,  // [B] or nullopt
     const std::optional<at::Tensor>& attn_sink,          // [H] or nullopt
     double sm_scale,
     int64_t head_dim_v,
     bool is_fp8_kvcache) {
+  namespace F = cutlass::flash_attention::kernel;
+  using KvLayout = F::SparseMlaFp8KvLayout<D_QK>;
+
+  // The op validates k_cache against the host-side mirror of this trait
+  // (sparse_mla_decode_fp8_head_bytes); this pins the mirror to the trait so the two
+  // cannot drift apart silently.
+  static_assert(
+      KvLayout::HEAD_BYTES == mla_sparse_decode::sparse_mla_decode_fp8_head_bytes(D_QK),
+      "sparse_mla_decode_fp8_head_bytes (host mirror) disagrees with SparseMlaFp8KvLayout::HEAD_BYTES");
+
   TORCH_CHECK(is_fp8_kvcache, "2-stage sparse MLA decode requires the FP8 packed KV cache");
   TORCH_CHECK(q.size(3) == D_QK, "2-stage sparse MLA decode q head dim must match the dispatched D_QK");
+  // Re-checked here (not only in the op) because this entry point is also what the JIT
+  // .so and any direct launcher call land on, and a width/D_QK mismatch would make
+  // Stage 1 read the wrong scale section rather than fail.
+  TORCH_CHECK(
+      k_cache.size(3) == KvLayout::HEAD_BYTES,
+      "2-stage sparse MLA decode k_cache last_dim must be ",
+      KvLayout::HEAD_BYTES,
+      " for d_qk=",
+      D_QK,
+      ", got ",
+      k_cache.size(3));
   TORCH_CHECK(attn_sink.has_value() == HAS_ATTN_SINK, "attn_sink presence must match the dispatched HAS_ATTN_SINK");
 
   // Delegate to the Impl, forwarding the compile-time config-keying params

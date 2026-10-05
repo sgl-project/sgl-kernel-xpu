@@ -105,14 +105,22 @@ def create_random_mxfp4_data(m: int, k: int, device: str, seed: int = 42):
     return packed.to(device), scales.to(device)
 
 
-def prepare_kernel_inputs(
-    a_list: list,
-    b_list: list,
-    scales_a_list: list,
-    scales_b_list: list,
-    device: str,
-):
-    """Prepare inputs for the mxfp4_blockwise_scaled_grouped_mm kernel."""
+def _common_meta(num_experts, m, n, k, device, workspace_bytes=64 * 1024 * 1024):
+    return {
+        "problem_sizes": torch.tensor(
+            [[m, n, k]] * num_experts, dtype=torch.int32, device=device
+        ),
+        "workspace": torch.empty((workspace_bytes,), dtype=torch.uint8, device=device),
+        "m": m,
+        "n": n,
+        "k": k,
+    }
+
+
+def prepare_kernel_inputs_legacy(
+    a_list, b_list, scales_a_list, scales_b_list, device: str
+) -> dict:
+    """Legacy path: build pointer arrays + transpose A/B-scales in Python."""
     num_experts = len(a_list)
     m, packed_k = a_list[0].shape
     k = packed_k * 2
@@ -133,56 +141,75 @@ def prepare_kernel_inputs(
 
     output = torch.zeros((num_experts, m, n), dtype=torch.float32, device=device)
 
-    a_ptrs = torch.tensor(
-        [a_stack[i].data_ptr() for i in range(num_experts)],
-        dtype=torch.uint64,
-        device=device,
-    )
-    b_ptrs = torch.tensor(
-        [b_stack[i].data_ptr() for i in range(num_experts)],
-        dtype=torch.uint64,
-        device=device,
-    )
-    out_ptrs = torch.tensor(
-        [output[i].data_ptr() for i in range(num_experts)],
-        dtype=torch.uint64,
-        device=device,
-    )
-    a_scales_ptrs = torch.tensor(
-        [scales_a_stack[i].data_ptr() for i in range(num_experts)],
-        dtype=torch.uint64,
-        device=device,
-    )
-    b_scales_ptrs = torch.tensor(
-        [scales_b_stack[i].data_ptr() for i in range(num_experts)],
-        dtype=torch.uint64,
-        device=device,
-    )
+    def _ptrs(t):
+        return torch.tensor(
+            [t[i].data_ptr() for i in range(num_experts)],
+            dtype=torch.uint64,
+            device=device,
+        )
 
-    problem_sizes = torch.tensor(
-        [[m, n, k] for _ in range(num_experts)], dtype=torch.int32, device=device
-    )
-    expert_offsets = torch.arange(num_experts, dtype=torch.int32, device=device)
-    workspace = torch.empty((1024 * 1024 * 1024,), dtype=torch.uint8, device=device)
-
-    return {
+    inputs = {
         "output": output,
-        "a_ptrs": a_ptrs,
-        "b_ptrs": b_ptrs,
-        "out_ptrs": out_ptrs,
-        "a_scales_ptrs": a_scales_ptrs,
-        "b_scales_ptrs": b_scales_ptrs,
+        "a_ptrs": _ptrs(a_stack),
+        "b_ptrs": _ptrs(b_stack),
+        "out_ptrs": _ptrs(output),
+        "a_scales_ptrs": _ptrs(scales_a_stack),
+        "b_scales_ptrs": _ptrs(scales_b_stack),
         "a_stack": a_stack,
         "b_stack": b_stack,
         "scales_a_stack": scales_a_stack,
         "scales_b_stack": scales_b_stack,
-        "problem_sizes": problem_sizes,
-        "expert_offsets": expert_offsets,
-        "workspace": workspace,
-        "m": m,
-        "n": n,
-        "k": k,
+        "expert_offsets": torch.arange(num_experts, dtype=torch.int32, device=device),
     }
+    inputs.update(_common_meta(num_experts, m, n, k, device))
+    return inputs
+
+
+def prepare_kernel_inputs_ondevice(
+    a_list, b_list, sa_list, sb_list, device: str
+) -> dict:
+    """Empty sentinel ptrs + flat-2D inputs; kernel does prep on device."""
+    num_experts = len(a_list)
+    m, packed_k = a_list[0].shape
+    k = packed_k * 2
+    n = b_list[0].shape[0]
+    total_m = num_experts * m
+
+    a_flat = torch.cat(
+        [ensure_contiguous_layout(a) for a in a_list], dim=0
+    ).contiguous()
+    sa_flat = torch.cat(
+        [ensure_contiguous_layout(s) for s in sa_list], dim=0
+    ).contiguous()
+    b_stack = torch.stack(
+        [ensure_contiguous_layout(b) for b in b_list], dim=0
+    ).contiguous()
+    sb_stack = torch.stack(
+        [ensure_contiguous_layout(s) for s in sb_list], dim=0
+    ).contiguous()
+
+    output = torch.zeros((total_m, n), dtype=torch.float32, device=device)
+    empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
+
+    inputs = {
+        "output": output,
+        "a_ptrs": empty_ptrs,
+        "b_ptrs": empty_ptrs,
+        "out_ptrs": empty_ptrs,
+        "a_scales_ptrs": empty_ptrs,
+        "b_scales_ptrs": empty_ptrs,
+        "a_stack": a_flat,
+        "b_stack": b_stack,
+        "scales_a_stack": sa_flat,
+        "scales_b_stack": sb_stack,
+        "expert_offsets": torch.arange(0, total_m, m, dtype=torch.int32, device=device),
+    }
+    inputs.update(_common_meta(num_experts, m, n, k, device))
+    return inputs
+
+
+# Default = legacy (CI-backed).
+prepare_kernel_inputs = prepare_kernel_inputs_legacy
 
 
 def calculate_flops(m: int, n: int, k: int, num_groups: int) -> int:
@@ -261,6 +288,71 @@ def construct_mxfp4_grouped_data(
     return a_list, b_list, scales_a_list, scales_b_list
 
 
+def _call(inputs: dict) -> None:
+    from sgl_kernel import mxfp4_blockwise_scaled_grouped_mm
+
+    mxfp4_blockwise_scaled_grouped_mm(
+        inputs["output"],
+        inputs["a_ptrs"],
+        inputs["b_ptrs"],
+        inputs["out_ptrs"],
+        inputs["a_scales_ptrs"],
+        inputs["b_scales_ptrs"],
+        inputs["a_stack"],
+        inputs["b_stack"],
+        inputs["scales_a_stack"],
+        inputs["scales_b_stack"],
+        inputs["problem_sizes"],
+        inputs["expert_offsets"],
+        inputs["workspace"],
+    )
+
+
+def _time_kernel_only(inputs: dict, num_warmup: int, num_run: int) -> float:
+    """Kernel-only timing (avg us)."""
+    for _ in range(num_warmup):
+        _call(inputs)
+    torch.xpu.synchronize()
+
+    start = torch.xpu.Event(enable_timing=True)
+    end = torch.xpu.Event(enable_timing=True)
+    start.record()
+    for _ in range(num_run):
+        _call(inputs)
+    end.record()
+    end.synchronize()
+    torch.xpu.synchronize()
+    return (start.elapsed_time(end) / num_run) * 1000
+
+
+def _time_prep_plus_kernel(
+    a_list,
+    b_list,
+    sa_list,
+    sb_list,
+    device: str,
+    prep_fn,
+    num_warmup: int,
+    num_run: int,
+) -> float:
+    """E2E (prep + kernel) timing (avg us)."""
+    for _ in range(num_warmup):
+        inputs = prep_fn(a_list, b_list, sa_list, sb_list, device)
+        _call(inputs)
+    torch.xpu.synchronize()
+
+    start = torch.xpu.Event(enable_timing=True)
+    end = torch.xpu.Event(enable_timing=True)
+    start.record()
+    for _ in range(num_run):
+        inputs = prep_fn(a_list, b_list, sa_list, sb_list, device)
+        _call(inputs)
+    end.record()
+    end.synchronize()
+    torch.xpu.synchronize()
+    return (start.elapsed_time(end) / num_run) * 1000
+
+
 def bench_mxfp4_cutlass(
     expected_m_per_group: int,
     n: int,
@@ -268,10 +360,9 @@ def bench_mxfp4_cutlass(
     num_groups: int,
     num_warmup: int,
     num_run: int,
-) -> Tuple[float, int, int]:
-    """Benchmark the MXFP4 blockwise scaled grouped MM kernel."""
-    from sgl_kernel import mxfp4_blockwise_scaled_grouped_mm
-
+    prep_mode: str = "legacy",
+) -> Tuple[float, int, int, dict]:
+    """Returns (kernel_us, m, k_aligned, extra)."""
     device = "xpu"
     alignment = 64
     m = ceil_div(expected_m_per_group, alignment) * alignment
@@ -280,47 +371,53 @@ def bench_mxfp4_cutlass(
     a_list, b_list, scales_a_list, scales_b_list = construct_mxfp4_grouped_data(
         num_groups, m, k_aligned, n, device
     )
-    inputs = prepare_kernel_inputs(a_list, b_list, scales_a_list, scales_b_list, device)
 
-    def run_kernel():
-        mxfp4_blockwise_scaled_grouped_mm(
-            inputs["output"],
-            inputs["a_ptrs"],
-            inputs["b_ptrs"],
-            inputs["out_ptrs"],
-            inputs["a_scales_ptrs"],
-            inputs["b_scales_ptrs"],
-            inputs["a_stack"],
-            inputs["b_stack"],
-            inputs["scales_a_stack"],
-            inputs["scales_b_stack"],
-            inputs["problem_sizes"],
-            inputs["expert_offsets"],
-            inputs["workspace"],
+    extra = {}
+
+    def _measure(prep_fn):
+        inputs = prep_fn(a_list, b_list, scales_a_list, scales_b_list, device)
+        kernel_us = _time_kernel_only(inputs, num_warmup, num_run)
+        e2e_us = _time_prep_plus_kernel(
+            a_list,
+            b_list,
+            scales_a_list,
+            scales_b_list,
+            device,
+            prep_fn,
+            num_warmup,
+            num_run,
+        )
+        return kernel_us, e2e_us
+
+    if prep_mode in ("legacy", "compare"):
+        legacy_kernel, legacy_e2e = _measure(prepare_kernel_inputs_legacy)
+        extra["legacy_kernel_us"] = legacy_kernel
+        extra["legacy_e2e_us"] = legacy_e2e
+        extra["legacy_prep_us"] = max(0.0, legacy_e2e - legacy_kernel)
+
+    if prep_mode in ("ondevice", "compare"):
+        ondevice_kernel, ondevice_e2e = _measure(prepare_kernel_inputs_ondevice)
+        extra["ondevice_kernel_us"] = ondevice_kernel
+        extra["ondevice_e2e_us"] = ondevice_e2e
+        extra["ondevice_prep_us"] = max(0.0, ondevice_e2e - ondevice_kernel)
+
+    if prep_mode == "compare":
+        extra["speedup_kernel"] = (
+            extra["legacy_kernel_us"] / extra["ondevice_kernel_us"]
+        )
+        extra["speedup_e2e"] = extra["legacy_e2e_us"] / extra["ondevice_e2e_us"]
+        extra["speedup_prep"] = (
+            extra["legacy_prep_us"] / extra["ondevice_prep_us"]
+            if extra["ondevice_prep_us"] > 1.0
+            else float("inf")
         )
 
-    for _ in range(num_warmup):
-        run_kernel()
-    torch.xpu.synchronize()
-
-    start_event = torch.xpu.Event(enable_timing=True)
-    end_event = torch.xpu.Event(enable_timing=True)
-
-    start_event.record()
-    for _ in range(num_run):
-        run_kernel()
-    end_event.record()
-    end_event.synchronize()
-    torch.xpu.synchronize()
-
-    elapsed_ms = start_event.elapsed_time(end_event)
-    avg_us = (elapsed_ms / num_run) * 1000
-
-    return avg_us, m, k_aligned
+    chosen_us = extra.get("ondevice_kernel_us") or extra["legacy_kernel_us"]
+    return chosen_us, m, k_aligned, extra
 
 
 def benchmark_one_shape(
-    shape_args: List[ShapeArg], num_warmup: int, num_run: int
+    shape_args: List[ShapeArg], num_warmup: int, num_run: int, prep_mode: str = "legacy"
 ) -> List[dict]:
     """Run benchmark for a list of shapes and collect results."""
     all_results = []
@@ -332,13 +429,14 @@ def benchmark_one_shape(
         )
 
         try:
-            avg_time_us, actual_m, actual_k = bench_mxfp4_cutlass(
+            avg_time_us, actual_m, actual_k, extra = bench_mxfp4_cutlass(
                 shape.expected_m_per_group,
                 shape.n,
                 shape.k,
                 shape.num_groups,
                 num_warmup,
                 num_run,
+                prep_mode=prep_mode,
             )
 
             metrics = calculate_metrics(
@@ -359,14 +457,24 @@ def benchmark_one_shape(
                 "tflops": metrics["tflops"],
                 "total_flops_g": metrics["total_flops"] / 1e9,
             }
+            result.update(extra)
             all_results.append(result)
 
-            print(f"  MXFP4 CUTLASS: {avg_time_us:.2f} us")
+            print(f"  MXFP4 CUTLASS kernel-only: {avg_time_us:.2f} us")
             print(f"    Effective bandwidth: {metrics['bandwidth_gbs']:.2f} GB/s")
             print(
                 f"    Performance: {metrics['gflops']:.2f} GFLOPS ({metrics['tflops']:.4f} TFLOPS)"
             )
-            print(f"    Total memory: {metrics['total_bytes_mb']:.2f} MB")
+            if prep_mode == "compare":
+                print(
+                    f"  Prep+kernel  legacy={extra['legacy_e2e_us']:.2f} us  "
+                    f"ondevice={extra['ondevice_e2e_us']:.2f} us  "
+                    f"speedup={extra['speedup_e2e']:.2f}x"
+                )
+                print(
+                    f"  Prep-only    legacy={extra['legacy_prep_us']:.2f} us  "
+                    f"ondevice={extra['ondevice_prep_us']:.2f} us"
+                )
 
         except Exception as e:
             print(f"  MXFP4 CUTLASS: FAILED - {e}")
@@ -400,6 +508,12 @@ def main():
     )
     parser.add_argument(
         "--num-run", type=int, default=10, help="Number of benchmark iterations"
+    )
+    parser.add_argument(
+        "--prep-mode",
+        choices=("legacy", "ondevice", "compare"),
+        default="legacy",
+        help="legacy = Python prep; ondevice = SYCL prep; compare = both + speedup",
     )
     args = parser.parse_args()
 
@@ -470,8 +584,36 @@ def main():
             ShapeArg(expected_m_per_group=4, n=2880, k=2880, num_groups=32),
         ]
 
-    results = benchmark_one_shape(shape_args, args.num_warmup, args.num_run)
+    results = benchmark_one_shape(
+        shape_args, args.num_warmup, args.num_run, prep_mode=args.prep_mode
+    )
     print_summary(results, title="MXFP4 Blockwise Group GEMM Benchmark Results")
+
+    if args.prep_mode == "compare":
+        print("\n" + "=" * 100)
+        print("Prep+Kernel End-to-End Comparison")
+        print("=" * 100)
+        ok = [r for r in results if r.get("legacy_e2e_us") is not None]
+        if ok:
+            import pandas as pd
+
+            df = pd.DataFrame(
+                [
+                    {
+                        "M": r["actual_m"],
+                        "N": r["n"],
+                        "K": r["k"],
+                        "E": r["num_groups"],
+                        "legacy_e2e_us": round(r["legacy_e2e_us"], 2),
+                        "ondevice_e2e_us": round(r["ondevice_e2e_us"], 2),
+                        "legacy_prep_us": round(r["legacy_prep_us"], 2),
+                        "ondevice_prep_us": round(r["ondevice_prep_us"], 2),
+                        "speedup_e2e": round(r["speedup_e2e"], 2),
+                    }
+                    for r in ok
+                ]
+            )
+            print(df.to_markdown(index=False))
 
 
 if __name__ == "__main__":

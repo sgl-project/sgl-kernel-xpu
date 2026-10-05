@@ -380,6 +380,8 @@ class FMHAFwdEpilogue {
           make_tensor(make_smem_ptr<ElementA>(&shared.a_sum_data), sA_row_layout);  // (q,rblk_dst,rblk_src,a_tile)
 
       /* Write my contributions to SLM. */
+      // Row (max/sum) copies use the 2-arg flat overload; only the 2D accumulator
+      // (tArA/sA) needs the coordinate-aware 3-arg overload.
       copy_block_r2s(tA_max, sA_max(_, _, k_blk, a_tile));
       barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
       copy_block_r2s(tA_sum, sA_sum(_, _, k_blk, a_tile));
@@ -781,6 +783,8 @@ class DecodeFwdEpilogue {
           sA_row_layout);  // (q,rblk_dst,rblk_src,a_tile)
 
       /* Write my contributions to SLM. */
+      // Row (max/sum) copies use the 2-arg flat overload; only the 2D accumulator
+      // (tArA/sA) needs the coordinate-aware 3-arg overload.
       copy_block_r2s(tA_max, sA_max(_, _, k_blk, a_tile));
       barrier_arrive(ScopeWorkgroup, SemanticsRelease | SemanticsWGMemory);
       copy_block_r2s(tA_sum, sA_sum(_, _, k_blk, a_tile));

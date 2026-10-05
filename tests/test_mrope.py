@@ -62,6 +62,12 @@ def torch_impl_mrope(
     return query, key
 
 
+def split_3(n: int) -> List[int]:
+    chunk = n // 3
+    remainder = n % 3
+    return [chunk + (1 if i < remainder else 0) for i in range(3)]
+
+
 # ---------------------------------------------------------------------------
 # Test parameters
 # ---------------------------------------------------------------------------
@@ -70,10 +76,8 @@ NUM_KV_HEADS_LIST = [1, 4]
 GQA_RATIO = [4]
 HEAD_DIM_LIST = [256]
 PARTIAL_ROTARY_FACTOR = [0.25]
-ROTARY_DIM_LIST = [64]
 IS_NEOX_LIST = [False, True]
 MROPE_IS_INTERLEAVED = [False, True]
-MROPE_SECTION_LIST = [[11, 11, 10]]
 DTYPE_LIST = [torch.bfloat16, torch.float16]
 
 
@@ -84,7 +88,6 @@ DTYPE_LIST = [torch.bfloat16, torch.float16]
 @pytest.mark.parametrize("partial_rotary_factor", PARTIAL_ROTARY_FACTOR)
 @pytest.mark.parametrize("mrope_is_interleaved", MROPE_IS_INTERLEAVED)
 @pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
-@pytest.mark.parametrize("mrope_section", MROPE_SECTION_LIST)
 @pytest.mark.parametrize("dtype", DTYPE_LIST)
 def test_multimodal_rotary_embedding(
     batch_size: int,
@@ -94,7 +97,6 @@ def test_multimodal_rotary_embedding(
     partial_rotary_factor: float,
     mrope_is_interleaved: bool,
     is_neox: bool,
-    mrope_section: List[int],
     dtype: torch.dtype,
 ):
 
@@ -107,6 +109,7 @@ def test_multimodal_rotary_embedding(
     positions = torch.randint(
         0, MAX_SEQ_LEN, (3, batch_size), device=DEVICE, dtype=torch.int64
     )
+    mrope_section = split_3(rotary_dim // 2)
 
     cos_sin_cache = create_cos_sin_cache(rotary_dim).to(dtype)
 

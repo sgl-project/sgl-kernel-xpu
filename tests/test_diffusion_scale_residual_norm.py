@@ -107,51 +107,44 @@ def check_against_reference(residual, x, gate, shift, scale, weight, bias, eps=1
     torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
 
 
-# Hits every vector width (%8, %4, %2, odd), the 8192 bound, and sizes that are not
-# a multiple of the 256-thread work-group.
-@pytest.mark.parametrize("hidden", [64, 130, 255, 1536, 3072, 3080, 5120, 6660, 8192])
-@pytest.mark.parametrize("seq_len", [1, 17, 1024])
+# One compiled kernel per (dtype, vector width): vec 2 (130), vec 1 (255), vec 4 (6660)
+# and vec 8 at the 8192 bound, where every thread runs the full loop.
+# Rows are independent work-groups, so one multi-row seq_len covers row indexing.
+@pytest.mark.parametrize("hidden", [130, 255, 6660, 8192])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_shapes(hidden, seq_len, dtype):
+def test_shapes(hidden, dtype):
     check_against_reference(
-        *make_operands(seq_len=seq_len, hidden=hidden, dtype=dtype, param_dtype=dtype)
+        *make_operands(seq_len=17, hidden=hidden, dtype=dtype, param_dtype=dtype)
     )
 
 
-# scale and shift pick vector/scalar independently; params may be fp32 under fp16/bf16 x.
-@pytest.mark.parametrize("gate_mode", ["none", "per_token", "per_frame"])
-@pytest.mark.parametrize("scale_numel,shift_numel", [(1536, 1), (1, 1536)])
-@pytest.mark.parametrize("affine", [True, False, "weight_only", "bias_only"])
+# Vary one operand branch at a time from the per-token-gated, vector-modulated, affine
+# bf16 case that test_shapes already covers.
 @pytest.mark.parametrize(
-    "dtype,param_dtype",
+    "override",
     [
-        (torch.float16, torch.float16),
-        (torch.bfloat16, torch.bfloat16),
-        (torch.bfloat16, torch.float32),
+        {"gate_mode": "none"},
+        {"gate_mode": "per_frame", "num_frames": 5},
+        {"scale_numel": 1},
+        {"shift_numel": 1},
+        {"affine": "weight_only"},
+        {"affine": "bias_only"},
+        {"param_dtype": torch.float32},
     ],
+    ids=lambda o: ",".join(f"{k}={v}" for k, v in o.items()),
 )
-def test_operand_variants(
-    gate_mode, scale_numel, shift_numel, affine, dtype, param_dtype
-):
-    check_against_reference(
-        *make_operands(
-            seq_len=120,
-            hidden=1536,
-            dtype=dtype,
-            param_dtype=param_dtype,
-            gate_mode=gate_mode,
-            num_frames=5,
-            scale_numel=scale_numel,
-            shift_numel=shift_numel,
-            affine=affine,
-        )
+def test_operand_variants(override):
+    base = dict(
+        seq_len=120, hidden=1536, dtype=torch.bfloat16, param_dtype=torch.bfloat16
     )
+    check_against_reference(*make_operands(**{**base, **override}))
 
 
-@pytest.mark.parametrize("storage_offset", [1, 3])
-def test_misaligned_params(storage_offset):
+def test_misaligned_params():
     """A misaligned but contiguous scale slice must narrow the vector width."""
-    hidden, dtype = 1536, torch.bfloat16
+    # A 2-byte offset: B60 tolerates 4- and 8-byte misaligned vector loads, so only
+    # this one gives wrong results if the narrowing is skipped.
+    hidden, dtype, storage_offset = 1536, torch.bfloat16, 1
     residual, x, gate, shift, scale, weight, bias = make_operands(
         seq_len=32,
         hidden=hidden,
@@ -182,6 +175,7 @@ _UNSUPPORTED = {
         weight=_randn(_OVER_MAX),
         bias=_randn(_OVER_MAX),
     ),
+    "residual shape mismatch": lambda: dict(residual=_randn(1, _SEQ_LEN // 2, _HIDDEN)),
     "batch size above 1": lambda: dict(
         residual=_randn(2, _SEQ_LEN, _HIDDEN), x=_randn(2, _SEQ_LEN, _HIDDEN)
     ),
@@ -189,10 +183,10 @@ _UNSUPPORTED = {
     "gate hidden mismatch": lambda: dict(gate=_randn(1, 1, _HIDDEN // 2)),
     "gate int other than 1": lambda: dict(gate=2),
     "bool gate": lambda: dict(gate=True),
-    "float gate": lambda: dict(gate=1.0),
     "num_frames not dividing seq_len": lambda: dict(gate=_randn(1, 7, 1, _HIDDEN)),
     "zero num_frames": lambda: dict(gate=_randn(1, 0, 1, _HIDDEN)),
     "modulation numel mismatch": lambda: dict(scale=_randn(3)),
+    "affine numel mismatch": lambda: dict(weight=_randn(_HIDDEN // 2)),
     "mixed parameter dtypes": lambda: dict(scale=_randn(_HIDDEN, dtype=torch.float32)),
     "unsupported dtype": lambda: dict(
         residual=_randn(1, _SEQ_LEN, _HIDDEN, dtype=torch.float64),

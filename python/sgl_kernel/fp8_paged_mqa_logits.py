@@ -5,78 +5,102 @@ import triton
 import triton.language as tl
 
 FP8_DTYPE = torch.float8_e4m3fn
-_FP8_PAGED_MQA_LOGITS_CHUNK_BYTES = 256 * 1024 * 1024
+_MIN_PROGRAMS = 2048
+_MAX_PAGES_PER_PROG = 32
 
 
 @triton.jit
-def _score_relu_weight_scale_kernel(
-    # score: [cb, padded_seq_len, num_heads] fp32 (input/output fused)
-    # weight: [cb, num_heads] fp32
-    # kv_scale: [cb, padded_seq_len] fp32
-    # seq_lens: [cb] int
-    # logits_out: [cb, max_seq_len] fp32
-    score_ptr,
-    weight_ptr,
+def _paged_mqa_logits_kernel(
+    q_ptr,
+    kv_value_ptr,
     kv_scale_ptr,
+    weight_ptr,
     seq_lens_ptr,
+    page_table_ptr,
     logits_ptr,
-    cb,
-    padded_seq_len,
+    num_pages,
+    num_pages_req,
     max_seq_len,
-    num_heads: tl.constexpr,
-    score_stride_b,
-    score_stride_s,
+    q_stride_b,
+    q_stride_h,
+    kv_value_stride_p,
+    kv_scale_stride_p,
     weight_stride_b,
-    scale_stride_b,
+    page_table_stride_b,
     logits_stride_b,
-    BLOCK_S: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SZ: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    SCALE_COL: tl.constexpr,
+    PAGES_PER_PROG: tl.constexpr,
 ):
-    """Fused: relu(score) * weight → sum over heads → * kv_scale → masked store.
+    """logits[b, s] = kv_scale[b, s] * sum_h relu(q[b, h] . k[b, s]) * weight[b, h]
 
-    Grid: (cb, cdiv(padded_seq_len, BLOCK_S))
-    Each program handles BLOCK_S seq positions for one batch row.
+    One program per (batch row, page block). BLOCK_SZ equals the KV page size, so
+    each iteration covers exactly one page and the gather is a single base offset.
+    q is loaded once per program and reused across the page loop.
+
+    The QK product is a bf16 tl.dot with an fp32 accumulator. e4m3 widens
+    exactly to bf16, so the operands are unchanged; the reduction order differs
+    from an eager fp32 matmul.
     """
     pid_b = tl.program_id(0)
-    pid_s = tl.program_id(1)
+    pid_page_block = tl.program_id(1)
 
-    if pid_b >= cb:
-        return
+    s_local = tl.arange(0, BLOCK_SZ)
+    d_offs = tl.arange(0, HEAD_DIM)
+    h_offs = tl.arange(0, BLOCK_H)
+    h_mask = h_offs < NUM_HEADS
 
+    q_t_ptrs = (
+        q_ptr + pid_b * q_stride_b + h_offs[None, :] * q_stride_h + d_offs[:, None]
+    )
+    q_t = tl.load(q_t_ptrs, mask=h_mask[None, :], other=0.0).to(tl.bfloat16)
+
+    weight = tl.load(
+        weight_ptr + pid_b * weight_stride_b + h_offs, mask=h_mask, other=0.0
+    ).to(tl.float32)
     seq_len = tl.load(seq_lens_ptr + pid_b).to(tl.int32)
 
-    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
-    s_mask = s_offs < padded_seq_len
+    for i in tl.static_range(PAGES_PER_PROG):
+        pid_page = pid_page_block * PAGES_PER_PROG + i
+        if pid_page < num_pages_req:
+            page = tl.load(
+                page_table_ptr + pid_b * page_table_stride_b + pid_page
+            ).to(tl.int32)
+            page = tl.minimum(tl.maximum(page, 0), num_pages - 1)
 
-    # Load weight[batch, :] — all heads
-    wt_base = weight_ptr + pid_b * weight_stride_b
-    h_offs = tl.arange(0, BLOCK_H)
-    h_mask = h_offs < num_heads
+            k = tl.load(
+                kv_value_ptr
+                + page * kv_value_stride_p
+                + s_local[:, None] * HEAD_DIM
+                + d_offs[None, :]
+            ).to(tl.bfloat16)
 
-    # Accumulate: for each position, sum over heads of relu(score) * weight
-    score_base = score_ptr + pid_b * score_stride_b
-    acc = tl.zeros([BLOCK_S], dtype=tl.float32)
+            score = tl.maximum(tl.dot(k, q_t), 0.0)
+            acc = tl.sum(score * weight[None, :], axis=1)
 
-    for h in range(num_heads):
-        # score[batch, s, h]
-        s_ptrs = score_base + s_offs * score_stride_s + h
-        val = tl.load(s_ptrs, mask=s_mask, other=0.0)
-        # ReLU
-        val = tl.maximum(val, 0.0)
-        # Multiply by weight[h]
-        w_h = tl.load(wt_base + h).to(tl.float32)
-        acc += val * w_h
+            scale = tl.load(
+                kv_scale_ptr + page * kv_scale_stride_p + SCALE_COL + s_local
+            )
+            acc = acc * scale
 
-    # Multiply by kv_scale[batch, s]
-    scale_base = kv_scale_ptr + pid_b * scale_stride_b
-    kv_s = tl.load(scale_base + s_offs, mask=s_mask, other=0.0)
-    acc = acc * kv_s
+            s_global = pid_page * BLOCK_SZ + s_local
+            valid = (s_global < seq_len) & (s_global < max_seq_len)
+            tl.store(
+                logits_ptr + pid_b * logits_stride_b + s_global,
+                tl.where(valid, acc, 0.0),
+                mask=s_global < max_seq_len,
+            )
 
-    # Masked store to logits — zero out positions >= seq_len
-    valid = s_mask & (s_offs < seq_len) & (s_offs < max_seq_len)
-    write_mask = s_mask & (s_offs < max_seq_len)
-    out_base = logits_ptr + pid_b * logits_stride_b
-    tl.store(out_base + s_offs, tl.where(valid, acc, 0.0), mask=write_mask)
+
+def _pages_per_prog(batch_size: int, num_pages_req: int) -> int:
+    pages_per_prog = _MAX_PAGES_PER_PROG
+    if batch_size * num_pages_req < _MIN_PROGRAMS * pages_per_prog:
+        pages_per_prog = max(1, (batch_size * num_pages_req) // _MIN_PROGRAMS)
+        pages_per_prog = 1 << (pages_per_prog.bit_length() - 1)
+    return pages_per_prog
 
 
 def fp8_paged_mqa_logits_triton(
@@ -89,12 +113,12 @@ def fp8_paged_mqa_logits_triton(
     max_seq_len: int,
     clean_logits: bool = True,
 ) -> torch.Tensor:
-    """Triton-accelerated fp8_paged_mqa_logits.
+    """Triton fp8_paged_mqa_logits.
 
-    Paged KV gather + fp8→fp32 upcast + einsum remain in PyTorch (already
-    vectorized, no host syncs). The post-matmul pipeline (ReLU, weight multiply,
-    head reduction, scale multiply, validity masking, store) is fused into a
-    single Triton kernel — replacing 5 separate PyTorch ops per chunk.
+    The paged gather, the fp8 dequantization, the QK product and the
+    relu/weight/head-reduction/scale/mask pipeline all run in one kernel. The
+    product is taken in bf16 so it maps to the XPU matrix engines; keeping it in
+    fp32 leaves it on the scalar units, since Xe2 has no fp32 DPAS path.
     """
     _ = deep_gemm_metadata
     batch_size, _, num_heads, head_dim = q_fp8.shape
@@ -112,80 +136,59 @@ def fp8_paged_mqa_logits_triton(
     assert clean_logits == False
 
     head_dim_with_sf = head_dim + 4
-    SCALE_OFFSET = block_size * head_dim
 
     max_pages_eff = (max_seq_len + block_size - 1) // block_size
-    P = min(page_table.shape[1], max_pages_eff)
-    padded_seq_len = P * block_size
+    num_pages_req = min(page_table.shape[1], max_pages_eff)
+    padded_seq_len = num_pages_req * block_size
 
     logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
 
-    kv_flat = kvcache_fp8.reshape(-1, block_size * head_dim_with_sf)
-    num_pages_total = kv_flat.shape[0]
+    kv_bytes = kvcache_fp8.reshape(kvcache_fp8.shape[0], -1)
+    kv_value = kv_bytes.view(FP8_DTYPE)
+    kv_scale = kv_bytes.view(torch.float32)
 
-    bytes_per_row = max(1, P * block_size * head_dim * 4)
-    chunk_size = max(1, _FP8_PAGED_MQA_LOGITS_CHUNK_BYTES // bytes_per_row)
+    q = q_fp8[:, 0]
+    if not q.is_contiguous():
+        q = q.contiguous()
+    if not page_table.is_contiguous():
+        page_table = page_table.contiguous()
+    if not weight.is_contiguous():
+        weight = weight.contiguous()
+    if not seq_lens.is_contiguous():
+        seq_lens = seq_lens.contiguous()
 
-    pt = page_table[:, :P]
-    if num_pages_total > 0:
-        pt = pt.clamp(min=0, max=num_pages_total - 1)
+    pages_per_prog = _pages_per_prog(batch_size, num_pages_req)
+    grid = (batch_size, triton.cdiv(num_pages_req, pages_per_prog))
 
-    BLOCK_S = 64
-    BLOCK_H = triton.next_power_of_2(num_heads)
+    _paged_mqa_logits_kernel[grid](
+        q,
+        kv_value,
+        kv_scale,
+        weight,
+        seq_lens,
+        page_table,
+        logits,
+        kvcache_fp8.shape[0],
+        num_pages_req,
+        max_seq_len,
+        q.stride(0),
+        q.stride(1),
+        kv_value.stride(0),
+        kv_scale.stride(0),
+        weight.stride(0),
+        page_table.stride(0),
+        logits.stride(0),
+        NUM_HEADS=num_heads,
+        HEAD_DIM=head_dim,
+        BLOCK_SZ=block_size,
+        BLOCK_H=max(16, triton.next_power_of_2(num_heads)),
+        SCALE_COL=(block_size * head_dim) // 4,
+        PAGES_PER_PROG=pages_per_prog,
+        num_warps=8,
+        num_stages=4,
+    )
 
-    for s in range(0, batch_size, chunk_size):
-        e = min(s + chunk_size, batch_size)
-        cb = e - s
-
-        # Paged gather (vectorized, no host sync)
-        kv = kv_flat[pt[s:e]]
-        kv_value_b = kv[..., :SCALE_OFFSET].contiguous()
-        kv_scale_b = kv[..., SCALE_OFFSET:].contiguous()
-
-        # bytes -> fp8 -> fp32
-        kv_value = (
-            kv_value_b.view(dtype=FP8_DTYPE)
-            .view(cb, padded_seq_len, head_dim)
-            .to(torch.float32)
-        )
-        # bytes -> fp32 scale per token
-        kv_scale = kv_scale_b.view(dtype=torch.float32).view(cb, padded_seq_len)
-
-        # q: (cb, num_heads, head_dim) fp32
-        q = q_fp8[s:e, 0].to(torch.float32)
-
-        # Batched matmul: score[b,s,h] = sum_d(kv_value[b,s,d] * q[b,h,d])
-        # shape: (cb, padded_seq_len, num_heads)
-        score = torch.einsum("bsd,bhd->bsh", kv_value, q)
-
-        # Fused Triton kernel: relu -> weight -> sum_heads -> scale -> mask -> store
-        score = score.contiguous()
-        kv_scale = kv_scale.contiguous()
-
-        write_len = min(padded_seq_len, max_seq_len)
-        grid = (cb, triton.cdiv(padded_seq_len, BLOCK_S))
-
-        _score_relu_weight_scale_kernel[grid](
-            score,
-            weight[s:e],
-            kv_scale,
-            seq_lens[s:e],
-            logits[s:e],
-            cb,
-            padded_seq_len,
-            max_seq_len,
-            num_heads=num_heads,
-            score_stride_b=score.stride(0),
-            score_stride_s=score.stride(1),
-            weight_stride_b=weight.stride(0),
-            scale_stride_b=kv_scale.stride(0),
-            logits_stride_b=logits.stride(1) * 0 + max_seq_len,  # logits is contiguous
-            BLOCK_S=BLOCK_S,
-            BLOCK_H=BLOCK_H,
-        )
-
-        # Zero-fill remaining columns if padded_seq_len < max_seq_len
-        if write_len < max_seq_len:
-            logits[s:e, write_len:] = 0
+    if padded_seq_len < max_seq_len:
+        logits[:, padded_seq_len:] = 0
 
     return logits

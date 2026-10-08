@@ -198,11 +198,8 @@ class XeMlaEpilogue {
     copy(copy_o, tOrO, tOgO);
   }
 
-  /// Call store(row, i) once per query row this thread owns, from the v == 0
-  /// column only, so each row is stored exactly once. `i` indexes rA, for use
-  /// with broadcast<0>(row_frag, rA, i). Rows >= num_rows (a partial Q tile's
-  /// padding) are skipped: unlike O's block store these per-row stores are not
-  /// bounds-clamped.
+  /// Invokes store(row, i) once for each valid query row owned by this thread.
+  /// Padding rows in a partial Q tile are skipped.
   template <class RedFragA, class FragO, class CoordO, class CoordFull, class QVCoord, class StoreFn>
   CUTLASS_DEVICE void for_each_row(
       RedFragA const& rA,   // Reduced O accumulator: (q,v)
@@ -287,17 +284,17 @@ class XeMlaEpilogue {
   /// Stores unnormalized partial O to O_accum and writes the per-query-row
   /// exp_sum / max_logit for this (head, batch, kv_split) to global memory.
   ///
-  template <typename QVCoord, typename TensorStat>
+  template <typename QVCoord, typename TensorSoftmaxStat>
   CUTLASS_DEVICE void operator()(
-      TensorO2D const& O_accum,      // 2D slice of partial output buffer: (q, v)
-      FragA& tArA,                   // O accumulator fragment from mainloop
-      FragARow& tA_max,              // Softmax row-wise max accumulator
-      FragARow& tA_sum,              // Softmax row-wise sum accumulator
-      QVCoord blk_qv,                // WG tile indices: (Q, V)
-      int thr_id,                    // Work-item ID
-      TensorStat const& gExpSums,    // This split's exp_sum per query row: (q)
-      TensorStat const& gMaxLogits,  // This split's max_logit per query row: (q)
-      int num_kv_splits) {           // Total number of KV splits
+      TensorO2D const& O_accum,             // 2D slice of partial output buffer: (q, v)
+      FragA& tArA,                          // O accumulator fragment from mainloop
+      FragARow& tA_max,                     // Softmax row-wise max accumulator
+      FragARow& tA_sum,                     // Softmax row-wise sum accumulator
+      QVCoord blk_qv,                       // WG tile indices: (Q, V)
+      int thr_id,                           // Work-item ID
+      TensorSoftmaxStat const& gExpSums,    // This split's exp_sum per query row: (q)
+      TensorSoftmaxStat const& gMaxLogits,  // This split's max_logit per query row: (q)
+      int num_kv_splits) {                  // Total number of KV splits
     using namespace cute;
 
     // Step 1: Cross-subgroup reduction of accumulators

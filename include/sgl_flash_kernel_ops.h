@@ -88,8 +88,6 @@ void mha_fwd(
     // attended bidirectionally, causal otherwise.
     std::optional<const at::Tensor>& bidirectional_block_ids_);
 
-// q_nope / q_pe / out are (batch, num_heads, dim) for single-token decode or
-// (batch, s_q, num_heads, dim), s_q in {1, 2, 4, 8, 16}, for multi-token decode.
 void flash_mla_decode(
     torch::Tensor& out,
     const std::optional<torch::Tensor>& lse,  // (batch, [s_q,] num_heads) fp32; nullopt = skip

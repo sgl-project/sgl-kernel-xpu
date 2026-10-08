@@ -246,9 +246,24 @@ def cutlass_scaled_fp4_mm(
     b: torch.Tensor,
     block_scale_a: torch.Tensor,
     block_scale_b: torch.Tensor,
-    alpha: torch.Tensor,
-    out_dtype: torch.dtype,
+    alpha: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
+    """MXFP4 scaled GEMM: alpha * (a @ b.T), block size 32 with UE8M0 scales.
+
+    NVFP4 (block 16, E4M3 scales) has no Intel Xe equivalent, so this op carries
+    the MX flavour of the format. `sgl_per_token_group_quant_fp4` produces both
+    operands in exactly the layout expected here.
+
+    Args:
+        a: (m, k // 2) uint8, two E2M1 values per byte (low nibble first).
+        b: (n, k // 2) uint8, same packing.
+        block_scale_a: (m, k // 32) uint8 UE8M0, row-major.
+        block_scale_b: (n, k // 32) uint8 UE8M0, row-major.
+        alpha: optional 1-element fp32 device tensor; read on device, so it
+            never forces a host sync.
+        out_dtype: float32, bfloat16, or float16.
+    """
     assert a.ndim == 2 and b.ndim == 2
     m, n = a.shape[0], b.shape[0]
     out = torch.empty((m, n), dtype=out_dtype, device=a.device)

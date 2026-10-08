@@ -355,6 +355,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype)"
       " -> Tensor");
   m.impl("fp8_blockwise_scaled_mm", torch::kXPU, &fp8_blockwise_scaled_mm);
+  m.def("cutlass_scaled_fp4_mm(Tensor! D, Tensor A, Tensor B, Tensor A_sf, Tensor B_sf, Tensor? alpha) -> ()");
+  m.impl("cutlass_scaled_fp4_mm", torch::kXPU, &cutlass_scaled_fp4_mm);
   m.def(
       "mxfp4_blockwise_scaled_grouped_mm(Tensor! output, Tensor! a_ptrs, Tensor! b_ptrs, Tensor! out_ptrs, "
       "Tensor! a_scales_ptrs, Tensor! b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, "

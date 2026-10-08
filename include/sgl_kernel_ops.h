@@ -625,6 +625,8 @@ void bmm_fp8(
     int64_t cublas_handle,
     int64_t sycl_stream);
 
+void bmm_bf16(at::Tensor A, at::Tensor B, at::Tensor D);
+
 /*
  * From csrc/nsa (Native Sparse Attention)
  */

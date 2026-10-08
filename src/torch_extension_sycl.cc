@@ -327,6 +327,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
 #endif  // USE_MOE
 
+  m.def(
+      "bmm_fp8(Tensor A, Tensor B, Tensor! D, Tensor A_scale, Tensor B_scale, Tensor workspace_buffer, int "
+      "cublas_handle, int xpu_stream) -> ()",
+      {at::Tag::needs_fixed_stride_order});
+  m.impl("bmm_fp8", torch::kXPU, &bmm_fp8);
+
+  m.def("bmm_bf16(Tensor A, Tensor B, Tensor! D) -> ()", {at::Tag::needs_fixed_stride_order});
+  m.impl("bmm_bf16", torch::kXPU, &bmm_bf16);
+
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
   m.def("merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");

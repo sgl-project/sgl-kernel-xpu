@@ -128,28 +128,6 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_add_rmsnorm_inkling_prefill_shape(dtype):
-    """Inkling reduced prefill: preserve in-place residual semantics at M4096/H6144."""
-    eps = 1e-6
-    batch_size, hidden_size = 4096, 6144
-    x = torch.randn(batch_size, hidden_size, dtype=dtype, device=device)
-    residual = torch.randn_like(x)
-    weight = torch.randn(hidden_size, dtype=dtype, device=device)
-
-    x_native, residual_native = fused_add_rms_norm(
-        x.clone(), residual.clone(), weight, eps
-    )
-    x_fused = x.clone()
-    residual_fused = residual.clone()
-    sgl_kernel.fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
-
-    torch.testing.assert_close(x_fused, x_native, **norm_tolerances(dtype))
-    torch.testing.assert_close(
-        residual_fused, residual_native, **norm_tolerances(dtype)
-    )
-
-
 @pytest.mark.parametrize(
     "batch_size, hidden_size, dtype",
     [

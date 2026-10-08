@@ -22,8 +22,8 @@ ARG SG_LANG_KERNEL_BRANCH=main
 # Pin the compute UMD + IGC. The kobuk-team PPA is rolling; an untested build
 # mismatched the host xe KMD and faulted libze_intel_gpu.so on the B580 runner.
 # Must stay in lockstep with the host KMD; override via --build-arg per workflow.
-ARG COMPUTE_RUNTIME_VERSION=26.35.39758.10
-ARG IGC_VERSION=2.41.5+22716
+ARG COMPUTE_RUNTIME_VERSION=26.27.39122.11
+ARG IGC_VERSION=2.38.2+22051
 ARG GMM_VERSION=22.10.0
 RUN apt-get install -y software-properties-common && \
     add-apt-repository -y ppa:kobuk-team/intel-graphics && \

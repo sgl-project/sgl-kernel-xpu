@@ -125,9 +125,6 @@ struct MlaXe {
   static constexpr int PAGE_SIZE = PageSizeOpt::value;
 
   static constexpr int Q_TILE_M = QTileM;
-  static_assert(
-      Q_TILE_M == 1 || Q_TILE_M == 2 || Q_TILE_M == 4 || Q_TILE_M == 8 || Q_TILE_M == 16,
-      "MLA decode supports seq_len_q in {1, 2, 4, 8, 16}");
 
   static constexpr int RowsPerSubgroup = (Q_TILE_M == 1) ? 1 : 2;
   static constexpr int NumSubgroupsM = Q_TILE_M / RowsPerSubgroup;
@@ -258,11 +255,11 @@ inline typename T::Fmla::Arguments args_from_options(
   // kv_cache: (num_blocks, block_size, head_dim) where head_dim = 576 (d_latent + d_rope)
   // out:    (bs, [s_q,] num_heads, v_head_dim)
   // lse:    (bs, [s_q,] num_heads)
-  // 3D tensors are single-token decode (s_q == 1); 4D carry s_q == T::Q_TILE_M
-  // (validated by runMla).
-  const bool is_4d = q_nope.dim() == 4;
+  // 3D tensors are single-token decode (s_q == 1); 4D carry s_q == T::Q_TILE_M.
+  // runMla has already checked seq_len_q == T::Q_TILE_M, so the rank is not
+  // needed here: dims and strides are indexed from the back, which is valid
+  // for both ranks.
   int batch = q_nope.size(0);
-  int seq_len_q = is_4d ? q_nope.size(1) : 1;
   int num_heads = q_nope.size(-2);
   int v_head_dim = q_nope.size(-1);
   int q_pe_dim = q_pe.size(-1);
@@ -276,7 +273,7 @@ inline typename T::Fmla::Arguments args_from_options(
   problem_shape.batch = batch;
   problem_shape.num_heads_q = num_heads;
   problem_shape.num_heads_kv = 1;
-  problem_shape.seq_len_qo = seq_len_q;
+  problem_shape.seq_len_qo = T::Q_TILE_M;
   problem_shape.seq_len_kv = max_seq_len;
   problem_shape.head_size_q_nope = v_head_dim;
   problem_shape.head_size_q_pe = q_pe_dim;
@@ -296,16 +293,17 @@ inline typename T::Fmla::Arguments args_from_options(
   using ElementO = typename T::ElementO;
   using ElementLSE = typename T::ElementLSE;
 
-  // Kernel strides are (seq_q, dim, head, batch). For 3D inputs seq_q == 1 and
-  // its stride is never dereferenced, so any value works there.
+  // Kernel strides are (seq_q, dim, head, batch). stride(-3) is the s_q stride
+  // of a 4D tensor; on a 3D tensor it is the batch stride, which is harmless
+  // because seq_q == 1 there and the stride is never dereferenced.
   StrideQ stride_Q_nope = cute::make_stride(
-      static_cast<int>(is_4d ? q_nope.stride(1) : batch * num_heads * v_head_dim),
+      static_cast<int>(q_nope.stride(-3)),
       cute::_1{},
       static_cast<int>(q_nope.stride(-2)),
       static_cast<int>(q_nope.stride(0)));
 
   StrideQ stride_Q_pe = cute::make_stride(
-      static_cast<int>(is_4d ? q_pe.stride(1) : batch * num_heads * q_pe_dim),
+      static_cast<int>(q_pe.stride(-3)),
       cute::_1{},
       static_cast<int>(q_pe.stride(-2)),
       static_cast<int>(q_pe.stride(0)));
@@ -323,14 +321,11 @@ inline typename T::Fmla::Arguments args_from_options(
       static_cast<int>(1));
 
   StrideO stride_O = cute::make_stride(
-      static_cast<int>(is_4d ? out.stride(1) : batch * num_heads * v_head_dim),
-      cute::_1{},
-      static_cast<int>(out.stride(-2)),
-      static_cast<int>(out.stride(0)));
+      static_cast<int>(out.stride(-3)), cute::_1{}, static_cast<int>(out.stride(-2)), static_cast<int>(out.stride(0)));
 
   // lse: (batch, [s_q,] num_heads) -> kernel layout (seq_len_qo, num_heads, batch)
   StrideLSE stride_LSE = cute::make_stride(
-      static_cast<int>((lse.has_value() && is_4d) ? lse->stride(1) : batch * num_heads),
+      static_cast<int>(lse.has_value() ? lse->stride(-2) : 0),
       cute::_1{},
       static_cast<int>(lse.has_value() ? lse->stride(0) : 0));
 
@@ -356,7 +351,7 @@ inline typename T::Fmla::Arguments args_from_options(
   if constexpr (T::is_split_kv) {
     using cutlass::flash_attention::kernel::SplitKVWorkspaceLayout;
     SplitKVWorkspaceLayout ws(
-        batch, problem_shape.num_heads_q, num_kv_splits, problem_shape.head_size_o, sizeof(ElementO), seq_len_q);
+        batch, problem_shape.num_heads_q, num_kv_splits, problem_shape.head_size_o, sizeof(ElementO), T::Q_TILE_M);
 
     auto* ws_ptr = static_cast<char*>(workspace.data_ptr());
     auto* o_accum_ptr = reinterpret_cast<ElementO*>(ws_ptr + ws.o_accum_offset);

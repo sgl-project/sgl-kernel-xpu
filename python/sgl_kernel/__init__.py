@@ -76,6 +76,8 @@ from sgl_kernel.elementwise import (
     gemma_rmsnorm,
     multimodal_rotary_embedding,
     rmsnorm,
+    rmsnorm_heads_inplace,
+    rmsnorm_heads_inplace_supported,
     silu_and_mul,
     silu_and_mul_clamp,
     store_cache_xpu,

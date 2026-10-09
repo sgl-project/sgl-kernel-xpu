@@ -12,11 +12,19 @@ set(ATen_XPU_SYCL_COMMON)
 find_package(Python3 COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 execute_process(
-  COMMAND ${PYTHON3_EXECUTABLE}
+  COMMAND ${Python3_EXECUTABLE}
           -c "import torch; print(torch.utils.cmake_prefix_path)"
   OUTPUT_VARIABLE TORCH_PY_PREFIX
   OUTPUT_STRIP_TRAILING_WHITESPACE
+  RESULT_VARIABLE TORCH_PY_PREFIX_RESULT
 )
+
+if(NOT TORCH_PY_PREFIX_RESULT EQUAL 0 OR TORCH_PY_PREFIX STREQUAL "")
+  message(FATAL_ERROR
+    "Could not import torch with ${Python3_EXECUTABLE}. Build isolation hides "
+    "torch from the build environment; build with --no-build-isolation "
+    "(or --no-isolation for `python -m build`).")
+endif()
 
 message(STATUS ${TORCH_PY_PREFIX})
 list(APPEND CMAKE_PREFIX_PATH ${TORCH_PY_PREFIX}/Torch)
@@ -102,6 +110,16 @@ else()
     "Unsupported DPCPP_SYCL_TARGET: ${DPCPP_SYCL_TARGET}. "
     "Must be one of: bmg, cri.")
 endif()
+
+# Binaries install into a per-architecture subpackage so two builds can be
+# merged into one wheel (see scripts/build_fat_wheel.sh); _arch.py picks one at
+# import time. The probe itself stays at the package root.
+if(DPCPP_SYCL_TARGET MATCHES "bmg")
+  set(SGL_ARCH_PKG_DIR "sgl_kernel/_xe20")
+elseif(DPCPP_SYCL_TARGET MATCHES "cri")
+  set(SGL_ARCH_PKG_DIR "sgl_kernel/_xe35")
+endif()
+message(STATUS "Installing architecture binaries into: ${SGL_ARCH_PKG_DIR}")
 
 # cutlass — repo and commit depend on the target architecture
 if(DPCPP_SYCL_TARGET MATCHES "bmg")

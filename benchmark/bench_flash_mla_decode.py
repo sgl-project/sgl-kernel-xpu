@@ -333,8 +333,9 @@ if __name__ == "__main__":
         nargs="+",
         type=int,
         default=[1],
-        choices=[1, 2, 4, 8, 16],
-        help="List of query tokens per request (1 = single-token decode)",
+        help="List of query tokens per request (1 = single-token decode; any "
+        "s_q >= 1 is accepted, off-bucket values pad up to 2/4/8/16 and "
+        "s_q > 16 runs several 16-row Q tiles)",
     )
     # How it works:
     # First run (no previous.csv): Creates current.csv and plots the current results only

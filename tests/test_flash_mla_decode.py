@@ -236,30 +236,10 @@ def _make_decode_inputs(bs, s_q, h_q, d, mean_seq_len, varlen, block_size, dtype
     return q, kv_cache, block_table, seq_lens, block_num
 
 
-@pytest.mark.arch("xe20", "xe35")
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-# 1 exercises the 4D (bs, 1, H, D) path, which shares the single-token kernel
-# instantiation with 3D q; the causal mask degenerates to no mask.
-@pytest.mark.parametrize("s_q", [1, 2, 4, 8, 16])
-# 20 is shorter than one 128-wide split, so num_kv_splits=4 leaves empty splits,
-# and with s_q=16 the causal boundary falls inside the only (partial) KV tile.
-@pytest.mark.parametrize("mean_seq_len", [20, 1024])
-@pytest.mark.parametrize("bs", [1, 3])
-@pytest.mark.parametrize("varlen", [True, False])
-# 16: one subgroup along KV; 64/128: sub-page KV tiles for s_q >= 8 / >= 4.
-@pytest.mark.parametrize("block_size", [16, 64, 128])
-@pytest.mark.parametrize("num_heads", [16, 128])
-@pytest.mark.parametrize("num_kv_splits", [-1, 1, 4])
-def test_flash_mla_decode_multi_token(
-    dtype: torch.dtype,
-    s_q: int,
-    mean_seq_len: int,
-    bs: int,
-    varlen: bool,
-    block_size: int,
-    num_heads: int,
-    num_kv_splits: int,
+def _check_multi_token_decode(
+    dtype, s_q, mean_seq_len, bs, varlen, block_size, num_heads, num_kv_splits
 ):
+    """Run one multi-token decode case against ref_mla_multi_token."""
     torch.random.manual_seed(42)
 
     dv, q_pe_dim = 512, 64
@@ -306,6 +286,70 @@ def test_flash_mla_decode_multi_token(
     torch.testing.assert_close(lse_ref, lse.cpu(), atol=lse_atol, rtol=lse_rtol)
 
     del out, lse, out_ref, lse_ref, q, q_xpu, kv_cache, block_table, workspace
+
+
+@pytest.mark.arch("xe20", "xe35")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+# 1 exercises the 4D (bs, 1, H, D) path, which shares the single-token kernel
+# instantiation with 3D q; the causal mask degenerates to no mask.
+@pytest.mark.parametrize("s_q", [1, 2, 4, 8, 16])
+# 20 is shorter than one 128-wide split, so num_kv_splits=4 leaves empty splits,
+# and with s_q=16 the causal boundary falls inside the only (partial) KV tile.
+@pytest.mark.parametrize("mean_seq_len", [20, 1024])
+@pytest.mark.parametrize("bs", [1, 3])
+@pytest.mark.parametrize("varlen", [True, False])
+# 16: one subgroup along KV; 64/128: sub-page KV tiles for s_q >= 8 / >= 4.
+@pytest.mark.parametrize("block_size", [16, 64, 128])
+@pytest.mark.parametrize("num_heads", [16, 128])
+@pytest.mark.parametrize("num_kv_splits", [-1, 1, 4])
+def test_flash_mla_decode_multi_token(
+    dtype: torch.dtype,
+    s_q: int,
+    mean_seq_len: int,
+    bs: int,
+    varlen: bool,
+    block_size: int,
+    num_heads: int,
+    num_kv_splits: int,
+):
+    _check_multi_token_decode(
+        dtype, s_q, mean_seq_len, bs, varlen, block_size, num_heads, num_kv_splits
+    )
+
+
+@pytest.mark.arch("xe20", "xe35")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+# Token counts that are not a kernel Q tile. 3/5/7/9/13/15 are padded up to
+# the 4/8/16-row kernels; 17/28/53/130 run the 16-row kernel over 2/2/4/9 Q
+# tiles with a partial last tile. 130 exceeds the 16-row kernel's 128-thread
+# work-group, which checks the split-KV empty-split sentinel is written per
+# Q tile rather than one row per thread.
+@pytest.mark.parametrize("s_q", [3, 5, 7, 9, 13, 15, 17, 28, 53, 130])
+# 0: sequences are (about) exactly their s_q new tokens, so all KV is new and
+# the causal boundary cuts through every Q tile; 1000: a long causal-free prefix
+# with the boundary in the last pages only.
+@pytest.mark.parametrize("kv_prefix", [0, 1000])
+# 16: one subgroup along KV, KV tile == page; 128: sub-page KV tiles.
+@pytest.mark.parametrize("block_size", [16, 128])
+# 1 is the fused kernel; 4 is the split-KV kernel plus reduction.
+@pytest.mark.parametrize("num_kv_splits", [1, 4])
+def test_flash_mla_decode_off_bucket_seq_len_q(
+    dtype: torch.dtype,
+    s_q: int,
+    kv_prefix: int,
+    block_size: int,
+    num_kv_splits: int,
+):
+    _check_multi_token_decode(
+        dtype,
+        s_q,
+        mean_seq_len=s_q + kv_prefix,
+        bs=3,
+        varlen=True,
+        block_size=block_size,
+        num_heads=16,
+        num_kv_splits=num_kv_splits,
+    )
 
 
 @pytest.mark.arch("xe20", "xe35")

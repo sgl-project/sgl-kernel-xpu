@@ -13,14 +13,15 @@
 namespace sgl {
 namespace mla_jit {
 
-// Launch MLA decode for (query dtype, page size, seq_len_q). seq_len_q is the
-// number of query tokens per request (1, 2, 4, 8 or 16) and selects the Q-tile
-// instantiation. Tensor args are at::Tensor* passed as void*. Returns true on
-// success; fills *err on failure.
+// Launch MLA decode for (query dtype, page size, Q tile). q_tile is the Q-tile
+// height (1, 2, 4, 8 or 16) chosen by mla_decode_q_tile(seq_len_q) and selects
+// the instantiation; the request's real seq_len_q travels in the tensors.
+// Tensor args are at::Tensor* passed as void*. Returns true on success; fills
+// *err on failure.
 bool mla_decode_launch(
     bool is_fp16,
     int page_size,
-    int seq_len_q,
+    int q_tile,
     void* out,
     const void* lse,  // const std::optional<at::Tensor>*; nullopt = skip
     const void* q_nope,

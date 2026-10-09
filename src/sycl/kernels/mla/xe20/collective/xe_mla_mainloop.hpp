@@ -469,9 +469,10 @@ struct XeMlaMainloop<
         }
       }
 
-      // Mask out phantom Q rows in partial last tile so softmax stats stay finite.
-      // Compiled out for QK_BLK_M=1; skipped for full tiles at runtime (decode's
-      // Q tile is exactly seq_len_qo, so it is always full).
+      // Mask out phantom Q rows in a partial last tile so softmax stats stay finite.
+      // Compiled out for QK_BLK_M=1; skipped for full tiles at runtime. Decode
+      // hits it when seq_len_qo is padded up to the Q tile and on the last of
+      // several Q tiles.
       if constexpr (QK_BLK_M > 1) {
         if (q_valid_rows < static_cast<int>(QK_BLK_M)) {
           Tensor cPgPq = make_identity_tensor(take<0, 2>(TileShapeQK{}));

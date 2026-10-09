@@ -248,8 +248,8 @@ class XeMlaFwdKernel {
 
       // --- Varlen Q handling (prefill only) ---
       // For prefill, Q/O are ragged 3D (total_q, heads, dim) and cu_seqlens_q
-      // gives per-batch Q starts. For decode, Q is fixed-shape (seq_len_qo ==
-      // Q_TILE_M, one tile) and cu_seqlens_q is always nullptr — gating on IsPrefill lets the
+      // gives per-batch Q starts. For decode, Q is fixed-shape (batch, seq_len_qo)
+      // and cu_seqlens_q is always nullptr — gating on IsPrefill lets the
       // compiler skip the runtime branch + offset arithmetic + per-WG continue
       // check entirely on the decode path. At high WG counts (bs=16, long seq)
       // the per-WG-dispatch overhead from these dead branches is measurable.
@@ -335,8 +335,9 @@ class XeMlaFwdKernel {
       // For causal attention: limit K loop with causal offset.
       // causal_offset = seqlen_k - seqlen_q; mask: k_idx <= causal_offset + q_idx
       // Prefill is always causal. Decode is causal only for seq_len_qo > 1 (the
-      // s_q query tokens are the last s_q positions of the sequence); its single
-      // Q tile then spans all of them and blk_k1 folds to total_blk.
+      // s_q query tokens are the last s_q positions of the sequence). seq_len_qo
+      // is padded up to one Q tile or spread over several; the last tile's bound
+      // folds to total_blk and earlier tiles stop at their causal horizon.
       // For single-token decode (CausalMask=false): blk_k1 stays at total_blk.
       int blk_k1 = total_blk;
       int causal_offset = 0;
@@ -348,14 +349,15 @@ class XeMlaFwdKernel {
         blk_k1 = cute::min(total_blk, causal_blk_k1);
       }
 
-      // Valid Q rows in this tile; < QK_BLK_M only on the last partial tile.
-      // Decode (Q_TILE_M == seq_len_qo, blk_q=0) always has a full tile, so
-      // this folds to the constexpr tile height — the mainloop's partial-tile
-      // mask is then skipped at runtime (or dead for Q_TILE_M=1). Compiling the
-      // min/sub still has measurable cost at high WG count; gate it to prefill.
+      // Valid Q rows in this tile; < QK_BLK_M only on the last (partial) tile.
+      // Decode pads seq_len_qo up to the Q tile, or spreads it over several
+      // tiles, so its last tile may be partial as well. Single-token decode
+      // (Q_TILE_M=1) is always a full tile: keep the constexpr fold there, as
+      // the min/sub has measurable cost at high WG count and the mainloop's
+      // row mask is dead for QK_BLK_M=1 anyway.
       constexpr int Q_TILE_M_C = static_cast<int>(get<0>(TileShapeQK{}));
       int q_valid_rows = Q_TILE_M_C;
-      if constexpr (CollectiveMainloop::IsPrefill) {
+      if constexpr (CollectiveMainloop::IsPrefill || Q_TILE_M_C > 1) {
         q_valid_rows = cute::min(Q_TILE_M_C, seqlen_q_i - blk_q * Q_TILE_M_C);
       }
 
@@ -585,14 +587,32 @@ class XeMlaSplitKVKernel {
       int start_blk = idx_kv_split * num_blocks_per_split;
       int end_blk = cute::min(start_blk + num_blocks_per_split, total_blk);
 
+      constexpr int Q_TILE_M_C = static_cast<int>(get<0>(TileShapeQK{}));
+
+      // Multi-token decode (seq_len_qo > 1) is causal among the s_q new tokens:
+      // query row q attends to k <= causal_offset + q. KV blocks past this Q
+      // tile's last row are fully masked, so clip the split to them; a split
+      // lying entirely past the bound becomes empty below. When one tile holds
+      // all rows (seq_len_qo <= Q_TILE_M) the bound is total_blk and nothing
+      // changes.
+      int causal_offset = 0;
+      if constexpr (CollectiveMainloop::CausalMask) {
+        causal_offset = seq_len_kv - s.seq_len_qo;
+        int causal_blk_k1 =
+            cute::ceil_div(causal_offset + (blk_q + 1) * Q_TILE_M_C, static_cast<int>(get<1>(TileShapeQK{})));
+        end_blk = cute::min(end_blk, causal_blk_k1);
+      }
+
       // Empty split: write zero-contribution sentinels and skip.
       // exp_sums=0 gates any garbage in O_accum for this split.
       // max_logits=lowest() ensures empty splits don't pollute global_max.
-      // One lane per query row (seq_len_qo <= 16 <= WG size).
-      if (start_blk >= total_blk) {
-        if (thr_id < s.seq_len_qo) {
-          gExpSums(thr_id, idx_kv_split, head_coord, batch_coord) = ElementAcc(0);
-          gMaxLogits(thr_id, idx_kv_split, head_coord, batch_coord) = std::numeric_limits<ElementAcc>::lowest();
+      // One lane per query row of this Q tile (Q_TILE_M <= 16 <= WG size); rows
+      // past seq_len_qo on a partial tile have no statistics slot.
+      if (start_blk >= end_blk) {
+        int row = blk_q * Q_TILE_M_C + thr_id;
+        if (thr_id < Q_TILE_M_C && row < s.seq_len_qo) {
+          gExpSums(row, idx_kv_split, head_coord, batch_coord) = ElementAcc(0);
+          gMaxLogits(row, idx_kv_split, head_coord, batch_coord) = std::numeric_limits<ElementAcc>::lowest();
         }
         continue;
       }
@@ -626,13 +646,11 @@ class XeMlaSplitKVKernel {
       Tensor K_pe = make_tensor(make_gmem_ptr(dcK_pe), make_layout(shape_K_pe, p.dK_pe));
       Tensor V = make_tensor(make_gmem_ptr(dcK), make_layout(shape_V, p.dV));
 
-      // Multi-token decode (seq_len_qo > 1) is causal among the s_q new tokens:
-      // query row q attends to k <= causal_offset + q. The single Q tile holds
-      // all s_q rows, so the causal K bound equals total_blk and the split's
-      // [start_blk, end_blk) range needs no further clamp.
-      int causal_offset = 0;
-      if constexpr (CollectiveMainloop::CausalMask) {
-        causal_offset = seq_len_kv - s.seq_len_qo;
+      // Valid rows of this Q tile: partial when seq_len_qo is padded up to the
+      // tile or on the last of several tiles (see XeMlaFwdKernel).
+      int q_valid_rows = Q_TILE_M_C;
+      if constexpr (Q_TILE_M_C > 1) {
+        q_valid_rows = cute::min(Q_TILE_M_C, s.seq_len_qo - blk_q * Q_TILE_M_C);
       }
 
       CollectiveMainloop mainloop(params.mainloop, shared_storage.mainloop);
@@ -652,7 +670,8 @@ class XeMlaSplitKVKernel {
           thr_id,
           seq_len_kv,
           batch_coord,
-          causal_offset);
+          causal_offset,
+          q_valid_rows);
 
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());

@@ -99,9 +99,28 @@ struct FMlAProblemShape {
   FMlAProblemShape() = default;
 };
 
+//----------------- decode Q-tile (bucket) selection --------------------//
+// Largest instantiated Q tile: MlaXe::kMaxSubgroups (8) subgroups x 2 query
+// rows each. Must agree with MLA_DECODE_Q_TILES in MlaDecodeXe{20,35}.cmake.
+inline constexpr int kMlaDecodeMaxQTile = 16;
+
+// Q-tile instantiation for a request with seq_len_q query tokens. seq_len_q is
+// rounded up to the next instantiated tile (1, 2, 4, 8, 16); the padding rows
+// read zeros, are masked out of the softmax and are never stored (the Xe 2D
+// block copies clamp to the tensor's real row count). Above kMlaDecodeMaxQTile
+// the 16-row kernel is launched with ceil(seq_len_q / 16) Q tiles, the last of
+// which may be partial in the same way. Returns the tile for any seq_len_q >= 1.
+inline int mla_decode_q_tile(int64_t seq_len_q) {
+  int tile = 1;
+  while (tile < seq_len_q && tile < kMlaDecodeMaxQTile)
+    tile *= 2;
+  return tile;
+}
+
 //----------------- define MLA Xe configuration --------------------//
-// QTileM is the number of query tokens per request (seq_len_q); one Q tile
-// covers all of them, so there is never a partial Q tile.
+// QTileM is the Q-tile height, mla_decode_q_tile(seq_len_q). It is >= the
+// request's seq_len_q for seq_len_q <= 16 (padding rows are masked) and 16 with
+// several Q tiles per request beyond that.
 //   1:  single-token decode. One Q row per subgroup (DPAS M=1); the PAGE_SIZE/16
 //       subgroups split the KV tile along N; 128-GRF launch. Unchanged path.
 //   >1: multi-token (MTP / speculative) decode. Two Q rows per subgroup (DPAS
@@ -125,8 +144,10 @@ struct MlaXe {
   static constexpr int PAGE_SIZE = PageSizeOpt::value;
 
   static constexpr int Q_TILE_M = QTileM;
+  static_assert(Q_TILE_M >= 1 && Q_TILE_M <= kMlaDecodeMaxQTile, "decode Q tile out of range");
 
   static constexpr int RowsPerSubgroup = (Q_TILE_M == 1) ? 1 : 2;
+  static_assert(Q_TILE_M % RowsPerSubgroup == 0, "Q tile must be a whole number of subgroup rows");
   static constexpr int NumSubgroupsM = Q_TILE_M / RowsPerSubgroup;
   // Work-group cap: 8 subgroups (128 work-items), the single-token kernel's
   // size at PAGE_SIZE=128. Keeps the epilogue's cross-subgroup SLM reduction
@@ -255,11 +276,12 @@ inline typename T::Fmla::Arguments args_from_options(
   // kv_cache: (num_blocks, block_size, head_dim) where head_dim = 576 (d_latent + d_rope)
   // out:    (bs, [s_q,] num_heads, v_head_dim)
   // lse:    (bs, [s_q,] num_heads)
-  // 3D tensors are single-token decode (s_q == 1); 4D carry s_q == T::Q_TILE_M.
-  // runMla has already checked seq_len_q == T::Q_TILE_M, so the rank is not
-  // needed here: dims and strides are indexed from the back, which is valid
-  // for both ranks.
+  // 3D tensors are single-token decode (s_q == 1); 4D carry any s_q >= 1, with
+  // runMla having checked that T::Q_TILE_M is the tile mla_decode_q_tile picks
+  // for it. Dims and strides are indexed from the back, which is valid for both
+  // ranks.
   int batch = q_nope.size(0);
+  int seq_len_q = q_nope.dim() == 4 ? q_nope.size(1) : 1;
   int num_heads = q_nope.size(-2);
   int v_head_dim = q_nope.size(-1);
   int q_pe_dim = q_pe.size(-1);
@@ -273,7 +295,9 @@ inline typename T::Fmla::Arguments args_from_options(
   problem_shape.batch = batch;
   problem_shape.num_heads_q = num_heads;
   problem_shape.num_heads_kv = 1;
-  problem_shape.seq_len_qo = T::Q_TILE_M;
+  // The real token count, not the tile: it sizes the Q/O/LSE tensors (so the 2D
+  // block copies clamp padding rows), the causal offset and the Q-tile grid.
+  problem_shape.seq_len_qo = seq_len_q;
   problem_shape.seq_len_kv = max_seq_len;
   problem_shape.head_size_q_nope = v_head_dim;
   problem_shape.head_size_q_pe = q_pe_dim;
@@ -409,8 +433,8 @@ inline void runMlaImpl(
   CUTLASS_CHECK(fmla.run(arguments, workspace.data_ptr()));
 }
 
-// QTileM must equal the input's seq_len_q (1 for 3D q, q.size(1) for 4D q);
-// the host dispatcher (mla_decode.cpp) selects the matching instantiation.
+// QTileM must be mla_decode_q_tile(seq_len_q) for the input's seq_len_q (1 for
+// 3D q, q.size(1) for 4D q); the host dispatcher (mla_decode.cpp) selects it.
 template <typename Element, typename PageSizeOpt, int QTileM = 1>
 inline void runMla(
     at::Tensor& out,
@@ -428,7 +452,14 @@ inline void runMla(
   const bool is_4d = q_nope.dim() == 4;
   const int seq_len_q = is_4d ? q_nope.size(1) : 1;
   TORCH_CHECK(
-      seq_len_q == QTileM, "MLA decode kernel instantiated for seq_len_q=", QTileM, " but q has seq_len_q=", seq_len_q);
+      mla_decode_q_tile(seq_len_q) == QTileM,
+      "MLA decode kernel instantiated for Q tile ",
+      QTileM,
+      " but q has seq_len_q=",
+      seq_len_q,
+      " (wants Q tile ",
+      mla_decode_q_tile(seq_len_q),
+      ")");
 
   if (num_kv_splits > 1) {
     using cutlass::flash_attention::kernel::SplitKVWorkspaceLayout;

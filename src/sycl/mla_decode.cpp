@@ -110,29 +110,29 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
   mla_decode::launch_mla_decode_##ELEM##_##PS##_q##QT( \
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits)
 
-// seq_len_q (query tokens per request) selects the Q-tile instantiation. Must
+// q_tile = mla_decode_q_tile(seq_len_q) selects the Q-tile instantiation. Must
 // match MLA_DECODE_Q_TILES in MlaDecodeXe{20,35}.cmake.
-#define DISPATCH_MLA_Q_TILE(ELEM, PS)                                                             \
-  do {                                                                                            \
-    switch (seq_len_q) {                                                                          \
-      case 1:                                                                                     \
-        DISPATCH_MLA_LAUNCH(ELEM, PS, 1);                                                         \
-        break;                                                                                    \
-      case 2:                                                                                     \
-        DISPATCH_MLA_LAUNCH(ELEM, PS, 2);                                                         \
-        break;                                                                                    \
-      case 4:                                                                                     \
-        DISPATCH_MLA_LAUNCH(ELEM, PS, 4);                                                         \
-        break;                                                                                    \
-      case 8:                                                                                     \
-        DISPATCH_MLA_LAUNCH(ELEM, PS, 8);                                                         \
-        break;                                                                                    \
-      case 16:                                                                                    \
-        DISPATCH_MLA_LAUNCH(ELEM, PS, 16);                                                        \
-        break;                                                                                    \
-      default:                                                                                    \
-        TORCH_CHECK(false, "MLA decode supports seq_len_q in {1, 2, 4, 8, 16}, got ", seq_len_q); \
-    }                                                                                             \
+#define DISPATCH_MLA_Q_TILE(ELEM, PS)                                    \
+  do {                                                                   \
+    switch (q_tile) {                                                    \
+      case 1:                                                            \
+        DISPATCH_MLA_LAUNCH(ELEM, PS, 1);                                \
+        break;                                                           \
+      case 2:                                                            \
+        DISPATCH_MLA_LAUNCH(ELEM, PS, 2);                                \
+        break;                                                           \
+      case 4:                                                            \
+        DISPATCH_MLA_LAUNCH(ELEM, PS, 4);                                \
+        break;                                                           \
+      case 8:                                                            \
+        DISPATCH_MLA_LAUNCH(ELEM, PS, 8);                                \
+        break;                                                           \
+      case 16:                                                           \
+        DISPATCH_MLA_LAUNCH(ELEM, PS, 16);                               \
+        break;                                                           \
+      default:                                                           \
+        TORCH_CHECK(false, "MLA decode: no kernel for Q tile ", q_tile); \
+    }                                                                    \
   } while (0)
 
 #define DISPATCH_MLA_PAGE_SIZE(ELEM)                                             \
@@ -173,11 +173,13 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
 /// @brief Dispatch kernel implementation for MLA decode.
 ///
 /// q_nope / q_pe / out / lse are either 3D (batch, num_heads, ...) for one query
-/// token per request, or 4D (batch, s_q, num_heads, ...) for s_q in
-/// {1, 2, 4, 8, 16} query tokens per request (MTP / speculative decode). With
-/// s_q > 1 the tokens are the last s_q positions of the sequence (seq_lens
-/// includes them) and are causally masked: token i attends to KV positions
-/// [0, seq_lens - s_q + i].
+/// token per request, or 4D (batch, s_q, num_heads, ...) for any s_q >= 1 query
+/// tokens per request (MTP / speculative decode). With s_q > 1 the tokens are
+/// the last s_q positions of the sequence (seq_lens includes them) and are
+/// causally masked: token i attends to KV positions [0, seq_lens - s_q + i].
+/// s_q is served by the Q-tile kernel mla_decode_q_tile(s_q) picks: rounded up
+/// to 1/2/4/8/16 (padding rows are masked), and above 16 by the 16-row kernel
+/// over ceil(s_q / 16) Q tiles.
 ///
 /// `lse` is an output taken by const ref: the bindings cannot box a non-const
 /// optional, and at::Tensor constness is shallow.
@@ -226,10 +228,8 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
       q_pe.dim() == q_nope.dim() && out.dim() == q_nope.dim(), "q_pe and out must have the same rank as q_nope");
   const int64_t seq_len_q = q_nope.dim() == 4 ? q_nope.size(1) : 1;
   const int64_t num_heads = q_nope.size(-2);
-  TORCH_CHECK(
-      seq_len_q == 1 || seq_len_q == 2 || seq_len_q == 4 || seq_len_q == 8 || seq_len_q == 16,
-      "MLA decode supports seq_len_q in {1, 2, 4, 8, 16}, got ",
-      seq_len_q);
+  TORCH_CHECK(seq_len_q >= 1, "MLA decode: seq_len_q must be >= 1, got ", seq_len_q);
+  const int q_tile = mla_decode_q_tile(seq_len_q);
   const auto row_shape = q_nope.sizes().slice(0, q_nope.dim() - 1);  // (batch, [s_q,] num_heads)
   TORCH_CHECK(q_pe.sizes().slice(0, q_pe.dim() - 1) == row_shape, "q_pe leading dims must match q_nope");
   TORCH_CHECK(out.sizes().slice(0, out.dim() - 1) == row_shape, "out leading dims must match q_nope");
@@ -246,7 +246,8 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
     int page_count_per_seq = page_table.size(1);
     int max_seq_len = page_size * page_count_per_seq;
     // Heuristic tuned for single-token decode; it keys on the (batch, heads)
-    // work-group count, which is unchanged by seq_len_q.
+    // work-group count, which is unchanged by seq_len_q up to 16 (above that
+    // each request adds ceil(seq_len_q / 16) Q-tile work-groups).
     num_kv_splits = set_split_kv(q_nope.size(0), num_heads, max_seq_len, page_size);
   }
 
@@ -279,7 +280,7 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
         sgl::mla_jit::mla_decode_launch(
             in_dtype == at::ScalarType::Half,
             page_size,
-            static_cast<int>(seq_len_q),
+            q_tile,
             &out,
             &lse,
             &q_nope,

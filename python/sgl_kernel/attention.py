@@ -65,11 +65,13 @@ def flash_mla_decode(
     """MLA decode.
 
     q_nope / q_pe are either 3D (batch, num_heads, dim) for one query token per
-    request, or 4D (batch, s_q, num_heads, dim) for s_q in {1, 2, 4, 8, 16}
-    query tokens per request (MTP / speculative decode). With s_q > 1 the
-    tokens are the last s_q positions of the sequence (seq_lens includes them)
-    and are causally masked: token i attends to KV positions
-    [0, seq_lens - s_q + i].
+    request, or 4D (batch, s_q, num_heads, dim) for any s_q >= 1 query tokens
+    per request (MTP / speculative decode). With s_q > 1 the tokens are the
+    last s_q positions of the sequence (seq_lens includes them, so every
+    seq_lens[i] must be >= s_q) and are causally masked: token i attends to KV
+    positions [0, seq_lens - s_q + i]. s_q is rounded up to the next kernel
+    Q tile (1, 2, 4, 8, 16); above 16 the 16-row kernel covers it with
+    several Q tiles. Padding rows cost time, not accuracy.
 
     Args:
         return_lse: also return the softmax log-sum-exp. Default False.
@@ -93,7 +95,7 @@ def flash_mla_decode(
     device_type = q_nope.device.type
     if q_nope.ndim == 4:
         B_q, S_q, H, D_q_nope = q_nope.shape
-        assert S_q in (1, 2, 4, 8, 16), f"s_q must be 1, 2, 4, 8 or 16, but got {S_q}"
+        assert S_q >= 1, f"s_q must be >= 1, but got {S_q}"
         assert device_type == "xpu", "4D (multi-token) q is only supported on xpu"
     else:
         B_q, H, D_q_nope = q_nope.shape

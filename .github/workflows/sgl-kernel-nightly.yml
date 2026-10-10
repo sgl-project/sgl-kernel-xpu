@@ -69,12 +69,12 @@ jobs:
           docker cp ./tests/. sgl_kernel_nightly:/root/sglang/sgl-kernel-xpu/tests/
           docker cp ./benchmark/. sgl_kernel_nightly:/root/sglang/sgl-kernel-xpu/benchmark/
 
-      - name: Install runner extras + HF login
+      - name: Install runner extras
         timeout-minutes: 20
         run: |
+          # huggingface_hub reads HF_TOKEN from the env; `hf auth login` hits a rate-limited whoami call.
           docker exec sgl_kernel_nightly /miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
-          docker exec sgl_kernel_nightly /miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub scipy tabulate
-          docker exec sgl_kernel_nightly /bin/bash -c '/miniforge3/envs/py3.12/bin/hf auth login --token ${HF_TOKEN}'
+          docker exec sgl_kernel_nightly /miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
           docker exec sgl_kernel_nightly /bin/bash -c "ln -sf /miniforge3/envs/py3.12/bin/python3 /usr/bin/python3"
 
       - name: Verify pre-installed sgl-kernel wheel

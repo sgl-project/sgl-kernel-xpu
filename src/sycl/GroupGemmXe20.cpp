@@ -171,12 +171,19 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   int total_m = activations.sizes()[0];
   int gemm_k = activations.sizes()[1];
   auto weights_shape = weights.sizes().vec();
-  int gemm_n = weights.sizes()[1];
-  int avg_m = total_m / n_experts;
-
-  TORCH_CHECK(weights_shape.size() == 3, "weights must be 3D");
+  TORCH_CHECK(weights_shape.size() == 3, "weights must be 3D [E, K, N]");
+  TORCH_CHECK(n_experts > 0, "n_experts must be positive");
   TORCH_CHECK(weights_shape[0] == n_experts, "weights must have n_experts as the first dimension");
-  TORCH_CHECK(weights_shape[1] == gemm_n, "weights must be gemm_n * gemm_k");
+  TORCH_CHECK(
+      weights_shape[1] == gemm_k,
+      "weights must be column-major [E, K, N] with K=",
+      gemm_k,
+      ", got shape: ",
+      weights.sizes());
+
+  int gemm_n = weights.sizes()[2];
+  int avg_m = total_m / n_experts;
+  int ld_b = static_cast<int>(weights.stride(1));
   TORCH_CHECK(
       weights_shape[0] == total_rows_for_experts.size(0),
       "rows_for_experts must have the same size as the first dimension of weights");
@@ -190,7 +197,10 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   } else {
     TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
   }
-  TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
+  TORCH_CHECK(
+      !(fuse_act && activation_type == static_cast<int64_t>(ActivationType::SWIGLU_GPT_OSS)),
+      "moe_grouped_mm_nt_xe20: SWIGLU_GPT_OSS does not support fused activation in column-major layout; use "
+      "fuse_act=false");
   if (bias.has_value()) {
     TORCH_CHECK(
         bias->scalar_type() == at::kFloat,
@@ -221,7 +231,6 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
-  int ld_b = static_cast<int>(weights.stride(1));
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // Grouped GEMM: sum over experts of (m_e, K) @ (K, N). Total M rows summed as total_m.

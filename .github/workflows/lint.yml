@@ -11,7 +11,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: "3.10"
+          # Match the interpreter the Docker image / CI containers build and
+          # test with (Dockerfile.xpu_kernel ARG PYTHON_VERSION=3.12) so lint
+          # never disagrees with the environment the code actually runs in.
+          python-version: "3.12"
 
       - name: Install pre-commit hook
         run: |

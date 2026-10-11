@@ -8,6 +8,11 @@ sglang-kernel-xpu is the official kernel library of the [SGLang](https://github.
 
 Currently we only support building from source. To use on Intel GPUs, you need to install the Intel GPUs driver first. For installation guide, visit [Intel GPUs Driver Installation](https://www.intel.com/content/www/us/en/developer/articles/tool/pytorch-prerequisites-for-intel-gpu/2-8.html#driver-installation).
 
+**Python 3.12 is required.** It is the only interpreter this package is built,
+tested and released against: the `intel/sgl-kernel-xpu-dev` image, both CI
+workflows and the published wheel all use 3.12. Older versions are rejected at
+install time rather than silently advertised as supported.
+
 ## Build from source
 
 Development build:

@@ -13,6 +13,12 @@ jobs:
     if: github.repository == 'sgl-project/sgl-kernel-xpu'
     runs-on: sglang-bmg
     environment: 'prod'
+    env:
+      # The interpreter baked into the published image. pr-test-xpu.yml and
+      # sgl-kernel-nightly.yml consume /miniforge3/envs/py<PYTHON_VERSION> from
+      # it, so pass it explicitly instead of inheriting the Dockerfile default:
+      # a silent default change there would break those workflows at runtime.
+      PYTHON_VERSION: "3.12"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -52,6 +58,7 @@ jobs:
             -f sgl-kernel-xpu-nightly-build/Dockerfile.xpu_kernel \
             --build-arg SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git \
             --build-arg SG_LANG_KERNEL_BRANCH=main \
+            --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
             --no-cache --progress=plain \
             -t "intel/sgl-kernel-xpu-dev:${{ env.IMAGE_TAG }}" \
             -t "intel/sgl-kernel-xpu-dev:latest"

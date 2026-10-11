@@ -20,6 +20,13 @@ jobs:
       contents: write
       pull-requests: write
     runs-on: sglang-bmg
+    env:
+      # Must match ARG PYTHON_VERSION in Dockerfile.xpu_kernel: the conda env
+      # baked into intel/sgl-kernel-xpu-dev is named py<PYTHON_VERSION> and
+      # lives at /miniforge3/envs/py<PYTHON_VERSION>. Declared once here so a
+      # future interpreter bump is a one-line change instead of a hunt for
+      # hardcoded paths that fail at runtime with "No such file or directory".
+      PYTHON_VERSION: "3.12"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -47,11 +54,11 @@ jobs:
           # the PR was in flight.
           PR_MERGE_REF: refs/pull/${{ github.event.pull_request.number }}/merge
         run: |
-          docker exec -e PR_MERGE_REF="${PR_MERGE_REF}" ci_sglkernel_xpu \
+          docker exec -e PR_MERGE_REF="${PR_MERGE_REF}" -e PYTHON_VERSION="${PYTHON_VERSION}" ci_sglkernel_xpu \
             /bin/bash -c '\
               set -exo pipefail && \
               . /miniforge3/bin/activate && \
-              conda activate py3.12 && \
+              conda activate py${PYTHON_VERSION} && \
               cd /root/sglang/sgl-kernel-xpu && \
               git remote set-url origin https://github.com/sgl-project/sgl-kernel-xpu.git && \
               git fetch --depth=1 origin "${PR_MERGE_REF}" && \
@@ -70,16 +77,18 @@ jobs:
       - name: Install Dependency
         timeout-minutes: 20
         run: |
-          docker exec ci_sglkernel_xpu /miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
-          docker exec ci_sglkernel_xpu /miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub
-          docker exec ci_sglkernel_xpu /bin/bash -c '/miniforge3/envs/py3.12/bin/hf auth login --token ${HF_TOKEN} '
-          docker exec ci_sglkernel_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.12/bin/python3 /usr/bin/python3"
+          docker exec ci_sglkernel_xpu /miniforge3/envs/py${PYTHON_VERSION}/bin/python3 -m pip install --upgrade pip
+          docker exec ci_sglkernel_xpu /miniforge3/envs/py${PYTHON_VERSION}/bin/python3 -m pip install pytest expecttest ray huggingface_hub
+          # Single-quoted so ${HF_TOKEN} expands inside the container; ${PYTHON_VERSION}
+          # therefore has to be handed in explicitly rather than expanded by the runner.
+          docker exec -e PYTHON_VERSION="${PYTHON_VERSION}" ci_sglkernel_xpu /bin/bash -c '/miniforge3/envs/py${PYTHON_VERSION}/bin/hf auth login --token ${HF_TOKEN} '
+          docker exec ci_sglkernel_xpu /bin/bash -c "ln -sf /miniforge3/envs/py${PYTHON_VERSION}/bin/python3 /usr/bin/python3"
 
       - name: Run Sglang Kernel Cases
         timeout-minutes: 70
         run: |
           docker exec -w /root/sglang ci_sglkernel_xpu \
-            /bin/bash -c "cd /root/sglang/sgl-kernel-xpu/tests && /miniforge3/envs/py3.12/bin/python3 -m pip install scipy && \
+            /bin/bash -c "cd /root/sglang/sgl-kernel-xpu/tests && /miniforge3/envs/py${PYTHON_VERSION}/bin/python3 -m pip install scipy && \
                           python3 run_suite.py --suite per-commit "
 
       - name: Run Sglang Kernel Benchmarks
@@ -90,7 +99,7 @@ jobs:
           docker exec -w /root/sglang ci_sglkernel_xpu \
             /bin/bash -c "\
                set -exo pipefail && \
-               /miniforge3/envs/py3.12/bin/python3 -m pip install tabulate && \
+               /miniforge3/envs/py${PYTHON_VERSION}/bin/python3 -m pip install tabulate && \
                cd /root/sglang/sgl-kernel-xpu/benchmark && \
                python3 run_suite.py --suite per-commit "
 

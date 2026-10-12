@@ -151,10 +151,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "apply_routed_scaling_factor_on_output) -> ()");
   m.impl("biased_topk", torch::kXPU, &at::native::xpu::biased_topk);
 
+#if SYCL_INTEL_TARGET == 35
   m.def(
       "inkling_vocab_parallel_embedding(Tensor(a!) out, Tensor ids, Tensor weight, "
       "int vocab_start, int vocab_end) -> ()");
   m.impl("inkling_vocab_parallel_embedding", torch::kXPU, &inkling_vocab_parallel_embedding);
+#endif  // SYCL_INTEL_TARGET == 35
   m.def(
       "rotary_embedding(Tensor positions, Tensor query, Tensor key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> (Tensor, Tensor)");
@@ -336,6 +338,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state", torch::kXPU, &merge_state);
 
+#if SYCL_INTEL_TARGET == 35
   /*
    * Inkling short convolution
    */
@@ -422,6 +425,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int q_off, int k_off, int v_off, int dq, int dkv, bool silu_activation, "
       "bool use_residual, bool do_store, bool do_cache_update) -> (Tensor, Tensor, Tensor)");
   m.impl("inkling_attn_prologue_extend", torch::kXPU, &inkling_attn_prologue_extend);
+#endif  // SYCL_INTEL_TARGET == 35
 
   /*
    * From cutlass attention

@@ -1,0 +1,178 @@
+#if SYCL_INTEL_TARGET != 35
+#error "Inkling routed SiLU is a CRI-only kernel"
+#endif
+
+#include <ATen/ATen.h>
+#include <ATen/OpMathType.h>
+#include <ATen/Parallel.h>
+#include <c10/xpu/XPUStream.h>
+#include <torch/all.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <sycl/sycl.hpp>
+#include <vector>
+
+#include "MemoryAccess.h"
+#include "SYCLHelpers.h"
+#include "Utils.h"
+#include "sgl_kernel_export.h"
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include <cutlass/util/GPU_Clock.hpp>
+#endif
+
+
+namespace {
+
+template <typename scalar_t, typename accscalar_t>
+struct silu_mul_dpcpp_functor {
+  scalar_t operator()(scalar_t a, scalar_t b) const {
+    return (accscalar_t(a)) / (1.0f + expf(accscalar_t(-a))) * accscalar_t(b);
+  }
+};
+
+template <typename scalar_t, typename func_t, int N>
+struct op_and_mul_functor {
+  void operator()(sycl::nd_item<1> item) const {
+    using accscalar_t = at::opmath_type<scalar_t>;
+    int64_t offset = item.get_local_linear_id();
+    int64_t step = item.get_local_range(0);
+    int64_t token_id = item.get_group(0);
+    func_t fn;
+    int64_t bound = dim / N;
+    for (int64_t i = offset; i < bound; i += step) {
+      auto unary_val = reinterpret_cast<aligned_vector_loop<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i];
+      auto mul_val = reinterpret_cast<aligned_vector_loop<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i + bound];
+#pragma unroll
+      for (int i = 0; i < N; ++i) {
+        auto a = unary_val[i], b = mul_val[i];
+        unary_val[i] = fn(unary_val[i], mul_val[i]);
+      }
+      reinterpret_cast<aligned_vector_loop<scalar_t, N>*>(output_ptr)[token_id * bound + i] = unary_val;
+    }
+  }
+
+  scalar_t* input_ptr;
+  scalar_t* output_ptr;
+  int64_t num_;
+  int64_t dim;
+};
+
+#define VEC_LAUNCH(KERNEL, N)                                                \
+  case N: {                                                                  \
+    op_and_mul_functor<T_to, KERNEL<T_to, accscalar_t>, N> kfn = {           \
+        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim}; \
+    sycl_kernel_submit(num_group* wg_size, wg_size, q, kfn);                 \
+    break;                                                                   \
+  }
+
+template <typename T = float>
+void get_config(
+    const at::Tensor& input,
+    const at::Tensor& out,
+    int64_t& numel,
+    int64_t& dim,
+    int64_t& wg_size,
+    int64_t& num_group,
+    int& vec_size) {
+  auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
+  int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
+  numel = out.numel();
+  dim = out.size(-1);
+  int64_t tokens = numel / dim;
+  wg_size = std::min(dim, max_wg_size);
+  num_group = tokens;
+
+  vec_size = sizeof(float) * 4 / sizeof(T);
+  while ((vec_size >> 1) * wg_size >= dim) {
+    vec_size = vec_size >> 1;
+  }
+  if (dim % vec_size != 0) vec_size = 1;
+}
+
+template <typename T_to = float, typename T_from = float>
+void silu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
+  auto _input = reinterpret_cast<T_to*>(input.data_ptr<T_from>());
+  auto _out = reinterpret_cast<T_to*>(out.data_ptr<T_from>());
+
+  int64_t numel;
+  int64_t dim;
+  int64_t wg_size;
+  int64_t num_group;
+  int vec_size;
+  get_config<T_to>(input, out, numel, dim, wg_size, num_group, vec_size);
+  // Device-time B60 comparisons against the original dispatch show vec4 wins
+  // for large batches with widths 768 and 2048 (0.66->0.34-0.37 ms and
+  // 0.36->0.31 ms), while width 4096 regresses (0.60->0.65-0.71 ms).
+  // The bounds below select the large-batch, at-most-two-vec4-passes region.
+  if (vec_size < 4 && num_group >= 8 * wg_size && dim % 4 == 0 && wg_size >= 256) {
+    const int64_t vec4_wg_size = std::min<int64_t>(256, dim / 4);
+    if (dim / 4 <= 2 * vec4_wg_size) {
+      vec_size = 4;
+      wg_size = vec4_wg_size;
+    }
+  }
+
+  using accscalar_t = at::opmath_type<T_to>;
+  switch (vec_size) {
+    VEC_LAUNCH(silu_mul_dpcpp_functor, 1);
+    VEC_LAUNCH(silu_mul_dpcpp_functor, 2);
+    VEC_LAUNCH(silu_mul_dpcpp_functor, 4);
+    VEC_LAUNCH(silu_mul_dpcpp_functor, 8);
+    VEC_LAUNCH(silu_mul_dpcpp_functor, 16);
+    default:
+      TORCH_CHECK(false, "Unsupported vector size: ", vec_size);
+  }
+
+  return;
+}
+
+}  // namespace
+
+SGL_KERNEL_EXPORT void silu_and_mul(at::Tensor& out, at::Tensor& input) {
+  input = input.contiguous();
+  out = out.contiguous();
+
+  auto stream = at::xpu::getCurrentXPUStream();
+  auto queue = stream.queue();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
+  if (input.scalar_type() == at::ScalarType::Half) {
+    silu_and_mul_sycl<sycl::half, at::Half>(queue, input, out);
+  } else {
+    silu_and_mul_sycl<sycl::ext::oneapi::bfloat16, at::BFloat16>(queue, input, out);
+  }
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  queue.wait();
+  const double elapsed_s = timer.seconds();
+  const double out_elems = static_cast<double>(out.numel());
+  // silu(gate)*value: sigmoid (~4 flops) + mul + mul = ~6 flops per output element.
+  const double flops = 6.0 * out_elems;
+  const double bytes =
+      2.0 * out_elems * static_cast<double>(input.element_size()) + out_elems * static_cast<double>(out.element_size());
+  const double tflops = elapsed_s > 0.0 ? (flops * 1e-12) / elapsed_s : 0.0;
+  const double gbps = elapsed_s > 0.0 ? (bytes * 1e-9) / elapsed_s : 0.0;
+  ::printf(
+      "silu_and_mul perf(gpu_clock): time=%.9f ms (%.3f us), bandwidth=%.6f GB/s, "
+      "compute=%.6f TFLOPS (%.3f GFLOPS)\n",
+      elapsed_s * 1000.0,
+      elapsed_s * 1e6,
+      gbps,
+      tflops,
+      tflops * 1e3);
+  if (elapsed_s <= 0.0) {
+    ::printf(
+        "silu_and_mul perf(gpu_clock): unavailable (reported 0). Check SYCL profiling event path and "
+        "CUTLASS_SYCL_PROFILING_ENABLED build flag.\n");
+  }
+#endif
+  return;
+}

@@ -30,12 +30,16 @@
     DPCPP_KER_PRINTF(fmt_var, ##__VA_ARGS__); \
   }
 
+// CRI uses the Inkling-tuned implementation in InklingRoutedSiluXe35.cpp.
+#if SYCL_INTEL_TARGET != 35
 template <typename scalar_t, typename accscalar_t>
 struct silu_mul_dpcpp_functor {
   scalar_t operator()(scalar_t a, scalar_t b) const {
     return (accscalar_t(a)) / (1.0f + expf(accscalar_t(-a))) * accscalar_t(b);
   }
 };
+
+#endif  // SYCL_INTEL_TARGET != 35
 
 template <typename scalar_t, typename accscalar_t>
 struct gelu_tanh_mul_dpcpp_functor {
@@ -115,6 +119,7 @@ void get_config(
   if (dim % vec_size != 0) vec_size = 1;
 }
 
+#if SYCL_INTEL_TARGET != 35
 template <typename T_to = float, typename T_from = float>
 void silu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   auto _input = reinterpret_cast<T_to*>(input.data_ptr<T_from>());
@@ -126,17 +131,6 @@ void silu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   int64_t num_group;
   int vec_size;
   get_config<T_to>(input, out, numel, dim, wg_size, num_group, vec_size);
-  // Device-time B60 comparisons against the original dispatch show vec4 wins
-  // for large batches with widths 768 and 2048 (0.66->0.34-0.37 ms and
-  // 0.36->0.31 ms), while width 4096 regresses (0.60->0.65-0.71 ms).
-  // The bounds below select the large-batch, at-most-two-vec4-passes region.
-  if (vec_size < 4 && num_group >= 8 * wg_size && dim % 4 == 0 && wg_size >= 256) {
-    const int64_t vec4_wg_size = std::min<int64_t>(256, dim / 4);
-    if (dim / 4 <= 2 * vec4_wg_size) {
-      vec_size = 4;
-      wg_size = vec4_wg_size;
-    }
-  }
 
   using accscalar_t = at::opmath_type<T_to>;
   switch (vec_size) {
@@ -196,6 +190,8 @@ SGL_KERNEL_EXPORT void silu_and_mul(at::Tensor& out, at::Tensor& input) {
 #endif
   return;
 }
+
+#endif  // SYCL_INTEL_TARGET != 35
 
 template <typename T_to = float, typename T_from = float>
 void gelu_tanh_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {

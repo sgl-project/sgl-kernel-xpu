@@ -214,16 +214,9 @@ foreach(sycl_src ${ATen_XPU_SYCL_XE20})
     set(_lib_srcs ${sycl_src})
   endif()
 
-  set(_xe20_offline_flags "${XE20_OFFLINE_COMPILER_FLAGS}")
-  if(_src_name STREQUAL "InklingDenseMlpXe20")
-    # The 512x128 production tile uses 128 FP32 accumulator GRFs per
-    # subgroup. Force the spill-free 256-GRF mode used by the tuning sweep.
-    string(APPEND _xe20_offline_flags
-      " -options -cl-intel-256-GRF-per-thread")
-  endif()
   sycl_add_library(
     ${sycl_lib}
-    ${_xe20_offline_flags}
+    ${XE20_OFFLINE_COMPILER_FLAGS}
     ${COMMON_DEVICE_LINK_FLAGS}
     SHARED
     SYCL_SOURCES ${_lib_srcs})

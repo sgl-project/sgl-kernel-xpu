@@ -1,4 +1,4 @@
-#define SYCL_INTEL_TARGET 20
+#define SYCL_INTEL_TARGET 35
 
 #include <ATen/ATen.h>
 #include <ATen/xpu/XPUContext.h>

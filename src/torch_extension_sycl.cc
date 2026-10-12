@@ -332,6 +332,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state", torch::kXPU, &merge_state);
 
+#if SYCL_INTEL_TARGET == 35
   /*
    * Inkling short convolution
    */
@@ -418,6 +419,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int q_off, int k_off, int v_off, int dq, int dkv, bool silu_activation, "
       "bool use_residual, bool do_store, bool do_cache_update) -> (Tensor, Tensor, Tensor)");
   m.impl("inkling_attn_prologue_extend", torch::kXPU, &inkling_attn_prologue_extend);
+
+#endif  // SYCL_INTEL_TARGET == 35
 
   /*
    * From cutlass attention

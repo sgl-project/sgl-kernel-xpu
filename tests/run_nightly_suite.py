@@ -116,6 +116,10 @@ NIGHTLY_BENCHMARKS: List[Entry] = [
         tee_log="bench_scatter_tokens_to_experts.py.log",
     ),
     Entry("bench_top_k_renorm_probs.py", tee_log="bench_top_k_renorm_probs.py.log"),
+    Entry(
+        "bench_scale_residual_norm_scale_shift.py",
+        tee_log="bench_scale_residual_norm_scale_shift.py.log",
+    ),
     Entry("bench_hc_split_sinkhorn.py", tee_log="bench_hc_split_sinkhorn.py.log"),
     Entry("bench_hc_pre_fuse.py", tee_log="bench_hc_pre_fuse.py.log"),
     Entry("bench_embedding_lora_a_fwd.py", tee_log="bench_embedding_lora_a_fwd.py.log"),

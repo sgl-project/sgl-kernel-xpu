@@ -27,6 +27,15 @@ def is_xe2_device() -> bool:
     return is_xe2_arch()
 
 
+@functools.lru_cache(maxsize=1)
+def is_xe3_device() -> bool:
+    if not torch.xpu.is_available():
+        return False
+    from sgl_kernel.utils import is_xe3_arch
+
+    return is_xe3_arch()
+
+
 def get_reference_device():
     """Reference device for eager PyTorch baselines."""
     return get_device() if is_xe2_device() else torch.device("cpu")

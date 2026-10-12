@@ -50,6 +50,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
+  m.def(
+      "fused_scale_residual_norm_scale_shift(Tensor residual, Tensor x, Tensor? gate, Tensor? weight, "
+      "Tensor? bias, Tensor scale, Tensor shift, float eps) -> (Tensor, Tensor)");
+  m.impl("fused_scale_residual_norm_scale_shift", torch::kXPU, &at::native::xpu::fused_scale_residual_norm_scale_shift);
+
   m.def("hadamard_transform(Tensor input, float scale=1.0) -> Tensor");
   m.impl("hadamard_transform", torch::kXPU, &at::native::xpu::hadamard_transform);
 
@@ -96,6 +101,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor candidates, Tensor retrive_index, Tensor retrive_next_token, "
       "Tensor retrive_next_sibling, Tensor target_predict) -> ()");
   m.impl("verify_tree_greedy", torch::kXPU, &verify_tree_greedy);
+
+  /*
+   * Speculative decoding (NGRAM)
+   */
+  m.def(
+      "reconstruct_indices_from_tree_mask(Tensor tree_mask, Tensor verified_seq_len, "
+      "Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
+      "Tensor! retrive_next_sibling, int batch_size, int draft_token_num) -> ()");
+  m.impl("reconstruct_indices_from_tree_mask", torch::kXPU, &reconstruct_indices_from_tree_mask);
 
   /*
    * Fast radix top-k (DeepSeek V3.2 indexer)
@@ -253,9 +267,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("moe_grouped_mm_nt_xe20_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe20_w4a16);
 
   m.def(
-      "moe_grouped_mm_nt_xe20_fp8_w8a16(Tensor! output, Tensor activations, Tensor weights, "
+      "moe_grouped_mm_nt_xe20_w8a16(Tensor! output, Tensor activations, Tensor weights, "
       "Tensor weight_scales, Tensor? bias, Tensor total_rows_for_experts, int n_experts) -> ()");
-  m.impl("moe_grouped_mm_nt_xe20_fp8_w8a16", torch::kXPU, &moe_grouped_mm_nt_xe20_fp8_w8a16);
+  m.impl("moe_grouped_mm_nt_xe20_w8a16", torch::kXPU, &moe_grouped_mm_nt_xe20_w8a16);
 #endif  // Xe20 only kernels
 
 // Xe35 (CRI) only kernels
@@ -265,6 +279,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, "
       "float gemm1_alpha=1.702, float gemm1_limit=7.0) -> ()");
   m.impl("moe_grouped_mm_nt_xe35", torch::kXPU, &moe_grouped_mm_nt_xe35);
+  m.def(
+      "moe_grouped_mm_nt_xe35_mxfp4_w4a16(Tensor! output, Tensor activations, Tensor packed_weights, Tensor scales, "
+      "Tensor? bias, Tensor total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, "
+      "float gemm1_alpha=1.702, float gemm1_limit=7.0) -> ()");
+  m.impl("moe_grouped_mm_nt_xe35_mxfp4_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe35_mxfp4_w4a16);
   m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   m.impl("dsv3_router_gemm", torch::kXPU, &dsv3_router_gemm_xpu);
   m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
@@ -273,31 +292,22 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
       "bias) -> Tensor");
   m.impl("fp8_scaled_mm", torch::kXPU, &fp8_scaled_mm_xpu);
-
   m.def(
-      "moe_grouped_mm_nt_xe35_mxfp4_w4a16(Tensor! output, Tensor activations, Tensor packed_weights, Tensor scales, "
-      "Tensor? bias, Tensor total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, "
-      "float gemm1_alpha=1.702, float gemm1_limit=7.0) -> ()");
-  m.impl("moe_grouped_mm_nt_xe35_mxfp4_w4a16", torch::kXPU, &moe_grouped_mm_nt_xe35_mxfp4_w4a16);
-
-  // TEMPORARY: the mxfp4_blockwise_scaled_grouped_mm / fp8_blockwise_scaled_grouped_mm
-  // *kernels* (src/sycl/xe35/blockwise_moe_mxfp{4,8}.cpp) are excluded from the
-  // CRI build (see src/CMakeLists.txt) because they require a cutlass
-  // kernel-level specialization not yet available in the publicly pinned
-  // sycl-tla commit.
-#ifdef SGL_MOE_XE35_BLOCKWISE_SCALED
+      "fp8_blockwise_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype)"
+      " -> Tensor");
+  m.impl("fp8_blockwise_scaled_mm", torch::kXPU, &fp8_blockwise_scaled_mm);
   m.def(
       "mxfp4_blockwise_scaled_grouped_mm(Tensor! output, Tensor! a_ptrs, Tensor! b_ptrs, Tensor! out_ptrs, "
       "Tensor! a_scales_ptrs, Tensor! b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, "
       "Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> ()");
+  m.impl("mxfp4_blockwise_scaled_grouped_mm", torch::kXPU, &mxfp4_blockwise_scaled_grouped_mm);
+
   m.def(
       "fp8_blockwise_scaled_grouped_mm(Tensor! output, Tensor! a_ptrs, Tensor! b_ptrs, Tensor! out_ptrs, "
       "Tensor! a_scales_ptrs, Tensor! b_scales_ptrs, Tensor a, Tensor b, Tensor scales_a, Tensor scales_b, "
       "Tensor stride_a, Tensor stride_b, Tensor stride_c, Tensor layout_sfa, Tensor layout_sfb, "
       "Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> ()");
-  m.impl("mxfp4_blockwise_scaled_grouped_mm", torch::kXPU, &mxfp4_blockwise_scaled_grouped_mm);
   m.impl("fp8_blockwise_scaled_grouped_mm", torch::kXPU, &fp8_blockwise_scaled_grouped_mm);
-#endif  // SGL_MOE_XE35_BLOCKWISE_SCALED
 #endif  // Xe35 only kernels
 
   m.def(
@@ -445,7 +455,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor(a!)  out,"
       "    Tensor(b!)?  softmax_lse,"
       "    Tensor?  rel_bias=None,"
-      "    bool     rel_bias_is_sheared=False) -> ()");
+      "    bool     rel_bias_is_sheared=False,"
+      "    Tensor?  bidirectional_block_ids=None) -> ()");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 #endif  // USE_FMHA
 
@@ -619,6 +630,15 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor seg_indptr, Tensor weight_indices, Tensor lora_ranks, Tensor scalings, Tensor? seg_lens, "
       "Tensor? base_output) -> ()");
   m.impl("gate_up_lora_b_fwd", torch::kXPU, &gate_up_lora_b_fwd);
+  m.def(
+      "chunked_sgmv_lora_shrink_fwd(Tensor! output, Tensor x, Tensor weights, int num_slices, int num_segments, "
+      "Tensor seg_indptr, Tensor weight_indices, Tensor lora_ranks, Tensor? permutation) -> ()");
+  m.impl("chunked_sgmv_lora_shrink_fwd", torch::kXPU, &chunked_sgmv_lora_shrink_fwd);
+  m.def(
+      "chunked_sgmv_lora_expand_fwd(Tensor! output, Tensor x, Tensor weights, Tensor slice_offsets, "
+      "int max_slice_size, int num_slices, int num_segments, Tensor seg_indptr, Tensor weight_indices, "
+      "Tensor lora_ranks, Tensor scalings, Tensor? permutation, Tensor? base_output) -> ()");
+  m.impl("chunked_sgmv_lora_expand_fwd", torch::kXPU, &chunked_sgmv_lora_expand_fwd);
 
   /* NSA (Native Sparse Attention) indexer scoring */
   // fp8_mqa_logits (prefill) is implemented in pure Python via sgl_kernel.nsa.

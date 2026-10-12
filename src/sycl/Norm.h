@@ -10,6 +10,29 @@
 namespace at::native::xpu {
 
 constexpr int NUM_REDUCE_STAGES = 16;
+// Register-cached rows keep at most this many vectors per work-item; beyond it they spill.
+constexpr int kMaxCachedIters = 8;
+
+// Workgroup cap for a one-workgroup-per-row norm. A bf16 row of 8192 needs 1024 lanes, so the
+// default cap forces two passes. A 1024-lane workgroup at sub-group size 16 needs 64 hardware
+// threads, a whole Xe-core on Xe2, so one wide pass wins only while every row fits in a single wave;
+// past that it adds a wave. Measured on Arc Pro B60 (20 Xe-cores): -26% device time at 1-20 rows.
+constexpr int kDefaultRowWorkgroupCap = 512;
+constexpr int kWideRowWorkgroupCap = 1024;
+
+// How many kWideRowWorkgroupCap-lane workgroups the device holds at once; 20 on Arc Pro B60.
+inline int wide_rows_per_wave(DeviceId dev_id) {
+  const int64_t threads_per_core = dpcppGpuEuCountPerSubslice(dev_id) * dpcppGpuHWThreadsPerEU(dev_id);
+  const int64_t threads_per_workgroup = kWideRowWorkgroupCap / NUM_REDUCE_STAGES;
+  return static_cast<int>(dpcppGpuSubsliceCount(dev_id) * (threads_per_core / threads_per_workgroup));
+}
+
+inline int max_workgroup_for_row(int device_max_wg, int plane_vecs, int batch, int rows_per_wave) {
+  const bool wide_removes_a_pass = plane_vecs > kDefaultRowWorkgroupCap;
+  const bool fits_one_wave = batch <= rows_per_wave;
+  return std::min(
+      device_max_wg, (wide_removes_a_pass && fits_one_wave) ? kWideRowWorkgroupCap : kDefaultRowWorkgroupCap);
+}
 
 inline std::tuple<int64_t, int64_t> _check_layer_norm_inputs(
     const torch::Tensor& input,
@@ -178,6 +201,73 @@ class NormConfig {
     }
   }
 
+  // Launch config for contiguous inputs with one workgroup per row. Produces the same geometry as
+  // get_workgroup_size_single_wg_per_row, without its per-call device-property queries.
+  struct FastRowTag {};
+  NormConfig(FastRowTag, int Batch_, int Plane_, int element_size_bytes_, int vec, int batch_stride)
+      : Batch(Batch_),
+        Plane(Plane_),
+        WGPlane(Plane_),
+        problem_dim(1),
+        element_size_bytes(element_size_bytes_),
+        max_vec_size(vec),
+        block_row(0),
+        workgroup_num(Batch_),
+        workgroup_num_foreach(1),
+        update_vec_size(vec),
+        input_batch_stride(batch_stride),
+        output_batch_stride(batch_stride),
+        input_inner0_size(1),
+        input_inner0_stride(0),
+        output_inner0_size(1),
+        output_inner0_stride(0),
+        input_inner1_size(1),
+        input_inner1_stride(0),
+        output_inner1_size(1),
+        output_inner1_stride(0),
+        semaphores_ptr(nullptr),
+        scratchpad_ptr(nullptr),
+        sub_group_num_global(1) {
+    // Cache the device properties per device; the cap depends on row width and batch, so it is per call.
+    // Keyed on the current device because that is whose queue the kernel is submitted to.
+    static thread_local DeviceId cached_device = -1;
+    static thread_local int cached_device_max_wg = 0;
+    static thread_local int cached_total_resource = 0;
+    static thread_local int cached_wide_rows_per_wave = 0;
+    const DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue();
+    if (dev_id != cached_device) {
+      cached_device = dev_id;
+      cached_device_max_wg = static_cast<int>(dpcppMaxWorkGroupSize(dev_id));
+      cached_wide_rows_per_wave = wide_rows_per_wave(dev_id);
+      cached_total_resource = static_cast<int>(dpcppMaxWorkItemsPerTile(dev_id)) /
+                              static_cast<int>(dpcppMaxSubGroupSize(dev_id)) * NUM_REDUCE_STAGES;
+    }
+
+    const int plane_vecs = (Plane_ + vec - 1) / vec;
+    const int max_wg = max_workgroup_for_row(cached_device_max_wg, plane_vecs, Batch_, cached_wide_rows_per_wave);
+    workgroup_size = (plane_vecs + NUM_REDUCE_STAGES - 1) / NUM_REDUCE_STAGES * NUM_REDUCE_STAGES;
+    workgroup_size = std::min(workgroup_size, max_wg);
+
+    workgroup_size =
+        occupancy_limited_workgroup(workgroup_size, WGPlane, vec, Batch_, cached_total_resource, kMaxCachedIters);
+    sub_group_num = workgroup_size / NUM_REDUCE_STAGES;
+  }
+
+  // Reduce WG size to improve occupancy: only when the device cannot concurrently
+  // hold half the batch at the current WG size. Floor at 4 subgroups (64
+  // work-items) to maintain adequate per-row reduction throughput — below
+  // this each WG has too few SIMD threads to utilize XVEs effectively.
+  static int occupancy_limited_workgroup(
+      int workgroup_size, int wg_plane, int vec_size, int batch, int total_resource, int max_cached_iters) {
+    int iters = (wg_plane + workgroup_size * vec_size - 1) / (workgroup_size * vec_size);
+    while ((iters << 1) <= max_cached_iters && (total_resource / workgroup_size) < (batch >> 1) &&
+           (workgroup_size >> 1) >= NUM_REDUCE_STAGES * 4) {
+      workgroup_size = workgroup_size >> 1;
+      iters = (wg_plane + workgroup_size * vec_size - 1) / (workgroup_size * vec_size);
+    }
+    return std::max(workgroup_size, NUM_REDUCE_STAGES);
+  }
+
   void get_max_vec_size() {
     auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
     int total_resource = dpcppMaxWorkItemsPerTile(dev_id);
@@ -283,7 +373,8 @@ class NormConfig {
   //   - The vec_size policy is provided by callback to keep per-kernel
   //     alignment rules close to the corresponding forward functor.
   template <typename GetUpdateVecSizeFn>
-  void get_workgroup_size_single_wg_per_row(GetUpdateVecSizeFn get_update_vec_size, int max_cached_iters = 8) {
+  void
+  get_workgroup_size_single_wg_per_row(GetUpdateVecSizeFn get_update_vec_size, int max_cached_iters = kMaxCachedIters) {
     constexpr int float4_size = sizeof(float) * 4;
     max_vec_size = float4_size / element_size_bytes;
     update_vec_size = get_update_vec_size(WGPlane, max_vec_size);
@@ -293,35 +384,41 @@ class NormConfig {
     }
 
     auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
-    int max_wg_size = static_cast<int>(dpcppMaxWorkGroupSize(dev_id));
-    if constexpr (NUM_REDUCE_STAGES == 16) {
-      // See the note of max_workgroup_size in get_workgroup_size
-      max_wg_size = std::min(max_wg_size, 512);
-    }
     int total_resource = static_cast<int>(dpcppMaxWorkItemsPerTile(dev_id)) /
                          static_cast<int>(dpcppMaxSubGroupSize(dev_id)) * NUM_REDUCE_STAGES;
 
-    // Start with the smallest WG that covers all vector lanes, capped at max.
+    // Start with the smallest WG that covers all vector lanes, capped at max. The cap depends on the
+    // row width and the batch, so plane_vecs has to be known first -- see max_workgroup_for_row.
     int plane_vecs = (Plane + update_vec_size - 1) / update_vec_size;
+    const int max_wg_size = max_workgroup_for_row(
+        static_cast<int>(dpcppMaxWorkGroupSize(dev_id)), plane_vecs, Batch, wide_rows_per_wave(dev_id));
     workgroup_size = (plane_vecs + NUM_REDUCE_STAGES - 1) / NUM_REDUCE_STAGES * NUM_REDUCE_STAGES;
     workgroup_size = std::min(workgroup_size, max_wg_size);
 
-    int iters = (WGPlane + workgroup_size * update_vec_size - 1) / (workgroup_size * update_vec_size);
-
-    // Reduce WG size to improve occupancy: only when the device cannot concurrently
-    // hold half the batch at the current WG size. Floor at 4 subgroups (64
-    // work-items) to maintain adequate per-row reduction throughput — below
-    // this each WG has too few SIMD threads to utilize XVEs effectively.
-    while ((iters << 1) <= max_cached_iters && (total_resource / workgroup_size) < (Batch >> 1) &&
-           (workgroup_size >> 1) >= NUM_REDUCE_STAGES * 4) {
-      workgroup_size = workgroup_size >> 1;
-      iters = (WGPlane + workgroup_size * update_vec_size - 1) / (workgroup_size * update_vec_size);
-    }
-
-    workgroup_size = std::max(workgroup_size, NUM_REDUCE_STAGES);
+    workgroup_size =
+        occupancy_limited_workgroup(workgroup_size, WGPlane, update_vec_size, Batch, total_resource, max_cached_iters);
     sub_group_num = workgroup_size / NUM_REDUCE_STAGES;
   }
 };
+
+// Launch params for the contiguous fast path. Every inner size/stride is a compile-time constant,
+// so compute_row_offset folds its integer div/mod (Xe has no hardware divide) to row * batch_stride.
+struct NormFastParams {
+  int Plane;
+  int workgroup_size;
+  int input_batch_stride;
+  int output_batch_stride;
+
+  static constexpr int input_inner0_size = 1;
+  static constexpr int input_inner0_stride = 0;
+  static constexpr int output_inner0_size = 1;
+  static constexpr int output_inner0_stride = 0;
+  static constexpr int input_inner1_size = 1;
+  static constexpr int input_inner1_stride = 0;
+  static constexpr int output_inner1_size = 1;
+  static constexpr int output_inner1_stride = 0;
+};
+static_assert(sizeof(NormFastParams) == 4 * sizeof(int), "only the four live ints should be stored");
 
 bool canUse32BitIndexMath(const at::Tensor& t, int64_t max_elem) {
   int64_t elements = t.numel();

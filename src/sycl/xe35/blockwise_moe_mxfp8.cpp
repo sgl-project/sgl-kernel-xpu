@@ -69,7 +69,9 @@ struct BlockScaledMoETypes {
       ThreadLayout>::TiledMMA;
 
   static constexpr int PipelineStages = 2;
-  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16BlockScaledGroup<
+  // ...GroupImpl (not the ...Group alias): the alias takes an `int` GroupSize,
+  // while the variants here pass a type (cute::Int<32> or a cute::tuple).
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16BlockScaledGroupImpl<
       PipelineStages, GroupSize_>;
   using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeGenericGroup;
 

@@ -381,6 +381,34 @@ def test_fused_add_rmsnorm_3d(batch_size, seq_len, hidden_size, dtype):
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("seq_len", [1, 7])
+@pytest.mark.parametrize("num_groups", [2, 4])
+@pytest.mark.parametrize("hidden_size", [1024, 2048, 8192])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_add_rmsnorm_4d(batch_size, seq_len, num_groups, hidden_size, dtype):
+    eps = 1e-6
+
+    x = torch.randn(
+        batch_size, seq_len, num_groups, hidden_size, dtype=dtype, device=device
+    )
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+
+    x_native, residual_native = fused_add_rms_norm(
+        x.clone(), residual.clone(), weight, eps
+    )
+
+    x_fused = x.clone()
+    residual_fused = residual.clone()
+    sgl_kernel.fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
+
+    torch.testing.assert_close(x_fused, x_native, **norm_tolerances(dtype))
+    torch.testing.assert_close(
+        residual_fused, residual_native, **norm_tolerances(dtype)
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1, 4, 19])
 @pytest.mark.parametrize("seq_len", [1, 7, 32])
 # hidden_size=1 exercises the "other dim == 1" shape (excluding the leading

@@ -130,6 +130,11 @@ W8_BENCH_SHAPES = [
     (256, 8, 256, 2048, "block"),
     (256, 1, 2048, 128, "block"),
     (256, 256, 2048, 128, "block"),
+    # MXFP8 shapes (E4M3 with 1x32 UE8M0 block scales)
+    (256, 1, 256, 2048, "mxfp8"),
+    (256, 8, 256, 2048, "mxfp8"),
+    (256, 1, 2048, 128, "mxfp8"),
+    (256, 256, 2048, 128, "mxfp8"),
 ]
 
 
@@ -151,6 +156,21 @@ def _quantize_w8_weights(weights, scale_layout):
                 experts, rows // FP8_BLOCK_SIZE, columns // FP8_BLOCK_SIZE
             ).contiguous(),
         )
+    elif scale_layout == "mxfp8":
+        experts, rows, columns = weights.shape
+        num_blocks = columns // 32
+        w_f32 = weights.float().reshape(experts, rows, num_blocks, 32)
+        amax = w_f32.abs().amax(dim=-1).clamp(min=1e-10)
+        exp = torch.ceil(torch.log2(amax / FP8_MAX)).clamp(-127.0, 127.0)
+        scale_biased = (exp + 127.0).to(torch.uint8)
+        descale = torch.exp2(exp).unsqueeze(-1)
+        quantized = (
+            (w_f32 / descale)
+            .clamp(-FP8_MAX, FP8_MAX)
+            .to(torch.float8_e4m3fn)
+            .reshape_as(weights)
+        )
+        return quantized.contiguous(), scale_biased.contiguous()
 
     parts = 2 if scale_layout == "scalar_gemm1" else 1
     chunks = weights.chunk(parts, dim=1)
@@ -182,6 +202,12 @@ def _build_w8_weights(num_experts, gemm_n, gemm_k, scale_layout):
             device="xpu",
             dtype=torch.float32,
         )
+    elif scale_layout == "mxfp8":
+        scales = torch.empty(
+            (num_experts, gemm_n, gemm_k // 32),
+            device="xpu",
+            dtype=torch.uint8,
+        )
     else:
         parts = 2 if scale_layout == "scalar_gemm1" else 1
         scales = torch.empty((num_experts, parts), device="xpu", dtype=torch.float32)
@@ -209,7 +235,7 @@ def _prepare_w8_inputs(num_experts, avg_m, gemm_n, gemm_k, scale_layout):
 
 
 def _run_w8(inputs):
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
         inputs["output"],
         inputs["activations"],
         inputs["weights"],

@@ -119,6 +119,7 @@ def ref_mla_prefill_varlen(
 # Primarily exercises incremental prefill (seqlen_q < seqlen_k); a handful
 # of full-prefill cases (seqlen_q == seqlen_k) are included for coverage.
 # ============================================================================
+@pytest.mark.arch("xe20", "xe35")
 @pytest.mark.parametrize("return_lse", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("block_size", [16, 32, 64, 128])

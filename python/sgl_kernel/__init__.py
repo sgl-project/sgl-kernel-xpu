@@ -60,6 +60,7 @@ from sgl_kernel.compress_plan import (
     plan_compress_prefill,
     plan_compress_prefill_legacy,
 )
+from sgl_kernel.diffusion import fused_scale_residual_norm_scale_shift
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
@@ -162,6 +163,8 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_ph_lf,
 )
 from sgl_kernel.lora import (
+    chunked_sgmv_lora_expand_fwd,
+    chunked_sgmv_lora_shrink_fwd,
     embedding_lora_a_fwd,
     gate_up_lora_b_fwd,
     qkv_lora_b_fwd,
@@ -222,6 +225,7 @@ from sgl_kernel.sparse_flash_attn import (
 from sgl_kernel.speculative import (
     TreeMaskMode,
     build_tree_kernel_efficient,
+    reconstruct_indices_from_tree_mask,
     segment_packbits,
     tree_speculative_sampling_target_only,
     verify_tree_greedy,

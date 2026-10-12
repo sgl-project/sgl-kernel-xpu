@@ -68,6 +68,7 @@ def ref_mla(
     return out
 
 
+@pytest.mark.arch("xe20", "xe35")
 @pytest.mark.parametrize("return_lse", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize(

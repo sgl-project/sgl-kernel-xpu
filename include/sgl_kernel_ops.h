@@ -122,6 +122,15 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_norm_scale_shift(
+    const torch::Tensor& residual,
+    const torch::Tensor& x,
+    const std::optional<torch::Tensor>& gate,
+    const std::optional<torch::Tensor>& weight,
+    const std::optional<torch::Tensor>& bias,
+    const torch::Tensor& scale,
+    const torch::Tensor& shift,
+    double eps);
 at::Tensor hadamard_transform(const at::Tensor& input, double scale);
 void fused_q_norm_rope(
     torch::Tensor& q_input, torch::Tensor& q_output, torch::Tensor& freqs_cis, torch::Tensor& positions, double eps);
@@ -746,10 +755,11 @@ void moe_grouped_mm_nt_xe20_w4a16(
     bool is_int4,
     const int64_t group_size);
 
-// FP8 weight-only MoE grouped GEMM. Activations are BF16, weights are FP8
-// E4M3, and weight_scales is [E, 1]/[E, 2] for per-expert scalar scales or
-// [E, ceil(N/128), K/128] for 128x128 block scales.
-void moe_grouped_mm_nt_xe20_fp8_w8a16(
+// W8A16 grouped GEMM. Activations are BF16, weights are 8-bit (FP8 E4M3),
+// and weight_scales is 1D [E] / 2D [E, 1] / [E, 2] for float32 per-expert scalar scales,
+// 3D [E, ceil(N/128), K/128] for 128x128 float32 block scales, or
+// 3D [E, N, K/32] uint8/float8_e8m0fnu for MXFP8 (1x32 UE8M0) block scales.
+void moe_grouped_mm_nt_xe20_w8a16(
     torch::Tensor& output,
     const torch::Tensor& activations,
     const torch::Tensor& weights,
@@ -976,6 +986,16 @@ void build_tree_kernel_efficient(
     int64_t depth,
     int64_t draft_token_num,
     int64_t tree_mask_mode = 0);
+
+void reconstruct_indices_from_tree_mask(
+    const at::Tensor& tree_mask,
+    const at::Tensor& verified_seq_len,
+    at::Tensor& positions,
+    at::Tensor& retrive_index,
+    at::Tensor& retrive_next_token,
+    at::Tensor& retrive_next_sibling,
+    int64_t batch_size,
+    int64_t draft_token_num);
 
 void segment_packbits(
     at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t sycl_stream);
@@ -1300,6 +1320,34 @@ void gate_up_lora_b_fwd(
     const std::optional<torch::Tensor>& base_output  // [num_tokens, 2*N]
 );
 
+void chunked_sgmv_lora_shrink_fwd(
+    torch::Tensor& output,         // [num_tokens, num_slices*max_rank]
+    const torch::Tensor& x,        // [num_tokens, input_dim]
+    const torch::Tensor& weights,  // [num_loras, num_slices*max_rank, input_dim]
+    const int64_t num_slices,      // stacked projections (qkv=3, gate_up=2, else 1)
+    const int64_t num_segments,
+    const torch::Tensor& seg_indptr,                 // [num_segments + 1,]
+    const torch::Tensor& weight_indices,             // [num_segments,]
+    const torch::Tensor& lora_ranks,                 // [num_loras,]
+    const std::optional<torch::Tensor>& permutation  // [num_tokens,] logical -> physical (optional)
+);
+
+void chunked_sgmv_lora_expand_fwd(
+    torch::Tensor& output,               // [num_tokens, N_total]
+    const torch::Tensor& x,              // [num_tokens, num_slices*max_rank]
+    const torch::Tensor& weights,        // [num_loras, N_total, max_rank]
+    const torch::Tensor& slice_offsets,  // [num_slices + 1,]
+    const int64_t max_slice_size,        // max per-slice output width
+    const int64_t num_slices,            // stacked projections (qkv=3, gate_up=2, else 1)
+    const int64_t num_segments,
+    const torch::Tensor& seg_indptr,                  // [num_segments + 1,]
+    const torch::Tensor& weight_indices,              // [num_segments,]
+    const torch::Tensor& lora_ranks,                  // [num_loras,]
+    const torch::Tensor& scalings,                    // [num_loras,]
+    const std::optional<torch::Tensor>& permutation,  // [num_tokens,] logical -> physical (optional)
+    const std::optional<torch::Tensor>& base_output   // [num_tokens, N_total] optional residual
+);
+
 /*
  * From GDN (Gated DeltaNet) attention
  */
@@ -1463,6 +1511,20 @@ torch::Tensor fp8_scaled_mm_xpu(
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype,
     const c10::optional<torch::Tensor>& bias);
+void mxfp4_blockwise_scaled_grouped_mm(
+    torch::Tensor& output,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& a_scales_ptrs,
+    torch::Tensor& b_scales_ptrs,
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const torch::Tensor& scales_a,
+    const torch::Tensor& scales_b,
+    const torch::Tensor& problem_sizes,
+    const torch::Tensor& expert_offsets,
+    const torch::Tensor& workspace);
 #endif
 
 void causal_conv1d_update(

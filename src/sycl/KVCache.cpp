@@ -30,13 +30,13 @@ struct StoreCacheKernel {
     scalar_t* k_dst = k_cache_ + cache_idx * row_dim_;
     scalar_t* v_dst = v_cache_ + cache_idx * row_dim_;
 
-    // K/V are a pure copy. For 2-byte scalar_t (bf16/half) we move 16 bytes at a
+    // K/V are a pure copy. We move 16 bytes at a
     // time as one Intel Xe LSC OWord message via sycl::vec<uint32_t, 4>, using the
     // native sycl::vec::load/store(offset, ptr) API (no memcpy) — offset is in units
     // of the 16-byte pack, ptr is the reinterpreted uint32_t row base. This mirrors
     // the B1 V-write idiom in Rope.cpp and src/sycl/merge_states.cpp:106. A native
-    // sycl::vec<scalar_t, 8> would hit the c10::BFloat16/Half element-type-trait
-    // mismatch and (measured on the rope kernel) does not coalesce to one OWord.
+    // sycl::vec<scalar_t, N> path can hit c10::BFloat16/Half element-type-trait
+    // issues and (measured on rope) does not always coalesce to one OWord.
     //
     // vec_count_ is computed on the host: it is row_dim_ / vec_width when every
     // row base is 16-byte aligned (so the OWord load/store is legal), and 0
@@ -129,7 +129,8 @@ store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cac
   SGL_KERNEL_PERF_SCOPE("store_cache", profiling_queue, bytes, flops);
 #endif
 
-  SYCL_DISPATCH_FLOATING_TYPES(at::ScalarType::Half, at::ScalarType::BFloat16, k.scalar_type(), "store_cache", [&]() {
+  auto launch = [&](auto* type_tag) {
+    using scalar_t = std::remove_pointer_t<decltype(type_tag)>;
     // The 16-byte OWord load/store is only legal when every row base is
     // 16-byte aligned. Row bases are at multiples of the row stride (source) or
     // row_dim (dense cache), plus the tensor's own base offset. Enable the
@@ -160,7 +161,21 @@ store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cac
           sycl::nd_range<1>(sycl::range<1>(num_tokens * group_size), sycl::range<1>(group_size)), kernel);
     };
     dpcppGetCurrentQueue().submit(cgf);
-  });
+  };
+
+  switch (k.scalar_type()) {
+    case at::ScalarType::Half:
+      launch(static_cast<decltype(c10::impl::ScalarTypeToCPPType<at::ScalarType::Half>::t)*>(nullptr));
+      break;
+    case at::ScalarType::BFloat16:
+      launch(static_cast<decltype(c10::impl::ScalarTypeToCPPType<at::ScalarType::BFloat16>::t)*>(nullptr));
+      break;
+    case at::ScalarType::Byte:
+      launch(static_cast<decltype(c10::impl::ScalarTypeToCPPType<at::ScalarType::Byte>::t)*>(nullptr));
+      break;
+    default:
+      TORCH_CHECK(false, "store_cache only supports k/v dtype in {fp16, bf16, uint8}; got ", k.scalar_type());
+  }
 }
 
 }  // namespace at::native::xpu

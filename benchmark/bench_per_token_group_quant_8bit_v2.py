@@ -180,6 +180,29 @@ configs = list(
     )
 )
 
+# Shapes from the v1 Xe35 fcvt-asm commit (87d86d9) so the v2 fast path can be
+# compared against the same workloads. (batch=1, seq_len=N, hidden_dim, group).
+# hidden_dim is read from `prepare_token_group_quant_test_data` (fixed 7168
+# downstream); for these probes we pass hidden_dim explicitly.
+xe35_shapes = [
+    # (num_tokens, hidden_dim, group_size)
+    (128, 1024, 128),
+    (128, 7168, 128),
+    (512, 7168, 128),
+    (128, 7168, 32),
+]
+
+
+def _bench_bytes(num_tokens: int, hidden_dim: int) -> int:
+    """Effective traffic for the fused silu_and_mul + per-token-group quant FP8 kernel.
+
+    The fused kernel reads `(num_tokens, 2*hidden_dim)` bf16 and writes
+    `(num_tokens, hidden_dim)` fp8 + (negligible) scales.
+    """
+    bf16 = 2
+    fp8 = 1
+    return num_tokens * hidden_dim * (2 * bf16 + fp8)
+
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
@@ -216,8 +239,40 @@ def benchmark(batch_size, seq_len, group_size, dst_dtype, provider):
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
+def benchmark_xe35_shapes():
+    """Run the v1 commit's reference shapes and report us + GB/s.
+
+    The v1 patch (87d86d9) reports 2-3x speedups on these shapes; this loop
+    reproduces them for the v2 fused kernel so the Xe35 fast-path lift is
+    visible.
+    """
+    print()
+    print("Xe35 reference shapes (fused silu_and_mul + per-token-group FP8 quant):")
+    print(f"  {'shape':<22} {'group':>6} {'time (us)':>12} {'eff GB/s':>10}")
+    for num_tokens, hidden_dim, group_size in xe35_shapes:
+        device = torch.device("xpu")
+        gen = torch.Generator(device="xpu")
+        gen.manual_seed(num_tokens * 10000 + hidden_dim)
+        x = torch.randn(
+            num_tokens,
+            hidden_dim * 2,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=gen,
+        )
+        fn = lambda x=x, g=group_size: sglang_per_token_group_quant_8bit_layer(
+            x, g, fp8_type_, 1e-10, True, True, True, True, None, True
+        )
+        ms = triton.testing.do_bench(fn, quantiles=[0.5])
+        us = ms * 1000.0
+        gb_s = _bench_bytes(num_tokens, hidden_dim) / (ms * 1e-3) / 1e9
+        shape = f"{num_tokens}x{hidden_dim}"
+        print(f"  {shape:<22} {group_size:>6} {us:>12.2f} {gb_s:>10.1f}")
+
+
 if __name__ == "__main__":
 
     calculate_diff(batch_size=2, seq_len=32, group_size=128, dst_dtype=fp8_type_)
 
     benchmark.run(print_data=True)
+    benchmark_xe35_shapes()

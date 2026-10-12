@@ -197,29 +197,56 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
 #endif
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-
-          using Element = @ELEM_TYPE@;
-        dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
-      constexpr bool Softcap = decltype(softcap_tag)::value;
-        FMHAConfig<
-            Causal,
-            LocalMask,
-            false,
-            Softcap,
-            /*LSE=*/false,
-            TileShapeQK,
-            TileShapePV,
-            TileShapeOutput,
-            SubgroupLayoutQK,
-            void,
-            false,
-            2,
-            false,
-            Element,
-            Element,
-            Element,
-              Element>::run_paged(params);
-        });
+      using Element = @ELEM_TYPE@;
+      dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+        constexpr bool Softcap = decltype(softcap_tag)::value;
+        if constexpr (Causal || LocalMask) {
+          // bidirectional_block_ids requires is_causal=false and no sliding
+          // window, so the causal/local paths never carry the mask; skip those
+          // instantiations (host-side checks enforce the precondition).
+          FMHAConfig<
+              Causal,
+              LocalMask,
+              false,
+              Softcap,
+              /*LSE=*/false,
+              TileShapeQK,
+              TileShapePV,
+              TileShapeOutput,
+              SubgroupLayoutQK,
+              void,
+              false,
+              2,
+              false,
+              Element,
+              Element,
+              Element,
+              Element,
+              /*HasBidirectionalBlock=*/false>::run_paged(params);
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(params.block_id_ptr != nullptr, HasBidirectionalBlock, {
+            FMHAConfig<
+                Causal,
+                LocalMask,
+                false,
+                Softcap,
+                /*LSE=*/false,
+                TileShapeQK,
+                TileShapePV,
+                TileShapeOutput,
+                SubgroupLayoutQK,
+                void,
+                false,
+                2,
+                false,
+                Element,
+                Element,
+                Element,
+                Element,
+                HasBidirectionalBlock>::run_paged(params);
+          });
+        }
+      });
     });
   });
 #endif

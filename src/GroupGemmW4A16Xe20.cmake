@@ -41,12 +41,4 @@ foreach(policy
     endforeach()
 endforeach()
 
-# MXFP4/BF16 K32 launch policies for large down projection.
-foreach(policy
-        w4a16_launch_policy_inkling_down_prefill_low
-        w4a16_launch_policy_inkling_down_prefill_high)
-    add_group_gemm_w4a16_xe20_inst(
-        ${policy} "uint8_t" "cutlass::bfloat16_t" "mxfp4_bf16")
-endforeach()
-
 list(APPEND device_cpp_xe20 ${GROUP_GEMM_W4A16_XE20_INST_SRCS})

@@ -2184,14 +2184,12 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_ragged_production_tiles(
     ],
 )
 def test_moe_grouped_mm_nt_xe20_w4a16_inkling_prefill_nonzero_reference(gemm_n, gemm_k):
-    """Reference-check the exact Inkling TP4 prefill dispatch.
+    """Reference-check the generic Xe20 path at Inkling TP4 prefill shapes.
 
-    The down projection splits 256 experts between two launches at the
-    96/97-row boundary. Full production weights are used so dispatch,
-    offsets, and launch geometry are real.  A deterministic subset of output
-    rows and columns is compared against FP32 matmul on independently
-    dequantized MXFP4 weights; checking the complete output for finite values
-    additionally catches experts skipped by either launch.
+    Full production weights are used so dispatch, offsets, and launch
+    geometry are real. A deterministic subset of output rows and columns is
+    compared against FP32 matmul on independently dequantized MXFP4 weights;
+    checking the complete output for finite values also catches skipped experts.
     """
     num_experts = 256
     rows_per_expert = torch.full((num_experts,), 96, dtype=torch.int32)

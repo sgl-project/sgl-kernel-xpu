@@ -5,7 +5,7 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
-#include "sycl/kernels/moe/xe20/inkling_routed_moe_launch_policy.hpp"
+#include "sycl/kernels/moe/xe20/w4a16_launch_policy.hpp"
 
 // Keep the imported fmha-cri kernel source byte-identical while making its
 // unqualified detail:: lookup robust in translation units that include
@@ -90,9 +90,7 @@ void MoEGEMMLauncher(
                     policy::PrefetchDist,
                     policy::MainloopBarrier,
                     policy::RowExtend,
-                    policy::SkipPaddedN,
-                    w4a16_expert_row_range<policy>::Min,
-                    w4a16_expert_row_range<policy>::Max>(
+                    policy::SkipPaddedN>(
                     activations,
                     weights,
                     scales,

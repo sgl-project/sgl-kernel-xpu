@@ -431,10 +431,6 @@ struct update_states_kernel {
     int states_id = cache_indices[batch_id];
     T* conv_states_ptr = conv_states + states_id * conv_states_stride_0;
     const T* conv_states_tmp_ptr = conv_states_tmp + batch_id * (width - 1) * conv_elems;
-    // NOTE: bounds check against conv_elems is required here -- when conv_elems
-    // (dim) is not an exact multiple of elems_per_group, the group covering the
-    // tail would otherwise write/read past the tensor end (only latent for
-    // production shapes like dim=8192, which happens to divide evenly).
     for (int i = elems_start_offset_group + local_id; i < (local_group_id + 1) * elems_per_group && i < conv_elems;
          i += group_size) {
       conv_states_ptr[width_id * conv_w_stride + i * conv_d_stride] = conv_states_tmp_ptr[width_id * conv_elems + i];

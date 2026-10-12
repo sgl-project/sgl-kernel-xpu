@@ -77,7 +77,7 @@ def causal_conv1d_update_verify_xpu(
 ):
     """GDN target-verify conv1d update (speculative decoding).
 
-    x: (batch, dim, cache_steps) -- left unchanged; a separate output is returned.
+    x: (batch, dim, cache_steps) -- not modified in-place.
     conv_state: (num_cache_lines, dim, width-1), read-only (seeds ancestor
         history for each sequence's tree root).
     intermediate_conv_window: (scratch_rows, cache_steps, dim, width-1),

@@ -565,122 +565,8 @@ static void launch_causal_conv1d_update(const ConvParamsBase& params) {
 }
 
 // ---------------------------------------------------------------------------
-// Token-parallel implementation (causal_conv1d_token_parallel.hpp). Used by
-// causal_conv1d_update's single-token decode path; prefill still uses the
-// channel-parallel kernels above.
+// Token-parallel single-token decode (causal_conv1d_token_parallel.hpp).
 // ---------------------------------------------------------------------------
-
-template <typename scalar_t, int Width>
-static void launch_causal_conv1d_fwd_token_parallel_w(
-    sycl::queue& queue,
-    at::Tensor& out,
-    const at::Tensor& x,
-    const at::Tensor& weight,
-    const std::optional<at::Tensor>& bias_,
-    const std::optional<at::Tensor>& conv_states,
-    const at::Tensor& query_start_loc,
-    const std::optional<at::Tensor>& cache_indices,
-    const std::optional<at::Tensor>& has_initial_state,
-    bool silu_activation,
-    int64_t pad_slot_id,
-    int batch_size,
-    int num_virtual_tokens,
-    int dim) {
-  const bool has_conv_states = conv_states.has_value();
-
-  // Kept alive until both kernels below finish.
-  at::Tensor conv_states_tmp;
-  if (has_conv_states) {
-    conv_states_tmp = at::empty({std::max(batch_size, 1), Width - 1, dim}, x.options());
-  }
-
-  using KERNEL_MAIN = sgl_conv1d::CausalConv1dFwdTokenParallelKernel<scalar_t, Width>;
-  auto range_main = KERNEL_MAIN::get_nd_range(num_virtual_tokens, dim);
-  KERNEL_MAIN task_main(
-      reinterpret_cast<scalar_t*>(out.data_ptr()),
-      reinterpret_cast<const scalar_t*>(x.data_ptr()),
-      static_cast<int>(x.stride(1)),
-      static_cast<int>(x.stride(0)),
-      static_cast<int>(out.stride(1)),
-      static_cast<int>(out.stride(0)),
-      reinterpret_cast<const scalar_t*>(weight.data_ptr()),
-      static_cast<int>(weight.stride(0)),
-      static_cast<int>(weight.stride(1)),
-      bias_.has_value() ? reinterpret_cast<const scalar_t*>(bias_.value().data_ptr()) : nullptr,
-      has_conv_states ? reinterpret_cast<scalar_t*>(conv_states.value().data_ptr()) : nullptr,
-      has_conv_states ? static_cast<int>(conv_states.value().stride(0)) : 0,
-      has_conv_states ? static_cast<int>(conv_states.value().stride(-1)) : 0,
-      has_conv_states ? static_cast<int>(conv_states.value().stride(-2)) : 0,
-      has_conv_states ? reinterpret_cast<scalar_t*>(conv_states_tmp.data_ptr()) : nullptr,
-      reinterpret_cast<const int32_t*>(query_start_loc.data_ptr()),
-      cache_indices.has_value() ? reinterpret_cast<const int*>(cache_indices.value().data_ptr()) : nullptr,
-      has_initial_state.has_value() ? reinterpret_cast<const bool*>(has_initial_state.value().data_ptr()) : nullptr,
-      silu_activation,
-      static_cast<int>(pad_slot_id),
-      batch_size,
-      dim);
-  sycl_kernel_submit(range_main.get_global_range(), range_main.get_local_range(), queue, task_main);
-
-  if (has_conv_states) {
-    using KERNEL_FINALIZE = sgl_conv1d::FinalizeConvStatesKernel<scalar_t>;
-    auto range_finalize = KERNEL_FINALIZE::get_nd_range(batch_size, Width, dim);
-    KERNEL_FINALIZE task_finalize(
-        reinterpret_cast<scalar_t*>(conv_states.value().data_ptr()),
-        static_cast<int>(conv_states.value().stride(0)),
-        static_cast<int>(conv_states.value().stride(-1)),
-        static_cast<int>(conv_states.value().stride(-2)),
-        reinterpret_cast<const scalar_t*>(conv_states_tmp.data_ptr()),
-        cache_indices.has_value() ? reinterpret_cast<const int*>(cache_indices.value().data_ptr()) : nullptr,
-        Width,
-        dim,
-        reinterpret_cast<const int32_t*>(query_start_loc.data_ptr()),
-        static_cast<int>(pad_slot_id));
-    sycl_kernel_submit(range_finalize.get_global_range(), range_finalize.get_local_range(), queue, task_finalize);
-  }
-}
-
-template <typename scalar_t>
-static void launch_causal_conv1d_fwd_token_parallel(
-    sycl::queue& queue,
-    at::Tensor& out,
-    const at::Tensor& x,
-    const at::Tensor& weight,
-    const std::optional<at::Tensor>& bias_,
-    const std::optional<at::Tensor>& conv_states,
-    const at::Tensor& query_start_loc,
-    const std::optional<at::Tensor>& cache_indices,
-    const std::optional<at::Tensor>& has_initial_state,
-    bool silu_activation,
-    int64_t pad_slot_id,
-    int batch_size,
-    int num_virtual_tokens,
-    int dim,
-    int width) {
-#define LAUNCH_WIDTH(W)                                     \
-  if (width == W) {                                         \
-    launch_causal_conv1d_fwd_token_parallel_w<scalar_t, W>( \
-        queue,                                              \
-        out,                                                \
-        x,                                                  \
-        weight,                                             \
-        bias_,                                              \
-        conv_states,                                        \
-        query_start_loc,                                    \
-        cache_indices,                                      \
-        has_initial_state,                                  \
-        silu_activation,                                    \
-        pad_slot_id,                                        \
-        batch_size,                                         \
-        num_virtual_tokens,                                 \
-        dim);                                               \
-    return;                                                 \
-  }
-  LAUNCH_WIDTH(2)
-  LAUNCH_WIDTH(3)
-  LAUNCH_WIDTH(4)
-#undef LAUNCH_WIDTH
-  TORCH_CHECK(false, "causal_conv1d only supports width between 2 and 4");
-}
 
 template <typename scalar_t, int Width>
 static void launch_causal_conv1d_update_token_parallel_w(
@@ -838,8 +724,7 @@ SGL_KERNEL_EXPORT void causal_conv1d_fwd(
   // skip the race-avoidance scratch buffers when no tiling occurs.
 
   // Tiling only wins for small batch + long seqlen (measured); gate on
-  // `batch <= 2 && seqlen >= 1024` with a fixed `block_t` (exact value
-  // doesn't matter much, see gdn_spec_decode_xpu_investigation).
+  // `batch <= 2 && seqlen >= 1024` with a fixed `block_t`.
 
   // `seqlen` is total tokens across the batch (varlen, sync-free), so the
   // threshold scales by `batch_size`; used directly for grid sizing too
@@ -989,8 +874,7 @@ SGL_KERNEL_EXPORT void causal_conv1d_update(
   at::Tensor out = x;
 
   if (seqlen == 1 && !cache_seqlens_.has_value()) {
-    // Token-parallel design: faster via vectorized loads/stores (see
-    // gdn_spec_decode_xpu_investigation for hardware-counter data).
+    // Token-parallel design: faster via vectorized loads/stores.
     auto queue = c10::xpu::getCurrentXPUStream().queue();
     SYCL_DISPATCH_FLOATING_TYPES(
         at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "causal_conv1d_update", [&]() {
@@ -1012,8 +896,6 @@ SGL_KERNEL_EXPORT void causal_conv1d_update(
     return;
   }
 
-  // Multi-token/circular-buffer update: unused by SGLang, so this keeps
-  // the simpler channel-parallel kernel rather than extending token-parallel.
   ConvParamsBase params;
   set_conv_params_fwd(params, batch_size, dim, seqlen, width, x, weight, out, bias_, silu_activation, pad_slot_id);
   params.conv_state_ptr = conv_state.data_ptr();

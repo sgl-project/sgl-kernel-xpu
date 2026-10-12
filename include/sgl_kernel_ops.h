@@ -1398,8 +1398,7 @@ int64_t gdn_attention_workspace_bytes_needed(
     const int64_t tp_size,
     const torch::ScalarType dtype);
 
-// Standalone GDN recurrent op for plain (non-spec) prefill/decode -- the
-// SSM-only half of what `gdn_attention` does internally after conv1d.
+// Standalone GDN recurrent op for plain (non-spec) prefill/decode.
 // `ssm_state` (the committed recurrent-state pool) is updated in place.
 // See `gated_delta_rule_verify` below for the separate spec-decode/verify
 // entry point, which never mutates the committed pool.
@@ -1443,50 +1442,6 @@ void gated_delta_rule_verify(
     const std::optional<torch::Tensor>& token_indx,
     const std::optional<torch::Tensor>& retrieve_parent_token);
 
-// BENCHMARK-ONLY: isolate the conv1d-only cost of the GDN-specific
-// (token-parallel) causal-conv1d design vs. the general-purpose
-// (channel-parallel) `causal_conv1d_fwd`/`causal_conv1d_update` design. Not
-// a production API; see causal_conv1d_only_bench.hpp. To be removed once
-// B.1b's conv1d-verify design is decided.
-void bench_gdn_style_causal_conv1d_prefill(
-    torch::Tensor& out,
-    const torch::Tensor& x_in,
-    const torch::Tensor& conv_weights,
-    const std::optional<torch::Tensor>& conv_bias,
-    torch::Tensor& conv_states,
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& cache_indices,
-    const std::optional<torch::Tensor>& has_initial_state,
-    bool silu_activation,
-    int64_t pad_slot_id);
-
-void bench_gdn_style_causal_conv1d_decode(
-    torch::Tensor& out,
-    const torch::Tensor& x_in,
-    const torch::Tensor& conv_weights,
-    const std::optional<torch::Tensor>& conv_bias,
-    torch::Tensor& conv_states,
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& cache_indices,
-    const std::optional<torch::Tensor>& has_initial_state,
-    bool silu_activation,
-    int64_t pad_slot_id);
-
-// Decode fast-path variant that skips the O(batch_size) per-thread linear
-// scan (batch_id == token_id trivially for decode). See
-// causal_conv1d_only_bench.hpp / causal_conv1d_only_decode_fast.
-void bench_gdn_style_causal_conv1d_decode_fast(
-    torch::Tensor& out,
-    const torch::Tensor& x_in,
-    const torch::Tensor& conv_weights,
-    const std::optional<torch::Tensor>& conv_bias,
-    torch::Tensor& conv_states,
-    const torch::Tensor& query_start_loc,
-    const torch::Tensor& cache_indices,
-    const std::optional<torch::Tensor>& has_initial_state,
-    bool silu_activation,
-    int64_t pad_slot_id);
-
 /*
  * Mamba causal conv1d (XPU)
  */
@@ -1500,6 +1455,32 @@ void causal_conv1d_fwd(
     const std::optional<at::Tensor>& has_initial_state,
     bool silu_activation,
     int64_t pad_slot_id);
+
+void causal_conv1d_update(
+    at::Tensor& x,
+    at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens_,
+    const std::optional<at::Tensor>& conv_state_indices_,
+    int64_t pad_slot_id);
+
+// GDN target-verify (speculative decoding) conv1d update.
+at::Tensor causal_conv1d_update_verify(
+    const at::Tensor& x,
+    const at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_indices_,
+    at::Tensor& intermediate_conv_window,
+    const at::Tensor& intermediate_state_indices,
+    const at::Tensor& retrieve_next_token,
+    const at::Tensor& retrieve_next_sibling,
+    at::Tensor& retrieve_parent_token,
+    int64_t pad_slot_id);
+
 // Xe35 only kernels
 #if SYCL_INTEL_TARGET == 35
 void dsv3_router_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
@@ -1526,32 +1507,6 @@ void mxfp4_blockwise_scaled_grouped_mm(
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
 #endif
-
-void causal_conv1d_update(
-    at::Tensor& x,
-    at::Tensor& conv_state,
-    const at::Tensor& weight,
-    const std::optional<at::Tensor>& bias_,
-    bool silu_activation,
-    const std::optional<at::Tensor>& cache_seqlens_,
-    const std::optional<at::Tensor>& conv_state_indices_,
-    int64_t pad_slot_id);
-
-// GDN target-verify (speculative decoding) conv1d update; see
-// causal_conv1d_verify.hpp for the tree-mode contract.
-at::Tensor causal_conv1d_update_verify(
-    const at::Tensor& x,
-    const at::Tensor& conv_state,
-    const at::Tensor& weight,
-    const std::optional<at::Tensor>& bias_,
-    bool silu_activation,
-    const std::optional<at::Tensor>& cache_indices_,
-    at::Tensor& intermediate_conv_window,
-    const at::Tensor& intermediate_state_indices,
-    const at::Tensor& retrieve_next_token,
-    const at::Tensor& retrieve_next_sibling,
-    at::Tensor& retrieve_parent_token,
-    int64_t pad_slot_id);
 
 /*
  * HiSparse hierarchical sparse KV cache (DeepSeek DSA / V4)

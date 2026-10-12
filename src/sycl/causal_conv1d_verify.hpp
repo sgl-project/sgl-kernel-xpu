@@ -23,7 +23,7 @@ limitations under the License.
 // `retrieve_next_sibling` encode the tree as a first-child/next-sibling
 // list. `CausalConv1dVerifyTreeDecodeKernel` decodes it into a per-token
 // parent index once per batch entry (not redundantly per channel-group,
-// and not redundantly per work-group either -- see git history: both of
+// and not redundantly per work-group either -- measured: both of
 // those cost more than a tiny dedicated kernel launch does), writing both
 // `retrieve_parent_token` (consumed later by `gated_delta_rule_verify`)
 // and a `parent_idx` scratch buffer that `CausalConv1dUpdateVerifyKernel`

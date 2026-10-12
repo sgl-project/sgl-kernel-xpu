@@ -1475,6 +1475,22 @@ void causal_conv1d_update(
     const std::optional<at::Tensor>& conv_state_indices_,
     int64_t pad_slot_id);
 
+// GDN target-verify (speculative decoding) conv1d update; see
+// causal_conv1d_verify.hpp for the tree-mode contract.
+at::Tensor causal_conv1d_update_verify(
+    const at::Tensor& x,
+    const at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_indices_,
+    at::Tensor& intermediate_conv_window,
+    const at::Tensor& intermediate_state_indices,
+    const at::Tensor& retrieve_next_token,
+    const at::Tensor& retrieve_next_sibling,
+    at::Tensor& retrieve_parent_token,
+    int64_t pad_slot_id);
+
 /*
  * HiSparse hierarchical sparse KV cache (DeepSeek DSA / V4)
  */

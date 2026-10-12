@@ -168,7 +168,11 @@ from sgl_kernel.lora import (
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
 )
-from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
+from sgl_kernel.mamba import (
+    causal_conv1d_fn_xpu,
+    causal_conv1d_update_verify_xpu,
+    causal_conv1d_update_xpu,
+)
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
     hc_post,

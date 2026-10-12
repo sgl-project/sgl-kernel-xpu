@@ -1,5 +1,6 @@
 """Benchmark JIT per-token-group 8-bit quant (v2) vs AOT implementation."""
 
+import argparse
 import itertools
 
 import pandas as pd
@@ -89,9 +90,8 @@ configs = list(
         args={},
     )
 )
-def benchmark(batch_size, seq_len, group_size, provider):
+def benchmark(batch_size, seq_len, group_size, provider, hidden_dim=7168):
     device = torch.device("xpu")
-    hidden_dim = 7168
     num_tokens = batch_size * seq_len
 
     x = torch.randn(num_tokens, hidden_dim * 2, device=device, dtype=torch.bfloat16)
@@ -126,6 +126,37 @@ def benchmark(batch_size, seq_len, group_size, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=[16, 32, 64],
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--seq-lens",
+        nargs="+",
+        type=int,
+        default=[128, 512, 1024],
+        help="Sequence lengths to sweep",
+    )
+    parser.add_argument(
+        "--group-sizes",
+        nargs="+",
+        type=int,
+        default=[128],
+        help="Quant group sizes to sweep",
+    )
+    parser.add_argument(
+        "--hidden-dim", type=int, default=7168, help="Output hidden dim (input is 2x)"
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(args.batch_sizes, args.seq_lens, args.group_sizes)
+    )
+    benchmark.benchmarks.args = {"hidden_dim": args.hidden_dim}
+
     if not HAS_AOT:
         print("ERROR: sgl_kernel (AOT) not available. Please install sgl-kernel-xpu.")
         exit(1)

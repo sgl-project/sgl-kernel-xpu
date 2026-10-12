@@ -1,3 +1,4 @@
+import argparse
 from itertools import product
 from typing import Optional, Tuple
 
@@ -24,11 +25,16 @@ batch_size_range = [16, 32, 64, 128]
 seq_len_range = [64, 128, 256, 512, 1024, 2048]
 hidden_size = 1024
 
-configs = [
-    (bs, seq_len, is_static)
-    for is_static in [True, False]
-    for bs, seq_len in product(batch_size_range, seq_len_range)
-]
+
+def get_configs(batch_size_range, seq_len_range):
+    return [
+        (bs, seq_len, is_static)
+        for is_static in [True, False]
+        for bs, seq_len in product(batch_size_range, seq_len_range)
+    ]
+
+
+configs = get_configs(batch_size_range, seq_len_range)
 
 all_results = []
 
@@ -46,7 +52,7 @@ all_results = []
         args={},
     )
 )
-def benchmark(batch_size, seq_len, is_static, provider):
+def benchmark(batch_size, seq_len, is_static, provider, hidden_size=hidden_size):
     print(
         f"benchmark {provider} with batch_size={batch_size} seq_len={seq_len} is_static={is_static}"
     )
@@ -119,7 +125,26 @@ def benchmark(batch_size, seq_len, is_static, provider):
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=False)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="List of batch sizes",
+    )
+    parser.add_argument(
+        "--seq-lens",
+        nargs="+",
+        type=int,
+        default=seq_len_range,
+        help="List of sequence lengths",
+    )
+    parser.add_argument("--hidden-size", type=int, default=hidden_size)
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = get_configs(args.batch_sizes, args.seq_lens)
+
+    benchmark.run(print_data=False, hidden_size=args.hidden_size)
     print("Benchmark finished!")
 
     import pandas as pd

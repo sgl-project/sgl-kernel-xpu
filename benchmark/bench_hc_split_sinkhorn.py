@@ -1,3 +1,4 @@
+import argparse
 from itertools import product
 
 import pandas as pd
@@ -198,7 +199,41 @@ def benchmark(batch_size, seq_len, sinkhorn_iters, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--seq-lens",
+        nargs="+",
+        type=int,
+        default=seq_len_range,
+        help="Sequence lengths to sweep",
+    )
+    parser.add_argument(
+        "--sinkhorn-iters",
+        nargs="+",
+        type=int,
+        default=sinkhorn_iters_range,
+        help="Sinkhorn iteration counts to sweep",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=MAX_TOKENS,
+        help="Skip configs with batch_size * seq_len above this",
+    )
+    args = parser.parse_args()
 
+    benchmark.benchmarks.x_vals = [
+        (b, s, it)
+        for b, s, it in product(args.batch_sizes, args.seq_lens, args.sinkhorn_iters)
+        if b * s <= args.max_tokens
+    ]
     benchmark.run(print_data=True)
 
     # Print results

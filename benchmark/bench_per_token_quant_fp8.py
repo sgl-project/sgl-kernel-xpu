@@ -7,6 +7,7 @@ Usage:
     python benchmark/bench_per_token_quant_fp8.py
 """
 
+import argparse
 import itertools
 
 import sgl_kernel  # noqa: F401 – registers XPU ops
@@ -57,13 +58,13 @@ def verify(num_tokens=512, hidden_dim=4096):
     print(f"correctness ({num_tokens}x{hidden_dim}): {'PASS' if ok else 'FAIL'}")
 
 
-def main():
+def main(
+    token_range=(512, 2048, 8192, 16384, 32768),
+    hidden_range=(2048, 4096, 8192),
+):
     print(f"Device : {torch.xpu.get_device_name(0)}")
     print(f"dtype  : torch.float16")
     verify()
-
-    token_range = [512, 2048, 8192, 16384, 32768]
-    hidden_range = [2048, 4096, 8192]
 
     print(f"\n  {'tokens':>8} {'hidden':>7}  {'us':>9}  {'GB/s':>8}")
     print(f"  {'-'*40}")
@@ -80,4 +81,20 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num-tokens",
+        nargs="+",
+        type=int,
+        default=[512, 2048, 8192, 16384, 32768],
+        help="List of token counts",
+    )
+    parser.add_argument(
+        "--hidden-dims",
+        nargs="+",
+        type=int,
+        default=[2048, 4096, 8192],
+        help="List of hidden dims",
+    )
+    args = parser.parse_args()
+    main(args.num_tokens, args.hidden_dims)

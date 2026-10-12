@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 import triton
 from sgl_kernel import scatter_tokens_to_experts
@@ -31,40 +33,33 @@ def scatter_tokens_compiled(input_tensor, src2dst_map, output_tensor, topk):
     return output_tensor
 
 
-def get_benchmark():
-    num_tokens_range = [2**i for i in range(4, 13)]  # 16 to 4096 tokens
-    topk_vals = [2, 4, 8]
-    hidden_dim_vals = [512, 1024, 2048, 4096, 8192]
-    dtype_vals = [torch.bfloat16, torch.float16, torch.float8_e4m3fn]
+DEFAULT_NUM_TOKENS = [2**i for i in range(4, 13)]  # 16 to 4096 tokens
+DTYPE_CHOICES = ["bf16", "fp16", "fp8"]
+
+
+def get_benchmark(
+    num_tokens_range=DEFAULT_NUM_TOKENS,
+    dtypes=DTYPE_CHOICES,
+    hidden_dims=(4096,),  # Focus on common hidden_dim
+    topks=(8,),  # Common topk
+):
+    line_vals = [
+        f"{dtype_str}-{hidden_dim}-{topk}-{version}"
+        for dtype_str in dtypes
+        for hidden_dim in hidden_dims
+        for topk in topks
+        for version in ["xpu"]  # Only test XPU kernel (baseline is too slow)
+    ]
+    colors = [("blue", "-"), ("green", "-"), ("red", "-")]
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=["num_tokens"],
             x_vals=num_tokens_range,
             line_arg="config",
-            line_vals=[
-                f"{dtype_str}-{hidden_dim}-{topk}-{version}"
-                for dtype_str, dtype in [
-                    ("bf16", torch.bfloat16),
-                    ("fp16", torch.float16),
-                    ("fp8", torch.float8_e4m3fn),
-                ]
-                for hidden_dim in [4096]  # Focus on common hidden_dim
-                for topk in [8]  # Common topk
-                for version in ["xpu"]  # Only test XPU kernel (baseline is too slow)
-            ],
-            line_names=[
-                f"{dtype_str}-{hidden_dim}-{topk}-{version}"
-                for dtype_str, dtype in [
-                    ("bf16", torch.bfloat16),
-                    ("fp16", torch.float16),
-                    ("fp8", torch.float8_e4m3fn),
-                ]
-                for hidden_dim in [4096]
-                for topk in [8]
-                for version in ["xpu"]
-            ],
-            styles=[("blue", "-"), ("green", "-"), ("red", "-")],
+            line_vals=line_vals,
+            line_names=line_vals,
+            styles=[colors[i % len(colors)] for i in range(len(line_vals))],
             ylabel="GB/s",
             plot_name="scatter_tokens_bandwidth",
             args={},
@@ -278,6 +273,33 @@ def benchmark_all_configs():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num-tokens",
+        nargs="+",
+        type=int,
+        default=DEFAULT_NUM_TOKENS,
+        help="Token counts for the triton report",
+    )
+    parser.add_argument(
+        "--dtypes",
+        nargs="+",
+        choices=DTYPE_CHOICES,
+        default=DTYPE_CHOICES,
+        help="Dtypes for the triton report",
+    )
+    parser.add_argument(
+        "--hidden-dims",
+        nargs="+",
+        type=int,
+        default=[4096],
+        help="Hidden dims for the triton report",
+    )
+    parser.add_argument(
+        "--topks", nargs="+", type=int, default=[8], help="Topk for the triton report"
+    )
+    args = parser.parse_args()
+
     verify_correctness()
 
     print("\n" + "=" * 80)
@@ -295,5 +317,7 @@ if __name__ == "__main__":
     print("Running Triton benchmark report...")
     print("=" * 80)
 
-    benchmark = get_benchmark()
+    benchmark = get_benchmark(
+        args.num_tokens, args.dtypes, args.hidden_dims, args.topks
+    )
     benchmark.run(print_data=True)

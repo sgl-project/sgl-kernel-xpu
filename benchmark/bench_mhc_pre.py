@@ -131,6 +131,19 @@ def benchmark(b_s, seq_len, hidden_size, provider):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes", nargs="+", type=int, default=[c[0] for c in configs]
+    )
+    parser.add_argument("--seq-len", type=int, default=1)
+    parser.add_argument("--hidden-size", type=int, default=4096)
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = [
+        (b_s, args.seq_len, args.hidden_size) for b_s in args.batch_sizes
+    ]
+
     benchmark.run(print_data=False)
     print("Benchmark finished!")
 

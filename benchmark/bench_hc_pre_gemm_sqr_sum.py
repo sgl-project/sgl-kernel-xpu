@@ -1,3 +1,5 @@
+import argparse
+
 import pandas as pd
 import torch
 import triton
@@ -102,6 +104,23 @@ def benchmark(M, K, N, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--m-values",
+        nargs="+",
+        type=int,
+        default=[c[0] for c in configs],
+        help="M (token) values to sweep",
+    )
+    parser.add_argument("--hc", type=int, default=hc, help="hc_mult")
+    parser.add_argument(
+        "--hidden-size", type=int, default=hidden_size, help="Hidden size"
+    )
+    args = parser.parse_args()
+
+    k = args.hc * args.hidden_size
+    n = (2 + args.hc) * args.hc
+    benchmark.benchmarks.x_vals = [(m, k, n) for m in args.m_values]
     benchmark.run(print_data=False)
     print("Benchmark finished!")
 

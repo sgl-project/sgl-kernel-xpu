@@ -1,3 +1,4 @@
+import argparse
 from itertools import product
 
 import pandas as pd
@@ -27,19 +28,6 @@ configs = [
 all_results = []
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch_size", "seq_len", "hidden_size", "dtype"],
-        x_vals=configs,
-        line_arg="provider",
-        line_vals=["sgl_kernel"],
-        line_names=["SGL Kernel fused_hc_head"],
-        styles=[("green", "-")],
-        ylabel="ms",
-        plot_name="fused-hc-head-performance",
-        args={},
-    )
-)
 def benchmark(batch_size, seq_len, hidden_size, dtype, provider):
     device = torch.device("xpu")
 
@@ -107,8 +95,65 @@ def benchmark(batch_size, seq_len, hidden_size, dtype, provider):
     return ms, max_ms, min_ms
 
 
+def get_benchmark(configs=configs):
+    return triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["batch_size", "seq_len", "hidden_size", "dtype"],
+            x_vals=configs,
+            line_arg="provider",
+            line_vals=["sgl_kernel"],
+            line_names=["SGL Kernel fused_hc_head"],
+            styles=[("green", "-")],
+            ylabel="ms",
+            plot_name="fused-hc-head-performance",
+            args={},
+        )
+    )(benchmark)
+
+
+DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16}
+
+
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--seq-lens",
+        nargs="+",
+        type=int,
+        default=seq_len_range,
+        help="Sequence lengths to sweep",
+    )
+    parser.add_argument(
+        "--hidden-sizes",
+        nargs="+",
+        type=int,
+        default=hidden_size_range,
+        help="Hidden sizes to sweep",
+    )
+    parser.add_argument(
+        "--dtypes",
+        nargs="+",
+        choices=list(DTYPE_MAP),
+        default=["bfloat16"],
+        help="Input dtypes to sweep",
+    )
+    args = parser.parse_args()
+
+    configs = [
+        (b, s, h, DTYPE_MAP[dt])
+        for b, s, h, dt in product(
+            args.batch_sizes, args.seq_lens, args.hidden_sizes, args.dtypes
+        )
+        if b * s <= MAX_TOKENS
+    ]
+    get_benchmark(configs).run(print_data=True)
 
     print("\n" + "=" * 80)
     print("Performance Results")

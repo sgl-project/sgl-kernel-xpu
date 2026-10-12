@@ -10,6 +10,7 @@ The fused kernel demonstrates bandwidth savings and latency reduction by elimina
 intermediate tensor materialization.
 """
 
+import argparse
 import itertools
 import os
 
@@ -360,7 +361,40 @@ def print_summary(results: list):
         print(f"Average Bandwidth Saved: {avg_bw_saved:.1f}%")
 
 
-def main():
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--seq-lens",
+        nargs="+",
+        type=int,
+        default=seq_len_range,
+        help="Sequence lengths to sweep",
+    )
+    parser.add_argument(
+        "--hidden-dims",
+        nargs="+",
+        type=int,
+        default=hidden_dim_range,
+        help="Hidden dims to sweep",
+    )
+    parser.add_argument(
+        "--src-dtypes",
+        nargs="+",
+        choices=["bfloat16", "float16", "float32"],
+        default=["bfloat16"],
+        help="Input dtypes to sweep",
+    )
+    return parser.parse_args()
+
+
+def main(args):
     if not is_xpu_available():
         print("Error: Intel XPU not available")
         return
@@ -404,6 +438,15 @@ def main():
     print("\n" + "=" * 80)
     print("Performance Benchmark")
     print("=" * 80)
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(
+            args.batch_sizes,
+            args.seq_lens,
+            args.hidden_dims,
+            group_size_range,
+            [getattr(torch, d) for d in args.src_dtypes],
+        )
+    )
     benchmark.run(print_data=True, save_path="./")
 
     print_summary(all_results)
@@ -426,4 +469,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main(parse_args())

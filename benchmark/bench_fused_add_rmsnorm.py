@@ -1,3 +1,4 @@
+import argparse
 import itertools
 
 import pandas as pd
@@ -161,6 +162,17 @@ def benchmark_nd():
 results = []
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--decode-batches", nargs="+", type=int, default=DECODE_BATCHES)
+    parser.add_argument(
+        "--prefill-batches", nargs="+", type=int, default=PREFILL_BATCHES
+    )
+    parser.add_argument("--hidden-sizes", nargs="+", type=int, default=HIDDEN_SIZES)
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(args.decode_batches + args.prefill_batches, args.hidden_sizes)
+    )
+
     print(
         "fused_add_rmsnorm: wall time (triton do_bench) and device time (torch profiler, XPU only)"
     )

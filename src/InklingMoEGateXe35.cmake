@@ -1,6 +1,6 @@
 # Generate dtype instantiations independently to bound compiler memory.
 set(INKLING_GATE_PROJECTION_TEMPLATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/inkling_moe_gate_projection_kernel.cpp.in")
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/inkling_moe_gate_projection_kernel_Xe35.cpp.in")
 set(INKLING_GATE_PROJECTION_GEN_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/generated/inkling_moe_gate_projection")
 file(MAKE_DIRECTORY ${INKLING_GATE_PROJECTION_GEN_DIR})
@@ -13,7 +13,7 @@ foreach(_elem_index RANGE ${_inkling_gate_elem_last})
   list(GET INKLING_GATE_ELEM_TAGS ${_elem_index} ELEM_TAG)
   list(GET INKLING_GATE_ELEMENT_TYPES ${_elem_index} ELEMENT_TYPE)
   set(GEN_SRC
-      "${INKLING_GATE_PROJECTION_GEN_DIR}/inkling_moe_gate_projection_${ELEM_TAG}.cpp")
+      "${INKLING_GATE_PROJECTION_GEN_DIR}/inkling_moe_gate_projection_${ELEM_TAG}Xe35.cpp")
   configure_file(${INKLING_GATE_PROJECTION_TEMPLATE} ${GEN_SRC} @ONLY)
   # Keep generated providers separate until CMakeLists has appended the
   # hand-written dispatcher. BuildOnLinux relies on provider libraries

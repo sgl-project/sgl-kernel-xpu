@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  */
 
-#define SYCL_INTEL_TARGET 20
+#define SYCL_INTEL_TARGET 35
 
 #include "sycl/kernels/inkling_moe_gate/inkling_moe_gate_projection.hpp"
 

@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  */
 
-#define SYCL_INTEL_TARGET 20
+#define SYCL_INTEL_TARGET 35
 
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>

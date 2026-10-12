@@ -115,7 +115,7 @@ if(NOT USE_MLA)
     list(FILTER device_cpp EXCLUDE REGEX "/mla_(decode|prefill|sparse_decode)\\.cpp$")
 endif()
 if(NOT USE_MOE)
-    list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20|W8A16Xe20)|InklingMoEGateXe20|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20|W8A16Xe20)|InklingMoEGateXe35|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")
     list(FILTER device_cpp EXCLUDE REGEX "/xe35/(GroupGemm|GroupGemmMxfp4W4A16|blockwise_moe_mxfp4|blockwise_moe_mxfp8)\\.cpp$")
 endif()
 
@@ -171,7 +171,7 @@ if(USE_MOE)
         include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW4A16Xe20.cmake)
         include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW8A16Xe20.cmake)
     endif()
-    include(${CMAKE_CURRENT_SOURCE_DIR}/InklingMoEGateXe20.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/InklingMoEGateXe35.cmake)
     # Xe3 (CRI) does not participate in the runtime-JIT path (Xe3 AOT
     # instances are always built when USE_MOE is on).
     include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe35.cmake)
@@ -209,10 +209,10 @@ endif()
 
 list(APPEND ATen_XPU_CPP_SRCS ${host_cpp})
 list(APPEND ATen_XPU_SYCL_COMMON ${device_cpp_common})
-list(APPEND ATen_XPU_SYCL_XE20
-    ${device_cpp_xe20}
+list(APPEND ATen_XPU_SYCL_XE20 ${device_cpp_xe20})
+list(APPEND ATen_XPU_SYCL_XE35
+    ${device_cpp_xe35}
     ${INKLING_GATE_PROJECTION_SRCS})
-list(APPEND ATen_XPU_SYCL_XE35 ${device_cpp_xe35})
 
 set(ATen_XPU_CPP_SRCS ${ATen_XPU_CPP_SRCS} PARENT_SCOPE)
 set(ATen_XPU_SYCL_COMMON ${ATen_XPU_SYCL_COMMON} PARENT_SCOPE)

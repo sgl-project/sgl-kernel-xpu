@@ -31,7 +31,13 @@
  **************************************************************************************************/
 // Auto-generated from xe_fmha_fwd_split_decode_kernel.cpp.in
 // Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@, ELEM_TAG=@ELEM_TAG@
+#ifndef SYCL_INTEL_TARGET
+#if defined(XPU_ENABLED_XE3P)
+#define SYCL_INTEL_TARGET 35
+#else
 #define SYCL_INTEL_TARGET 20
+#endif
+#endif
 
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
 
@@ -85,7 +91,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
         return;
     }
 
-#if @HEAD_DIM@ == 128 || @HEAD_DIM@ == 512
+#if SYCL_INTEL_TARGET == 35 && (@HEAD_DIM@ == 128 || @HEAD_DIM@ == 512)
   if (params.rel_bias_ptr != nullptr) {
     TORCH_CHECK(params.dv == @HEAD_DIM@, "relative attention requires head_dim_v == @HEAD_DIM@");
     TORCH_CHECK(!params.is_e4m3 && !params.is_e5m2, "relative attention does not support fp8 KV cache");
@@ -130,7 +136,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
     return;
   }
 #else
-  TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention is only compiled for head_dim == 128 or 512");
+  TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention is supported only on CRI with head_dim == 128 or 512");
 #endif
 
 #if @HEAD_DIM@ == 64

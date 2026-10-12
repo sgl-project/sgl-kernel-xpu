@@ -29,13 +29,14 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
-#define SYCL_INTEL_TARGET 20
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#if SYCL_INTEL_TARGET == 35
 #include "kernels/flash_attention_v2/relative_attention.hpp"
+#endif
 #include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
 #include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
 #ifdef USE_FMHA_JIT
@@ -75,6 +76,7 @@ get_per_tensor_descale_ptr(const at::Tensor& descale, const at::Tensor& ref, con
   return descale.data_ptr<float>();
 }
 
+#if SYCL_INTEL_TARGET == 35
 template <typename Element, int QTile, int KTile, int ElementsPerItem = 8>
 struct PrefillShearBiasBatchOneKernel {
   const Element* input;
@@ -208,6 +210,7 @@ at::Tensor prepare_prefill_relative_bias(
   }
   return bias;
 }
+#endif  // SYCL_INTEL_TARGET == 35
 
 }  // namespace
 
@@ -711,6 +714,7 @@ void mha_fwd(
   params.o_ptr = out.data_ptr();
   params.o_row_stride = out.stride(-3);
   params.o_head_stride = out.stride(-2);
+#if SYCL_INTEL_TARGET == 35
   at::Tensor sheared_rel_bias;
   if (rel_bias_.has_value()) {
     const at::Tensor& rel_bias = rel_bias_.value();
@@ -728,6 +732,8 @@ void mha_fwd(
     params.rel_bias_head_stride = sheared_rel_bias.stride(1);
     params.rel_bias_extent = rel_bias_is_sheared ? rel_bias.size(-1) - page_size : rel_bias.size(-1);
   }
+
+#endif  // SYCL_INTEL_TARGET == 35
 
   // Per-batch skip mask for the chunkprefill two-launch path
   // (vllm-xpu-kernels#218). When provided, decode skips batches where
@@ -1307,6 +1313,7 @@ void mha_fwd(
   params.o_ptr = out.data_ptr();
   params.o_row_stride = out.stride(-3);
   params.o_head_stride = out.stride(-2);
+#if SYCL_INTEL_TARGET == 35
   at::Tensor sheared_rel_bias;
   if (rel_bias_.has_value()) {
     const at::Tensor& rel_bias = rel_bias_.value();
@@ -1340,6 +1347,8 @@ void mha_fwd(
     params.rel_bias_head_stride = sheared_rel_bias.stride(1);
     params.rel_bias_extent = rel_bias.size(-1);
   }
+
+#endif  // SYCL_INTEL_TARGET == 35
 
   // A per-token block id (-1 = none) enables the bidirectional-block mask in the
   // prefill mainloop: keys sharing a query's non-negative id are attended
@@ -1699,6 +1708,9 @@ SGL_KERNEL_EXPORT void mha_fwd(
     std::optional<const at::Tensor>& rel_bias_,
     bool rel_bias_is_sheared,
     std::optional<const at::Tensor>& bidirectional_block_ids_) {
+#if SYCL_INTEL_TARGET != 35
+  TORCH_CHECK(!rel_bias_.has_value(), "relative attention is supported only on CRI");
+#endif
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
@@ -1819,4 +1831,3 @@ SGL_KERNEL_EXPORT void mha_fwd(
     dispatch(chunkprefill::mha_fwd, bidirectional_block_ids_);
   }
 }
-#undef SYCL_INTEL_TARGET

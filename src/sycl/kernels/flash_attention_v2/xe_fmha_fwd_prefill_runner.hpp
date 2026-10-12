@@ -47,10 +47,13 @@
 #include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
 #include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
+#if SYCL_INTEL_TARGET == 35
 #include "sycl/kernels/flash_attention_v2/relative_attention.hpp"
+#endif
 
 using namespace cute;
 namespace prefill {
+#if SYCL_INTEL_TARGET == 35
 inline constexpr int kRelBiasLocalQTile = flash_attention_v2::relative_attention::kLocalQTile;
 inline constexpr int kRelBiasLocalKTile = flash_attention_v2::relative_attention::kLocalKTile;
 inline constexpr int kRelBiasGlobalQTile = flash_attention_v2::relative_attention::kGlobalQTile;
@@ -62,6 +65,7 @@ inline constexpr int rel_bias_padded_cols(int rel_extent, bool is_local) {
       is_local ? kRelBiasLocalQTile : kRelBiasGlobalQTile,
       is_local ? kRelBiasLocalKTile : kRelBiasGlobalKTile);
 }
+#endif
 
 struct Arguments {
   // The QKV matrices.

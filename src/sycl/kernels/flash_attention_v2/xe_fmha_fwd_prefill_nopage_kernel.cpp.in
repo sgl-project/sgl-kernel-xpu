@@ -36,7 +36,13 @@
 // own translation unit / runner type (FmhaPrefillNpRunner) so its kernel
 // instantiations land in shared libraries separate from the paged prefill path.
 // Non-paged prefill supports bf16/fp16 queries only (no fp8 KV cache).
+#ifndef SYCL_INTEL_TARGET
+#if defined(XPU_ENABLED_XE3P)
+#define SYCL_INTEL_TARGET 35
+#else
 #define SYCL_INTEL_TARGET 20
+#endif
+#endif
 
 #if @ENABLE_SCORE_BLOCK2D@
 #define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 1

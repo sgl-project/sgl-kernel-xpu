@@ -71,12 +71,18 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
 
                 set(GENERATED_FILE
                     "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DT16}.cpp")
+                if(DPCPP_SYCL_TARGET MATCHES "cri")
+                    string(REGEX REPLACE "\\.cpp$" "Xe35.cpp" GENERATED_FILE "${GENERATED_FILE}")
+                endif()
                 configure_file(${FMHA_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
                 list(APPEND device_cpp_xe20 ${GENERATED_FILE})
                 list(APPEND device_cpp_xe35 ${GENERATED_FILE})
 
                 set(GENERATED_SPLIT_FILE
                     "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DT16}.cpp")
+                if(DPCPP_SYCL_TARGET MATCHES "cri")
+                    string(REGEX REPLACE "\\.cpp$" "Xe35.cpp" GENERATED_SPLIT_FILE "${GENERATED_SPLIT_FILE}")
+                endif()
                 configure_file(${FMHA_SPLIT_DECODE_TEMPLATE} ${GENERATED_SPLIT_FILE} @ONLY)
                 list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FILE})
                 list(APPEND device_cpp_xe35 ${GENERATED_SPLIT_FILE})
@@ -86,12 +92,18 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
                 if(ELEM_TAG STREQUAL "bf16")
                     set(GENERATED_FP8_FILE
                         "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DTFP8}.cpp")
+                    if(DPCPP_SYCL_TARGET MATCHES "cri")
+                        string(REGEX REPLACE "\\.cpp$" "Xe35.cpp" GENERATED_FP8_FILE "${GENERATED_FP8_FILE}")
+                    endif()
                     configure_file(${FMHA_DECODE_FP8_TEMPLATE} ${GENERATED_FP8_FILE} @ONLY)
                     list(APPEND device_cpp_xe20 ${GENERATED_FP8_FILE})
                     list(APPEND device_cpp_xe35 ${GENERATED_FP8_FILE})
 
                     set(GENERATED_SPLIT_FP8_FILE
                         "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_split_decode_page_${QG_SZ}_${HEAD_DIM}_${PAGE_SIZE}_${DTFP8}.cpp")
+                    if(DPCPP_SYCL_TARGET MATCHES "cri")
+                        string(REGEX REPLACE "\\.cpp$" "Xe35.cpp" GENERATED_SPLIT_FP8_FILE "${GENERATED_SPLIT_FP8_FILE}")
+                    endif()
                     configure_file(${FMHA_SPLIT_DECODE_FP8_TEMPLATE} ${GENERATED_SPLIT_FP8_FILE} @ONLY)
                     list(APPEND device_cpp_xe20 ${GENERATED_SPLIT_FP8_FILE})
                     list(APPEND device_cpp_xe35 ${GENERATED_SPLIT_FP8_FILE})
@@ -116,6 +128,9 @@ foreach(QG_SZ ${FMHA_DECODE_QG_SIZES})
 
             set(GENERATED_NP_FILE
                 "${CMAKE_CURRENT_BINARY_DIR}/sycl/xe_fmha_fwd_decode_nopage_${QG_SZ}_${HEAD_DIM}_${DT16}.cpp")
+            if(DPCPP_SYCL_TARGET MATCHES "cri")
+                string(REGEX REPLACE "\\.cpp$" "Xe35.cpp" GENERATED_NP_FILE "${GENERATED_NP_FILE}")
+            endif()
             configure_file(${FMHA_DECODE_NOPAGE_TEMPLATE} ${GENERATED_NP_FILE} @ONLY)
             list(APPEND device_cpp_xe20 ${GENERATED_NP_FILE})
             list(APPEND device_cpp_xe35 ${GENERATED_NP_FILE})

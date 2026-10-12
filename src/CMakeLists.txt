@@ -65,7 +65,7 @@ if(USE_GDN)
     add_compile_definitions(USE_GDN)
 endif()
 if(USE_FMHA AND USE_SYCL_JIT)
-    # Route decode/prefill dispatch (flash_attention.cpp) through the runtime-JIT
+    # Route decode/prefill dispatch (flash_attentionXe20.cpp / flash_attentionXe35.cpp) through the runtime-JIT
     # path; the AOT FMHA instances are not generated (see include() guard below).
     add_compile_definitions(USE_FMHA_JIT)
 endif()
@@ -99,12 +99,10 @@ file(GLOB_RECURSE device_cpp "sycl/*.cpp" "sycl/*.sycl")
 file(GLOB host_cpp "./*.cpp" "./*.cc")
 
 # Filter out source files belonging to disabled features BEFORE splitting them
-# into common/Xe20 buckets. The disabled base sources (flash_attention.cpp,
-# mla_*.cpp) are non-Xe20 and would otherwise land in device_cpp_common, which
-# is never filtered; removing them from device_cpp up front is the only way to
-# keep them out of the build.
+# into common/Xe20/Xe35 buckets. Sources left in the common bucket are not
+# filtered later, so every disabled feature is removed here.
 if(NOT USE_FMHA)
-    list(FILTER device_cpp EXCLUDE REGEX "/flash_attention\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/flash_attentionXe(20|35)\\.cpp$")
 endif()
 if(NOT USE_GDN)
     list(FILTER device_cpp EXCLUDE REGEX "/gdn_attention\\.cpp$")

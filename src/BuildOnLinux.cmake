@@ -100,8 +100,13 @@ if(USE_GDN
 endif()
 
 # Dispatchers that call the runtime-JIT engine link the static JIT library.
-if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-flash_attention)
-  target_link_libraries(sgl-ops-sycl-flash_attention PRIVATE sgl_jit)
+if(USE_FMHA AND USE_SYCL_JIT)
+  if(TARGET sgl-ops-sycl-flash_attentionXe20)
+    target_link_libraries(sgl-ops-sycl-flash_attentionXe20 PRIVATE sgl_jit)
+  endif()
+  if(TARGET sgl-ops-sycl-flash_attentionXe35)
+    target_link_libraries(sgl-ops-sycl-flash_attentionXe35 PRIVATE sgl_jit)
+  endif()
 endif()
 if(USE_MLA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-mla_decode)
   target_link_libraries(sgl-ops-sycl-mla_decode PRIVATE sgl_jit)

@@ -30,7 +30,13 @@
  **************************************************************************************************/
 // Auto-generated from xe_fmha_fwd_prefill_kernel.cpp.in
 // Template parameters: HEAD_DIM=@HEAD_DIM@, TILED_Q=@TILED_Q@, TILED_KV=@TILED_KV@, NUM_SG=@NUM_SG@, ELEM_TAG=@ELEM_TAG@
+#ifndef SYCL_INTEL_TARGET
+#if defined(XPU_ENABLED_XE3P)
+#define SYCL_INTEL_TARGET 35
+#else
 #define SYCL_INTEL_TARGET 20
+#endif
+#endif
 
 #if @ENABLE_SCORE_BLOCK2D@
 #define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 1
@@ -152,6 +158,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
       !use_sink,
       "sink is only supported for head_size == 64, got @HEAD_DIM@");
 #if @HEAD_DIM@ == 128
+#if SYCL_INTEL_TARGET == 35
   if (params.rel_bias_ptr != nullptr) {
     TORCH_CHECK(params.dv == 128, "relative attention requires head_dim_v == 128");
     TORCH_CHECK(!params.is_e4m3 && !params.is_e5m2, "relative attention does not support fp8 KV cache");
@@ -198,6 +205,9 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
     });
     return;
   }
+#else
+  TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention is supported only on CRI");
+#endif  // SYCL_INTEL_TARGET == 35
 #else
   TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention is only compiled for head_dim == 128");
 #endif

@@ -9,7 +9,13 @@
 // the e4m3/e5m2 kernel instantiations (which fan out over is_local x is_causal)
 // compile in their own translation unit and keep the peak compiler memory of
 // the (bf16/fp16) paged prefill TU low.
+#ifndef SYCL_INTEL_TARGET
+#if defined(XPU_ENABLED_XE3P)
+#define SYCL_INTEL_TARGET 35
+#else
 #define SYCL_INTEL_TARGET 20
+#endif
+#endif
 
 #include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"

@@ -27,6 +27,8 @@ if(USE_SYCL_JIT)
     ${SGL_OPS_XPU_ROOT}/src/jit/mla_jit.cpp
     ${SGL_OPS_XPU_ROOT}/src/jit/gdn_jit.cpp)
   set_target_properties(sgl_jit PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  # Pure host C++, so it misses SYCL_HOST_FLAGS; apply the hardening set directly.
+  target_compile_options(sgl_jit PRIVATE ${SGL_SDL_WARNING_FLAGS} ${SGL_SDL_HARDENING_FLAGS})
   target_include_directories(sgl_jit PUBLIC ${SGL_OPS_XPU_ROOT}/src)
   # Feed the runtime-JIT compile the exact AOT flags: host flags (-fPIC,
   # -std=c++20, visibility, warnings) + kernel compile options + shared
@@ -36,9 +38,11 @@ if(USE_SYCL_JIT)
   # globally via add_compile_definitions (not part of SYCL_COMPILE_FLAGS) and
   # without it cutlass-sycl headers take the CUDA path and fail on
   # <cuda_runtime_api.h>. default_sycl_flags() drops the -fsycl-targets token so
-  # the per-arch JIT target wins.
+  # the per-arch JIT target wins. SGL_SDL_LINK_FLAGS is included because this is
+  # a single-shot compile *and* link, so the .so it emits needs the same NX /
+  # full-RELRO hardening as its AOT sibling.
   string(REPLACE ";" " " SGL_JIT_SYCL_FLAGS_VALUE
-    "-shared;${SYCL_HOST_FLAGS};${SYCL_COMPILE_FLAGS};${COMMON_DEVICE_LINK_FLAGS};-DCUTLASS_ENABLE_SYCL")
+    "-shared;${SYCL_HOST_FLAGS};${SYCL_COMPILE_FLAGS};${COMMON_DEVICE_LINK_FLAGS};${SGL_SDL_LINK_FLAGS};-DCUTLASS_ENABLE_SYCL")
   # AOT feeds the IGC/ocloc backend the -cl-* codegen options via `-Xs` at the
   # device-link step (SYCL_OFFLINE_COMPILER_CG_OPTIONS). The single-shot JIT must
   # pass the same options (e.g. correctly-rounded fp32 div/sqrt, >4GB buffers,
@@ -304,4 +308,6 @@ foreach(lib ${SGL_OPS_LIBRARIES})
   target_link_libraries(${lib} PRIVATE ${TORCH_LIBRARIES} c10 torch torch_cpu ${SYCL_LIBRARY})
 
   target_link_libraries(${lib} PUBLIC ${SYCL_LIBRARY})
+
+  target_link_options(${lib} PRIVATE ${SGL_SDL_LINK_FLAGS})
 endforeach()

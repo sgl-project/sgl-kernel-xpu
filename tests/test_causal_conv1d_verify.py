@@ -1,6 +1,4 @@
-# Correctness tests for the GDN target-verify (speculative decoding) conv1d
-# op, which mirrors SGLang's Triton tree-mode `causal_conv1d_update`
-# contract (_causal_conv1d_update_kernel w/ HAS_EAGLE_TREE_CUSTOM_ATTN_MASK).
+# Correctness tests for GDN target-verify conv1d (linear and tree drafts).
 import pytest
 import torch
 import utils
@@ -170,6 +168,156 @@ def test_causal_conv1d_update_verify(
         intermediate_conv_window.float().cpu(), window_ref.float(), atol=tol, rtol=tol
     )
     torch.testing.assert_close(retrieve_parent_token.cpu(), parent_ref.to(index_dtype))
+
+
+@pytest.mark.parametrize("width", [2, 4])
+@pytest.mark.parametrize("cache_steps", [1, 5])
+@pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("input_layout", ["contiguous", "transposed"])
+@pytest.mark.parametrize("activation", [None, "silu"])
+def test_causal_conv1d_update_verify_implicit_chain(
+    width, cache_steps, itype, input_layout, activation
+):
+    torch.manual_seed(1)
+    batch, dim = 2, 64
+    x = (
+        torch.randn(batch, cache_steps, dim, dtype=itype, device=device).transpose(1, 2)
+        if input_layout == "transposed"
+        else torch.randn(batch, dim, cache_steps, dtype=itype, device=device)
+    )
+    conv_state = torch.randn(batch + 1, dim, width - 1, dtype=itype, device=device)
+    weight = torch.randn(dim, width, dtype=itype, device=device)
+    bias = torch.randn(dim, dtype=itype, device=device)
+    cache_indices = torch.tensor([2, 0], dtype=torch.int32, device=device)
+    intermediate_state_indices = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    window = torch.full(
+        (batch, cache_steps, dim, width - 1), -42, dtype=itype, device=device
+    )
+    next_token, next_sibling = build_chain_tree(batch, cache_steps)
+    expected, expected_window, _ = ref_causal_conv1d_update_verify(
+        x.cpu(),
+        conv_state.cpu(),
+        weight.cpu(),
+        bias.cpu(),
+        activation=activation is not None,
+        cache_indices=cache_indices.cpu(),
+        retrieve_next_token=next_token,
+        retrieve_next_sibling=next_sibling,
+    )
+    original_x = x.clone()
+    original_state = conv_state.clone()
+
+    output = causal_conv1d_update_verify_xpu(
+        x,
+        conv_state,
+        weight,
+        window,
+        intermediate_state_indices,
+        bias=bias,
+        activation=activation,
+        cache_indices=cache_indices,
+    )
+
+    tol = 2e-2 if itype != torch.float32 else 1e-3
+    assert output.data_ptr() != x.data_ptr()
+    assert output.stride() == x.stride()
+    torch.testing.assert_close(x, original_x)
+    torch.testing.assert_close(conv_state, original_state)
+    torch.testing.assert_close(
+        output.float().cpu(), expected.float(), atol=tol, rtol=tol
+    )
+    torch.testing.assert_close(
+        window[intermediate_state_indices.long()].float().cpu(),
+        expected_window.float(),
+        atol=tol,
+        rtol=tol,
+    )
+
+
+@pytest.mark.parametrize("input_layout", ["contiguous", "transposed"])
+def test_causal_conv1d_update_verify_implicit_chain_pad_slot(input_layout):
+    batch, dim, cache_steps, width = 3, 32, 5, 3
+    x = (
+        torch.randn(batch, cache_steps, dim, device=device).transpose(1, 2)
+        if input_layout == "transposed"
+        else torch.randn(batch, dim, cache_steps, device=device)
+    )
+    conv_state = torch.randn(batch, dim, width - 1, device=device)
+    weight = torch.randn(dim, width, device=device)
+    cache_indices = torch.tensor([0, PAD_SLOT_ID, 2], dtype=torch.int32, device=device)
+    intermediate_state_indices = torch.arange(batch, dtype=torch.int32, device=device)
+    window = torch.full(
+        (batch, cache_steps, dim, width - 1), -42, dtype=x.dtype, device=device
+    )
+    next_token, next_sibling = build_chain_tree(batch, cache_steps)
+    expected, expected_window, _ = ref_causal_conv1d_update_verify(
+        x.cpu(),
+        conv_state.cpu(),
+        weight.cpu(),
+        bias=None,
+        activation=False,
+        cache_indices=cache_indices.cpu(),
+        retrieve_next_token=next_token,
+        retrieve_next_sibling=next_sibling,
+    )
+
+    output = causal_conv1d_update_verify_xpu(
+        x,
+        conv_state,
+        weight,
+        window,
+        intermediate_state_indices,
+        cache_indices=cache_indices,
+    )
+
+    torch.testing.assert_close(output[[0, 2]].cpu(), expected[[0, 2]])
+    torch.testing.assert_close(window[[0, 2]].cpu(), expected_window[[0, 2]])
+    torch.testing.assert_close(output[1], x[1])
+    torch.testing.assert_close(window[1], torch.full_like(window[1], -42))
+
+
+@pytest.mark.parametrize("missing", ["next", "sibling", "parent"])
+def test_causal_conv1d_update_verify_rejects_partial_tree(missing):
+    x = torch.zeros(1, 32, 3, device=device)
+    next_token, next_sibling = build_chain_tree(1, 3)
+    links = {
+        "next": next_token.to(device),
+        "sibling": next_sibling.to(device),
+        "parent": torch.empty(1, 3, dtype=torch.int32, device=device),
+    }
+    links[missing] = None
+    with pytest.raises(RuntimeError, match="all be present or all be None"):
+        causal_conv1d_update_verify_xpu(
+            x,
+            torch.zeros(1, 32, 2, device=device),
+            torch.zeros(32, 3, device=device),
+            torch.empty(1, 3, 32, 2, device=device),
+            torch.zeros(1, dtype=torch.int32, device=device),
+            links["next"],
+            links["sibling"],
+            links["parent"],
+        )
+
+
+@pytest.mark.parametrize("invalid", ["window_dtype", "indices_dtype"])
+def test_causal_conv1d_update_verify_rejects_invalid_intermediate(invalid):
+    x = torch.zeros(1, 32, 3, device=device)
+    window = torch.empty(1, 3, 32, 2, device=device)
+    indices = torch.zeros(1, dtype=torch.int32, device=device)
+    if invalid == "window_dtype":
+        window = window.long()
+    else:
+        indices = indices.long()
+    with pytest.raises(
+        RuntimeError, match="intermediate_conv_window|intermediate_state_indices"
+    ):
+        causal_conv1d_update_verify_xpu(
+            x,
+            torch.zeros(1, 32, 2, device=device),
+            torch.zeros(32, 3, device=device),
+            window,
+            indices,
+        )
 
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])

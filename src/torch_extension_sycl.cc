@@ -704,8 +704,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "causal_conv1d_update_verify(Tensor x, Tensor conv_state, Tensor weight, Tensor? bias_, "
       "bool silu_activation, Tensor? cache_indices_, Tensor! intermediate_conv_window, "
-      "Tensor intermediate_state_indices, Tensor retrieve_next_token, Tensor retrieve_next_sibling, "
-      "Tensor! retrieve_parent_token, int pad_slot_id) -> Tensor");
+      "Tensor intermediate_state_indices, Tensor? retrieve_next_token, Tensor? retrieve_next_sibling, "
+      "Tensor(a!)? retrieve_parent_token, int pad_slot_id) -> Tensor");
   m.impl("causal_conv1d_update_verify", torch::kXPU, &causal_conv1d_update_verify);
 
   /*

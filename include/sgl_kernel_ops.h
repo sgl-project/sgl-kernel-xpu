@@ -1476,9 +1476,9 @@ at::Tensor causal_conv1d_update_verify(
     const std::optional<at::Tensor>& cache_indices_,
     at::Tensor& intermediate_conv_window,
     const at::Tensor& intermediate_state_indices,
-    const at::Tensor& retrieve_next_token,
-    const at::Tensor& retrieve_next_sibling,
-    at::Tensor& retrieve_parent_token,
+    const std::optional<at::Tensor>& retrieve_next_token,
+    const std::optional<at::Tensor>& retrieve_next_sibling,
+    const std::optional<at::Tensor>& retrieve_parent_token,
     int64_t pad_slot_id);
 
 // Xe35 only kernels

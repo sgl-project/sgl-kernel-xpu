@@ -873,7 +873,7 @@ SGL_KERNEL_EXPORT void causal_conv1d_update(
 
   at::Tensor out = x;
 
-  if (seqlen == 1 && !cache_seqlens_.has_value()) {
+  if (seqlen == 1 && !cache_seqlens_.has_value() && conv_state_len == width - 1) {
     // Token-parallel design: faster via vectorized loads/stores.
     auto queue = c10::xpu::getCurrentXPUStream().queue();
     SYCL_DISPATCH_FLOATING_TYPES(
@@ -935,7 +935,7 @@ static void launch_causal_conv1d_verify_tree_decode(
     const std::optional<at::Tensor>& cache_indices_,
     const at::Tensor& retrieve_next_token,
     const at::Tensor& retrieve_next_sibling,
-    at::Tensor& retrieve_parent_token,
+    const at::Tensor& retrieve_parent_token,
     at::Tensor& parent_idx,
     int64_t pad_slot_id,
     int batch_size,
@@ -963,7 +963,7 @@ static void launch_causal_conv1d_update_verify_w(
     at::Tensor& intermediate_conv_window,
     const at::Tensor& intermediate_state_indices,
     const std::optional<at::Tensor>& cache_indices_,
-    const at::Tensor& parent_idx,
+    const std::optional<at::Tensor>& parent_idx,
     bool silu_activation,
     int64_t pad_slot_id,
     int batch_size,
@@ -995,7 +995,7 @@ static void launch_causal_conv1d_update_verify_w(
       static_cast<int>(intermediate_conv_window.stride(3)),
       cache_indices_.has_value() ? reinterpret_cast<const int*>(cache_indices_.value().data_ptr()) : nullptr,
       reinterpret_cast<const int*>(intermediate_state_indices.data_ptr()),
-      reinterpret_cast<const int*>(parent_idx.data_ptr()),
+      parent_idx.has_value() ? reinterpret_cast<const int*>(parent_idx->data_ptr()) : nullptr,
       silu_activation,
       static_cast<int>(pad_slot_id),
       batch_size,
@@ -1015,7 +1015,7 @@ static void launch_causal_conv1d_update_verify(
     at::Tensor& intermediate_conv_window,
     const at::Tensor& intermediate_state_indices,
     const std::optional<at::Tensor>& cache_indices_,
-    const at::Tensor& parent_idx,
+    const std::optional<at::Tensor>& parent_idx,
     bool silu_activation,
     int64_t pad_slot_id,
     int batch_size,
@@ -1049,12 +1049,9 @@ static void launch_causal_conv1d_update_verify(
   TORCH_CHECK(false, "causal_conv1d_update_verify only supports width between 2 and 4, got ", width);
 }
 
-// Standalone verify-path op backing GDN's speculative decoding, matching
-// SGLang's Triton tree-mode `causal_conv1d_update` contract (see
-// causal_conv1d_verify.hpp for the full design). `conv_state` is read-only
-// here (root-ancestor seed); accepted-token commit happens elsewhere via
-// `intermediate_conv_window`. The result is separate from `x`: a later
-// draft token's ancestor walk may need an earlier token's raw value.
+// Verify-path conv1d for linear chains or trees. `conv_state` is read-only;
+// accepted-token commit uses `intermediate_conv_window`. Keep `x` unchanged
+// because later draft tokens may need earlier raw values.
 SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
     const at::Tensor& x,
     const at::Tensor& conv_state,
@@ -1064,9 +1061,9 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
     const std::optional<at::Tensor>& cache_indices_,
     at::Tensor& intermediate_conv_window,
     const at::Tensor& intermediate_state_indices,
-    const at::Tensor& retrieve_next_token,
-    const at::Tensor& retrieve_next_sibling,
-    at::Tensor& retrieve_parent_token,
+    const std::optional<at::Tensor>& retrieve_next_token,
+    const std::optional<at::Tensor>& retrieve_next_sibling,
+    const std::optional<at::Tensor>& retrieve_parent_token,
     int64_t pad_slot_id) {
   auto input_type = x.scalar_type();
   auto weight_type = weight.scalar_type();
@@ -1097,23 +1094,39 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
     CHECK_SHAPE(bias_.value(), dim);
   }
   CHECK_SHAPE(intermediate_state_indices, batch_size);
-  CHECK_SHAPE(retrieve_next_token, batch_size, cache_steps);
-  CHECK_SHAPE(retrieve_next_sibling, batch_size, cache_steps);
-  CHECK_SHAPE(retrieve_parent_token, batch_size, cache_steps);
-  const auto index_type = retrieve_next_token.scalar_type();
-  TORCH_CHECK(index_type == at::kInt || index_type == at::kLong, "retrieve_next_token must be int32 or int64");
   TORCH_CHECK(
-      retrieve_next_sibling.scalar_type() == index_type && retrieve_parent_token.scalar_type() == index_type,
-      "retrieve_next_sibling and retrieve_parent_token must match retrieve_next_token dtype");
+      intermediate_state_indices.is_xpu() && intermediate_state_indices.scalar_type() == at::kInt &&
+          intermediate_state_indices.is_contiguous(),
+      "intermediate_state_indices must be contiguous XPU int32");
+  const bool has_tree = retrieve_next_token.has_value();
   TORCH_CHECK(
-      retrieve_next_token.is_xpu() && retrieve_next_sibling.is_xpu() && retrieve_parent_token.is_xpu(),
-      "tree indices must be XPU tensors");
-  TORCH_CHECK(
-      retrieve_next_token.is_contiguous() && retrieve_next_sibling.is_contiguous() &&
-          retrieve_parent_token.is_contiguous(),
-      "tree indices must be contiguous");
+      retrieve_next_sibling.has_value() == has_tree && retrieve_parent_token.has_value() == has_tree,
+      "retrieve_next_token, retrieve_next_sibling and retrieve_parent_token must all be present or all be None");
+  if (has_tree) {
+    const auto& next_token = *retrieve_next_token;
+    const auto& next_sibling = *retrieve_next_sibling;
+    const auto& parent_token = *retrieve_parent_token;
+    CHECK_SHAPE(next_token, batch_size, cache_steps);
+    CHECK_SHAPE(next_sibling, batch_size, cache_steps);
+    CHECK_SHAPE(parent_token, batch_size, cache_steps);
+    const auto index_type = retrieve_next_token->scalar_type();
+    TORCH_CHECK(index_type == at::kInt || index_type == at::kLong, "retrieve_next_token must be int32 or int64");
+    TORCH_CHECK(
+        retrieve_next_sibling->scalar_type() == index_type && retrieve_parent_token->scalar_type() == index_type,
+        "retrieve_next_sibling and retrieve_parent_token must match retrieve_next_token dtype");
+    TORCH_CHECK(
+        retrieve_next_token->is_xpu() && retrieve_next_sibling->is_xpu() && retrieve_parent_token->is_xpu(),
+        "tree indices must be XPU tensors");
+    TORCH_CHECK(
+        retrieve_next_token->is_contiguous() && retrieve_next_sibling->is_contiguous() &&
+            retrieve_parent_token->is_contiguous(),
+        "tree indices must be contiguous");
+  }
   TORCH_CHECK(
       intermediate_conv_window.dim() == 4, "intermediate_conv_window must be (rows, cache_steps, dim, width-1)");
+  TORCH_CHECK(
+      intermediate_conv_window.is_xpu() && intermediate_conv_window.scalar_type() == input_type,
+      "intermediate_conv_window must be an XPU tensor matching the input dtype");
   TORCH_CHECK(intermediate_conv_window.size(1) == cache_steps);
   TORCH_CHECK(intermediate_conv_window.size(2) == dim);
   TORCH_CHECK(intermediate_conv_window.size(3) == width - 1);
@@ -1127,9 +1140,7 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
   at::Tensor out = at::empty_like(x);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
-  // Decode the tree once per batch entry (not redundantly per channel-group
-  // inside the conv kernel below) into a small int32 scratch buffer.
-  at::Tensor parent_idx = at::empty({batch_size, cache_steps}, x.options().dtype(at::kInt));
+  std::optional<at::Tensor> parent_idx;
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
@@ -1137,28 +1148,31 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
   timer.start();
 #endif
 
-  if (index_type == at::kInt) {
-    launch_causal_conv1d_verify_tree_decode<int32_t>(
-        queue,
-        cache_indices_,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        retrieve_parent_token,
-        parent_idx,
-        pad_slot_id,
-        batch_size,
-        cache_steps);
-  } else {
-    launch_causal_conv1d_verify_tree_decode<int64_t>(
-        queue,
-        cache_indices_,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        retrieve_parent_token,
-        parent_idx,
-        pad_slot_id,
-        batch_size,
-        cache_steps);
+  if (has_tree) {
+    parent_idx = at::empty({batch_size, cache_steps}, x.options().dtype(at::kInt));
+    if (retrieve_next_token->scalar_type() == at::kInt) {
+      launch_causal_conv1d_verify_tree_decode<int32_t>(
+          queue,
+          cache_indices_,
+          *retrieve_next_token,
+          *retrieve_next_sibling,
+          *retrieve_parent_token,
+          *parent_idx,
+          pad_slot_id,
+          batch_size,
+          cache_steps);
+    } else {
+      launch_causal_conv1d_verify_tree_decode<int64_t>(
+          queue,
+          cache_indices_,
+          *retrieve_next_token,
+          *retrieve_next_sibling,
+          *retrieve_parent_token,
+          *parent_idx,
+          pad_slot_id,
+          batch_size,
+          cache_steps);
+    }
   }
 
   auto launch = [&]() {

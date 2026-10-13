@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 
@@ -66,9 +66,9 @@ def causal_conv1d_update_verify_xpu(
     weight: torch.Tensor,
     intermediate_conv_window: torch.Tensor,
     intermediate_state_indices: torch.Tensor,
-    retrieve_next_token: torch.Tensor,
-    retrieve_next_sibling: torch.Tensor,
-    retrieve_parent_token: torch.Tensor,
+    retrieve_next_token: Optional[torch.Tensor] = None,
+    retrieve_next_sibling: Optional[torch.Tensor] = None,
+    retrieve_parent_token: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
     activation: Optional[str] = None,
     cache_indices: Optional[torch.Tensor] = None,
@@ -82,11 +82,10 @@ def causal_conv1d_update_verify_xpu(
         history for each sequence's tree root).
     intermediate_conv_window: (scratch_rows, cache_steps, dim, width-1),
         written with every draft token's post-update window.
-    retrieve_next_token / retrieve_next_sibling: (batch, cache_steps) int32
-        or int64, with matching dtype.
-        first-child/next-sibling encoding of the speculative tree.
-    retrieve_parent_token: (batch, cache_steps) matching index dtype,
-        written in place with the decoded parent index of each draft token.
+    retrieve_next_token / retrieve_next_sibling: optional first-child/next-sibling
+        tree links (batch, cache_steps), int32 or int64 with matching dtype.
+    retrieve_parent_token: matching tree index dtype, written with parent
+        indices. Omit all three for an implicit linear draft chain.
     """
     _ = kwargs
     return torch.ops.sgl_kernel.causal_conv1d_update_verify(

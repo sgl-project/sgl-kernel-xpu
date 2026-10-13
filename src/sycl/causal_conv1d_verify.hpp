@@ -13,25 +13,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-// Standalone causal-conv1d op backing GDN's target-verify (speculative
-// decoding) path. Mirrors SGLang's Triton `causal_conv1d_update` tree-mode
-// contract (`_causal_conv1d_update_kernel` with HAS_EAGLE_TREE_CUSTOM_ATTN_MASK)
-// so the SYCL path needs no XPU-special-casing in gdn_backend.py.
+// Standalone causal-conv1d op backing GDN's target-verify path.
+// Supports both implicit linear chains and first-child/next-sibling trees.
 //
-// Each draft token's conv window is built by walking up its EAGLE-tree
-// ancestors (not a linear t-1,t-2,... window): `retrieve_next_token` /
-// `retrieve_next_sibling` encode the tree as a first-child/next-sibling
-// list. `CausalConv1dVerifyTreeDecodeKernel` decodes it into a per-token
-// parent index once per batch entry (not redundantly per channel-group,
-// and not redundantly per work-group either -- measured: both of
-// those cost more than a tiny dedicated kernel launch does), writing both
-// `retrieve_parent_token` (consumed later by `gated_delta_rule_verify`)
-// and a `parent_idx` scratch buffer that `CausalConv1dUpdateVerifyKernel`
-// reads while computing the convolution. Ancestor chains shorter than
-// `width-1` fall back to the committed `conv_state` window (read-only;
-// never written here). Every token's post-update window is also
-// snapshotted into `intermediate_conv_window` so a later accept/commit step
-// can seed the next decode round without replaying the tree walk.
+// Tree links are decoded once per batch entry and written to
+// `retrieve_parent_token` for the recurrent verify kernel. Without links,
+// parents are implicit (t-1) and no decode kernel or scratch is needed.
+// Each token's window is saved for the accepted-token commit.
 #include <torch/all.h>
 
 #include <sycl/sycl.hpp>
@@ -205,7 +193,7 @@ struct CausalConv1dUpdateVerifyKernel {
     }
     const int active_elems = sycl::min(elems_per_item, dim - channel_id);
     const int scratch_row = (intermediate_state_indices != nullptr) ? intermediate_state_indices[batch_id] : batch_id;
-    const int* batch_parent_idx = parent_idx + batch_id * cache_steps;
+    const int* batch_parent_idx = parent_idx != nullptr ? parent_idx + batch_id * cache_steps : nullptr;
 
     // STEP 2: preload weights and the committed window (root's ancestors).
     T local_weights[Width][ElemsPerItem];
@@ -238,9 +226,7 @@ struct CausalConv1dUpdateVerifyKernel {
       }
     }
 
-    // STEP 3: compute each draft token's convolution by walking its
-    // ancestor chain (parent -> grandparent -> ...), falling back to the
-    // committed window once the chain runs out (reaches token 0's "parent").
+    // Walk tree parents or the implicit linear chain, then the committed window.
 #pragma unroll 1
     for (int idx_token = 0; idx_token < cache_steps; ++idx_token) {
       float acc[ElemsPerItem];
@@ -267,7 +253,7 @@ struct CausalConv1dUpdateVerifyKernel {
           acc[e] += static_cast<float>(cur_val[e]) * static_cast<float>(local_weights[Width - 1 - j][e]);
         }
         if (cur > 0) {
-          cur = batch_parent_idx[cur];
+          cur = batch_parent_idx != nullptr ? batch_parent_idx[cur] : cur - 1;
 #pragma unroll
           for (int e = 0; e < ElemsPerItem; ++e) {
             cur_val[e] = (e < active_elems)

@@ -907,8 +907,14 @@ void gated_delta_rule_verify(
   TORCH_CHECK(
       intermediate_state_indices.dim() == 1, "intermediate_state_indices must be 1D of shape [num_spec_decodes]");
   TORCH_CHECK(cache_indices.dtype() == torch::kInt32, "cache_indices must be int32");
+  TORCH_CHECK(cache_indices.is_xpu() && cache_indices.is_contiguous(), "cache_indices must be a contiguous XPU tensor");
   TORCH_CHECK(intermediate_state_indices.dtype() == torch::kInt32, "intermediate_state_indices must be int32");
-  TORCH_CHECK(intermediate_states_buffer.is_contiguous(), "intermediate_states_buffer must be contiguous");
+  TORCH_CHECK(
+      intermediate_state_indices.is_xpu() && intermediate_state_indices.is_contiguous(),
+      "intermediate_state_indices must be a contiguous XPU tensor");
+  TORCH_CHECK(
+      intermediate_states_buffer.is_xpu() && intermediate_states_buffer.is_contiguous(),
+      "intermediate_states_buffer must be a contiguous XPU tensor");
   TORCH_CHECK(
       intermediate_states_buffer.dim() == 5,
       "intermediate_states_buffer must be 5D of shape [scratch_rows, cache_steps, "

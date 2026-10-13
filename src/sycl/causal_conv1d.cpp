@@ -1121,6 +1121,9 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
         retrieve_next_token->is_contiguous() && retrieve_next_sibling->is_contiguous() &&
             retrieve_parent_token->is_contiguous(),
         "tree indices must be contiguous");
+    TORCH_CHECK(
+        intermediate_conv_window.is_xpu() && intermediate_conv_window.scalar_type() == input_type,
+        "intermediate_conv_window must be an XPU tensor matching x dtype");
   }
   TORCH_CHECK(
       intermediate_conv_window.dim() == 4, "intermediate_conv_window must be (rows, cache_steps, dim, width-1)");

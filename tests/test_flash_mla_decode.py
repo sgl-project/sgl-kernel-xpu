@@ -291,14 +291,16 @@ def _check_multi_token_decode(
 @pytest.mark.arch("xe20", "xe35")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 # 1 exercises the 4D (bs, 1, H, D) path, which shares the single-token kernel
-# instantiation with 3D q; the causal mask degenerates to no mask.
+# instantiation with 3D q; the causal mask degenerates to no mask. 2 and 4 run
+# padded on the 8-row kernel; 16 runs it over two Q tiles.
 @pytest.mark.parametrize("s_q", [1, 2, 4, 8, 16])
 # 20 is shorter than one 128-wide split, so num_kv_splits=4 leaves empty splits,
-# and with s_q=16 the causal boundary falls inside the only (partial) KV tile.
+# and with s_q=16 the causal boundary cuts through the last KV tile of each Q
+# tile.
 @pytest.mark.parametrize("mean_seq_len", [20, 1024])
 @pytest.mark.parametrize("bs", [1, 3])
 @pytest.mark.parametrize("varlen", [True, False])
-# 16: one subgroup along KV; 64/128: sub-page KV tiles for s_q >= 8 / >= 4.
+# 16: one subgroup along KV; 64/128: sub-page (32-wide) KV tiles for s_q > 1.
 @pytest.mark.parametrize("block_size", [16, 64, 128])
 @pytest.mark.parametrize("num_heads", [16, 128])
 @pytest.mark.parametrize("num_kv_splits", [-1, 1, 4])
@@ -319,11 +321,11 @@ def test_flash_mla_decode_multi_token(
 
 @pytest.mark.arch("xe20", "xe35")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-# Token counts that are not a kernel Q tile. 3/5/7/9/13/15 are padded up to
-# the 4/8/16-row kernels; 17/28/53/130 run the 16-row kernel over 2/2/4/9 Q
-# tiles with a partial last tile. 130 exceeds the 16-row kernel's 128-thread
-# work-group, which checks the split-KV empty-split sentinel is written per
-# Q tile rather than one row per thread.
+# Token counts that are not a kernel Q tile. 3/5/7 are padded up to the 8-row
+# kernel; 9/13/15/17/28/53/130 run it over 2/2/2/3/4/7/17 Q tiles with a
+# partial last tile. 130 exceeds the kernel's 128-thread work-group, which
+# checks the split-KV empty-split sentinel is written per Q tile rather than
+# one row per thread.
 @pytest.mark.parametrize("s_q", [3, 5, 7, 9, 13, 15, 17, 28, 53, 130])
 # 0: sequences are (about) exactly their s_q new tokens, so all KV is new and
 # the causal boundary cuts through every Q tile; 1000: a long causal-free prefix

@@ -100,27 +100,25 @@ struct FMlAProblemShape {
 };
 
 //----------------- decode Q-tile (bucket) selection --------------------//
-// Largest instantiated Q tile: MlaXe::kMaxSubgroups (8) subgroups x 2 query
+// Largest (and only multi-token) instantiated Q tile: 4 subgroups x 2 query
 // rows each. Must agree with MLA_DECODE_Q_TILES in MlaDecodeXe{20,35}.cmake.
-inline constexpr int kMlaDecodeMaxQTile = 16;
+inline constexpr int kMlaDecodeMaxQTile = 8;
 
-// Q-tile instantiation for a request with seq_len_q query tokens. seq_len_q is
-// rounded up to the next instantiated tile (1, 2, 4, 8, 16); the padding rows
-// read zeros, are masked out of the softmax and are never stored (the Xe 2D
-// block copies clamp to the tensor's real row count). Above kMlaDecodeMaxQTile
-// the 16-row kernel is launched with ceil(seq_len_q / 16) Q tiles, the last of
-// which may be partial in the same way. Returns the tile for any seq_len_q >= 1.
+// Q-tile instantiation for a request with seq_len_q query tokens. Two tiles are
+// built: 1 for single-token decode and 8 for everything else. seq_len_q in 2..8
+// is padded up to 8; the padding rows read zeros, are masked out of the softmax
+// and are never stored (the Xe 2D block copies clamp to the tensor's real row
+// count). Above 8 the 8-row kernel is launched with ceil(seq_len_q / 8) Q
+// tiles, the last of which may be partial in the same way. Returns the tile for
+// any seq_len_q >= 1.
 inline int mla_decode_q_tile(int64_t seq_len_q) {
-  int tile = 1;
-  while (tile < seq_len_q && tile < kMlaDecodeMaxQTile)
-    tile *= 2;
-  return tile;
+  return seq_len_q <= 1 ? 1 : kMlaDecodeMaxQTile;
 }
 
 //----------------- define MLA Xe configuration --------------------//
-// QTileM is the Q-tile height, mla_decode_q_tile(seq_len_q). It is >= the
-// request's seq_len_q for seq_len_q <= 16 (padding rows are masked) and 16 with
-// several Q tiles per request beyond that.
+// QTileM is the Q-tile height, mla_decode_q_tile(seq_len_q): 1 for a single
+// token, else 8. It is >= the request's seq_len_q for seq_len_q <= 8 (padding
+// rows are masked) and 8 with several Q tiles per request beyond that.
 //   1:  single-token decode. One Q row per subgroup (DPAS M=1); the PAGE_SIZE/16
 //       subgroups split the KV tile along N; 128-GRF launch. Unchanged path.
 //   >1: multi-token (MTP / speculative) decode. Two Q rows per subgroup (DPAS

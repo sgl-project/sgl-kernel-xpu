@@ -11,14 +11,14 @@
 set(MLA_DECODE_ELEM_TAGS half bf16)
 set(MLA_DECODE_ELEM_SYCL_TYPES "sycl::half" "sycl::ext::oneapi::bfloat16")
 set(MLA_DECODE_PAGE_SIZES 16 32 64 128)
-# Q-tile heights. 1 is single-token decode; 2/4/8/16 are the multi-token (MTP /
-# speculative) decode variants with a causal mask among the new tokens. Any
-# seq_len_q is served: it is rounded up to the next tile (padding rows masked),
-# and above 16 the 16-row kernel runs several Q tiles. Must match
+# Q-tile heights. 1 is single-token decode; 8 is the multi-token (MTP /
+# speculative) decode variant with a causal mask among the new tokens. Any
+# seq_len_q is served: 2..8 are padded up to 8 (padding rows masked), and
+# above 8 the 8-row kernel runs several Q tiles. Must match
 # mla_decode_q_tile() / kMlaDecodeMaxQTile in mla_decode_types.hpp, the Q_TILE
 # ladder in mla_decode.cpp and the declarations in
 # kernels/mla/<arch>/device/mla_decode_dispatch.hpp.
-set(MLA_DECODE_Q_TILES 1 2 4 8 16)
+set(MLA_DECODE_Q_TILES 1 8)
 
 set(MLA_DECODE_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/mla_decode_kernel.cpp.in")

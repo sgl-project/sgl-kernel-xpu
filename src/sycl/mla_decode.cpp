@@ -118,17 +118,8 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
       case 1:                                                            \
         DISPATCH_MLA_LAUNCH(ELEM, PS, 1);                                \
         break;                                                           \
-      case 2:                                                            \
-        DISPATCH_MLA_LAUNCH(ELEM, PS, 2);                                \
-        break;                                                           \
-      case 4:                                                            \
-        DISPATCH_MLA_LAUNCH(ELEM, PS, 4);                                \
-        break;                                                           \
       case 8:                                                            \
         DISPATCH_MLA_LAUNCH(ELEM, PS, 8);                                \
-        break;                                                           \
-      case 16:                                                           \
-        DISPATCH_MLA_LAUNCH(ELEM, PS, 16);                               \
         break;                                                           \
       default:                                                           \
         TORCH_CHECK(false, "MLA decode: no kernel for Q tile ", q_tile); \
@@ -177,9 +168,9 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
 /// tokens per request (MTP / speculative decode). With s_q > 1 the tokens are
 /// the last s_q positions of the sequence (seq_lens includes them) and are
 /// causally masked: token i attends to KV positions [0, seq_lens - s_q + i].
-/// s_q is served by the Q-tile kernel mla_decode_q_tile(s_q) picks: rounded up
-/// to 1/2/4/8/16 (padding rows are masked), and above 16 by the 16-row kernel
-/// over ceil(s_q / 16) Q tiles.
+/// s_q is served by the Q-tile kernel mla_decode_q_tile(s_q) picks: the 1-row
+/// kernel for a single token, otherwise the 8-row kernel, padded up to 8
+/// (padding rows are masked) and above 8 run over ceil(s_q / 8) Q tiles.
 ///
 /// `lse` is an output taken by const ref: the bindings cannot box a non-const
 /// optional, and at::Tensor constness is shallow.
@@ -246,8 +237,8 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
     int page_count_per_seq = page_table.size(1);
     int max_seq_len = page_size * page_count_per_seq;
     // Heuristic tuned for single-token decode; it keys on the (batch, heads)
-    // work-group count, which is unchanged by seq_len_q up to 16 (above that
-    // each request adds ceil(seq_len_q / 16) Q-tile work-groups).
+    // work-group count, which is unchanged by seq_len_q up to 8 (above that
+    // each request adds ceil(seq_len_q / 8) Q-tile work-groups).
     num_kv_splits = set_split_kv(q_nope.size(0), num_heads, max_seq_len, page_size);
   }
 

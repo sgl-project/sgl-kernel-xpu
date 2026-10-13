@@ -69,9 +69,9 @@ def flash_mla_decode(
     per request (MTP / speculative decode). With s_q > 1 the tokens are the
     last s_q positions of the sequence (seq_lens includes them, so every
     seq_lens[i] must be >= s_q) and are causally masked: token i attends to KV
-    positions [0, seq_lens - s_q + i]. s_q is rounded up to the next kernel
-    Q tile (1, 2, 4, 8, 16); above 16 the 16-row kernel covers it with
-    several Q tiles. Padding rows cost time, not accuracy.
+    positions [0, seq_lens - s_q + i]. s_q > 1 runs on the 8-row kernel: 2..8
+    are padded up to 8, and above 8 it covers the request with several Q
+    tiles. Padding rows cost time, not accuracy.
 
     Args:
         return_lse: also return the softmax log-sum-exp. Default False.

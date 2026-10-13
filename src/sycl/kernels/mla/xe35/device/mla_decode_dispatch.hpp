@@ -49,12 +49,12 @@ namespace mla_decode {
 // Parameters:
 //   ELEM_TAG  in {half, bf16}
 //   PAGE_SIZE in {16, 32, 64, 128}
-//   Q_TILE    in {1, 2, 4, 8, 16}  -- Q-tile height, mla_decode_q_tile(seq_len_q).
+//   Q_TILE    in {1, 8}  -- Q-tile height, mla_decode_q_tile(seq_len_q).
 //     1:  single-token decode (seq_len_q == 1, no causal mask)
-//     >1: multi-token decode (4D q, MTP / speculative). seq_len_q is rounded up
-//         to the tile (padding rows are masked and never stored); above 16 the
-//         16-row kernel runs ceil(seq_len_q / 16) Q tiles. The s_q tokens are
-//         the last s_q positions of the sequence and are causally masked.
+//     8:  multi-token decode (4D q, MTP / speculative). seq_len_q in 2..8 is
+//         padded up to 8 (padding rows are masked and never stored); above 8
+//         the kernel runs ceil(seq_len_q / 8) Q tiles. The s_q tokens are the
+//         last s_q positions of the sequence and are causally masked.
 
 #define DECLARE_MLA_DECODE_LAUNCH(ELEM, PS, QT) \
   void launch_mla_decode_##ELEM##_##PS##_q##QT( \
@@ -71,10 +71,7 @@ namespace mla_decode {
 
 #define DECLARE_MLA_DECODE_ALL_Q_TILES(ELEM, PS) \
   DECLARE_MLA_DECODE_LAUNCH(ELEM, PS, 1)         \
-  DECLARE_MLA_DECODE_LAUNCH(ELEM, PS, 2)         \
-  DECLARE_MLA_DECODE_LAUNCH(ELEM, PS, 4)         \
-  DECLARE_MLA_DECODE_LAUNCH(ELEM, PS, 8)         \
-  DECLARE_MLA_DECODE_LAUNCH(ELEM, PS, 16)
+  DECLARE_MLA_DECODE_LAUNCH(ELEM, PS, 8)
 
 #define DECLARE_MLA_DECODE_ALL_PAGE_SIZES(ELEM) \
   DECLARE_MLA_DECODE_ALL_Q_TILES(ELEM, 16)      \

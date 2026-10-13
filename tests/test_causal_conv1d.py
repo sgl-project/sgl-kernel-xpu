@@ -482,5 +482,64 @@ def test_causal_conv1d_varlen(
     )
 
 
+@pytest.mark.parametrize("pad_first", [False, True])
+@pytest.mark.parametrize(
+    "layout", ["channel_first", "strided_channel_first", "channel_last"]
+)
+def test_causal_conv1d_varlen_long_preserves_padding(pad_first, layout):
+    torch.manual_seed(0)
+    dim, steps, width = 63, 1024, 4
+    if layout == "channel_last":
+        x = torch.randn(2 * steps, dim, device=device, dtype=torch.bfloat16).T
+    else:
+        x = torch.randn(
+            dim + int(layout == "strided_channel_first"),
+            2 * steps,
+            device=device,
+            dtype=torch.bfloat16,
+        )[:dim]
+    x_before = x.clone()
+    weight = torch.randn(dim, width, device=device, dtype=x.dtype)
+    bias = torch.randn(dim, device=device, dtype=x.dtype)
+    conv_states = torch.randn(2, dim, width - 1, device=device, dtype=x.dtype)
+    conv_states_before = conv_states.clone()
+    cache_indices = torch.tensor(
+        [PAD_SLOT_ID, 1] if pad_first else [1, PAD_SLOT_ID],
+        device=device,
+        dtype=torch.int32,
+    )
+    query_start_loc = torch.tensor(
+        [0, steps, 2 * steps], device=device, dtype=torch.int32
+    )
+    has_initial_state = torch.ones(2, device=device, dtype=torch.bool)
+
+    valid = slice(steps, 2 * steps) if pad_first else slice(0, steps)
+    padded = slice(0, steps) if pad_first else slice(steps, 2 * steps)
+    expected, final_state = causal_conv1d_ref(
+        x_before[:, valid].unsqueeze(0),
+        weight,
+        bias,
+        initial_states=conv_states_before[1:2],
+        return_final_states=True,
+        activation="silu",
+    )
+    out = causal_conv1d_fn_xpu(
+        x,
+        weight,
+        bias=bias,
+        conv_states=conv_states,
+        query_start_loc=query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial_state,
+        activation="silu",
+        pad_slot_id=PAD_SLOT_ID,
+    )
+
+    assert torch.equal(out[:, padded], x_before[:, padded])
+    torch.testing.assert_close(out[:, valid], expected.squeeze(0), rtol=1e-2, atol=5e-2)
+    torch.testing.assert_close(conv_states[1:2], final_state, rtol=1e-2, atol=5e-2)
+    assert torch.equal(conv_states[0], conv_states_before[0])
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

@@ -290,8 +290,24 @@ struct CausalConv1dFwdTiledKernel {
     const int t_block_end = t_block_start + block_t < cur_seqlen ? t_block_start + block_t : cur_seqlen;
 
     const int cache_idx = (params.cache_indices_ptr != nullptr) ? params.cache_indices_ptr[batch_id] : batch_id;
-    // Skip padded slots.
+    // Precompute offset base and step to avoid per-token conditional logic.
+    int x_base_offset, out_base_offset, x_step, out_step;
+    if (varlen) {
+      x_base_offset = seq_start * params.x_batch_stride + channel_id * params.x_c_stride;
+      out_base_offset = seq_start * params.out_batch_stride + channel_id * params.out_c_stride;
+      x_step = params.x_batch_stride;
+      out_step = params.out_batch_stride;
+    } else {
+      x_base_offset = batch_id * params.x_batch_stride + channel_id * params.x_c_stride;
+      out_base_offset = batch_id * params.out_batch_stride + channel_id * params.out_c_stride;
+      x_step = params.x_l_stride;
+      out_step = params.out_l_stride;
+    }
+
     if (cache_idx == static_cast<int>(params.pad_slot_id)) {
+      for (int t = t_block_start; t < t_block_end; ++t) {
+        out_ptr[out_base_offset + t * out_step] = x_ptr[x_base_offset + t * x_step];
+      }
       return;
     }
     const bool has_init = (params.has_initial_state_ptr != nullptr) ? params.has_initial_state_ptr[batch_id] : false;
@@ -306,20 +322,6 @@ struct CausalConv1dFwdTiledKernel {
     const float bias_val = (bias_ptr != nullptr) ? static_cast<float>(bias_ptr[channel_id]) : 0.f;
     const bool has_conv_states = (conv_states_ptr != nullptr);
     auto* conv_states_init_ptr = reinterpret_cast<scalar_t*>(params.conv_states_init_ptr);
-
-    // Precompute offset base and step to avoid per-token conditional logic.
-    int x_base_offset, out_base_offset, x_step, out_step;
-    if (varlen) {
-      x_base_offset = seq_start * params.x_batch_stride + channel_id * params.x_c_stride;
-      out_base_offset = seq_start * params.out_batch_stride + channel_id * params.out_c_stride;
-      x_step = params.x_batch_stride;
-      out_step = params.out_batch_stride;
-    } else {
-      x_base_offset = batch_id * params.x_batch_stride + channel_id * params.x_c_stride;
-      out_base_offset = batch_id * params.out_batch_stride + channel_id * params.out_c_stride;
-      x_step = params.x_l_stride;
-      out_step = params.out_l_stride;
-    }
 
     // Initialize the sliding window history.
     float x_vals[kWidth];
@@ -723,16 +725,14 @@ SGL_KERNEL_EXPORT void causal_conv1d_fwd(
   // Predict `block_t`/`time_blocks` before allocating anything, so we can
   // skip the race-avoidance scratch buffers when no tiling occurs.
 
-  // Tiling only wins for small batch + long seqlen (measured); gate on
-  // `batch <= 2 && seqlen >= 1024` with a fixed `block_t`.
-
-  // `seqlen` is total tokens across the batch (varlen, sync-free), so the
-  // threshold scales by `batch_size`; used directly for grid sizing too
-  // since the kernel no-ops past `cur_seqlen`.
+  // Tile long sequences only when adjacent channels are contiguous.
+  // Channel-first inputs regress with time tiling.
+  // `seqlen` is total tokens across the batch for varlen inputs.
   constexpr int kConv1dTilingMaxBatch = 2;
   constexpr int kConv1dTilingMinSeqlen = 1024;
   constexpr int kConv1dFixedBlockT = 128;
-  const bool tiling_candidate = batch_size <= kConv1dTilingMaxBatch && seqlen >= kConv1dTilingMinSeqlen * batch_size;
+  const bool tiling_candidate = x.stride(varlen ? 0 : 1) == 1 && batch_size <= kConv1dTilingMaxBatch &&
+                                seqlen >= kConv1dTilingMinSeqlen * batch_size;
   int block_t = seqlen;
   int time_blocks = 1;
   if (tiling_candidate) {

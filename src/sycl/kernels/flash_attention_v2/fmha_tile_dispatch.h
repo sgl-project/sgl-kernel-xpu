@@ -77,7 +77,8 @@ constexpr PrefillTile prefill_nopage_tile(int hd) {
     case 256:
       return {128, 64, 16, true};
     case 512:
-      return {128, 128, 16, true};
+      // A 128-wide KV tile spills registers at HD512; match the paged tile.
+      return {256, 64, 32, true};
     default:
       return {0, 0, 0, false};
   }

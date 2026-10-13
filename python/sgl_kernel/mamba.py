@@ -82,10 +82,11 @@ def causal_conv1d_update_verify_xpu(
         history for each sequence's tree root).
     intermediate_conv_window: (scratch_rows, cache_steps, dim, width-1),
         written with every draft token's post-update window.
-    retrieve_next_token / retrieve_next_sibling: (batch, cache_steps) int32,
+    retrieve_next_token / retrieve_next_sibling: (batch, cache_steps) int32
+        or int64, with matching dtype.
         first-child/next-sibling encoding of the speculative tree.
-    retrieve_parent_token: (batch, cache_steps) int32, written in place with
-        the decoded parent index of each draft token.
+    retrieve_parent_token: (batch, cache_steps) matching index dtype,
+        written in place with the decoded parent index of each draft token.
     """
     _ = kwargs
     return torch.ops.sgl_kernel.causal_conv1d_update_verify(

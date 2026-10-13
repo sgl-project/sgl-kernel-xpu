@@ -47,13 +47,14 @@ constexpr int kVerifyMaxCacheSteps = 128;
 // kernel (grid=(batch_size)) so `CausalConv1dUpdateVerifyKernel` below
 // doesn't redundantly repeat this O(cache_steps) scan once per
 // channel-group.
+template <typename index_t>
 struct CausalConv1dVerifyTreeDecodeKernel {
  public:
   CausalConv1dVerifyTreeDecodeKernel(
       const int* cache_indices,
-      const int* retrieve_next_token,
-      const int* retrieve_next_sibling,
-      int* retrieve_parent_token,
+      const index_t* retrieve_next_token,
+      const index_t* retrieve_next_sibling,
+      index_t* retrieve_parent_token,
       int* parent_idx,
       const int pad_slot_id,
       const int cache_steps)
@@ -82,11 +83,11 @@ struct CausalConv1dVerifyTreeDecodeKernel {
     }
 #pragma unroll 1
     for (int t = 0; t < cache_steps; ++t) {
-      const int child = retrieve_next_token[batch_id * cache_steps + t];
+      const index_t child = retrieve_next_token[batch_id * cache_steps + t];
       if (child != -1) {
         row[child] = t;
       }
-      const int sibling = retrieve_next_sibling[batch_id * cache_steps + t];
+      const index_t sibling = retrieve_next_sibling[batch_id * cache_steps + t];
       if (sibling != -1) {
         row[sibling] = row[t];
       }
@@ -99,9 +100,9 @@ struct CausalConv1dVerifyTreeDecodeKernel {
 
  private:
   const int* cache_indices;
-  const int* retrieve_next_token;
-  const int* retrieve_next_sibling;
-  int* retrieve_parent_token;
+  const index_t* retrieve_next_token;
+  const index_t* retrieve_next_sibling;
+  index_t* retrieve_parent_token;
   int* parent_idx;
   const int pad_slot_id;
   const int cache_steps;

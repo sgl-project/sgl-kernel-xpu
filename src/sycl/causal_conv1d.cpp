@@ -929,6 +929,7 @@ SGL_KERNEL_EXPORT void causal_conv1d_update(
 #endif
 }
 
+template <typename index_t>
 static void launch_causal_conv1d_verify_tree_decode(
     sycl::queue& queue,
     const std::optional<at::Tensor>& cache_indices_,
@@ -939,12 +940,12 @@ static void launch_causal_conv1d_verify_tree_decode(
     int64_t pad_slot_id,
     int batch_size,
     int cache_steps) {
-  using KERNEL = sgl_conv1d::CausalConv1dVerifyTreeDecodeKernel;
+  using KERNEL = sgl_conv1d::CausalConv1dVerifyTreeDecodeKernel<index_t>;
   KERNEL task(
       cache_indices_.has_value() ? reinterpret_cast<const int*>(cache_indices_.value().data_ptr()) : nullptr,
-      reinterpret_cast<const int*>(retrieve_next_token.data_ptr()),
-      reinterpret_cast<const int*>(retrieve_next_sibling.data_ptr()),
-      reinterpret_cast<int*>(retrieve_parent_token.data_ptr()),
+      retrieve_next_token.data_ptr<index_t>(),
+      retrieve_next_sibling.data_ptr<index_t>(),
+      retrieve_parent_token.data_ptr<index_t>(),
       reinterpret_cast<int*>(parent_idx.data_ptr()),
       static_cast<int>(pad_slot_id),
       cache_steps);
@@ -1099,6 +1100,18 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
   CHECK_SHAPE(retrieve_next_token, batch_size, cache_steps);
   CHECK_SHAPE(retrieve_next_sibling, batch_size, cache_steps);
   CHECK_SHAPE(retrieve_parent_token, batch_size, cache_steps);
+  const auto index_type = retrieve_next_token.scalar_type();
+  TORCH_CHECK(index_type == at::kInt || index_type == at::kLong, "retrieve_next_token must be int32 or int64");
+  TORCH_CHECK(
+      retrieve_next_sibling.scalar_type() == index_type && retrieve_parent_token.scalar_type() == index_type,
+      "retrieve_next_sibling and retrieve_parent_token must match retrieve_next_token dtype");
+  TORCH_CHECK(
+      retrieve_next_token.is_xpu() && retrieve_next_sibling.is_xpu() && retrieve_parent_token.is_xpu(),
+      "tree indices must be XPU tensors");
+  TORCH_CHECK(
+      retrieve_next_token.is_contiguous() && retrieve_next_sibling.is_contiguous() &&
+          retrieve_parent_token.is_contiguous(),
+      "tree indices must be contiguous");
   TORCH_CHECK(
       intermediate_conv_window.dim() == 4, "intermediate_conv_window must be (rows, cache_steps, dim, width-1)");
   TORCH_CHECK(intermediate_conv_window.size(1) == cache_steps);
@@ -1106,6 +1119,9 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
   TORCH_CHECK(intermediate_conv_window.size(3) == width - 1);
   if (cache_indices_.has_value()) {
     CHECK_SHAPE(cache_indices_.value(), batch_size);
+    TORCH_CHECK(
+        cache_indices_->is_xpu() && cache_indices_->scalar_type() == at::kInt, "cache_indices must be XPU int32");
+    TORCH_CHECK(cache_indices_->is_contiguous(), "cache_indices must be contiguous");
   }
 
   at::Tensor out = at::empty_like(x);
@@ -1121,16 +1137,29 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
   timer.start();
 #endif
 
-  launch_causal_conv1d_verify_tree_decode(
-      queue,
-      cache_indices_,
-      retrieve_next_token,
-      retrieve_next_sibling,
-      retrieve_parent_token,
-      parent_idx,
-      pad_slot_id,
-      batch_size,
-      cache_steps);
+  if (index_type == at::kInt) {
+    launch_causal_conv1d_verify_tree_decode<int32_t>(
+        queue,
+        cache_indices_,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        retrieve_parent_token,
+        parent_idx,
+        pad_slot_id,
+        batch_size,
+        cache_steps);
+  } else {
+    launch_causal_conv1d_verify_tree_decode<int64_t>(
+        queue,
+        cache_indices_,
+        retrieve_next_token,
+        retrieve_next_sibling,
+        retrieve_parent_token,
+        parent_idx,
+        pad_slot_id,
+        batch_size,
+        cache_steps);
+  }
 
   auto launch = [&]() {
     SYCL_DISPATCH_FLOATING_TYPES(

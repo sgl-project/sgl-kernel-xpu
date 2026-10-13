@@ -555,7 +555,7 @@ struct gated_delta_rule_spec_kernel {
 //     position's own snapshot (within the same request's scratch row)
 //     instead of carried forward sequentially. `nullptr` selects the fast
 //     chain-only path (register-carried state, no extra scratch reload).
-template <typename T, typename StateT, int k_bucket_size>
+template <typename T, typename StateT, typename index_t, int k_bucket_size>
 struct gated_delta_rule_verify_kernel {
  public:
   static constexpr int group_size = 32;
@@ -580,7 +580,7 @@ struct gated_delta_rule_verify_kernel {
       StateT* intermediate_states_buffer,
       const int intermediate_states_stride_0,
       const int* intermediate_state_indices,
-      const int* retrieve_parent_token,
+      const index_t* retrieve_parent_token,
       const int num_spec_decodes,
       const int num_spec_tokens,
       const int num_k_heads,
@@ -679,7 +679,7 @@ struct gated_delta_rule_verify_kernel {
       // request's own scratch row instead of carrying state_local forward.
       // step_idx == 0 always keeps the seeded state above.
       if (retrieve_parent_token != nullptr && t_local != 0) {
-        int parent_step = retrieve_parent_token[batch_id * num_spec_tokens + t_local];
+        int parent_step = static_cast<int>(retrieve_parent_token[batch_id * num_spec_tokens + t_local]);
         if (parent_step >= 0) {
           const StateT* parent_ptr = scratch_base + static_cast<int64_t>(parent_step) * step_stride;
 #pragma unroll
@@ -812,7 +812,7 @@ struct gated_delta_rule_verify_kernel {
   StateT* intermediate_states_buffer;
   const int intermediate_states_stride_0;
   const int* intermediate_state_indices;
-  const int* retrieve_parent_token;
+  const index_t* retrieve_parent_token;
   const int num_spec_decodes;
   const int num_spec_tokens;
   const int num_k_heads;
@@ -821,7 +821,7 @@ struct gated_delta_rule_verify_kernel {
   const int head_v_dim;
 };
 
-template <typename T, typename StateT, int k_bucket_size>
+template <typename T, typename StateT, typename index_t, int k_bucket_size>
 void kernel_launcher_verify(
     sycl::queue& queue,
     T* core_attn_out,
@@ -839,14 +839,14 @@ void kernel_launcher_verify(
     StateT* intermediate_states_buffer,
     const int intermediate_states_stride_0,
     const int* intermediate_state_indices,
-    const int* retrieve_parent_token,
+    const index_t* retrieve_parent_token,
     const int num_spec_decodes,
     const int num_spec_tokens,
     const int num_k_heads,
     const int head_k_dim,
     const int num_v_heads,
     const int head_v_dim) {
-  using KERNEL = gated_delta_rule_verify_kernel<T, StateT, k_bucket_size>;
+  using KERNEL = gated_delta_rule_verify_kernel<T, StateT, index_t, k_bucket_size>;
   auto range = KERNEL::get_nd_range(num_spec_decodes, num_v_heads, head_v_dim);
   assert(head_v_dim % KERNEL::v_dim_per_group == 0);
   queue.submit([&](sycl::handler& cgh) {
@@ -933,10 +933,14 @@ void gated_delta_rule_verify(
   const int intermediate_states_stride_0 = intermediate_states_buffer.stride(0);
 
   if (retrieve_parent_token.has_value()) {
-    TORCH_CHECK(retrieve_parent_token->dtype() == torch::kInt32, "retrieve_parent_token must be int32");
+    TORCH_CHECK(
+        retrieve_parent_token->dtype() == torch::kInt32 || retrieve_parent_token->dtype() == torch::kInt64,
+        "retrieve_parent_token must be int32 or int64");
     TORCH_CHECK(
         retrieve_parent_token->size(0) == num_spec_decodes && retrieve_parent_token->size(1) == num_spec_tokens,
         "retrieve_parent_token must be [num_spec_decodes, num_spec_tokens]");
+    TORCH_CHECK(retrieve_parent_token->is_xpu(), "retrieve_parent_token must be an XPU tensor");
+    TORCH_CHECK(retrieve_parent_token->is_contiguous(), "retrieve_parent_token must be contiguous");
   }
 
   TORCH_CHECK(num_v_heads % num_k_heads == 0);
@@ -955,30 +959,30 @@ void gated_delta_rule_verify(
   TORCH_CHECK(head_k_dim % sub_group_size == 0);
   const int k_bucket_size = head_k_dim / sub_group_size;
 
-#define VERIFY_KERNEL_LAUNCHER(scalar_t, state_scalar_t, k_bucket_size)                                        \
-  kernel_launcher_verify<scalar_t, state_scalar_t, k_bucket_size>(                                             \
-      queue,                                                                                                   \
-      reinterpret_cast<scalar_t*>(core_attn_out.data_ptr()),                                                   \
-      reinterpret_cast<scalar_t*>(q.data_ptr()),                                                               \
-      reinterpret_cast<scalar_t*>(k.data_ptr()),                                                               \
-      reinterpret_cast<scalar_t*>(v.data_ptr()),                                                               \
-      reinterpret_cast<scalar_t*>(b.data_ptr()),                                                               \
-      reinterpret_cast<scalar_t*>(a.data_ptr()),                                                               \
-      reinterpret_cast<float*>(A_log.data_ptr()),                                                              \
-      reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),                                                         \
-      reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),                                                 \
-      ssm_state_stride_0,                                                                                      \
-      token_indx.has_value() ? reinterpret_cast<int*>(token_indx->data_ptr()) : nullptr,                       \
-      reinterpret_cast<int*>(cache_indices.data_ptr()),                                                        \
-      reinterpret_cast<state_scalar_t*>(intermediate_states_buffer.data_ptr()),                                \
-      intermediate_states_stride_0,                                                                            \
-      reinterpret_cast<int*>(intermediate_state_indices.data_ptr()),                                           \
-      retrieve_parent_token.has_value() ? reinterpret_cast<int*>(retrieve_parent_token->data_ptr()) : nullptr, \
-      num_spec_decodes,                                                                                        \
-      num_spec_tokens,                                                                                         \
-      num_k_heads,                                                                                             \
-      head_k_dim,                                                                                              \
-      num_v_heads,                                                                                             \
+#define VERIFY_KERNEL_LAUNCHER(scalar_t, state_scalar_t, k_bucket_size)                                \
+  kernel_launcher_verify<scalar_t, state_scalar_t, index_scalar_t, k_bucket_size>(                     \
+      queue,                                                                                           \
+      reinterpret_cast<scalar_t*>(core_attn_out.data_ptr()),                                           \
+      reinterpret_cast<scalar_t*>(q.data_ptr()),                                                       \
+      reinterpret_cast<scalar_t*>(k.data_ptr()),                                                       \
+      reinterpret_cast<scalar_t*>(v.data_ptr()),                                                       \
+      reinterpret_cast<scalar_t*>(b.data_ptr()),                                                       \
+      reinterpret_cast<scalar_t*>(a.data_ptr()),                                                       \
+      reinterpret_cast<float*>(A_log.data_ptr()),                                                      \
+      reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),                                                 \
+      reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),                                         \
+      ssm_state_stride_0,                                                                              \
+      token_indx.has_value() ? reinterpret_cast<int*>(token_indx->data_ptr()) : nullptr,               \
+      reinterpret_cast<int*>(cache_indices.data_ptr()),                                                \
+      reinterpret_cast<state_scalar_t*>(intermediate_states_buffer.data_ptr()),                        \
+      intermediate_states_stride_0,                                                                    \
+      reinterpret_cast<int*>(intermediate_state_indices.data_ptr()),                                   \
+      retrieve_parent_token.has_value() ? retrieve_parent_token->data_ptr<index_scalar_t>() : nullptr, \
+      num_spec_decodes,                                                                                \
+      num_spec_tokens,                                                                                 \
+      num_k_heads,                                                                                     \
+      head_k_dim,                                                                                      \
+      num_v_heads,                                                                                     \
       head_v_dim);
 
 #define VERIFY_BUCKET_DISPATCH(scalar_t, state_scalar_t, k_bucket_size) \
@@ -1015,15 +1019,23 @@ void gated_delta_rule_verify(
     }                                                                                                            \
   } while (0)
 
-  if (core_attn_out.scalar_type() == at::kBFloat16) {
-    using scalar_t = sycl::ext::oneapi::bfloat16;
-    VERIFY_DISPATCH_STATE_DTYPE(scalar_t);
-  } else if (core_attn_out.scalar_type() == at::kHalf) {
-    using scalar_t = sycl::half;
-    VERIFY_DISPATCH_STATE_DTYPE(scalar_t);
+  auto launch_for_index = [&](auto index_value) {
+    using index_scalar_t = decltype(index_value);
+    if (core_attn_out.scalar_type() == at::kBFloat16) {
+      using scalar_t = sycl::ext::oneapi::bfloat16;
+      VERIFY_DISPATCH_STATE_DTYPE(scalar_t);
+    } else if (core_attn_out.scalar_type() == at::kHalf) {
+      using scalar_t = sycl::half;
+      VERIFY_DISPATCH_STATE_DTYPE(scalar_t);
+    } else {
+      using scalar_t = float;
+      VERIFY_DISPATCH_STATE_DTYPE(scalar_t);
+    }
+  };
+  if (retrieve_parent_token.has_value() && retrieve_parent_token->scalar_type() == at::kLong) {
+    launch_for_index(int64_t{});
   } else {
-    using scalar_t = float;
-    VERIFY_DISPATCH_STATE_DTYPE(scalar_t);
+    launch_for_index(int32_t{});
   }
 #undef VERIFY_DISPATCH_STATE_DTYPE
 #undef VERIFY_BUCKET_DISPATCH

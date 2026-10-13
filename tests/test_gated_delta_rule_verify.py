@@ -28,6 +28,7 @@ import pytest
 import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel.gated_delta_rule_verify
 import torch
 import torch.nn.functional as F
+from sgl_kernel import causal_conv1d_update_verify_xpu
 
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available()
@@ -228,23 +229,55 @@ def test_gated_delta_rule_verify_chain(num_spec_decodes, num_spec_tokens, dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_gated_delta_rule_verify_tree(dtype):
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_gated_delta_rule_verify_tree(dtype, index_dtype):
     """EAGLE-style tree draft: request 0 is a depth-3 binary tree (7 nodes),
     request 1 is a plain linear chain (parent == t_local - 1), exercised
     together to make sure per-request ``retrieve_parent_token`` rows don't
-    interfere with each other."""
+    interfere with each other. Pass the parent output of the conv verify op
+    directly to the recurrent verify op."""
     device = torch.device("xpu")
     num_spec_decodes, num_spec_tokens = 2, 7
     i = _make_inputs(num_spec_decodes, num_spec_tokens, dtype, device)
     ssm_state_before = i["ssm_state"].clone()
 
-    # Binary tree parent indices for a 7-node complete binary tree (root=0):
-    # node t's parent is (t - 1) // 2, root's parent is itself (t_local == 0
-    # is never read regardless of its value).
     tree_parents = [0, 0, 0, 1, 1, 2, 2]
-    chain_parents = list(range(-1, num_spec_tokens - 1))  # [-1, 0, 1, ..., 5]
-    retrieve_parent_token = torch.tensor(
-        [tree_parents, chain_parents], dtype=torch.int32, device=device
+    chain_parents = [0] + list(range(num_spec_tokens - 1))
+    next_token = torch.tensor(
+        [[1, 3, 5, -1, -1, -1, -1], list(range(1, num_spec_tokens)) + [-1]],
+        dtype=index_dtype,
+        device=device,
+    )
+    next_sibling = torch.full_like(next_token, -1)
+    next_sibling[0, 1] = 2
+    next_sibling[0, 3] = 4
+    next_sibling[0, 5] = 6
+    retrieve_parent_token = torch.empty_like(next_token)
+    conv_dim, conv_width = 32, 3
+    causal_conv1d_update_verify_xpu(
+        torch.zeros(
+            num_spec_decodes, conv_dim, num_spec_tokens, dtype=dtype, device=device
+        ),
+        torch.zeros(
+            num_spec_decodes, conv_dim, conv_width - 1, dtype=dtype, device=device
+        ),
+        torch.zeros(conv_dim, conv_width, dtype=dtype, device=device),
+        torch.empty(
+            num_spec_decodes,
+            num_spec_tokens,
+            conv_dim,
+            conv_width - 1,
+            dtype=dtype,
+            device=device,
+        ),
+        torch.arange(num_spec_decodes, dtype=torch.int32, device=device),
+        next_token,
+        next_sibling,
+        retrieve_parent_token,
+    )
+    torch.testing.assert_close(
+        retrieve_parent_token,
+        torch.tensor([tree_parents, chain_parents], dtype=index_dtype, device=device),
     )
 
     torch.ops.sgl_kernel.gated_delta_rule_verify(

@@ -102,8 +102,9 @@ def build_binary_tree(batch, cache_steps):
 @pytest.mark.parametrize("tree", ["chain", "binary"])
 @pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("input_layout", ["contiguous", "transposed"])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_causal_conv1d_update_verify(
-    width, dim, batch, cache_steps, tree, itype, input_layout
+    width, dim, batch, cache_steps, tree, itype, input_layout, index_dtype
 ):
     torch.manual_seed(0)
     num_cache_lines = batch + 2  # exercise non-identity cache_indices too
@@ -126,16 +127,13 @@ def test_causal_conv1d_update_verify(
     intermediate_conv_window = torch.zeros(
         scratch_rows, cache_steps, dim, width - 1, dtype=itype, device=device
     )
-    retrieve_parent_token = torch.zeros(
-        batch, cache_steps, dtype=torch.int32, device=device
-    )
-
     if tree == "chain":
         next_token, next_sibling = build_chain_tree(batch, cache_steps)
     else:
         next_token, next_sibling = build_binary_tree(batch, cache_steps)
-    next_token = next_token.to(device)
-    next_sibling = next_sibling.to(device)
+    next_token = next_token.to(device=device, dtype=index_dtype)
+    next_sibling = next_sibling.to(device=device, dtype=index_dtype)
+    retrieve_parent_token = torch.empty_like(next_token)
 
     x_ref, window_ref, parent_ref = ref_causal_conv1d_update_verify(
         x.cpu(),
@@ -171,11 +169,12 @@ def test_causal_conv1d_update_verify(
     torch.testing.assert_close(
         intermediate_conv_window.float().cpu(), window_ref.float(), atol=tol, rtol=tol
     )
-    torch.testing.assert_close(retrieve_parent_token.cpu(), parent_ref)
+    torch.testing.assert_close(retrieve_parent_token.cpu(), parent_ref.to(index_dtype))
 
 
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("input_layout", ["contiguous", "transposed"])
-def test_causal_conv1d_update_verify_pad_slot(input_layout):
+def test_causal_conv1d_update_verify_pad_slot(input_layout, index_dtype):
     width, dim, cache_steps = 4, 32, 5
     batch = 3
     num_cache_lines = batch
@@ -197,11 +196,10 @@ def test_causal_conv1d_update_verify_pad_slot(input_layout):
     intermediate_conv_window = torch.zeros(
         batch, cache_steps, dim, width - 1, dtype=itype, device=device
     )
-    retrieve_parent_token = torch.zeros(
-        batch, cache_steps, dtype=torch.int32, device=device
-    )
     next_token, next_sibling = build_chain_tree(batch, cache_steps)
-    next_token, next_sibling = next_token.to(device), next_sibling.to(device)
+    next_token = next_token.to(device=device, dtype=index_dtype)
+    next_sibling = next_sibling.to(device=device, dtype=index_dtype)
+    retrieve_parent_token = torch.zeros_like(next_token)
 
     x_out = causal_conv1d_update_verify_xpu(
         x,
@@ -221,3 +219,29 @@ def test_causal_conv1d_update_verify_pad_slot(input_layout):
     torch.testing.assert_close(x, x_before)
     # Padded entries retain their input values in the new output.
     torch.testing.assert_close(x_out[1].cpu(), x_before[1].cpu())
+
+
+@pytest.mark.parametrize(
+    "sibling_dtype,parent_dtype",
+    [
+        (torch.int64, torch.int32),
+        (torch.int32, torch.int64),
+        (torch.float32, torch.float32),
+    ],
+)
+def test_causal_conv1d_update_verify_rejects_invalid_tree_dtypes(
+    sibling_dtype, parent_dtype
+):
+    x = torch.zeros(1, 32, 3, device=device)
+    conv_state = torch.zeros(1, 32, 2, device=device)
+    weight = torch.zeros(32, 3, device=device)
+    next_token = torch.tensor([[1, 2, -1]], dtype=torch.int32, device=device)
+    next_sibling = torch.full((1, 3), -1, dtype=sibling_dtype, device=device)
+    parent = torch.empty((1, 3), dtype=parent_dtype, device=device)
+    window = torch.empty(1, 3, 32, 2, device=device)
+    indices = torch.zeros(1, dtype=torch.int32, device=device)
+
+    with pytest.raises(RuntimeError, match="int32 or int64|match retrieve_next_token"):
+        causal_conv1d_update_verify_xpu(
+            x, conv_state, weight, window, indices, next_token, next_sibling, parent
+        )

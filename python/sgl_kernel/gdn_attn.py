@@ -272,7 +272,7 @@ def gated_delta_rule_verify(
         token_indx: optional ``[num_spec_decodes * num_spec_tokens]`` remap
             from local to global token position for ``core_attn_out``.
         retrieve_parent_token: optional ``[num_spec_decodes,
-            num_spec_tokens]`` int32 EAGLE-tree parent-step index per draft
+            num_spec_tokens]`` int32 or int64 EAGLE-tree parent-step index per draft
             position; ``None`` selects the (faster) linear-chain path.
     """
     torch.ops.sgl_kernel.gated_delta_rule_verify.default(

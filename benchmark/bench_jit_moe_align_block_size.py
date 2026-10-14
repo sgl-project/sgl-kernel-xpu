@@ -1,5 +1,6 @@
 """Benchmark JIT moe_align_block_size vs AOT implementation."""
 
+import argparse
 import itertools
 
 import pandas as pd
@@ -47,13 +48,10 @@ def run_jit(topk_ids, num_experts, block_size, sti, eids, ntpp, cumsum):
 
 # (num_tokens, num_experts, topk). Includes small-batch shapes (numel < 1024,
 # experts <= 64) and general-path shapes.
-configs = list(
-    itertools.product(
-        [8, 64, 512, 2048, 8192],  # num_tokens
-        [64, 128, 256],  # num_experts
-        [8],  # topk
-    )
-)
+num_tokens_range = [8, 64, 512, 2048, 8192]
+num_experts_range = [64, 128, 256]
+topk_range = [8]
+configs = list(itertools.product(num_tokens_range, num_experts_range, topk_range))
 
 
 @triton.testing.perf_report(
@@ -69,9 +67,8 @@ configs = list(
         args={},
     )
 )
-def benchmark(num_tokens, num_experts, topk, provider):
+def benchmark(num_tokens, num_experts, topk, provider, block_size=128):
     device = torch.device("xpu")
-    block_size = 128
     topk_ids, sti, eids, ntpp, cumsum = _make_inputs(
         num_tokens, num_experts, topk, block_size, device
     )
@@ -107,6 +104,17 @@ def benchmark(num_tokens, num_experts, topk, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-tokens", nargs="+", type=int, default=num_tokens_range)
+    parser.add_argument("--num-experts", nargs="+", type=int, default=num_experts_range)
+    parser.add_argument("--topk", nargs="+", type=int, default=topk_range)
+    parser.add_argument("--block-size", type=int, default=128)
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(args.num_tokens, args.num_experts, args.topk)
+    )
+    benchmark.benchmarks.args = {"block_size": args.block_size}
+
     if not HAS_AOT:
         print("ERROR: sgl_kernel (AOT) not available. Please install sgl-kernel-xpu.")
         exit(1)

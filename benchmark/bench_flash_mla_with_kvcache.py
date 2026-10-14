@@ -7,6 +7,7 @@ Usage:
   python benchmark/bench_flash_mla_sparse_decode.py
 """
 
+import argparse
 import math
 from itertools import product
 from typing import NamedTuple, Optional, Tuple
@@ -574,23 +575,28 @@ batch_size_range = [1, 8, 42, 128, 256]
 topk_range = [64, 128, 512]
 extra_topk_range = [0, 512]
 
+
 # ---- DECODE-stage on synthetic data ----
-configs = [
-    DecodeConfig(
-        b,
-        H_PER_RANK,
-        topk,
-        extra_topk,
-        num_pages=512,
-        page_size=PAGE_SIZE,
-        extra_num_pages=512,
-        extra_page_size=64,
-    )
-    for b, topk, extra_topk in product(batch_size_range, topk_range, extra_topk_range)
-]
+def make_synthetic_configs(
+    batch_sizes=batch_size_range, topks=topk_range, extra_topks=extra_topk_range
+):
+    return [
+        DecodeConfig(
+            b,
+            H_PER_RANK,
+            topk,
+            extra_topk,
+            num_pages=512,
+            page_size=PAGE_SIZE,
+            extra_num_pages=512,
+            extra_page_size=64,
+        )
+        for b, topk, extra_topk in product(batch_sizes, topks, extra_topks)
+    ]
+
 
 # ---- DECODE-stage for DEEPSEEK V4 flash ----
-configs += [
+production_configs = [
     # conc=2
     DecodeConfig(
         2,
@@ -698,7 +704,7 @@ configs += [
     ),
 ]
 # ---- DECODE-stage for DEEPSEEK V4 pro ----
-configs += [
+production_configs += [
     DecodeConfig(1, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE),
     DecodeConfig(2, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE),
     DecodeConfig(8, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE),
@@ -707,7 +713,7 @@ configs += [
 ]
 
 # ---- DECODE-stage for DEEPSEEK V3.2 / GLM-DSA (d_qk=576, 656 B/token) ----
-configs += [
+production_configs += [
     # steady-state, no extra pool
     DecodeConfig(1, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE, d_qk=576),
     DecodeConfig(2, 64, 128, 0, num_pages=513, page_size=PAGE_SIZE, d_qk=576),
@@ -739,10 +745,44 @@ configs += [
     ),
 ]
 
+configs = make_synthetic_configs() + production_configs
+
 # ============================================================================
 # Main
 # ============================================================================
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Synthetic-config batch sizes",
+    )
+    parser.add_argument(
+        "--topks",
+        nargs="+",
+        type=int,
+        default=topk_range,
+        help="Synthetic-config topk values",
+    )
+    parser.add_argument(
+        "--extra-topks",
+        nargs="+",
+        type=int,
+        default=extra_topk_range,
+        help="Synthetic-config extra_topk values (0 = no extra pool)",
+    )
+    parser.add_argument(
+        "--synthetic-only",
+        action="store_true",
+        help="Skip the DeepSeek V4 / V3.2 production shapes",
+    )
+    args = parser.parse_args()
+    configs = make_synthetic_configs(args.batch_sizes, args.topks, args.extra_topks)
+    if not args.synthetic_only:
+        configs += production_configs
+
     require_arch("xe20", "xe35")
     device = torch.device("xpu")
 

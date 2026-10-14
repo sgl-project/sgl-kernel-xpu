@@ -1,3 +1,4 @@
+import argparse
 import itertools
 from typing import Optional, Tuple
 
@@ -294,6 +295,27 @@ def benchmark_kernel(num_tokens, num_heads, head_size, dtype, provider):
 
 
 if __name__ == "__main__":
+    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-tokens", nargs="+", type=int, default=num_tokens_range)
+    parser.add_argument("--num-heads", nargs="+", type=int, default=num_heads_range)
+    parser.add_argument("--head-sizes", nargs="+", type=int, default=head_size_range)
+    parser.add_argument(
+        "--dtypes",
+        nargs="+",
+        choices=list(dtype_map),
+        default=["float16", "bfloat16"],
+    )
+    args = parser.parse_args()
+    configs = list(
+        itertools.product(
+            args.num_tokens,
+            args.num_heads,
+            args.head_sizes,
+            [dtype_map[d] for d in args.dtypes],
+        )
+    )
+
     # Test correctness first
     print("Testing correctness...")
     calculate_diff(num_tokens=512, num_heads=16, head_size=128, dtype=torch.float16)

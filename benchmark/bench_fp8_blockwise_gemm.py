@@ -101,10 +101,34 @@ def time_once(M, N, K, out_dtype):
     }
 
 
+def _parse_shape(s):
+    return tuple(int(v) for v in s.split(","))
+
+
 if __name__ == "__main__":
+    import argparse
+
+    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--shapes",
+        nargs="+",
+        type=_parse_shape,
+        default=SHAPES,
+        help="M,N,K triples; N and K must be multiples of 128",
+    )
+    parser.add_argument(
+        "--out-dtypes",
+        nargs="+",
+        choices=list(dtype_map),
+        default=["bfloat16", "float16"],
+    )
+    args = parser.parse_args()
+    out_dtypes = [dtype_map[d] for d in args.out_dtypes]
+
     rows = []
-    for M, N, K in SHAPES:
-        for dt in OUT_DTYPES:
+    for M, N, K in args.shapes:
+        for dt in out_dtypes:
             print(f"[start] M={M} N={N} K={K} dtype={dt}", flush=True)
             row = time_once(M, N, K, dt)
             print(

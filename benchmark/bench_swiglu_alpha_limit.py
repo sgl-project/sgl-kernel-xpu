@@ -1,3 +1,4 @@
+import argparse
 import itertools
 
 import pandas as pd
@@ -139,23 +140,59 @@ def benchmark_swiglu_alpha_limit(batch_size, hidden_dim, alpha, limit, dtype, pr
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--hidden-dims",
+        nargs="+",
+        type=int,
+        default=hidden_dim_range,
+        help="Hidden dims (H, input is 2H) to sweep",
+    )
+    parser.add_argument(
+        "--no-large-configs",
+        action="store_true",
+        help="Skip the DRAM-resident gpt-oss shapes",
+    )
+    parser.add_argument("--alpha", type=float, default=1.0, help="Sigmoid alpha")
+    parser.add_argument("--limit", type=float, default=6.0, help="Clamp limit")
+    parser.add_argument(
+        "--dtype",
+        choices=["float32", "float16", "bfloat16"],
+        default="float32",
+        help="Input dtype",
+    )
+    args = parser.parse_args()
+    dtype = getattr(torch, args.dtype)
+
     # Test correctness kernel vs reference
     calculate_diff(
         batch_size=16,
         hidden_dim=1024,
-        alpha=1.0,
-        limit=6.0,
-        dtype=torch.float32,
+        alpha=args.alpha,
+        limit=args.limit,
+        dtype=dtype,
     )
 
     calculate_diff(
         batch_size=8,
         hidden_dim=4096,
-        alpha=1.0,
-        limit=6.0,
-        dtype=torch.float32,
+        alpha=args.alpha,
+        limit=args.limit,
+        dtype=dtype,
     )
 
+    bench = benchmark_swiglu_alpha_limit.benchmarks
+    bench.x_vals = list(itertools.product(args.batch_sizes, args.hidden_dims))
+    if not args.no_large_configs:
+        bench.x_vals += large_configs
+    bench.args = {"alpha": args.alpha, "limit": args.limit, "dtype": dtype}
     benchmark_swiglu_alpha_limit.run(print_data=True)
 
     # Print bandwidth and FLOPS results

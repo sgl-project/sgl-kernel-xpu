@@ -1,5 +1,6 @@
 """Benchmark JIT RMSNorm kernel vs AOT implementation."""
 
+import argparse
 import itertools
 
 import pandas as pd
@@ -113,6 +114,26 @@ def benchmark(batch_size, hidden_size, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=[1, 128, 256, 512, 1024, 4096],
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--hidden-sizes",
+        nargs="+",
+        type=int,
+        default=[2048, 4096, 8192, 12288],
+        help="Hidden sizes to sweep (must be JIT-supported)",
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(args.batch_sizes, args.hidden_sizes)
+    )
+
     if not HAS_AOT:
         print("ERROR: sgl_kernel (AOT) not available. Please install sgl-kernel-xpu.")
         exit(1)

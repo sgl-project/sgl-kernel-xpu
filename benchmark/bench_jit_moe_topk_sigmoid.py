@@ -64,9 +64,8 @@ configs = list(
         args={},
     )
 )
-def benchmark(num_tokens, num_experts, topk, provider):
+def benchmark(num_tokens, num_experts, topk, provider, dtype=torch.bfloat16):
     device = torch.device("xpu")
-    dtype = torch.bfloat16
     renormalize = True
     routed_scaling_factor = 1.0
     num_fused_shared_experts = 0
@@ -117,6 +116,29 @@ def benchmark(num_tokens, num_experts, topk, provider):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num-tokens", nargs="+", type=int, default=[128, 512, 4096, 16384]
+    )
+    parser.add_argument(
+        "--num-experts", nargs="+", type=int, default=[8, 32, 128, 256, 100]
+    )
+    parser.add_argument(
+        "--topk", nargs="+", type=int, default=[6], help="<= min(num_experts, 8)"
+    )
+    parser.add_argument("--dtype", choices=list(dtype_map), default="bfloat16")
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(args.num_tokens, args.num_experts, args.topk)
+    )
+
     if not HAS_AOT:
         print("ERROR: sgl_kernel (AOT) not available. Please install sgl-kernel-xpu.")
         exit(1)
@@ -126,7 +148,7 @@ if __name__ == "__main__":
     print("JIT: sgl_kernel.jit.topk_sigmoid (runtime JIT compilation)")
     print("\n" + "=" * 80 + "\n")
 
-    benchmark.run(print_data=True)
+    benchmark.run(print_data=True, dtype=dtype_map[args.dtype])
 
     print("Benchmark finished!")
     df = pd.DataFrame(all_results)

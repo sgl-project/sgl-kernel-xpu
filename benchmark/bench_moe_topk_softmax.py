@@ -138,7 +138,7 @@ if __name__ == "__main__":
         "num_tokens": args.num_tokens,
         "num_experts": params["num_experts"] or [64],
         "top_k": params["top_k"] or [2, 4],
-        "dtype": [torch.bfloat16],
+        "dtype": [getattr(torch, args.dtype.removeprefix("torch."))],
         "renormalize": [False],
     }
 

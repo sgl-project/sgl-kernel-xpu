@@ -1,5 +1,6 @@
 """Benchmark JIT QKNorm kernel vs PyTorch eager implementation."""
 
+import argparse
 import itertools
 
 import pandas as pd
@@ -61,13 +62,10 @@ def calculate_effective_bandwidth(batch_size, num_heads, head_dim, time_ms):
 
 
 # Test configurations
-configs = list(
-    itertools.product(
-        [1, 8, 16, 32, 64, 128],  # batch_size
-        [8, 16, 32],  # num_heads
-        [64, 128, 256],  # head_dim
-    )
-)
+batch_size_range = [1, 8, 16, 32, 64, 128]
+num_heads_range = [8, 16, 32]
+head_dim_range = [64, 128, 256]
+configs = list(itertools.product(batch_size_range, num_heads_range, head_dim_range))
 
 
 @triton.testing.perf_report(
@@ -141,6 +139,15 @@ def benchmark(batch_size, num_heads, head_dim, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=batch_size_range)
+    parser.add_argument("--num-heads", nargs="+", type=int, default=num_heads_range)
+    parser.add_argument("--head-dims", nargs="+", type=int, default=head_dim_range)
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(args.batch_sizes, args.num_heads, args.head_dims)
+    )
+
     print("Running QKNorm benchmarks...")
     print("Reference: PyTorch eager implementation")
     print("JIT: sgl_kernel.jit.fused_inplace_qknorm (runtime JIT compilation)")

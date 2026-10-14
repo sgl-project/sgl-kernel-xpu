@@ -1,3 +1,4 @@
+import argparse
 from itertools import product
 
 import pandas as pd
@@ -100,6 +101,34 @@ def benchmark(seq_len, hidden, dtype, provider):
 
 
 if __name__ == "__main__":
+    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--seq-lens",
+        nargs="+",
+        type=int,
+        default=seq_len_range,
+        help="List of sequence lengths",
+    )
+    parser.add_argument(
+        "--hidden-sizes",
+        nargs="+",
+        type=int,
+        default=hidden_range,
+        help="List of hidden sizes",
+    )
+    parser.add_argument(
+        "--dtypes",
+        nargs="+",
+        choices=list(dtype_map),
+        default=["bfloat16", "float16"],
+        help="List of dtypes",
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = list(
+        product(args.seq_lens, args.hidden_sizes, [dtype_map[d] for d in args.dtypes])
+    )
+
     benchmark.run(print_data=False)
     print("Benchmark finished!")
 

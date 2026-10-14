@@ -1,3 +1,4 @@
+import argparse
 import itertools
 from typing import Optional
 
@@ -7,6 +8,8 @@ import triton
 from sgl_kernel import biased_topk
 
 all_results = []
+
+DTYPE_MAP = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
 
 @torch.compile(dynamic=True)
@@ -175,16 +178,64 @@ def get_benchmark(device: str = "xpu"):
 
 
 if __name__ == "__main__":
-    # configs from deepseek-v4
+    # defaults are deepseek-v4 configs
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num-tokens",
+        nargs="+",
+        type=int,
+        default=[1, 32, 256, 1024, 8192],
+        help="Token counts to sweep",
+    )
+    parser.add_argument(
+        "--num-experts",
+        nargs="+",
+        type=int,
+        default=[256, 384],
+        help="Routed expert counts to sweep",
+    )
+    parser.add_argument(
+        "--topk", nargs="+", type=int, default=[6], help="Top-k values to sweep"
+    )
+    parser.add_argument(
+        "--dtypes",
+        nargs="+",
+        choices=list(DTYPE_MAP),
+        default=["fp32"],
+        help="Gating input dtypes to sweep",
+    )
+    parser.add_argument(
+        "--scoring-funcs",
+        nargs="+",
+        choices=["sigmoid", "sqrtsoftplus"],
+        default=["sqrtsoftplus"],
+        help="Scoring functions to sweep",
+    )
+    parser.add_argument(
+        "--num-shared",
+        nargs="+",
+        type=int,
+        default=[1],
+        help="Fused shared expert counts to sweep",
+    )
+    parser.add_argument(
+        "--scales",
+        nargs="+",
+        type=float,
+        default=[2.5],
+        help="Routed scaling factors to sweep",
+    )
+    args = parser.parse_args()
+
     sweep_params = {
-        "num_tokens": [1, 32, 256, 1024, 8192],
-        "num_experts": [256, 384],
-        "topk": [6],
-        "dtype": [torch.float32],
-        "scoring_func": ["sqrtsoftplus"],
+        "num_tokens": args.num_tokens,
+        "num_experts": args.num_experts,
+        "topk": args.topk,
+        "dtype": [DTYPE_MAP[name] for name in args.dtypes],
+        "scoring_func": args.scoring_funcs,
         "renormalize": [True],
-        "num_shared": [1],
-        "scale": [2.5],
+        "num_shared": args.num_shared,
+        "scale": args.scales,
         "apply_scale": [True],
     }
 

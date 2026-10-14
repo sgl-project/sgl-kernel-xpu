@@ -1,3 +1,4 @@
+import argparse
 import itertools
 
 import torch
@@ -12,8 +13,8 @@ block_size_range = [128, 256, 512]
 configs = list(itertools.product(batch_size_range, hidden_size_range, block_size_range))
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+def _benchmark_config(configs):
+    return triton.testing.Benchmark(
         x_names=["batch_size", "hidden_size", "block_size"],
         x_vals=[list(cfg) for cfg in configs],
         line_arg="provider",
@@ -24,7 +25,9 @@ configs = list(itertools.product(batch_size_range, hidden_size_range, block_size
         plot_name="ep-moe-silu-and-mul-performance",
         args={},
     )
-)
+
+
+@triton.testing.perf_report(_benchmark_config(configs))
 def benchmark(batch_size, hidden_size, block_size, provider):
     dtype = torch.bfloat16
     device = torch.device("cuda")
@@ -89,4 +92,26 @@ def benchmark(batch_size, hidden_size, block_size, provider):
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--hidden-sizes",
+        nargs="+",
+        type=int,
+        default=hidden_size_range,
+        help="Hidden sizes to sweep",
+    )
+    args = parser.parse_args()
+
+    sweep = list(
+        itertools.product(args.batch_sizes, args.hidden_sizes, block_size_range)
+    )
+    triton.testing.perf_report(_benchmark_config(sweep))(benchmark.fn).run(
+        print_data=True
+    )

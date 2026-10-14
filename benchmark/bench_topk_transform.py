@@ -14,7 +14,8 @@ from sgl_kernel import (
 
 # Sweep configuration (skip bs=1 per request).
 batch_size_range = [132, 256, 4096]
-k_range = [2048]  # only 2048 supported
+topk_range = [512, 2048]
+fused_topk_range = [2048]
 seq_len_range = [2048, 4096, 16384, 65536]
 has_row_starts_range = [True, False]
 transform_topk_range = [512, 1024]
@@ -25,24 +26,25 @@ ragged_topk_range = [512, 1024, 2048]
 
 def build_configs(
     batch_size_range=batch_size_range,
-    k_range=k_range,
+    topk_range=topk_range,
+    fused_topk_range=fused_topk_range,
     seq_len_range=seq_len_range,
     transform_topk_range=transform_topk_range,
     transform_seq_len_range=transform_seq_len_range,
     page_size_range=page_size_range,
     ragged_topk_range=ragged_topk_range,
 ):
-    configs = [
-        (bs, k, seq_len, has_row_starts)
-        for bs, k, seq_len, has_row_starts in product(
-            batch_size_range, k_range, seq_len_range, has_row_starts_range
+    topk_configs = [
+        (bs, topk, seq_len, has_row_starts)
+        for bs, topk, seq_len, has_row_starts in product(
+            batch_size_range, topk_range, seq_len_range, has_row_starts_range
         )
     ]
     fused_configs = [
         (bs, k, seq_len, mode)
         for bs, k, seq_len, mode in product(
             batch_size_range,
-            k_range,
+            fused_topk_range,
             seq_len_range,
             ["extend", "decode", "target_verify"],
         )
@@ -56,7 +58,7 @@ def build_configs(
             page_size_range,
         )
     ]
-    ragged_v2_configs = [
+    topk_transform_ragged_configs = [
         (bs, topk, seq_len, has_row_starts)
         for bs, topk, seq_len, has_row_starts in product(
             batch_size_range,
@@ -65,18 +67,37 @@ def build_configs(
             has_row_starts_range,
         )
     ]
-    return configs, fused_configs, topk_transform_configs, ragged_v2_configs
+    topk_transform_ragged_fused_configs = [
+        (bs, topk, seq_len, has_row_starts)
+        for bs, topk, seq_len, has_row_starts in product(
+            batch_size_range, fused_topk_range, seq_len_range, has_row_starts_range
+        )
+    ]
+
+    return (
+        topk_configs,
+        fused_configs,
+        topk_transform_configs,
+        topk_transform_ragged_configs,
+        topk_transform_ragged_fused_configs,
+    )
 
 
-configs, fused_configs, topk_transform_configs, ragged_v2_configs = build_configs()
+(
+    topk_configs,
+    fused_configs,
+    topk_transform_configs,
+    topk_transform_ragged_configs,
+    topk_transform_ragged_fused_configs,
+) = build_configs()
 
 all_results = []
 
 
 @triton.testing.perf_report(
     triton.testing.Benchmark(
-        x_names=["bs", "k", "seq_len", "has_row_starts"],
-        x_vals=configs,
+        x_names=["bs", "topk", "seq_len", "has_row_starts"],
+        x_vals=topk_configs,
         line_arg="provider",
         line_vals=["sgl_kernel"],
         line_names=["SGL Kernel"],
@@ -86,9 +107,9 @@ all_results = []
         args={},
     )
 )
-def benchmark_fast_topk_v2(bs, k, seq_len, has_row_starts, provider):
+def benchmark_fast_topk_v2(bs, topk, seq_len, has_row_starts, provider):
     print(
-        f"benchmark fast_topk_v2 {provider} bs={bs} k={k} seq_len={seq_len} "
+        f"benchmark fast_topk_v2 {provider} bs={bs} topk={topk} seq_len={seq_len} "
         f"has_row_starts={has_row_starts}"
     )
     torch.xpu.manual_seed_all(42)
@@ -105,7 +126,7 @@ def benchmark_fast_topk_v2(bs, k, seq_len, has_row_starts, provider):
     else:
         row_starts = None
 
-    fn = lambda: fast_topk_v2(score, lengths, k, row_starts=row_starts)
+    fn = lambda: fast_topk_v2(score, lengths, topk, row_starts=row_starts)
 
     # Warmup
     for _ in range(5):
@@ -124,7 +145,7 @@ def benchmark_fast_topk_v2(bs, k, seq_len, has_row_starts, provider):
         {
             "op": "fast_topk_v2",
             "bs": bs,
-            "k": k,
+            "topk": topk,
             "seq_len": seq_len,
             "has_row_starts": has_row_starts,
             "provider": provider,
@@ -219,7 +240,7 @@ def benchmark_fast_topk_transform_fused(bs, k, seq_len, mode, provider):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["bs", "k", "seq_len", "has_row_starts"],
-        x_vals=configs,
+        x_vals=topk_transform_ragged_fused_configs,
         line_arg="provider",
         line_vals=["sgl_kernel"],
         line_names=["SGL Kernel"],
@@ -412,7 +433,7 @@ def benchmark_topk_transform_paged(bs, topk, seq_len, page_size, provider):
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["bs", "topk", "seq_len", "has_row_starts"],
-        x_vals=ragged_v2_configs,
+        x_vals=topk_transform_ragged_configs,
         line_arg="provider",
         line_vals=["sgl_kernel"],
         line_names=["SGL Kernel"],
@@ -480,7 +501,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-sizes", nargs="+", type=int, default=batch_size_range)
     parser.add_argument(
-        "--ks", nargs="+", type=int, default=k_range, help="k for fast_topk ops"
+        "--topks",
+        nargs="+",
+        type=int,
+        default=topk_range,
+        help="topk range for fast_topk ops",
+    )
+    parser.add_argument(
+        "--fused-topks",
+        nargs="+",
+        type=int,
+        default=fused_topk_range,
+        help="topk range for fast_fused_topk ops",
     )
     parser.add_argument(
         "--seq-lens",
@@ -512,18 +544,23 @@ if __name__ == "__main__":
         help="topk for topk_transform_ragged",
     )
     args = parser.parse_args()
-    cfgs, fused_cfgs, transform_cfgs, ragged_cfgs = build_configs(
-        args.batch_sizes,
-        args.ks,
-        args.seq_lens,
-        args.transform_topks,
-        args.transform_seq_lens,
-        args.page_sizes,
-        args.ragged_topks,
+    cfgs, fused_cfgs, transform_cfgs, ragged_cfgs, transform_ragged_fused_cfgs = (
+        build_configs(
+            args.batch_sizes,
+            args.topks,
+            args.fused_topks,
+            args.seq_lens,
+            args.transform_topks,
+            args.transform_seq_lens,
+            args.page_sizes,
+            args.ragged_topks,
+        )
     )
     benchmark_fast_topk_v2.benchmarks.x_vals = cfgs
     benchmark_fast_topk_transform_fused.benchmarks.x_vals = fused_cfgs
-    benchmark_fast_topk_transform_ragged_fused.benchmarks.x_vals = cfgs
+    benchmark_fast_topk_transform_ragged_fused.benchmarks.x_vals = (
+        transform_ragged_fused_cfgs
+    )
     benchmark_topk_transform.benchmarks.x_vals = transform_cfgs
     benchmark_topk_transform_paged.benchmarks.x_vals = transform_cfgs
     benchmark_topk_transform_ragged.benchmarks.x_vals = ragged_cfgs

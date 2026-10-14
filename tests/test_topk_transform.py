@@ -187,7 +187,7 @@ def _setup_fast_topk_transform_ragged(bs: int, seq_len: int, has_row_starts: boo
 
 
 @pytest.mark.parametrize("bs", [1, 132, 256, 4096])
-@pytest.mark.parametrize("k", [2048])  # we only support 2048 now
+@pytest.mark.parametrize("k", [2048])
 @pytest.mark.parametrize("seq_len", [2048, 4096, 16384, 65536])
 @pytest.mark.parametrize("has_row_starts", [True, False])
 @torch.inference_mode()
@@ -212,6 +212,57 @@ def test_fast_topk_v2(bs: int, k: int, seq_len: int, has_row_starts: bool) -> No
         row_starts=row_starts,
         max_permit_error=5,
     )
+
+
+@pytest.mark.parametrize("bs", [1, 4])
+@pytest.mark.parametrize("seq_len", [0, 1, 511, 512, 513, 1024, 4096, 16384])
+@pytest.mark.parametrize("has_row_starts", [True, False])
+@torch.inference_mode()
+def test_fast_topk_v2_512(bs: int, seq_len: int, has_row_starts: bool) -> None:
+    score, lengths, row_starts = _setup_fast_topk_v2(bs, seq_len, has_row_starts)
+    indices = fast_topk_v2(score, lengths, 512, row_starts=row_starts)
+
+    assert indices.shape == (bs, 512)
+    if seq_len <= 512:
+        expected = torch.arange(512, device="xpu", dtype=torch.int32)
+        expected[seq_len:] = -1
+        torch.testing.assert_close(indices, expected.expand(bs, -1))
+    else:
+        indices_ref = _ref_torch_impl(score, seq_len, 512, row_starts=row_starts)
+        assert_equal(
+            score,
+            indices_ref,
+            indices,
+            bs,
+            512,
+            seq_len,
+            row_starts=row_starts,
+            max_permit_error=5,
+        )
+
+
+@torch.inference_mode()
+def test_fast_topk_v2_512_mixed_lengths() -> None:
+    score = torch.randn(4, 2100, dtype=torch.float32, device="xpu")
+    lengths = torch.tensor([0, 511, 513, 2048], dtype=torch.int32, device="xpu")
+    row_starts = torch.tensor([3, 7, 1, 0], dtype=torch.int32, device="xpu")
+    indices = fast_topk_v2(score, lengths, 512, row_starts=row_starts)
+
+    for row, length in enumerate(lengths.tolist()):
+        if length <= 512:
+            expected = torch.arange(512, device="xpu", dtype=torch.int32)
+            expected[length:] = -1
+            torch.testing.assert_close(indices[row], expected)
+        else:
+            start = row_starts[row].item()
+            reference = torch.topk(score[row, start : start + length], 512).indices
+            assert set(indices[row].tolist()) == set(reference.tolist())
+
+
+def test_fast_topk_v2_rejects_unsupported_k() -> None:
+    score, lengths, _ = _setup_fast_topk_v2(1, 1024, False)
+    with pytest.raises(RuntimeError, match="only supports topk=512 or 2048"):
+        fast_topk_v2(score, lengths, 256)
 
 
 @pytest.mark.parametrize("bs", [1, 132, 256, 4096])

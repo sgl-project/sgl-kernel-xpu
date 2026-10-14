@@ -2,6 +2,8 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <sycl/sycl.hpp>
@@ -12,15 +14,31 @@
 #include "sgl_kernel_export.h"
 
 namespace {
-// Runtime topk values must be in (0, kMaxTopK]. Shared-memory staging buffers
-// are sized against kMaxTopK, so every supported runtime value is safe.
+// Shared-memory staging buffers are sized for the largest supported topk.
 constexpr int kMaxTopK = 2048;
+constexpr int kQwen4TopK = 512;
+constexpr std::array<int, 2> kSupportedTopK = {kQwen4TopK, kMaxTopK};
 constexpr int kThreadsPerBlock = 1024;
 constexpr int kRadix = 256;
 constexpr int kHistPad = 128;  // padding so suffix-sum can read [tx + j] safely
 constexpr int kHistStride = kRadix + kHistPad;
 constexpr int kSmemInputBytes = 32 * 1024;  // 32 KB for ping-pong index buffer
 constexpr int kSmemInputSize = kSmemInputBytes / (2 * sizeof(int32_t));
+
+bool is_supported_topk(int64_t topk) {
+  return std::find(kSupportedTopK.begin(), kSupportedTopK.end(), topk) != kSupportedTopK.end();
+}
+
+std::string get_supported_topk_str() {
+  std::string s;
+  for (size_t i = 0; i < kSupportedTopK.size(); ++i) {
+    s += std::to_string(kSupportedTopK[i]);
+    if (i + 1 < kSupportedTopK.size()) {
+      s += " or ";
+    }
+  }
+  return s;
+}
 
 inline uint8_t convert_to_uint8(float x) {
   sycl::half h = static_cast<sycl::half>(x);
@@ -346,7 +364,7 @@ FastTopKParams get_params(
     const auto& indices = indices_opt.value();
     TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous());
     TORCH_CHECK(indices.size(0) == B, "indices.size(0) must equal score.size(0)");
-    TORCH_CHECK(indices.size(1) == kMaxTopK, "topk (indices.size(1)) must equal ", kMaxTopK);
+    TORCH_CHECK(is_supported_topk(indices.size(1)), "topk (indices.size(1)) must be ", get_supported_topk_str());
     TORCH_CHECK(indices.scalar_type() == at::kInt, "indices must be int32");
     indices_ptr = indices.data_ptr<int32_t>();
   }
@@ -362,8 +380,9 @@ FastTopKParams get_params(
 
 struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   FastTopKParams params;
+  int topk;
 
-  explicit FastTopKKernel(const FastTopKParams& p) : params(p) {}
+  FastTopKKernel(const FastTopKParams& p, int k) : params(p), topk(k) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {}
 
@@ -371,13 +390,13 @@ struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const int64_t bid = static_cast<int64_t>(item.get_group(0));
     const int row_start = params.row_starts ? params.row_starts[bid] : 0;
     const int length = params.lengths[bid];
-    int32_t* indice = params.indices + bid * kMaxTopK;
+    int32_t* indice = params.indices + bid * topk;
     const float* score = params.input + bid * params.input_stride;
 
-    if (length <= kMaxTopK) {
-      trivial_topk(item, indice, length);
+    if (length <= topk) {
+      trivial_topk(item, indice, length, topk);
     } else {
-      radix_topk(item, score, indice, row_start, length);
+      radix_topk(item, score, indice, row_start, length, topk);
     }
   }
 };
@@ -672,16 +691,16 @@ fast_topk(const at::Tensor& score, const at::Tensor& lengths, int64_t topk, std:
   if (row_starts_opt.has_value()) {
     CHECK_DEVICE(row_starts_opt.value());
   }
-  TORCH_CHECK(topk == kMaxTopK, "fast_topk only supports topk=", kMaxTopK);
+  TORCH_CHECK(is_supported_topk(topk), "fast_topk only supports topk=", get_supported_topk_str());
 
-  at::Tensor indices = at::empty({score.size(0), kMaxTopK}, score.options().dtype(at::kInt));
+  at::Tensor indices = at::empty({score.size(0), topk}, score.options().dtype(at::kInt));
   const auto params = get_params(score, lengths, row_starts_opt, indices);
   const int64_t B = score.size(0);
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto& queue = stream.queue();
 
-  FastTopKKernel kernel(params);
+  FastTopKKernel kernel(params, static_cast<int>(topk));
   sycl_kernel_submit(
       sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
   return indices;

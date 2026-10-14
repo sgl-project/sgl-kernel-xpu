@@ -38,8 +38,12 @@ inline std::tuple<int64_t, int64_t> _check_layer_norm_inputs(
     const torch::Tensor& input,
     [[maybe_unused]] IntArrayRef normalized_shape,
     std::optional<torch::Tensor>& weight /* optional */,
-    std::optional<torch::Tensor>& bias /* optional */) {
-  CHECK_LAST_DIM_CONTIGUOUS(input);
+    std::optional<torch::Tensor>& bias /* optional */,
+    bool allow_strided_last_dim = false) {
+  // Callers with a strided-plane kernel path accept a non-unit last-dim stride.
+  if (!allow_strided_last_dim) {
+    CHECK_LAST_DIM_CONTIGUOUS(input);
+  }
   TORCH_CHECK(input.dim() == 2 || input.dim() == 3 || input.dim() == 4, "input must be a 2D, 3D, or 4D tensor");
 #define TENSOR_CHECK(T)                          \
   if (T.has_value()) {                           \

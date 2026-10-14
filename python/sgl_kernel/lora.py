@@ -490,11 +490,10 @@ def chunked_sgmv_lora_shrink_fwd(
     segmented grouped GEMM, where each segment ``s`` uses the adapter
     ``l = weight_indices[s]``.
 
-    This is the three-kernel decomposition, fused into a single C++ op:
-
-    1. **gather** ``x_sorted[i] = input_x[permutation[i]]`` — physical -> logical,
-    2. a dedicated small-N grouped GEMM on ``x_sorted`` -> ``out_sorted`` (logical order),
-    3. **scatter** ``output[permutation[i]] = out_sorted[i]`` — logical -> physical.
+    Rows of ``input_x`` are read through ``permutation`` and output rows are
+    written back through it inside a single gather-fused DPAS kernel (no sorted
+    copies are materialized). Pass one coalesced segment per adapter: the kernel
+    tiles M itself, so fixed-size chunking only adds partially filled tiles.
 
     ``seg_indptr`` / ``weight_indices`` describe the *logical* (adapter-grouped)
     layout; ``permutation`` (``logical -> physical``, a bijection over the token
@@ -574,13 +573,11 @@ def chunked_sgmv_lora_expand_fwd(
     :func:`chunked_sgmv_lora_shrink_fwd`, and the generic ``num_slices`` sibling
     of :func:`qkv_lora_b_fwd` / :func:`gate_up_lora_b_fwd`.
 
-    This is the three-kernel decomposition, fused into a single C++ op:
-
-    1. **gather** ``x_sorted[i] = input_x[permutation[i]]`` — physical -> logical
-       (``base_output`` is gathered the same way when supplied),
-    2. a per-slice grouped GEMM on ``x_sorted`` -> ``out_sorted`` (logical order),
-       applying the per-adapter scaling and the (fused) residual,
-    3. **scatter** ``output[permutation[i]] = out_sorted[i]`` — logical -> physical.
+    Rows of ``input_x`` (and ``base_output``) are read through ``permutation``
+    and the scaled (+ residual) result is written back through it inside a
+    single gather-fused DPAS kernel (no sorted copies are materialized). Pass one
+    coalesced segment per adapter: the kernel tiles M itself, so fixed-size
+    chunking only adds partially filled tiles.
 
     ``seg_indptr`` / ``weight_indices`` describe the *logical* (adapter-grouped)
     layout; ``permutation`` (``logical -> physical``, a bijection over the token

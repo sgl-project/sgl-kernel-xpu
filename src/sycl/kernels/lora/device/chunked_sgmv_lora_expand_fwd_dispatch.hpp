@@ -27,21 +27,17 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
- **************************************************************************************************/
 /*!
   \file
   \brief Forward declarations of the generated per-(dtype, tile) launch
-         functions for the chunked-SGMV LoRA expand grouped GEMM. The definitions
-         are produced by chunked_sgmv_lora_expand_fwd_kernel.cpp.in via
-         ChunkedSgmvLoraExpandFwdXe20.cmake, each in its own translation unit for
-         parallel compilation of the heavy CUTLASS template instantiation.
+         functions of the chunked-SGMV LoRA expand kernel. The definitions are produced by
+         chunked_sgmv_lora_expand_fwd_kernel.cpp.in via ChunkedSgmvLoraExpandFwdXe20.cmake,
+         each in its own translation unit (parallel compilation; the entrypoint
+         stays free of kernel code).
 
          Naming: launch_chunked_sgmv_lora_expand_fwd_<ELEM_TAG>_<TILE_TAG>
-         Parameters:
-           ELEM_TAG in {half, bf16}       -- fp16/bf16.
-           TILE_TAG in {tall}             -- extend via ChunkedSgmvLoraExpandFwdXe20.cmake
-                                             + a new option tag/type in
-                                             chunked_sgmv_lora_expand_fwd_types.hpp.
+           ELEM_TAG  in {half, bf16}
+           TILE_TAG  in {wide}                 -- see chunked_sgmv_lora_expand_fwd_types.hpp
 */
 
 #pragma once
@@ -49,35 +45,34 @@
 #include <ATen/ATen.h>
 #include <torch/all.h>
 
+#include <cstdint>
 #include <optional>
 #include <sycl/sycl.hpp>
 
 namespace chunked_sgmv_lora_expand_fwd_impl {
 
-// Each function is defined in a separate generated .cpp file from
-// chunked_sgmv_lora_expand_fwd_kernel.cpp.in, compiled as its own library.
 #define DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_LAUNCH(ELEM, TILE) \
   void launch_chunked_sgmv_lora_expand_fwd_##ELEM##_##TILE(     \
       const torch::Tensor& input_x,                             \
       const torch::Tensor& weights,                             \
+      torch::Tensor& output,                                    \
+      const std::optional<torch::Tensor>& base_output,          \
       const torch::Tensor& slice_offsets_i32,                   \
       const torch::Tensor& seg_indptr_i32,                      \
       const torch::Tensor& weight_indices_i32,                  \
-      const torch::Tensor& scalings,                            \
-      torch::Tensor& output,                                    \
-      const std::optional<torch::Tensor>& base_output,          \
-      const int N_total,                                        \
+      const torch::Tensor& scalings_f32,                        \
+      const int64_t* permutation,                               \
       const int num_slices,                                     \
       const int num_segments,                                   \
       sycl::queue& queue);
 
 // One declaration per registered tile. Extend as tiles are added.
-#define DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_ALL_TILES(ELEM) DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_LAUNCH(ELEM, tall)
+#define DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_ALL(ELEM) DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_LAUNCH(ELEM, wide)
 
-DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_ALL_TILES(half)
-DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_ALL_TILES(bf16)
+DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_ALL(half)
+DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_ALL(bf16)
 
 #undef DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_LAUNCH
-#undef DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_ALL_TILES
+#undef DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_ALL
 
 }  // namespace chunked_sgmv_lora_expand_fwd_impl

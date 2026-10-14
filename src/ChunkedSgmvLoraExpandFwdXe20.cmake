@@ -1,7 +1,7 @@
-# Generate chunked-SGMV LoRA expand grouped-GEMM kernel instantiation files.
-# Each (ELEM_TAG, TILE_TAG) combination is compiled as a separate translation
-# unit so the heavy CUTLASS template instantiation parallelizes across the
-# build.
+# Generate chunked-SGMV LoRA expand (gather-fused DPAS) kernel instantiation files.
+# Each (ELEM_TAG, TILE_TAG) combination is compiled as a separate
+# translation unit so the instantiations build in parallel, matching the
+# convention of the other Xe20 LoRA kernels (see SGEMMLoraAFwdXe20.cmake).
 #
 # To add a new tile, register both a tag name in
 # CHUNKED_SGMV_LORA_EXPAND_FWD_TILE_TAGS and the matching C++ option-tag type in
@@ -20,8 +20,9 @@ set(CHUNKED_SGMV_LORA_EXPAND_FWD_ELEM_TORCH_TYPES "at::Half" "at::BFloat16")
 
 # Tile-configuration axis. Each tag maps to an option-tag type defined in
 # chunked_sgmv_lora_expand_fwd_types.hpp.
-set(CHUNKED_SGMV_LORA_EXPAND_FWD_TILE_TAGS tall)
-set(CHUNKED_SGMV_LORA_EXPAND_FWD_TILE_TYPES "chunked_sgmv_lora_expand_fwd_impl::ChunkedExpandTileTall")
+set(CHUNKED_SGMV_LORA_EXPAND_FWD_TILE_TAGS wide)
+set(CHUNKED_SGMV_LORA_EXPAND_FWD_TILE_TYPES "chunked_sgmv_lora_expand_fwd_impl::ChunkedExpandTileWide")
+
 
 list(LENGTH CHUNKED_SGMV_LORA_EXPAND_FWD_ELEM_TAGS _num_elems)
 math(EXPR _num_elems "${_num_elems} - 1")

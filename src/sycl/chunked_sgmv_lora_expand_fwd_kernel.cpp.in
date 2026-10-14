@@ -48,31 +48,18 @@ namespace chunked_sgmv_lora_expand_fwd_impl {
 __attribute__((visibility("default"))) void launch_chunked_sgmv_lora_expand_fwd_@ELEM_TAG@_@TILE_TAG@(
     const torch::Tensor& input_x,
     const torch::Tensor& weights,
+    torch::Tensor& output,
+    const std::optional<torch::Tensor>& base_output,
     const torch::Tensor& slice_offsets_i32,
     const torch::Tensor& seg_indptr_i32,
     const torch::Tensor& weight_indices_i32,
-    const torch::Tensor& scalings,
-    torch::Tensor& output,
-    const std::optional<torch::Tensor>& base_output,
-    const int N_total,
+    const torch::Tensor& scalings_f32,
+    const int64_t* permutation,
     const int num_slices,
     const int num_segments,
     sycl::queue& queue) {
   runChunkedSgmvLoraExpandFwd<@ELEM_TORCH_TYPE@, @TILE_TYPE@>(
-      input_x,
-      weights,
-      slice_offsets_i32,
-      seg_indptr_i32,
-      weight_indices_i32,
-      scalings,
-      output,
-      base_output,
-      N_total,
-      num_slices,
-      num_segments,
-      queue);
+      input_x, weights, output, base_output, slice_offsets_i32, seg_indptr_i32, weight_indices_i32, scalings_f32, permutation, num_slices, num_segments, queue);
 }
 
 }  // namespace chunked_sgmv_lora_expand_fwd_impl
-
-#undef SYCL_INTEL_TARGET

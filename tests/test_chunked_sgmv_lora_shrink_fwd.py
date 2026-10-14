@@ -133,6 +133,14 @@ def _build_logical_segments(row_adapters: List[int], permutation_mode: str = "so
 # ----------------------------------------------------------------------------
 
 
+def _misalign(t: torch.Tensor) -> torch.Tensor:
+    """Contiguous copy of ``t`` whose data pointer is 1 element past a 16-byte boundary."""
+    buf = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)
+    out = buf[1:].view(t.shape)
+    out.copy_(t)
+    return out
+
+
 def _run_and_compare_chunked(
     *,
     dtype: torch.dtype,
@@ -143,6 +151,7 @@ def _run_and_compare_chunked(
     num_loras: int,
     lora_ranks: torch.Tensor,
     permutation_mode: str = "sorted",
+    misaligned: bool = False,
 ) -> None:
     torch.manual_seed(0)
     num_tokens = len(row_adapters)
@@ -159,6 +168,8 @@ def _run_and_compare_chunked(
     input_x = torch.randn(num_tokens, input_dim, dtype=dtype, device="xpu")
     weights = torch.randn(num_loras, total_n, input_dim, dtype=dtype, device="xpu")
     weights = _zero_weight_rank_tail(weights, lora_ranks, stack_num)
+    if misaligned:
+        input_x, weights = _misalign(input_x), _misalign(weights)
 
     out = chunked_sgmv_lora_shrink_fwd(
         input_x=input_x,
@@ -199,6 +210,7 @@ _DEFAULT_SCENARIO = {
     "row_adapters": [0, 1, 0, 1, 0, 1, 0, 1],
     "lora_ranks": None,
     "permutation_mode": "sorted",
+    "misaligned": False,
 }
 
 # Deterministic 512-token random adapter assignment (isolated from global RNG).
@@ -280,6 +292,16 @@ _SCENARIOS = [
         },
         id="permutation-none",
     ),
+    # Arbitrary shapes: K tails (aligned and unaligned rows), odd N, unaligned bases.
+    pytest.param({"input_dim": 40, "max_rank": 16}, id="K-tail-aligned"),
+    pytest.param(
+        {"input_dim": 4100, "row_adapters": _MANY_ADAPTERS[:64], "num_loras": 4},
+        id="K-tail-unaligned-rows",
+    ),
+    pytest.param({"input_dim": 45, "max_rank": 5, "stack_num": 3}, id="odd-K-odd-N"),
+    pytest.param(
+        {"input_dim": 256, "max_rank": 16, "misaligned": True}, id="misaligned-ptrs"
+    ),
     # Identity permutation drives the gather/scatter path as a no-op remap.
     pytest.param(
         {
@@ -312,6 +334,7 @@ def test_chunked_shrink(dtype, scenario):
         num_loras=num_loras,
         lora_ranks=lora_ranks,
         permutation_mode=cfg["permutation_mode"],
+        misaligned=cfg["misaligned"],
     )
 
 

@@ -151,3 +151,144 @@ def gdn_attention(
         reorder_input,
         workspace,
     )
+
+
+def gated_delta_rule(
+    core_attn_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ssm_state: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    cache_indices: torch.Tensor,
+    num_prefills: int,
+    num_decodes: int,
+    token_indx: Optional[torch.Tensor] = None,
+    has_initial_state: Optional[torch.Tensor] = None,
+) -> None:
+    """Standalone GDN (Gated DeltaNet) recurrent op for plain (non-spec)
+    prefill/decode -- the SSM-only half of what the fused ``gdn_attention``
+    op does internally after conv1d. Exposed separately so callers can drive
+    prefill/decode via ``causal_conv1d_fwd``/``causal_conv1d_update`` +
+    this op, matching the same two-call convention CUDA/Triton/NPU/CPU
+    already use for GDN, instead of the fused monolithic op.
+
+    Writes the result in place into ``core_attn_out``, and updates
+    ``ssm_state`` (the committed recurrent-state pool) in place -- unlike
+    ``gated_delta_rule_verify``, there is no separate scratch pool here.
+
+    Args:
+        core_attn_out: ``[total_seqlen, num_v_heads, head_v_dim]``.
+        q/k: ``[total_seqlen, num_k_heads, head_k_dim]``.
+        v: ``[total_seqlen, num_v_heads, head_v_dim]``.
+        b/a: ``[total_seqlen, num_v_heads]``.
+        ssm_state: committed pool, ``[cache_batch_size, num_v_heads,
+            head_v_dim, head_k_dim]``, updated in place at the rows named by
+            ``cache_indices``.
+        query_start_loc: ``[num_prefills + num_decodes + 1]`` int32, cu_seqlen
+            boundaries (same convention as the standalone conv1d ops).
+        cache_indices: ``[num_prefills + num_decodes]`` int32, row into
+            ``ssm_state`` per sequence.
+        num_prefills/num_decodes: sequence-count split of ``query_start_loc``;
+            every prefill sequence may have length > 1, every decode sequence
+            has length exactly 1.
+        token_indx: optional ``[total_seqlen]`` remap from local to global
+            token position for ``core_attn_out``.
+        has_initial_state: optional ``[num_prefills + num_decodes]`` bool; if
+            provided, sequences with ``False`` start from a zero state
+            instead of seeding from ``ssm_state[cache_indices[i]]``.
+    """
+    torch.ops.sgl_kernel.gated_delta_rule.default(
+        core_attn_out,
+        q,
+        k,
+        v,
+        b,
+        a,
+        A_log,
+        dt_bias,
+        ssm_state,
+        query_start_loc,
+        token_indx,
+        cache_indices,
+        has_initial_state,
+        num_prefills,
+        num_decodes,
+    )
+
+
+def gated_delta_rule_verify(
+    core_attn_out: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    ssm_state: torch.Tensor,
+    cache_indices: torch.Tensor,
+    intermediate_states_buffer: torch.Tensor,
+    intermediate_state_indices: torch.Tensor,
+    cache_steps: int,
+    token_indx: Optional[torch.Tensor] = None,
+    retrieve_parent_token: Optional[torch.Tensor] = None,
+) -> None:
+    """Standalone GDN (Gated DeltaNet) recurrent ``target_verify`` op for
+    speculative decoding, using SGLang's native verify convention (matches
+    the Triton/KDA recurrent verify kernels): seeds this round's initial
+    state from the COMMITTED ``ssm_state`` pool via a plain 1D
+    ``cache_indices`` (same convention as decode/extend), and snapshots every
+    draft position's post-update state into ``intermediate_states_buffer``
+    (indexed by ``intermediate_state_indices`` + ``cache_steps``) instead of
+    writing into the committed pool. ``ssm_state`` is never mutated by this
+    op -- the caller commits the accepted-length snapshot into it afterwards,
+    once acceptance is known (mirrors SGLang's
+    ``update_mamba_state_after_mtp_verify``).
+
+    Writes results in place into ``core_attn_out`` and
+    ``intermediate_states_buffer``.
+
+    Args:
+        core_attn_out: ``[num_spec_decodes * num_spec_tokens, num_v_heads,
+            head_v_dim]``.
+        q/k: ``[num_spec_decodes * num_spec_tokens, num_k_heads, head_k_dim]``.
+        v: ``[num_spec_decodes * num_spec_tokens, num_v_heads, head_v_dim]``.
+        b/a: ``[num_spec_decodes * num_spec_tokens, num_v_heads]``.
+        ssm_state: committed pool, ``[cache_batch_size, num_v_heads,
+            head_v_dim, head_k_dim]``.
+        cache_indices: ``[num_spec_decodes]`` int32, row into ``ssm_state``
+            used to seed this round's initial state.
+        intermediate_states_buffer: ``[scratch_rows, cache_steps,
+            num_v_heads, head_v_dim, head_k_dim]``, contiguous.
+        intermediate_state_indices: ``[num_spec_decodes]`` int32, row into
+            ``intermediate_states_buffer``.
+        cache_steps: capacity (in steps) of each scratch row; must be
+            ``>= num_spec_tokens``.
+        token_indx: optional ``[num_spec_decodes * num_spec_tokens]`` remap
+            from local to global token position for ``core_attn_out``.
+        retrieve_parent_token: optional ``[num_spec_decodes,
+            num_spec_tokens]`` int32 or int64 EAGLE-tree parent-step index per draft
+            position; ``None`` selects the (faster) linear-chain path.
+    """
+    torch.ops.sgl_kernel.gated_delta_rule_verify.default(
+        core_attn_out,
+        q,
+        k,
+        v,
+        b,
+        a,
+        A_log,
+        dt_bias,
+        ssm_state,
+        cache_indices,
+        intermediate_states_buffer,
+        intermediate_state_indices,
+        cache_steps,
+        token_indx,
+        retrieve_parent_token,
+    )

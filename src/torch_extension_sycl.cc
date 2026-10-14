@@ -671,6 +671,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "ScalarType dtype) -> int");
   m.impl(
       "gdn_attention_workspace_bytes_needed", c10::DispatchKey::BackendSelect, &gdn_attention_workspace_bytes_needed);
+
+  m.def(
+      "gated_delta_rule(Tensor! core_attn_out, Tensor q, Tensor k, Tensor v, Tensor b, Tensor a, "
+      "Tensor A_log, Tensor dt_bias, Tensor! ssm_state, Tensor query_start_loc, Tensor? token_indx, "
+      "Tensor cache_indices, Tensor? has_initial_state, int num_prefills, int num_decodes) -> ()");
+  m.impl("gated_delta_rule", torch::kXPU, &gated_delta_rule);
+
+  m.def(
+      "gated_delta_rule_verify(Tensor! core_attn_out, Tensor q, Tensor k, Tensor v, Tensor b, Tensor a, "
+      "Tensor A_log, Tensor dt_bias, Tensor ssm_state, Tensor cache_indices, "
+      "Tensor! intermediate_states_buffer, Tensor intermediate_state_indices, int cache_steps, "
+      "Tensor? token_indx, Tensor? retrieve_parent_token) -> ()");
+  m.impl("gated_delta_rule_verify", torch::kXPU, &gated_delta_rule_verify);
 #endif  // USE_GDN
 
   /*
@@ -687,6 +700,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "bool silu_activation, Tensor? cache_seqlens_, Tensor? conv_state_indices_, "
       "int pad_slot_id) -> ()");
   m.impl("causal_conv1d_update", torch::kXPU, &causal_conv1d_update);
+
+  m.def(
+      "causal_conv1d_update_verify(Tensor x, Tensor conv_state, Tensor weight, Tensor? bias_, "
+      "bool silu_activation, Tensor? cache_indices_, Tensor! intermediate_conv_window, "
+      "Tensor intermediate_state_indices, Tensor? retrieve_next_token, Tensor? retrieve_next_sibling, "
+      "Tensor(a!)? retrieve_parent_token, int pad_slot_id) -> Tensor");
+  m.impl("causal_conv1d_update_verify", torch::kXPU, &causal_conv1d_update_verify);
 
   /*
    * Compress plan kernels

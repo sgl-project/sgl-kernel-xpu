@@ -1398,6 +1398,50 @@ int64_t gdn_attention_workspace_bytes_needed(
     const int64_t tp_size,
     const torch::ScalarType dtype);
 
+// Standalone GDN recurrent op for plain (non-spec) prefill/decode.
+// `ssm_state` (the committed recurrent-state pool) is updated in place.
+// See `gated_delta_rule_verify` below for the separate spec-decode/verify
+// entry point, which never mutates the committed pool.
+void gated_delta_rule(
+    torch::Tensor& core_attn_out,
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& b,
+    const torch::Tensor& a,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    torch::Tensor& ssm_state,
+    const torch::Tensor& query_start_loc,
+    const std::optional<torch::Tensor>& token_indx,
+    const torch::Tensor& cache_indices,
+    const std::optional<torch::Tensor>& has_initial_state,
+    const int64_t num_prefills,
+    const int64_t num_decodes);
+
+// Standalone GDN recurrent target_verify (speculative-decode) op, using
+// SGLang's native `target_verify` convention (matches the Triton/KDA
+// recurrent verify kernels): seeds from the committed `ssm_state` pool via a
+// plain 1D `cache_indices`, and snapshots every draft position's state into
+// `intermediate_states_buffer` (indexed by `intermediate_state_indices` +
+// `cache_steps`) instead of the committed pool. Never mutates `ssm_state`.
+void gated_delta_rule_verify(
+    torch::Tensor& core_attn_out,
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& b,
+    const torch::Tensor& a,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    const torch::Tensor& ssm_state,
+    const torch::Tensor& cache_indices,
+    torch::Tensor& intermediate_states_buffer,
+    const torch::Tensor& intermediate_state_indices,
+    const int64_t cache_steps,
+    const std::optional<torch::Tensor>& token_indx,
+    const std::optional<torch::Tensor>& retrieve_parent_token);
+
 /*
  * Mamba causal conv1d (XPU)
  */
@@ -1411,6 +1455,32 @@ void causal_conv1d_fwd(
     const std::optional<at::Tensor>& has_initial_state,
     bool silu_activation,
     int64_t pad_slot_id);
+
+void causal_conv1d_update(
+    at::Tensor& x,
+    at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_seqlens_,
+    const std::optional<at::Tensor>& conv_state_indices_,
+    int64_t pad_slot_id);
+
+// GDN target-verify (speculative decoding) conv1d update.
+at::Tensor causal_conv1d_update_verify(
+    const at::Tensor& x,
+    const at::Tensor& conv_state,
+    const at::Tensor& weight,
+    const std::optional<at::Tensor>& bias_,
+    bool silu_activation,
+    const std::optional<at::Tensor>& cache_indices_,
+    at::Tensor& intermediate_conv_window,
+    const at::Tensor& intermediate_state_indices,
+    const std::optional<at::Tensor>& retrieve_next_token,
+    const std::optional<at::Tensor>& retrieve_next_sibling,
+    const std::optional<at::Tensor>& retrieve_parent_token,
+    int64_t pad_slot_id);
+
 // Xe35 only kernels
 #if SYCL_INTEL_TARGET == 35
 void dsv3_router_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);
@@ -1437,16 +1507,6 @@ void mxfp4_blockwise_scaled_grouped_mm(
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace);
 #endif
-
-void causal_conv1d_update(
-    at::Tensor& x,
-    at::Tensor& conv_state,
-    const at::Tensor& weight,
-    const std::optional<at::Tensor>& bias_,
-    bool silu_activation,
-    const std::optional<at::Tensor>& cache_seqlens_,
-    const std::optional<at::Tensor>& conv_state_indices_,
-    int64_t pad_slot_id);
 
 /*
  * HiSparse hierarchical sparse KV cache (DeepSeek DSA / V4)

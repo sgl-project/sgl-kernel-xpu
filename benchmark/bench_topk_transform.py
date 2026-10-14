@@ -14,7 +14,8 @@ from sgl_kernel import (
 
 # Sweep configuration (skip bs=1 per request).
 batch_size_range = [132, 256, 4096]
-k_range = [2048]  # only 2048 supported
+k_range = [512, 2048]
+k_range_transform = [2048]  # only 2048 supported for topk_transform
 seq_len_range = [2048, 4096, 16384, 65536]
 has_row_starts_range = [True, False]
 
@@ -93,7 +94,10 @@ def benchmark_fast_topk_v2(bs, k, seq_len, has_row_starts, provider):
 fused_configs = [
     (bs, k, seq_len, mode)
     for bs, k, seq_len, mode in product(
-        batch_size_range, k_range, seq_len_range, ["extend", "decode", "target_verify"]
+        batch_size_range,
+        k_range_transform,
+        seq_len_range,
+        ["extend", "decode", "target_verify"],
     )
 ]
 
@@ -179,10 +183,18 @@ def benchmark_fast_topk_transform_fused(bs, k, seq_len, mode, provider):
     return ms
 
 
+configs_transform_ragged = [
+    (bs, k, seq_len, has_row_starts)
+    for bs, k, seq_len, has_row_starts in product(
+        batch_size_range, k_range_transform, seq_len_range, has_row_starts_range
+    )
+]
+
+
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["bs", "k", "seq_len", "has_row_starts"],
-        x_vals=configs,
+        x_vals=configs_transform_ragged,
         line_arg="provider",
         line_vals=["sgl_kernel"],
         line_names=["SGL Kernel"],

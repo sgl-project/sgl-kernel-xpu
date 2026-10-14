@@ -16,8 +16,7 @@
 namespace {
 // Shared-memory staging buffers are sized for the largest supported topk.
 constexpr int kMaxTopK = 2048;
-constexpr int kQwen4TopK = 512;
-constexpr std::array<int, 2> kSupportedTopK = {kQwen4TopK, kMaxTopK};
+constexpr std::array<int, 2> kSupportedTopK = {512, kMaxTopK};
 constexpr int kThreadsPerBlock = 1024;
 constexpr int kRadix = 256;
 constexpr int kHistPad = 128;  // padding so suffix-sum can read [tx + j] safely

@@ -39,6 +39,7 @@ suites = {
         TestFile("test_per_tensor_quant_fp8.py"),
         TestFile("test_per_token_quant_fp8.py"),
         TestFile("test_fused_qk_norm_rope.py"),
+        TestFile("test_rmsnorm_heads_inplace.py"),
         TestFile("test_fused_qk_rope_with_cache.py"),
         TestFile("test_merge_state.py"),
         TestFile("test_merge_state_v2.py"),

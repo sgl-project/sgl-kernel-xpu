@@ -30,11 +30,9 @@ bool is_supported_topk(int64_t topk) {
 
 std::string get_supported_topk_str() {
   std::string s;
-  for (size_t i = 0; i < kSupportedTopK.size(); ++i) {
-    s += std::to_string(kSupportedTopK[i]);
-    if (i + 1 < kSupportedTopK.size()) {
-      s += " or ";
-    }
+  for (int topk : kSupportedTopK) {
+    if (!s.empty()) s += " or ";
+    s += std::to_string(topk);
   }
   return s;
 }

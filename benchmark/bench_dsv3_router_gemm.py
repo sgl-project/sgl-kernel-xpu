@@ -101,7 +101,7 @@ def calc_bandwidth(
         args={},
     )
 )
-def benchmark(num_tokens, num_experts, out_dtype, provider):
+def benchmark(num_tokens, num_experts, out_dtype, provider, hidden_dim=hidden_dim):
     device = torch.device("xpu")
     M, N, K = num_tokens, num_experts, hidden_dim
 
@@ -139,8 +139,34 @@ def benchmark(num_tokens, num_experts, out_dtype, provider):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    dtype_map = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-tokens", nargs="+", type=int, default=num_tokens_range)
+    parser.add_argument("--num-experts", nargs="+", type=int, default=num_experts_range)
+    parser.add_argument("--hidden-dim", type=int, default=hidden_dim)
+    parser.add_argument(
+        "--out-dtypes",
+        nargs="+",
+        choices=list(dtype_map),
+        default=["float32", "bfloat16", "float16"],
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(
+            args.num_tokens,
+            args.num_experts,
+            [dtype_map[d] for d in args.out_dtypes],
+        )
+    )
+
     # Smoke correctness check on a small case before perf
-    M, N, K = 4, 256, hidden_dim
+    M, N, K = 4, 256, args.hidden_dim
     A = torch.randn((M, K), device="xpu", dtype=torch.bfloat16).contiguous()
     B = torch.randn((N, K), device="xpu", dtype=torch.bfloat16).contiguous()
 
@@ -152,7 +178,7 @@ if __name__ == "__main__":
         out.cpu(), ref, rtol=1e-3, atol=1e-3
     ), "Correctness check failed"
 
-    benchmark.run(print_data=True)
+    benchmark.run(print_data=True, hidden_dim=args.hidden_dim)
 
     print("\n" + "=" * 80)
     print("Effective Bandwidth / GFLOPs")

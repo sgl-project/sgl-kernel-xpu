@@ -1,5 +1,6 @@
 """Benchmark JIT activation-and-mul kernels vs AOT implementation."""
 
+import argparse
 import itertools
 
 import pandas as pd
@@ -44,17 +45,14 @@ def calculate_effective_bandwidth(num_tokens, dim, dtype, time_ms):
 
 
 # (num_tokens, dim) where input is [num_tokens, 2*dim].
-configs = list(
-    itertools.product(
-        [1, 128, 512, 4096],  # num_tokens
-        [1024, 4096, 14336],  # dim (SwiGLU hidden)
-        ["silu", "gelu", "gelu_tanh"],  # activation
-    )
-)
+num_tokens_range = [1, 128, 512, 4096]
+dim_range = [1024, 4096, 14336]  # SwiGLU hidden
+op_name_range = ["silu", "gelu", "gelu_tanh"]
+configs = list(itertools.product(num_tokens_range, dim_range, op_name_range))
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+def _benchmark_config(configs):
+    return triton.testing.Benchmark(
         x_names=["num_tokens", "dim", "op_name"],
         x_vals=configs,
         line_arg="provider",
@@ -65,7 +63,9 @@ configs = list(
         plot_name="aot-vs-jit-activation-performance",
         args={},
     )
-)
+
+
+@triton.testing.perf_report(_benchmark_config(configs))
 def benchmark(num_tokens, dim, op_name, provider):
     device = torch.device("xpu")
     dtype = torch.bfloat16
@@ -114,6 +114,30 @@ def benchmark(num_tokens, dim, op_name, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num-tokens",
+        nargs="+",
+        type=int,
+        default=num_tokens_range,
+        help="Token counts to sweep",
+    )
+    parser.add_argument(
+        "--dims",
+        nargs="+",
+        type=int,
+        default=dim_range,
+        help="Output dims to sweep (input is [num_tokens, 2*dim])",
+    )
+    parser.add_argument(
+        "--ops",
+        nargs="+",
+        choices=op_name_range,
+        default=op_name_range,
+        help="Activations to sweep",
+    )
+    args = parser.parse_args()
+
     if not HAS_AOT:
         print("ERROR: sgl_kernel (AOT) not available. Please install sgl-kernel-xpu.")
         exit(1)
@@ -123,7 +147,10 @@ if __name__ == "__main__":
     print("JIT: sgl_kernel.jit.{silu,gelu,gelu_tanh}_and_mul (runtime JIT compilation)")
     print("\n" + "=" * 80 + "\n")
 
-    benchmark.run(print_data=True)
+    sweep = list(itertools.product(args.num_tokens, args.dims, args.ops))
+    triton.testing.perf_report(_benchmark_config(sweep))(benchmark.fn).run(
+        print_data=True
+    )
 
     print("Benchmark finished!")
     df = pd.DataFrame(all_results)

@@ -1,3 +1,4 @@
+import argparse
 from typing import Tuple
 
 import pandas as pd
@@ -407,6 +408,18 @@ def benchmark(b_s, num_draft_tokens, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--configs",
+        nargs="+",
+        type=lambda s: tuple(int(x) for x in s.split(",")),
+        default=configs,
+        help="b_s,num_draft_tokens pairs, e.g. 1,21 4,21",
+    )
+    args = parser.parse_args()
+    configs = args.configs
+    benchmark.benchmarks.x_vals = configs
+
     torch.set_default_device("xpu")
 
     print("=" * 80)

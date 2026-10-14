@@ -1,3 +1,4 @@
+import argparse
 from typing import List, Tuple
 
 import pandas as pd
@@ -464,6 +465,19 @@ def benchmark(b_s, topk, depth, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--configs",
+        nargs="+",
+        type=lambda v: tuple(int(x) for x in v.split(",")),
+        default=configs,
+        metavar="B_S,TOPK,DEPTH",
+        help="List of b_s,topk,depth triples, e.g. 1,4,3 8,4,3",
+    )
+    args = parser.parse_args()
+    configs = args.configs
+    benchmark.benchmarks.x_vals = configs
+
     torch.set_default_device("xpu")
 
     print("=" * 80)

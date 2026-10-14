@@ -1,3 +1,4 @@
+import argparse
 from typing import Optional
 
 import torch
@@ -163,10 +164,16 @@ configs = [(sq,) for sq in seq_length_range]
         args={},
     )
 )
-def benchmark(seq_length, provider):
-    dtype = torch.bfloat16
+def benchmark(
+    seq_length,
+    provider,
+    num_experts=512,
+    num_expert_group=16,
+    topk_group=8,
+    topk=16,
+    dtype=torch.bfloat16,
+):
     device = torch.device("xpu")
-    num_experts, num_expert_group, topk_group, topk = 512, 16, 8, 16
 
     impl, scoring_func = provider.split("_", 1)
 
@@ -224,7 +231,31 @@ def benchmark(seq_length, provider):
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--seq-lengths",
+        nargs="+",
+        type=int,
+        default=seq_length_range,
+        help="List of sequence lengths (num tokens)",
+    )
+    parser.add_argument("--num-experts", type=int, default=512)
+    parser.add_argument("--num-expert-group", type=int, default=16)
+    parser.add_argument("--topk-group", type=int, default=8)
+    parser.add_argument("--topk", type=int, default=16)
+    parser.add_argument("--dtype", choices=list(dtype_map), default="bfloat16")
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = [[sq] for sq in args.seq_lengths]
+
+    benchmark.run(
+        print_data=True,
+        num_experts=args.num_experts,
+        num_expert_group=args.num_expert_group,
+        topk_group=args.topk_group,
+        topk=args.topk,
+        dtype=dtype_map[args.dtype],
+    )
 
     print("\n ✅ moe_fused_gate_performance: ")
     import pandas as pd

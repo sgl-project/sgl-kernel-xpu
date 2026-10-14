@@ -217,9 +217,8 @@ def _bench_bytes(num_tokens: int, hidden_dim: int) -> int:
         args={},
     )
 )
-def benchmark(batch_size, seq_len, group_size, dst_dtype, provider):
+def benchmark(batch_size, seq_len, group_size, dst_dtype, provider, hidden_dim=7168):
     device = torch.device("xpu")
-    hidden_dim = 7168
 
     x = prepare_token_group_quant_test_data(batch_size * seq_len, hidden_dim)
 
@@ -271,8 +270,21 @@ def benchmark_xe35_shapes():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=batch_size_range)
+    parser.add_argument("--seq-lens", nargs="+", type=int, default=seq_len_range)
+    parser.add_argument("--group-sizes", nargs="+", type=int, default=group_size_range)
+    parser.add_argument("--hidden-dim", type=int, default=7168)
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(
+            args.batch_sizes, args.seq_lens, args.group_sizes, dst_dtype_range
+        )
+    )
 
     calculate_diff(batch_size=2, seq_len=32, group_size=128, dst_dtype=fp8_type_)
 
-    benchmark.run(print_data=True)
+    benchmark.run(print_data=True, hidden_dim=args.hidden_dim)
     benchmark_xe35_shapes()

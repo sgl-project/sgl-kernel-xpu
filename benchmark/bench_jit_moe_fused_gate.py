@@ -1,5 +1,6 @@
 """Benchmark JIT MoE fused-gate kernel vs AOT implementation."""
 
+import argparse
 import itertools
 
 import pandas as pd
@@ -46,32 +47,23 @@ def calculate_effective_bandwidth(num_tokens, num_experts, dtype, time_ms):
 
 
 # Test configurations: number of tokens (rows).
-configs = list(
-    itertools.product(
-        [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000],  # num_tokens
-    )
-)
+num_tokens_range = [5000, 10000, 15000, 20000, 25000, 30000, 35000, 40000]
+configs = list(itertools.product(num_tokens_range))
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["num_tokens"],
-        x_vals=configs,
-        line_arg="provider",
-        line_vals=["aot", "jit"],
-        line_names=["AOT (sgl_kernel)", "JIT (sglang)"],
-        styles=[("blue", "-"), ("green", "-")],
-        ylabel="us",
-        plot_name="aot-vs-jit-moe-fused-gate-performance",
-        args={},
-    )
-)
-def benchmark(num_tokens, provider):
+def benchmark(
+    num_tokens,
+    provider,
+    num_experts=NUM_EXPERTS,
+    num_expert_group=NUM_EXPERT_GROUP,
+    topk_group=TOPK_GROUP,
+    topk=TOPK,
+):
     device = torch.device("xpu")
     dtype = torch.bfloat16
 
-    scores = torch.randn(num_tokens, NUM_EXPERTS, device=device, dtype=dtype)
-    bias = torch.rand(NUM_EXPERTS, device=device, dtype=dtype)
+    scores = torch.randn(num_tokens, num_experts, device=device, dtype=dtype)
+    bias = torch.rand(num_experts, device=device, dtype=dtype)
 
     quantiles = [0.5, 0.2, 0.8]
 
@@ -82,9 +74,9 @@ def benchmark(num_tokens, provider):
         fn = lambda: sgl_kernel.moe_fused_gate(
             scores.clone(),
             bias.clone(),
-            num_expert_group=NUM_EXPERT_GROUP,
-            topk_group=TOPK_GROUP,
-            topk=TOPK,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            topk=topk,
             renormalize=0,
             routed_scaling_factor=ROUTED_SCALING_FACTOR,
             apply_routed_scaling_factor_on_output=False,
@@ -98,9 +90,9 @@ def benchmark(num_tokens, provider):
             fn = lambda: jit_moe_fused_gate(
                 scores.clone(),
                 bias.clone(),
-                NUM_EXPERT_GROUP,
-                TOPK_GROUP,
-                TOPK,
+                num_expert_group,
+                topk_group,
+                topk,
                 num_fused_shared_experts=0,
                 routed_scaling_factor=ROUTED_SCALING_FACTOR,
                 apply_routed_scaling_factor_on_output=False,
@@ -112,13 +104,13 @@ def benchmark(num_tokens, provider):
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
 
     # Calculate metrics
-    bw_metrics = calculate_effective_bandwidth(num_tokens, NUM_EXPERTS, dtype, ms)
+    bw_metrics = calculate_effective_bandwidth(num_tokens, num_experts, dtype, ms)
 
     all_results.append(
         {
             "num_tokens": num_tokens,
-            "num_experts": NUM_EXPERTS,
-            "topk": TOPK,
+            "num_experts": num_experts,
+            "topk": topk,
             "provider": provider,
             "time_us": 1000 * ms,
             "bandwidth_gbs": bw_metrics["bandwidth_gbs"],
@@ -131,7 +123,57 @@ def benchmark(num_tokens, provider):
     return 1000 * ms, 1000 * min_ms, 1000 * max_ms
 
 
+def get_benchmark(
+    configs=configs,
+    num_experts=NUM_EXPERTS,
+    num_expert_group=NUM_EXPERT_GROUP,
+    topk_group=TOPK_GROUP,
+    topk=TOPK,
+):
+    return triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["num_tokens"],
+            x_vals=configs,
+            line_arg="provider",
+            line_vals=["aot", "jit"],
+            line_names=["AOT (sgl_kernel)", "JIT (sglang)"],
+            styles=[("blue", "-"), ("green", "-")],
+            ylabel="us",
+            plot_name="aot-vs-jit-moe-fused-gate-performance",
+            args={
+                "num_experts": num_experts,
+                "num_expert_group": num_expert_group,
+                "topk_group": topk_group,
+                "topk": topk,
+            },
+        )
+    )(benchmark)
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num-tokens",
+        nargs="+",
+        type=int,
+        default=num_tokens_range,
+        help="Token counts to sweep",
+    )
+    parser.add_argument(
+        "--num-experts", type=int, default=NUM_EXPERTS, help="Number of experts"
+    )
+    parser.add_argument(
+        "--num-expert-group",
+        type=int,
+        default=NUM_EXPERT_GROUP,
+        help="Number of expert groups",
+    )
+    parser.add_argument(
+        "--topk-group", type=int, default=TOPK_GROUP, help="Groups kept per token"
+    )
+    parser.add_argument("--topk", type=int, default=TOPK, help="Experts per token")
+    args = parser.parse_args()
+
     if not HAS_AOT:
         print("ERROR: sgl_kernel (AOT) not available. Please install sgl-kernel-xpu.")
         exit(1)
@@ -140,12 +182,16 @@ if __name__ == "__main__":
     print("AOT: sgl_kernel.moe_fused_gate (compiled SYCL kernels)")
     print("JIT: sgl_kernel.jit.moe_fused_gate (runtime JIT compilation)")
     print(
-        f"config: num_experts={NUM_EXPERTS}, num_expert_group={NUM_EXPERT_GROUP}, "
-        f"topk_group={TOPK_GROUP}, topk={TOPK}"
+        f"config: num_experts={args.num_experts}, "
+        f"num_expert_group={args.num_expert_group}, "
+        f"topk_group={args.topk_group}, topk={args.topk}"
     )
     print("\n" + "=" * 80 + "\n")
 
-    benchmark.run(print_data=True)
+    configs = list(itertools.product(args.num_tokens))
+    get_benchmark(
+        configs, args.num_experts, args.num_expert_group, args.topk_group, args.topk
+    ).run(print_data=True)
 
     print("Benchmark finished!")
 

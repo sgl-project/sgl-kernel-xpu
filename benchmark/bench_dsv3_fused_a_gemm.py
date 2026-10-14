@@ -23,6 +23,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
+import argparse
 import itertools
 
 import pandas as pd
@@ -53,6 +54,7 @@ num_tokens_range = [1, 4, 16]
 n_out_range = [2048, 2112]
 hidden_dim = 7168
 out_dtype_range = [torch.float32, torch.bfloat16, torch.float16]
+OUT_DTYPE_MAP = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
 
 configs = list(itertools.product(num_tokens_range, n_out_range, out_dtype_range))
 all_results = []
@@ -88,8 +90,8 @@ def calc_bandwidth(
     }
 
 
-@tt.perf_report(
-    tt.Benchmark(
+def _benchmark_config(configs):
+    return tt.Benchmark(
         x_names=["num_tokens", "n_out", "out_dtype"],
         x_vals=configs,
         line_arg="provider",
@@ -100,7 +102,9 @@ def calc_bandwidth(
         plot_name="dsv3-fused-a-gemm-performance",
         args={},
     )
-)
+
+
+@tt.perf_report(_benchmark_config(configs))
 def benchmark(num_tokens, n_out, out_dtype, provider):
     device = torch.device("xpu")
     M, N, K = num_tokens, n_out, hidden_dim
@@ -142,6 +146,32 @@ def benchmark(num_tokens, n_out, out_dtype, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num-tokens",
+        nargs="+",
+        type=int,
+        default=num_tokens_range,
+        help="Token counts (M) to sweep; kernel supports 1-16",
+    )
+    parser.add_argument(
+        "--n-out",
+        nargs="+",
+        type=int,
+        choices=[2048, 2112],
+        default=n_out_range,
+        help="Output widths (N) to sweep",
+    )
+    parser.add_argument(
+        "--out-dtypes",
+        nargs="+",
+        choices=list(OUT_DTYPE_MAP),
+        default=["fp32", "bf16", "fp16"],
+        help="Output dtypes to sweep",
+    )
+    args = parser.parse_args()
+    out_dtypes = [OUT_DTYPE_MAP[name] for name in args.out_dtypes]
+
     # Smoke correctness check on a small case before perf
     M, N, K = 4, 2112, hidden_dim
     A = torch.randn((M, K), device="xpu", dtype=torch.bfloat16).contiguous()
@@ -159,7 +189,8 @@ if __name__ == "__main__":
         out.cpu(), ref, rtol=1e-3, atol=1e-3
     ), "Correctness check failed"
 
-    benchmark.run(print_data=True)
+    sweep = list(itertools.product(args.num_tokens, args.n_out, out_dtypes))
+    tt.perf_report(_benchmark_config(sweep))(benchmark.fn).run(print_data=True)
 
     print("\n" + "=" * 80)
     print("Effective Bandwidth / GFLOPs")

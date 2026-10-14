@@ -1,3 +1,4 @@
+import argparse
 from itertools import product
 
 import pandas as pd
@@ -92,6 +93,51 @@ def benchmark(batch_size, vocab_size, min_p, dtype, deterministic, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--vocab-sizes",
+        nargs="+",
+        type=int,
+        default=vocab_size_range,
+        help="Vocab sizes to sweep",
+    )
+    parser.add_argument(
+        "--min-p",
+        nargs="+",
+        type=float,
+        default=min_p_range,
+        help="min_p values to sweep",
+    )
+    parser.add_argument(
+        "--dtypes",
+        nargs="+",
+        choices=["float32", "float16", "bfloat16"],
+        default=["float32"],
+        help="Probability dtypes to sweep",
+    )
+    parser.add_argument(
+        "--non-deterministic",
+        action="store_true",
+        help="Benchmark deterministic=False instead of True",
+    )
+    args = parser.parse_args()
+
+    benchmark.benchmarks.x_vals = list(
+        product(
+            args.batch_sizes,
+            args.vocab_sizes,
+            args.min_p,
+            [getattr(torch, d) for d in args.dtypes],
+            [not args.non_deterministic],
+        )
+    )
     benchmark.run(print_data=False)
     print("Benchmark finished!")
 

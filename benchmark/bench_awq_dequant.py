@@ -1,3 +1,4 @@
+import argparse
 import itertools
 from typing import Tuple
 
@@ -62,8 +63,8 @@ qweight_cols_range = [448, 576, 4736, 16, 32, 64, 128]
 configs = list(itertools.product(qweight_row_range, qweight_cols_range))
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+def _benchmark_config(configs):
+    return triton.testing.Benchmark(
         x_names=["qweight_row", "qweight_col"],
         x_vals=configs,
         line_arg="provider",
@@ -74,7 +75,9 @@ configs = list(itertools.product(qweight_row_range, qweight_cols_range))
         plot_name="awq-dequantize-performance",
         args={},
     )
-)
+
+
+@triton.testing.perf_report(_benchmark_config(configs))
 def benchmark(qweight_row, qweight_col, provider):
     dtype = torch.float16
     device = torch.device("cuda")
@@ -114,5 +117,25 @@ def benchmark(qweight_row, qweight_col, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--qweight-rows",
+        nargs="+",
+        type=int,
+        default=qweight_row_range,
+        help="qweight row counts to sweep",
+    )
+    parser.add_argument(
+        "--qweight-cols",
+        nargs="+",
+        type=int,
+        default=qweight_cols_range,
+        help="qweight column counts to sweep",
+    )
+    args = parser.parse_args()
+
     calculate_diff(qweight_row=3584, qweight_col=448)
-    benchmark.run(print_data=True)
+    sweep = list(itertools.product(args.qweight_rows, args.qweight_cols))
+    triton.testing.perf_report(_benchmark_config(sweep))(benchmark.fn).run(
+        print_data=True
+    )

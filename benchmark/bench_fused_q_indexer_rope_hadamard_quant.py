@@ -1,5 +1,6 @@
 """Benchmark for fused_q_indexer_rope_hadamard_quant SYCL kernel performance."""
 
+import argparse
 from itertools import product
 
 import pandas as pd
@@ -21,19 +22,6 @@ configs = [
 all_results = []
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch_size", "num_heads", "max_pos"],
-        x_vals=configs,
-        line_arg="provider",
-        line_vals=["sgl_kernel"],
-        line_names=["SGL Kernel (SYCL)"],
-        styles=[("blue", "-")],
-        ylabel="Time (ms)",
-        plot_name="fused-q-indexer-rope-hadamard-quant-performance",
-        args={},
-    )
-)
 def benchmark_fused_q_indexer_rope_hadamard_quant(
     batch_size, num_heads, max_pos, provider
 ):
@@ -80,8 +68,49 @@ def benchmark_fused_q_indexer_rope_hadamard_quant(
     return ms
 
 
+def get_benchmark(configs=configs):
+    return triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["batch_size", "num_heads", "max_pos"],
+            x_vals=configs,
+            line_arg="provider",
+            line_vals=["sgl_kernel"],
+            line_names=["SGL Kernel (SYCL)"],
+            styles=[("blue", "-")],
+            ylabel="Time (ms)",
+            plot_name="fused-q-indexer-rope-hadamard-quant-performance",
+            args={},
+        )
+    )(benchmark_fused_q_indexer_rope_hadamard_quant)
+
+
 if __name__ == "__main__":
-    benchmark_fused_q_indexer_rope_hadamard_quant.run(print_data=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--num-heads",
+        nargs="+",
+        type=int,
+        default=num_heads_range,
+        help="Head counts to sweep",
+    )
+    parser.add_argument(
+        "--max-pos",
+        nargs="+",
+        type=int,
+        default=max_pos_range,
+        help="RoPE cache lengths to sweep",
+    )
+    args = parser.parse_args()
+
+    configs = list(product(args.batch_sizes, args.num_heads, args.max_pos))
+    get_benchmark(configs).run(print_data=True)
     df = pd.DataFrame(all_results)
     print("\n" + "=" * 80)
     print("SYCL Kernel Performance Summary:")

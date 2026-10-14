@@ -15,6 +15,7 @@ Usage:
   python benchmark/bench_flash_mla_sparse_fwd.py
 """
 
+import argparse
 from typing import NamedTuple, Optional, Tuple
 
 import torch
@@ -285,6 +286,29 @@ configs += [
 # Main
 # ============================================================================
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--shape",
+        nargs=5,
+        type=int,
+        action="append",
+        metavar=("S_Q", "H_Q", "TOPK", "D_QK", "S_KV"),
+        help="Run this shape instead of the built-in list (repeatable)",
+    )
+    parser.add_argument(
+        "--use-topk-length",
+        action="store_true",
+        help="Apply random per-row topk_length to --shape configs",
+    )
+    args = parser.parse_args()
+    if args.use_topk_length and not args.shape:
+        parser.error("--use-topk-length requires --shape")
+    if args.shape:
+        configs = [
+            PrefillConfig(*shape, use_topk_length=args.use_topk_length)
+            for shape in args.shape
+        ]
+
     require_arch("xe20", "xe35")
     device = torch.device("xpu")
 

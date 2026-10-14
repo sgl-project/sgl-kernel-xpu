@@ -11,6 +11,7 @@ bandwidth:
   backup : dst[dst_idx[i], layer] <- src[layer, src_idx[i]]   (all layers)
 """
 
+import argparse
 import itertools
 
 import pandas as pd
@@ -60,33 +61,16 @@ def bytes_moved(op, num_items, item_elems, num_layers, elem_size):
 # (num_items, item_elems, op). item_elems spans a small per-page Mamba state up
 # to a large fused conv+ssm state; num_items spans a short prefix-cache hit up to
 # a full-batch backup.
-configs = list(
-    itertools.product(
-        [16, 128, 512],  # num_items (pages transferred)
-        [1024, 8192, 65536],  # item_elems (state elements per page per layer)
-        ["load", "backup"],
-    )
-)
+num_items_range = [16, 128, 512]  # pages transferred
+item_elems_range = [1024, 8192, 65536]  # state elements per page per layer
+op_range = ["load", "backup"]
+configs = list(itertools.product(num_items_range, item_elems_range, op_range))
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["num_items", "item_elems", "op"],
-        x_vals=configs,
-        line_arg="provider",
-        line_vals=["torch", "sycl"],
-        line_names=["PyTorch (index copy)", "SYCL"],
-        styles=[("blue", "-"), ("red", "-")],
-        ylabel="us",
-        plot_name="torch-vs-sycl-transfer-mamba-performance",
-        args={},
-    )
-)
-def benchmark(num_items, item_elems, op, provider):
+def benchmark(num_items, item_elems, op, provider, num_layers=NUM_LAYERS, dtype=DTYPE):
     device = torch.device("xpu")
-    num_layers = NUM_LAYERS
     pool = num_items  # every page in the pool participates
-    elem_size = torch.tensor([], dtype=DTYPE).element_size()
+    elem_size = torch.tensor([], dtype=dtype).element_size()
     item_size = item_elems * elem_size
     layout_dim = item_size * num_layers
     layer_id = min(2, num_layers - 1)
@@ -99,8 +83,8 @@ def benchmark(num_items, item_elems, op, provider):
     src_idx, dst_idx = _make_indices(pool, num_items, device)
 
     if op == "load":
-        src = torch.randn(pool, num_layers, item_elems, device=device, dtype=DTYPE)
-        dst = torch.zeros(pool, item_elems, device=device, dtype=DTYPE)
+        src = torch.randn(pool, num_layers, item_elems, device=device, dtype=dtype)
+        dst = torch.zeros(pool, item_elems, device=device, dtype=dtype)
         if provider == "torch":
             fn = lambda: torch_load_pf_lf(
                 src, dst, src_idx, dst_idx, layer_id, item_elems, num_layers
@@ -110,8 +94,8 @@ def benchmark(num_items, item_elems, op, provider):
                 src, dst, src_idx, dst_idx, layer_id, item_size, layout_dim
             )
     else:
-        src = torch.randn(num_layers, pool, item_elems, device=device, dtype=DTYPE)
-        dst = torch.zeros(pool, num_layers, item_elems, device=device, dtype=DTYPE)
+        src = torch.randn(num_layers, pool, item_elems, device=device, dtype=dtype)
+        dst = torch.zeros(pool, num_layers, item_elems, device=device, dtype=dtype)
         if provider == "torch":
             fn = lambda: torch_backup_lf_pf(
                 src, dst, src_idx, dst_idx, item_elems, num_layers
@@ -143,7 +127,61 @@ def benchmark(num_items, item_elems, op, provider):
     return 1000 * ms, 1000 * min_ms, 1000 * max_ms
 
 
+def get_benchmark(configs=configs, num_layers=NUM_LAYERS, dtype=DTYPE):
+    return triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["num_items", "item_elems", "op"],
+            x_vals=configs,
+            line_arg="provider",
+            line_vals=["torch", "sycl"],
+            line_names=["PyTorch (index copy)", "SYCL"],
+            styles=[("blue", "-"), ("red", "-")],
+            ylabel="us",
+            plot_name="torch-vs-sycl-transfer-mamba-performance",
+            args={"num_layers": num_layers, "dtype": dtype},
+        )
+    )(benchmark)
+
+
+DTYPE_MAP = {
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+    "float32": torch.float32,
+}
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num-items",
+        nargs="+",
+        type=int,
+        default=num_items_range,
+        help="Pages transferred per call",
+    )
+    parser.add_argument(
+        "--item-elems",
+        nargs="+",
+        type=int,
+        default=item_elems_range,
+        help="State elements per page per layer",
+    )
+    parser.add_argument(
+        "--ops",
+        nargs="+",
+        choices=op_range,
+        default=op_range,
+        help="Transfer directions to sweep",
+    )
+    parser.add_argument(
+        "--num-layers", type=int, default=NUM_LAYERS, help="Layers per backup call"
+    )
+    parser.add_argument(
+        "--dtype", choices=list(DTYPE_MAP), default="bfloat16", help="State dtype"
+    )
+    args = parser.parse_args()
+    dtype = DTYPE_MAP[args.dtype]
+
     if not torch.xpu.is_available():
         print("ERROR: Intel XPU not available.")
         exit(1)
@@ -157,10 +195,11 @@ if __name__ == "__main__":
     print("Running PyTorch vs SYCL Mamba HiCache transfer benchmarks...")
     print("torch: advanced-indexing gather/scatter copy")
     print("sycl : sgl_kernel.transfer_kv_mamba_{pf_lf,lf_pf}")
-    print(f"dtype={DTYPE}, num_layers={NUM_LAYERS}")
+    print(f"dtype={dtype}, num_layers={args.num_layers}")
     print("\n" + "=" * 80 + "\n")
 
-    benchmark.run(print_data=True)
+    configs = list(itertools.product(args.num_items, args.item_elems, args.ops))
+    get_benchmark(configs, args.num_layers, dtype).run(print_data=True)
 
     print("Benchmark finished!")
     df = pd.DataFrame(all_results)

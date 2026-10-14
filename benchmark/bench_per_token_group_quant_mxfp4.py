@@ -6,6 +6,7 @@ roundTiesToEven — at midpoints between representable values, the
 value with even mantissa (mantissa bit = 0) is chosen.
 """
 
+import argparse
 import itertools
 import os
 
@@ -438,9 +439,8 @@ all_results = []
         args={},
     )
 )
-def benchmark(batch_size, seq_len, group_size, src_dtype, provider):
+def benchmark(batch_size, seq_len, group_size, src_dtype, provider, hidden_dim=7168):
     device = torch.device("xpu")
-    hidden_dim = 7168
 
     x = torch.randn(batch_size * seq_len, hidden_dim, device=device, dtype=src_dtype)
 
@@ -504,7 +504,7 @@ def print_summary(results: list):
     print(summary.to_markdown())
 
 
-def main():
+def main(hidden_dim=7168):
     if not is_xpu_available():
         print("Error: Intel XPU not available")
         return
@@ -538,10 +538,48 @@ def main():
     print("\n" + "=" * 80)
     print("Performance Benchmark")
     print("=" * 80)
-    benchmark.run(print_data=True)
+    benchmark.run(print_data=True, hidden_dim=hidden_dim)
 
     print_summary(all_results)
 
 
 if __name__ == "__main__":
-    main()
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="List of batch sizes",
+    )
+    parser.add_argument(
+        "--seq-lens",
+        nargs="+",
+        type=int,
+        default=seq_len_range,
+        help="List of sequence lengths",
+    )
+    parser.add_argument("--hidden-dim", type=int, default=7168)
+    parser.add_argument(
+        "--src-dtypes",
+        nargs="+",
+        choices=list(dtype_map),
+        default=["bfloat16"],
+        help="List of input dtypes",
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(
+            args.batch_sizes,
+            args.seq_lens,
+            group_size_range,
+            [dtype_map[d] for d in args.src_dtypes],
+        )
+    )
+
+    main(args.hidden_dim)

@@ -8,7 +8,11 @@ import pytest
 import sgl_kernel
 import torch
 
-pytestmark = pytest.mark.skipif(not torch.xpu.is_available(), reason="XPU required")
+pytestmark = pytest.mark.skipif(
+    not torch.xpu.is_available()
+    or not hasattr(torch.ops.sgl_kernel, "qsa_sparse_attention"),
+    reason="Requires an XPU build with qsa_sparse_attention enabled",
+)
 
 
 def reference(q, k, v, slots, scale):

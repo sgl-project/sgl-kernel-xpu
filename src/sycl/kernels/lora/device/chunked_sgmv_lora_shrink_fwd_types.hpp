@@ -33,7 +33,7 @@
 
   Adding another tile is a two-step change (mirrors the prefill LoRA kernels):
     1) Define a new option tag here.
-    2) Register (tag name, C++ type) in ChunkedSgmvLoraShrinkFwdXe20.cmake.
+    2) Register (tag name, C++ type) in ChunkedSgmvLoraShrinkFwd.cmake.
   The entrypoint (ChunkedSgmvLoraShrinkFwd.cpp) then picks a tag per call.
 */
 

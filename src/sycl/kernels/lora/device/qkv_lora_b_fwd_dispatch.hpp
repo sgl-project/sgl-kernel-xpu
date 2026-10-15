@@ -32,14 +32,14 @@
   \file
   \brief Forward declarations of the generated per-dtype launch functions for
          qkv_lora_b_fwd. The definitions are produced by
-         qkv_lora_b_fwd_kernel.cpp.in via QKVLoraBFwdXe20.cmake, each in its own
+         qkv_lora_b_fwd_kernel.cpp.in via QKVLoraBFwd.cmake, each in its own
          translation unit for parallel compilation of the heavy CUTLASS template
          instantiation.
 
          Naming: launch_qkv_lora_b_fwd_<ELEM_TAG>_<TILE_TAG>
          Parameters:
            ELEM_TAG in {half, bf16}       -- fp16/bf16.
-           TILE_TAG in {tall}             -- extend via QKVLoraBFwdXe20.cmake
+           TILE_TAG in {tall}             -- extend via QKVLoraBFwd.cmake
                                              + a new option tag/type in
                                              qkv_lora_b_fwd_types.hpp.
 */

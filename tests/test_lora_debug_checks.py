@@ -127,6 +127,7 @@ def _embedding(**over):
         "input_ids": torch.randint(0, vocab, (T,), device=DEV),
         "weights": torch.randn(L, R, vocab, dtype=DT, device=DEV),
         "vocab_size": vocab,
+        "max_len": T // 2,  # longest segment of _segments()
         **_segments(),
         **_ranks(),
     }
@@ -211,6 +212,12 @@ def test_bad_permutation_raises(op, perm, match):
 @pytest.mark.parametrize(
     "op, bad, match",
     [
+        pytest.param(
+            _embedding,
+            {"max_len": T // 2 - 1},
+            "max_len must be >= the longest segment",
+            id="embedding-max-len-too-small",
+        ),
         pytest.param(
             _qkv,
             {"output_offset": _i32([1, 128, 192, 256])},

@@ -100,7 +100,7 @@ def fused_topk_sigmoid_torch_native(
 # tolerance as the reduced-float path.
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("n_token", [2, 32, 4096])
-@pytest.mark.parametrize("n_expert", [8, 32, 256])
+@pytest.mark.parametrize("n_expert", [8, 32, 256, 512])
 @pytest.mark.parametrize("renormalize", [False, True])
 @pytest.mark.parametrize("with_correction_bias", [False, True])
 @pytest.mark.parametrize("routed_scaling_factor", [1.0, 2.5])
@@ -167,6 +167,34 @@ def test_topk_sigmoid(
         ref_topk_indices,
         topk_indices,
         n_token,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("n_token", [2, 32])
+@pytest.mark.parametrize("n_topk", [10, 16])
+@pytest.mark.parametrize("n_expert", [111, 512])
+@pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("with_correction_bias", [False, True])
+@pytest.mark.parametrize("num_fused_shared_experts", [0, 1])
+def test_topk_sigmoid_none_pow_2_experts(
+    dtype,
+    n_token,
+    n_topk,
+    n_expert,
+    renormalize,
+    with_correction_bias,
+    num_fused_shared_experts,
+):
+    test_topk_sigmoid(
+        dtype,
+        n_token,
+        n_topk,
+        n_expert,
+        renormalize,
+        with_correction_bias,
+        1.0,
+        num_fused_shared_experts,
     )
 
 

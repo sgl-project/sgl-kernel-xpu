@@ -92,7 +92,7 @@ inline void launch_fp4_transpose_scales_and_build_pointers(
     int num_experts,
     int max_m,
     int packed_k,
-    int n,
+    [[maybe_unused]] int n,
     int scale_cols,
     const int32_t* problem_sizes_ptr,
     const int32_t* expert_offsets_ptr,

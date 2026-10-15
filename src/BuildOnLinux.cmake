@@ -298,13 +298,13 @@ foreach(lib ${SGL_OPS_LIBRARIES})
   target_compile_options_if_supported(${lib} "-Wno-deprecated-copy")
   target_compile_options(${lib} PRIVATE ${TORCH_XPU_OPS_FLAGS})
 
-  target_include_directories(${lib} PUBLIC ${TORCH_XPU_OPS_INCLUDE_DIRS})
-  target_include_directories(${lib} PUBLIC ${ATen_XPU_INCLUDE_DIRS})
-  target_include_directories(${lib} PUBLIC ${SYCL_INCLUDE_DIR})
-  target_include_directories(${lib} PRIVATE ${Python3_INCLUDE_DIRS})
+  target_include_directories(${lib} SYSTEM PUBLIC ${TORCH_XPU_OPS_INCLUDE_DIRS})
+  target_include_directories(${lib} SYSTEM PUBLIC ${ATen_XPU_INCLUDE_DIRS})
+  target_include_directories(${lib} SYSTEM PUBLIC ${SYCL_INCLUDE_DIR})
+  target_include_directories(${lib} SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
   target_link_libraries(${lib} PRIVATE ${Python3_LIBRARIES})
 
-  target_include_directories(${lib} PRIVATE ${TORCH_INCLUDE_DIRS})
+  target_include_directories(${lib} SYSTEM PRIVATE ${TORCH_INCLUDE_DIRS})
   target_link_libraries(${lib} PRIVATE ${TORCH_LIBRARIES} c10 torch torch_cpu ${SYCL_LIBRARY})
 
   target_link_libraries(${lib} PUBLIC ${SYCL_LIBRARY})

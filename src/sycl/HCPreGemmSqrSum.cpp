@@ -32,6 +32,7 @@
     \brief HC Pre Gemm Square Sum Kernel
 */
 
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>

@@ -50,6 +50,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     -Wformat
     -Wformat-security
     -Werror=format-security)
+  # Opt-in regression gate. Requires the SYSTEM include dirs (CMakeLists.txt,
+  # src/BuildOnLinux.cmake) so only first-party diagnostics are fatal.
+  option(SGL_WERROR "Treat compiler warnings in first-party sources as errors" OFF)
+  if(SGL_WERROR)
+    list(APPEND SGL_SDL_WARNING_FLAGS -Werror)
+  endif()
   list(APPEND SYCL_HOST_FLAGS ${SGL_SDL_WARNING_FLAGS})
   # SYCL headers warnings
   list(APPEND SYCL_HOST_FLAGS -Wno-deprecated-declarations)
@@ -125,8 +131,18 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-associative-math)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-approx-func)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -Wno-absolute-value)
+  # Mirrors the host-pass suppression above. nd_item::barrier(fence_space) is
+  # __SYCL2020_DEPRECATED in favour of sycl::group_barrier(), but group_barrier
+  # also fences CrossWorkgroupMemory, so the swap is a perf change and is
+  # deferred until it can be benchmarked.
+  set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -Wno-deprecated-declarations)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -no-ftz)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-sycl-instrument-device-code)
+  # The device pass only carries clang's default-on diagnostics, not -Wall/-Wextra;
+  # the gate keeps those (e.g. -Wmacro-redefined) from regressing.
+  if(SGL_WERROR)
+    set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -Werror)
+  endif()
 
   if(CMAKE_BUILD_TYPE MATCHES Debug)
     set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -g -O0 -Rno-debug-disables-optimization)

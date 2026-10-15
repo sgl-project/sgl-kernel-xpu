@@ -288,7 +288,7 @@ struct FMHAFwdMainloop<
 
   FMHAFwdMainloop(Params const& params_, SharedStorage&) : params(params_) {}
 
-  static constexpr Params to_underlying_arguments(Arguments const& args, void* workspace) {
+  static constexpr Params to_underlying_arguments(Arguments const& args, [[maybe_unused]] void* workspace) {
     constexpr double kLog2e = 1.4426950408889634074;  // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
     return Params{
@@ -316,7 +316,7 @@ struct FMHAFwdMainloop<
   }
 
   CUTLASS_DEVICE
-  int get_physical_k_tile(int K, int l_coord, int seq_len_kv_cache) {
+  int get_physical_k_tile(int K, int l_coord, [[maybe_unused]] int seq_len_kv_cache) {
     int next_page_logical_idx = K * get<1>(TileShapeQK{}) / params.page_size;
     // get<1>(TileShapeQK{}) usually smaller than page_size.
     // assuming page_size is multiple of get<1>(TileShapeQK{})
@@ -411,7 +411,7 @@ struct FMHAFwdMainloop<
       int bias_head_start,
       int q_token_offset,
       int full_tile_offset,
-      int discard_seq_coord,
+      [[maybe_unused]] int discard_seq_coord,
       TensorK_cache2D const& K_cache_2D = TensorK_cache2D{},
       TensorV_cache2D const& V_cache_2D = TensorV_cache2D{},
       float scale_k = 1.0f  // FP8 K per-tensor dequant scale
@@ -495,9 +495,9 @@ struct FMHAFwdMainloop<
 #endif
 
     /* Partition coordinate tensors for copy */
-    auto tQgQ = thr_copy_q.partition_S(gQ);        // (atom_val,q',d',D)
-    auto tKgK = thr_copy_k.partition_S(gK);        // (atom_val,k',d',K,D)
-    auto tVgV = thr_copy_v.partition_S(gV_split);  // (atom_val,v',k',VV,K)
+    auto tQgQ = thr_copy_q.partition_S(gQ);                         // (atom_val,q',d',D)
+    auto tKgK = thr_copy_k.partition_S(gK);                         // (atom_val,k',d',K,D)
+    [[maybe_unused]] auto tVgV = thr_copy_v.partition_S(gV_split);  // (atom_val,v',k',VV,K)
     auto tKgK_cache = thr_copy_k_cache.partition_S(gK_cache);
     auto tVgV_cache = thr_copy_v_cache.partition_S(gV_cache_split);
 
@@ -531,7 +531,7 @@ struct FMHAFwdMainloop<
     /* Partition global tensors for prefetch */
     auto pQgQ = prefetch_q.get_slice(thr_id).partition_S(gQ);
     auto pKgK = prefetch_k.get_slice(thr_id).partition_S(gK);
-    auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV_split);
+    [[maybe_unused]] auto pVgV = prefetch_v.get_slice(thr_id).partition_S(gV_split);
     auto pKgK_cache = prefetch_k_cache.get_slice(thr_id).partition_S(gK_cache);
     auto pVgV_cache = prefetch_v_cache.get_slice(thr_id).partition_S(gV_cache_split);
 
@@ -1133,11 +1133,11 @@ struct DecodeFwdMainloop<
       int const& idx_b,       // WG tile indices: (B)
       int blk_k0,             // K block range: [K0,K1)
       int blk_k1,
-      int total_blk,  // Total # of K blocks
+      [[maybe_unused]] int total_blk,  // Total # of K blocks
       int thr_id,
       int seq_len,
       int full_tile_offset,
-      int discard_seq_coord,
+      [[maybe_unused]] int discard_seq_coord,
       float scale_k = 1.0f,  // FP8 K per-tensor dequant scale (applied in GEMM1)
       int bias_row_base = 0) {
     using namespace sycl::ext::oneapi::this_work_item;
@@ -1174,7 +1174,7 @@ struct DecodeFwdMainloop<
     TiledMMAQK mma_qk{};
     TiledMMAPV mma_pv{};
 
-    auto copyQ = make_block_2d_copy_A(TiledMMAQK{}, TensorQ2D{});
+    [[maybe_unused]] auto copyQ = make_block_2d_copy_A(TiledMMAQK{}, TensorQ2D{});
 
     /* Slice TiledCopy/TiledMMA operations down to to work-item level */
     auto thr_copy_q = copy_q.get_slice(thr_id);

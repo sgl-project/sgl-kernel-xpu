@@ -152,7 +152,7 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         num_tokens_per_expert(num_tokens_per_expert),
         hidden_dim_num_groups(hidden_dim_num_groups) {}
 
-  void sycl_ker_config_convention(sycl::handler& cgh) {}
+  void sycl_ker_config_convention([[maybe_unused]] sycl::handler& cgh) {}
 
   [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
     const int64_t local_group_id = item.get_local_id(0) / THREADS_PER_GROUP;

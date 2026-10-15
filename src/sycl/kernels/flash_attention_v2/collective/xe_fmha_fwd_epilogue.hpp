@@ -135,7 +135,7 @@ class FMHAFwdEpilogue {
   SharedStorage& shared;
 
  public:
-  static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
+  static constexpr Params to_underlying_arguments([[maybe_unused]] Arguments const& args, void* /* workspace */) {
     return {};
   }
 
@@ -548,7 +548,7 @@ class DecodeFwdEpilogue {
   SharedStorage& shared;
 
  public:
-  static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
+  static constexpr Params to_underlying_arguments([[maybe_unused]] Arguments const& args, void* /* workspace */) {
     return {};
   }
 

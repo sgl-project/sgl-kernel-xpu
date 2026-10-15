@@ -30,6 +30,8 @@
  **************************************************************************************************/
 // Auto-generated from mla_decode_kernel.cpp.in
 // Template parameters: ELEM_TAG=@ELEM_TAG@, PAGE_SIZE=@PAGE_SIZE@, ARCH_TAG=@ARCH_TAG@
+// Undef first: the top-level CMakeLists also defines SYCL_INTEL_TARGET build-wide.
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET @SYCL_TARGET@
 
 #include "sycl/kernels/mla/@ARCH_TAG@/device/mla_decode_types.hpp"

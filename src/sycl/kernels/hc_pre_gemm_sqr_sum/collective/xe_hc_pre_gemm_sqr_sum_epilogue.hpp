@@ -56,7 +56,7 @@ class XeHcPreGemmSqrSumEpilogue {
   SharedStorage& shared;
   CUTLASS_HOST_DEVICE
   XeHcPreGemmSqrSumEpilogue(Params const& params_, SharedStorage& shared_) : params(params_), shared(shared_) {}
-  static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
+  static constexpr Params to_underlying_arguments([[maybe_unused]] Arguments const& args, void* /* workspace */) {
     return {};
   }
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const&) {

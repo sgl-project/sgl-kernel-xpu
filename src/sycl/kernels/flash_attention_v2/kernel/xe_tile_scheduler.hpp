@@ -58,7 +58,7 @@ struct XeFHMAIndividualTileScheduler {
   template <class ProblemShape, class TileShape>
   static Params to_underlying_arguments(
       ProblemShape const& shape,
-      KernelHardwareInfo hw_info,
+      [[maybe_unused]] KernelHardwareInfo hw_info,
       TileShape const& tile_shape,
       const int& num_kv_splits = -1) {
     using namespace cute;
@@ -199,8 +199,8 @@ struct XeReduceSplitKTileScheduler {
   template <class ProblemShape, class TileShape>
   static Params to_underlying_arguments(
       ProblemShape const& shape,
-      KernelHardwareInfo hw_info,
-      TileShape const& tile_shape,
+      [[maybe_unused]] KernelHardwareInfo hw_info,
+      [[maybe_unused]] TileShape const& tile_shape,
       const int& num_kv_splits = -1) {
     using namespace cute;
 

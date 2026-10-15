@@ -16,6 +16,7 @@ namespace {
 using bf16 = sycl::ext::oneapi::bfloat16;
 using Bf16Dpas = cute::XE_DPAS_TT<1, float, cute::bfloat16_t>;
 using DpasTraits = cute::MMA_Traits<Bf16Dpas>;
+// Qwen3.8-Flash-Next only: 256-wide heads require exactly 16 subgroups of 16 lanes in this mapping.
 constexpr int kHeadDim = 256;
 constexpr int kTileSize = 16;
 constexpr int kShortSplitSize = 64;
@@ -33,6 +34,7 @@ struct QSASplitKernel {
   int rows;
   int heads;
   int kv_heads;
+  int64_t cache_tokens;
   int topk;
   int splits;
   float scale;
@@ -45,7 +47,7 @@ struct QSASplitKernel {
     const int row = group / (splits * heads);
     const int kv_head = head / (heads / kv_heads);
     const int dim = item.get_local_id(0);
-    const int token = dim / kTileSize;
+    const int dim_tile = dim / kTileSize;
     const int lane = dim % kTileSize;
     auto wg = item.get_group();
     float* scores = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[kTileSize]>(wg);
@@ -62,12 +64,13 @@ struct QSASplitKernel {
 
     const int end = sycl::min(topk, (split + 1) * SplitSize);
     for (int start = split * SplitSize; start < end; start += kTileSize) {
-      const int column = start + token;
+      const int column = start + dim_tile;
       const int32_t slot = column < topk ? slots[row * topk + column] : -1;
-      if (lane == 0) selected[token] = slot;
+      // Mask invalid cache slots before scoring or gathering K and V.
+      if (lane == 0) selected[dim_tile] = slot >= 0 && static_cast<int64_t>(slot) < cache_tokens ? slot : -1;
       // Publish selected slots before other subgroups gather K and V.
       item.barrier(sycl::access::fence_space::local_space);
-      const int d = token * kTileSize;
+      const int d = dim_tile * kTileSize;
       const int query_dim = DpasTraits::ALayout{}(lane, 0);
       const bf16 query_value = q[(row * heads + head) * kHeadDim + d + query_dim];
       Bf16Dpas::AVector query;
@@ -86,7 +89,7 @@ struct QSASplitKernel {
       __builtin_memcpy(&key, key_values, sizeof(key_values));
       Bf16Dpas::DVector partial_score = 0.0f;
       Bf16Dpas::fma(partial_score, query, key, partial_score);
-      partial_scores[token * kTileSize + DpasTraits::CLayout{}(lane, 0)] = partial_score[0];
+      partial_scores[dim_tile * kTileSize + DpasTraits::CLayout{}(lane, 0)] = partial_score[0];
       // Finish writing all subgroup QK partials before summing them into scores.
       item.barrier(sycl::access::fence_space::local_space);
       if (dim < kTileSize) {
@@ -129,7 +132,7 @@ struct QSASplitKernel {
       for (int j = 0; j < kTileSize; ++j) {
         const int coordinate = DpasTraits::BLayout{}(lane, j);
         const int token_idx = coordinate / kTileSize;
-        const int value_dim = token * kTileSize + coordinate % kTileSize;
+        const int value_dim = dim_tile * kTileSize + coordinate % kTileSize;
         const int32_t value_slot = selected[token_idx];
         const int64_t offset = (static_cast<int64_t>(value_slot) * kv_heads + kv_head) * kHeadDim;
         value_fragments[j] = value_slot >= 0 ? sycl::bit_cast<uint16_t>(v[offset + value_dim]) : 0;
@@ -253,6 +256,7 @@ SGL_KERNEL_EXPORT at::Tensor qsa_sparse_attention(
               rows,
               heads,
               kv_heads,
+              k_cache.size(0),
               topk,
               splits,
               static_cast<float>(scale)});

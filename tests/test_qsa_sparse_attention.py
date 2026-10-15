@@ -19,7 +19,7 @@ def reference(q, k, v, slots, scale):
     result = torch.zeros_like(q)
     group_size = q.shape[1] // k.shape[1]
     for row in range(q.shape[0]):
-        valid = slots[row][slots[row] >= 0].long()
+        valid = slots[row][(slots[row] >= 0) & (slots[row] < k.shape[0])].long()
         if valid.numel() == 0:
             continue
         keys = k[valid].float().repeat_interleave(group_size, dim=1)
@@ -68,6 +68,27 @@ def test_qsa_bf16_matches_reference(rows, heads, kv_heads, topk, valid_count, sc
     expected = reference(q, k, v, slots, sm_scale)
     actual = torch.ops.sgl_kernel.qsa_sparse_attention(
         q.xpu(), k.xpu(), v.xpu(), slots.xpu(), scale
+    ).cpu()
+    torch.testing.assert_close(actual, expected, atol=0.025, rtol=0.025)
+
+
+@pytest.mark.parametrize("topk", [1, 17, 65])
+@pytest.mark.parametrize("cache_tokens", [0, 4])
+def test_qsa_masks_out_of_range_cache_slots(topk, cache_tokens):
+    torch.manual_seed(27)
+    q = torch.randn(2, 4, 256, dtype=torch.bfloat16)
+    k = torch.randn(cache_tokens, 2, 256, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    slots = torch.full((2, topk), -1, dtype=torch.int32)
+    slots[0, 0] = 0
+    slots[1, 0] = cache_tokens
+    if topk > 1:
+        slots[0, 1:4] = torch.tensor([4, 2**31 - 1, 2], dtype=torch.int32)
+        slots[1, 1] = 2**31 - 1
+
+    expected = reference(q, k, v, slots, 0.0625)
+    actual = torch.ops.sgl_kernel.qsa_sparse_attention(
+        q.xpu(), k.xpu(), v.xpu(), slots.xpu(), 0.0625
     ).cpu()
     torch.testing.assert_close(actual, expected, atol=0.025, rtol=0.025)
 

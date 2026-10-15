@@ -121,7 +121,7 @@ if(NOT USE_MLA)
     list(FILTER device_cpp EXCLUDE REGEX "/mla_(decode|prefill|sparse_decode|sparse_prefill)\\.cpp$")
 endif()
 if(NOT USE_QSA OR NOT DPCPP_SYCL_TARGET MATCHES "bmg")
-    list(FILTER device_cpp EXCLUDE REGEX "/QSASparseAttention\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/QSASparseAttentionXe20\\.cpp$")
     list(FILTER device_cpp EXCLUDE REGEX "/QSAMqaXe20\\.cpp$")
 endif()
 if(NOT USE_MOE)
@@ -141,7 +141,7 @@ foreach(file ${device_cpp})
 
     # Classify by filename suffix (e.g. Kernel.Xe35.cpp) or by parent
     # directory path containing /Xe20/ or /Xe35/.
-    if(fname STREQUAL "QSASparseAttention.cpp" OR fname MATCHES "Xe20\\.(cpp|sycl)$" OR file MATCHES "/xe20/")
+    if(fname MATCHES "Xe20\\.(cpp|sycl)$" OR file MATCHES "/xe20/")
         list(APPEND device_cpp_xe20 ${file})
     elseif(fname MATCHES "Xe35\\.(cpp|sycl)$" OR file MATCHES "/xe35/")
         list(APPEND device_cpp_xe35 ${file})

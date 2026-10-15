@@ -508,6 +508,9 @@ def _make_inputs(
         "vocab_size": vocab_size,
         "seg_indptr": seg_indptr,
         "seg_lens": seg_lens,
+        # Longest segment; the caller (LoRA batch info) knows it, so it is computed
+        # here once, outside the timed region.
+        "max_len": int(seg_lens.max().item()) if seg_lens.numel() else 0,
         "weight_indices": weight_indices,
         "lora_ranks": lora_ranks,
         "extra_embeddings": extra_embeddings,
@@ -519,6 +522,7 @@ def _run_sgl_once(args: Dict[str, Any]):
         input_ids=args["input_ids"],
         weights=args["weights"],
         vocab_size=int(args["vocab_size"]),
+        max_len=int(args["max_len"]),
         seg_indptr=args["seg_indptr"],
         weight_indices=args["weight_indices"],
         lora_ranks=args["lora_ranks"],

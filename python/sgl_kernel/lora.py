@@ -7,6 +7,7 @@ def embedding_lora_a_fwd(
     input_ids: torch.Tensor,
     weights: torch.Tensor,
     vocab_size: int,
+    max_len: int,
     seg_indptr: torch.Tensor,
     weight_indices: torch.Tensor,
     lora_ranks: torch.Tensor,
@@ -35,6 +36,10 @@ def embedding_lora_a_fwd(
         Weight tensor for embeddings, shape ``(num_loras, max_rank, vocab_size)``.
     vocab_size : int
         Vocabulary size.
+    max_len : int
+        Length of the longest segment (``max(seg_indptr[s + 1] - seg_indptr[s])``).
+        It sizes the kernel launch, so passing it avoids a device-to-host read of
+        ``seg_indptr``. Rows past ``max_len`` in a longer segment are not computed.
     seg_indptr : torch.Tensor
         Segment index pointer tensor, shape ``(num_segments + 1,)``.
     weight_indices : torch.Tensor
@@ -68,6 +73,7 @@ def embedding_lora_a_fwd(
         input_ids,
         weights,
         vocab_size,
+        max_len,
         seg_indptr,
         weight_indices,
         lora_ranks,

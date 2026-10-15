@@ -51,7 +51,7 @@ namespace {
 
 //----------------- Per-(dtype, tile) dispatch macros --------------------//
 // Tile selection currently has a single option (large). Add tiles to
-// DISPATCH_SGEMM_LORA_B_FWD_TILE (and to SGEMMLoraBFwdXe20.cmake +
+// DISPATCH_SGEMM_LORA_B_FWD_TILE (and to SGEMMLoraBFwd.cmake +
 // sgemm_lora_b_fwd_dispatch.hpp + sgemm_lora_b_fwd_types.hpp) with a runtime
 // heuristic (e.g. average M per segment) picking the tag.
 #define DISPATCH_SGEMM_LORA_B_FWD_TILE(ELEM, ...)                               \
@@ -182,7 +182,7 @@ SGL_KERNEL_EXPORT void sgemm_lora_b_fwd(
 #endif
 
   // Dispatch on (dtype, tile). Each launch symbol is defined in a separate
-  // generated translation unit (see SGEMMLoraBFwdXe20.cmake).
+  // generated translation unit (see SGEMMLoraBFwd.cmake).
   DISPATCH_SGEMM_LORA_B_FWD_DTYPE(
       input_x,
       weights,

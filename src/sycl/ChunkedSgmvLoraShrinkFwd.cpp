@@ -69,7 +69,7 @@ namespace {
 
 //----------------- Per-(dtype, tile) dispatch macros --------------------//
 // One tile (splitk) for now. Add tiles to DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE
-// (and to ChunkedSgmvLoraShrinkFwdXe20.cmake + chunked_sgmv_lora_shrink_fwd_dispatch.hpp
+// (and to ChunkedSgmvLoraShrinkFwd.cmake + chunked_sgmv_lora_shrink_fwd_dispatch.hpp
 // + chunked_sgmv_lora_shrink_fwd_types.hpp) with a runtime heuristic picking the tag.
 #define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE(ELEM, ...)                                            \
   do {                                                                                                   \

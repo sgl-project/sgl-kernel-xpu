@@ -60,7 +60,7 @@ namespace {
 // QKV LoRA-B is a K-thin (rank 16..64), memory-bandwidth-bound grouped GEMM.
 // After trying different shapes, a single tall/thin 32x512 workgroup tile is
 // fastest across the shape space, so tile selection currently has a single option (tall).
-// Add tiles to DISPATCH_QKV_LORA_B_FWD_TILE (and to QKVLoraBFwdXe20.cmake +
+// Add tiles to DISPATCH_QKV_LORA_B_FWD_TILE (and to QKVLoraBFwd.cmake +
 // qkv_lora_b_fwd_dispatch.hpp + qkv_lora_b_fwd_types.hpp) with a runtime
 // heuristic picking the tag.
 #define DISPATCH_QKV_LORA_B_FWD_TILE(ELEM, ...)                            \
@@ -213,7 +213,7 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
 #endif
 
   // Dispatch on dtype. Each launch symbol is defined in a separate generated
-  // translation unit (see QKVLoraBFwdXe20.cmake).
+  // translation unit (see QKVLoraBFwd.cmake).
   DISPATCH_QKV_LORA_B_FWD_DTYPE(
       input_x,
       qkv_lora_b,

@@ -50,7 +50,7 @@
 
   Adding a new tile is a two-step change:
     1) Define a new option tag here.
-    2) Register (tag name, C++ type) in GateUpLoraBFwdXe20.cmake.
+    2) Register (tag name, C++ type) in GateUpLoraBFwd.cmake.
   The dtype dispatch in GateUpLoraBFwd.cpp then picks a tag per call.
 */
 

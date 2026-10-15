@@ -31,7 +31,7 @@
   \file
   \brief Forward declarations of the generated per-(dtype, tile) launch
          functions of the chunked-SGMV LoRA expand kernel. The definitions are produced by
-         chunked_sgmv_lora_expand_fwd_kernel.cpp.in via ChunkedSgmvLoraExpandFwdXe20.cmake,
+         chunked_sgmv_lora_expand_fwd_kernel.cpp.in via ChunkedSgmvLoraExpandFwd.cmake,
          each in its own translation unit (parallel compilation; the entrypoint
          stays free of kernel code).
 

@@ -76,7 +76,7 @@ namespace {
 
 //----------------- Per-(dtype, tile) dispatch macros --------------------//
 // One tile (wide) for now. Add tiles to DISPATCH_CHUNKED_SGMV_LORA_EXPAND_FWD_TILE
-// (and to ChunkedSgmvLoraExpandFwdXe20.cmake + chunked_sgmv_lora_expand_fwd_dispatch.hpp
+// (and to ChunkedSgmvLoraExpandFwd.cmake + chunked_sgmv_lora_expand_fwd_dispatch.hpp
 // + chunked_sgmv_lora_expand_fwd_types.hpp) with a runtime heuristic picking the tag.
 #define DISPATCH_CHUNKED_SGMV_LORA_EXPAND_FWD_TILE(ELEM, ...)                                          \
   do {                                                                                                 \

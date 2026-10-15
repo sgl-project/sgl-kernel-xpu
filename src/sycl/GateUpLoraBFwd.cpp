@@ -63,7 +63,7 @@ namespace {
 // gate/up LoRA-B is a K-thin (rank 16..64), memory-bandwidth-bound grouped GEMM.
 // As with QKV LoRA-B, a single tall/thin 32x512 workgroup tile is fastest across
 // the shape space, so tile selection currently has a single option (tall). Add
-// tiles to DISPATCH_GATE_UP_LORA_B_FWD_TILE (and to GateUpLoraBFwdXe20.cmake +
+// tiles to DISPATCH_GATE_UP_LORA_B_FWD_TILE (and to GateUpLoraBFwd.cmake +
 // gate_up_lora_b_fwd_dispatch.hpp + gate_up_lora_b_fwd_types.hpp) with a runtime
 // heuristic picking the tag.
 #define DISPATCH_GATE_UP_LORA_B_FWD_TILE(ELEM, ...)                                \
@@ -192,7 +192,7 @@ SGL_KERNEL_EXPORT void gate_up_lora_b_fwd(
   const int num_segments = static_cast<int>(num_segments_i64);
 
   // Dispatch on dtype. Each launch symbol is defined in a separate generated
-  // translation unit (see GateUpLoraBFwdXe20.cmake).
+  // translation unit (see GateUpLoraBFwd.cmake).
   DISPATCH_GATE_UP_LORA_B_FWD_DTYPE(
       input_x,
       gate_up_lora_b,

@@ -90,7 +90,7 @@ void mha_fwd(
 
 void flash_mla_decode(
     torch::Tensor& out,
-    const std::optional<torch::Tensor>& lse,  // (batch, [s_q,] num_heads) fp32; nullopt = skip
+    const std::optional<torch::Tensor>& lse,
     const torch::Tensor& q_nope,
     const torch::Tensor& q_pe,
     const torch::Tensor& kv_c_and_k_pe_cache,

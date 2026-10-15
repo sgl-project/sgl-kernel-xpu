@@ -32,10 +32,6 @@ bool check_config(const char* op_label, std::string* err) {
 using DecodeFn = void (*)(
     void*, const void*, const void*, const void*, const void*, const void*, const void*, void*, double, int64_t);
 
-// `lse` is a runtime argument, so it does not key the cache or the module name.
-// q_tile (the decode Q-tile height, not the raw seq_len_q) is a compile-time
-// template parameter and does; the prefill resolve shares this packer with
-// q_tile == 0 (its Q bucket is runtime).
 uint64_t pack_decode_key(int arch, bool is_fp16, int page_size, int q_tile = 0) {
   uint64_t k = static_cast<uint64_t>(arch) & 0xFF;
   k = (k << 16) | (static_cast<uint64_t>(page_size) & 0xFFFF);

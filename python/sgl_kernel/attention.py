@@ -64,15 +64,6 @@ def flash_mla_decode(
 ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
     """MLA decode.
 
-    q_nope / q_pe are either 3D (batch, num_heads, dim) for one query token per
-    request, or 4D (batch, s_q, num_heads, dim) for any s_q >= 1 query tokens
-    per request (MTP / speculative decode). With s_q > 1 the tokens are the
-    last s_q positions of the sequence (seq_lens includes them, so every
-    seq_lens[i] must be >= s_q) and are causally masked: token i attends to KV
-    positions [0, seq_lens - s_q + i]. s_q > 1 runs on the 8-row kernel: 2..8
-    are padded up to 8, and above 8 it covers the request with several Q
-    tiles. Padding rows cost time, not accuracy.
-
     Args:
         return_lse: also return the softmax log-sum-exp. Default False.
 
@@ -195,11 +186,6 @@ def flash_mla_decode_get_workspace_size(
     num_kv_splits: int = -1,
     seq_len_q: int = 1,
 ) -> int:
-    """Split-KV workspace bytes for flash_mla_decode.
-
-    seq_len_q is the number of query tokens per request (1 for 3D q, else
-    q.shape[1]); the workspace scales linearly with it.
-    """
     assert max_seq_len > 0, f"max_seq_len must be greater than 0, got {max_seq_len}"
     assert num_batches > 0, f"num_batches must be greater than 0, got {num_batches}"
     assert seq_len_q > 0, f"seq_len_q must be greater than 0, got {seq_len_q}"

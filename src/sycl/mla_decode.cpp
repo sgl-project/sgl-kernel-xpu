@@ -110,8 +110,6 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
   mla_decode::launch_mla_decode_##ELEM##_##PS##_q##QT( \
       out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table, workspace, sm_scale, num_kv_splits)
 
-// q_tile = mla_decode_q_tile(seq_len_q) selects the Q-tile instantiation. Must
-// match MLA_DECODE_Q_TILES in MlaDecodeXe{20,35}.cmake.
 #define DISPATCH_MLA_Q_TILE(ELEM, PS)                                    \
   do {                                                                   \
     switch (q_tile) {                                                    \
@@ -163,15 +161,6 @@ int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int
 
 /// @brief Dispatch kernel implementation for MLA decode.
 ///
-/// q_nope / q_pe / out / lse are either 3D (batch, num_heads, ...) for one query
-/// token per request, or 4D (batch, s_q, num_heads, ...) for any s_q >= 1 query
-/// tokens per request (MTP / speculative decode). With s_q > 1 the tokens are
-/// the last s_q positions of the sequence (seq_lens includes them) and are
-/// causally masked: token i attends to KV positions [0, seq_lens - s_q + i].
-/// s_q is served by the Q-tile kernel mla_decode_q_tile(s_q) picks: the 1-row
-/// kernel for a single token, otherwise the 8-row kernel, padded up to 8
-/// (padding rows are masked) and above 8 run over ceil(s_q / 8) Q tiles.
-///
 /// `lse` is an output taken by const ref: the bindings cannot box a non-const
 /// optional, and at::Tensor constness is shallow.
 SGL_KERNEL_EXPORT void flash_mla_decode(
@@ -208,8 +197,6 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
       page_size,
       ". Supported: 16, 32, 64, 128");
 
-  // 3D (batch, num_heads, dim) is single-token decode; 4D (batch, s_q, num_heads, dim)
-  // is multi-token decode with s_q query tokens per request.
   TORCH_CHECK(
       q_nope.dim() == 3 || q_nope.dim() == 4,
       "q_nope must be (batch, num_heads, dim) or (batch, s_q, num_heads, dim), got ",
@@ -236,9 +223,6 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
   if (num_kv_splits < 1) {
     int page_count_per_seq = page_table.size(1);
     int max_seq_len = page_size * page_count_per_seq;
-    // Heuristic tuned for single-token decode; it keys on the (batch, heads)
-    // work-group count, which is unchanged by seq_len_q up to 8 (above that
-    // each request adds ceil(seq_len_q / 8) Q-tile work-groups).
     num_kv_splits = set_split_kv(q_nope.size(0), num_heads, max_seq_len, page_size);
   }
 
@@ -297,8 +281,7 @@ SGL_KERNEL_EXPORT void flash_mla_decode(
 #undef DISPATCH_MLA_DTYPE
 
 namespace {
-// The split-KV workspace layout does not depend on the Q tile, so the
-// single-token instantiation (QTileM=1) sizes every seq_len_q.
+// The workspace layout does not depend on the Q tile, so QTileM=1 sizes every seq_len_q.
 template <typename MlaXeType>
 int64_t mla_workspace_size(int64_t num_batches, int64_t num_heads, int64_t num_kv_splits, int64_t seq_len_q) {
   typename MlaXeType::Fmla::Arguments args{};

@@ -41,8 +41,6 @@ all_results = []
     )
 )
 def benchmark(batch_size, seq_len, provider, block_size, num_kv_splits, seq_len_q=1):
-    # seq_len_q > 1 is multi-token (MTP / speculative) decode: q is 4D
-    # (batch, s_q, heads, d) and seq_len includes the s_q new tokens.
     d = 576
     dv = 512
 
@@ -333,9 +331,7 @@ if __name__ == "__main__":
         nargs="+",
         type=int,
         default=[1],
-        help="List of query tokens per request (1 = single-token decode; any "
-        "s_q >= 1 is accepted, 2..8 pad up to the 8-row kernel and "
-        "s_q > 8 runs several 8-row Q tiles)",
+        help="List of query tokens per request",
     )
     # How it works:
     # First run (no previous.csv): Creates current.csv and plots the current results only

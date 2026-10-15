@@ -50,8 +50,7 @@ struct SplitKVWorkspaceLayout {
   size_t max_logits_offset;
   size_t total_bytes;
 
-  // Layouts are [seq_len_q][batch][head][split][...]; seq_len_q > 1 is the
-  // multi-token (MTP / speculative) decode path.
+  // Layouts are [seq_len_q][batch][head][split][...].
   SplitKVWorkspaceLayout(
       int batch, int num_heads, int num_splits, int head_size_o, size_t elem_o_size, int seq_len_q = 1) {
     size_t o_accum_bytes = size_t(seq_len_q) * batch * num_heads * num_splits * head_size_o * elem_o_size;
@@ -334,10 +333,6 @@ class XeMlaFwdKernel {
 
       // For causal attention: limit K loop with causal offset.
       // causal_offset = seqlen_k - seqlen_q; mask: k_idx <= causal_offset + q_idx
-      // Prefill is always causal. Decode is causal only for seq_len_qo > 1 (the
-      // s_q query tokens are the last s_q positions of the sequence). seq_len_qo
-      // is padded up to one Q tile or spread over several; the last tile's bound
-      // folds to total_blk and earlier tiles stop at their causal horizon.
       // For single-token decode (CausalMask=false): blk_k1 stays at total_blk.
       int blk_k1 = total_blk;
       int causal_offset = 0;
@@ -349,12 +344,11 @@ class XeMlaFwdKernel {
         blk_k1 = cute::min(total_blk, causal_blk_k1);
       }
 
-      // Valid Q rows in this tile; < QK_BLK_M only on the last (partial) tile.
-      // Decode pads seq_len_qo up to the Q tile, or spreads it over several
-      // tiles, so its last tile may be partial as well. Single-token decode
-      // (Q_TILE_M=1) is always a full tile: keep the constexpr fold there, as
-      // the min/sub has measurable cost at high WG count and the mainloop's
-      // row mask is dead for QK_BLK_M=1 anyway.
+      // Valid Q rows in this tile; < QK_BLK_M only on the last partial tile.
+      // Single-token decode (Q_TILE_M=1) folds to constexpr 1 — the mainloop's
+      // `if constexpr (QK_BLK_M > 1)` mask block is then dead and q_valid_rows
+      // is unused, but compiling the min/sub still has measurable cost at high
+      // WG count. Gate to skip it entirely on that path.
       constexpr int Q_TILE_M_C = static_cast<int>(get<0>(TileShapeQK{}));
       int q_valid_rows = Q_TILE_M_C;
       if constexpr (CollectiveMainloop::IsPrefill || Q_TILE_M_C > 1) {
@@ -589,12 +583,8 @@ class XeMlaSplitKVKernel {
 
       constexpr int Q_TILE_M_C = static_cast<int>(get<0>(TileShapeQK{}));
 
-      // Multi-token decode (seq_len_qo > 1) is causal among the s_q new tokens:
-      // query row q attends to k <= causal_offset + q. KV blocks past this Q
-      // tile's last row are fully masked, so clip the split to them; a split
-      // lying entirely past the bound becomes empty below. When one tile holds
-      // all rows (seq_len_qo <= Q_TILE_M) the bound is total_blk and nothing
-      // changes.
+      // Causal: clip the split to this Q tile's causal horizon; a split lying
+      // entirely past it becomes empty below.
       int causal_offset = 0;
       if constexpr (CollectiveMainloop::CausalMask) {
         causal_offset = seq_len_kv - s.seq_len_qo;
@@ -606,8 +596,7 @@ class XeMlaSplitKVKernel {
       // Empty split: write zero-contribution sentinels and skip.
       // exp_sums=0 gates any garbage in O_accum for this split.
       // max_logits=lowest() ensures empty splits don't pollute global_max.
-      // One lane per query row of this Q tile (Q_TILE_M <= 16 <= WG size); rows
-      // past seq_len_qo on a partial tile have no statistics slot.
+      // One lane per valid query row of this Q tile.
       if (start_blk >= end_blk) {
         int row = blk_q * Q_TILE_M_C + thr_id;
         if (thr_id < Q_TILE_M_C && row < s.seq_len_qo) {
@@ -646,8 +635,7 @@ class XeMlaSplitKVKernel {
       Tensor K_pe = make_tensor(make_gmem_ptr(dcK_pe), make_layout(shape_K_pe, p.dK_pe));
       Tensor V = make_tensor(make_gmem_ptr(dcK), make_layout(shape_V, p.dV));
 
-      // Valid rows of this Q tile: partial when seq_len_qo is padded up to the
-      // tile or on the last of several tiles (see XeMlaFwdKernel).
+      // Valid Q rows in this tile; < QK_BLK_M only on the last partial tile.
       int q_valid_rows = Q_TILE_M_C;
       if constexpr (Q_TILE_M_C > 1) {
         q_valid_rows = cute::min(Q_TILE_M_C, s.seq_len_qo - blk_q * Q_TILE_M_C);

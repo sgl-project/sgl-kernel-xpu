@@ -70,7 +70,7 @@ template <
                                // Q_TILE_M=1 (small per-thread footprint,
                                // doubles thread/EU occupancy for memory-bound
                                // decode); 256-GRF at Q_TILE_M>1 (two query
-                               // rows per subgroup). See device::MLA::kGrfSize.
+                               // rows per subgroup).
 struct XeMlaMainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
@@ -430,8 +430,6 @@ struct XeMlaMainloop<
       /* PagedKV masking - mask out invalid positions beyond seq_len_kv */
       if (check_remainder_k && K == total_blk - 1) {
         FragSRow k_rem_mask;
-        // tKgK carries the intra-page coordinate; add the logical page base so
-        // sub-page K tiles (QK_BLK_N < page_size) land on the right position.
         int k_intra_page = get<0>(tKgK(0, 0, 0, intra_page_tile_idx, 0, physical_block_idx)) +
                            (K * static_cast<int>(QK_BLK_N) / params.page_size) * params.page_size;
         int k = k_intra_page + get_sub_group().get_local_id()[0];
@@ -470,9 +468,7 @@ struct XeMlaMainloop<
       }
 
       // Mask out phantom Q rows in a partial last tile so softmax stats stay finite.
-      // Compiled out for QK_BLK_M=1; skipped for full tiles at runtime. Decode
-      // hits it when seq_len_qo is padded up to the Q tile and on the last of
-      // several Q tiles.
+      // Compiled out for QK_BLK_M=1; skipped for full tiles at runtime.
       if constexpr (QK_BLK_M > 1) {
         if (q_valid_rows < static_cast<int>(QK_BLK_M)) {
           Tensor cPgPq = make_identity_tensor(take<0, 2>(TileShapeQK{}));

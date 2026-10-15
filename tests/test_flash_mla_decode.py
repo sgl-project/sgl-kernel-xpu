@@ -176,11 +176,7 @@ def test_flash_mla_decode(
     del workspace, seq_lens_xpu
 
 
-# --------------------------------------------------------------------------- #
-# Multi-token decode: s_q in {2, 4, 8, 16} query tokens per request (MTP /
-# speculative decode). q is 4D (bs, s_q, num_heads, dim); the s_q tokens are the
-# last s_q positions of the sequence and are causally masked among themselves.
-# --------------------------------------------------------------------------- #
+# Multi-token decode: 4D q (bs, s_q, num_heads, dim), causal among the s_q tokens.
 
 
 def ref_mla_multi_token(
@@ -191,12 +187,7 @@ def ref_mla_multi_token(
     seq_lens: Tensor,  # (bs,), includes the s_q new tokens
     dv: int,
 ):
-    """Causal multi-token decode reference.
-
-    Token t of request i attends to KV positions [0, seq_lens[i] - s_q + t].
-    Returns out (bs, s_q, num_heads, dv) fp32 and lse (bs, s_q, num_heads) fp32
-    in the log2 domain, matching the kernel.
-    """
+    """Causal reference: token t sees KV [0, seq_lens - s_q + t]; lse is log2-domain."""
     bs, s_q, num_heads, head_dim = query.shape
     out = torch.empty(bs, s_q, num_heads, dv, dtype=torch.float32)
     lse = torch.empty(bs, s_q, num_heads, dtype=torch.float32)
@@ -290,13 +281,9 @@ def _check_multi_token_decode(
 
 @pytest.mark.arch("xe20", "xe35")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-# 1 exercises the 4D (bs, 1, H, D) path, which shares the single-token kernel
-# instantiation with 3D q; the causal mask degenerates to no mask. 2 and 4 run
-# padded on the 8-row kernel; 16 runs it over two Q tiles.
+# 1: 4D q on the single-token kernel; 2, 4: padded to the 8-row kernel; 16: two Q tiles.
 @pytest.mark.parametrize("s_q", [1, 2, 4, 8, 16])
-# 20 is shorter than one 128-wide split, so num_kv_splits=4 leaves empty splits,
-# and with s_q=16 the causal boundary cuts through the last KV tile of each Q
-# tile.
+# 20 leaves empty splits at num_kv_splits=4.
 @pytest.mark.parametrize("mean_seq_len", [20, 1024])
 @pytest.mark.parametrize("bs", [1, 3])
 @pytest.mark.parametrize("varlen", [True, False])
@@ -321,15 +308,9 @@ def test_flash_mla_decode_multi_token(
 
 @pytest.mark.arch("xe20", "xe35")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-# Token counts that are not a kernel Q tile. 3/5/7 are padded up to the 8-row
-# kernel; 9/13/15/17/28/53/130 run it over 2/2/2/3/4/7/17 Q tiles with a
-# partial last tile. 130 exceeds the kernel's 128-thread work-group, which
-# checks the split-KV empty-split sentinel is written per Q tile rather than
-# one row per thread.
+# Token counts that are not a kernel Q tile; 130 exceeds the 128-thread work-group.
 @pytest.mark.parametrize("s_q", [3, 5, 7, 9, 13, 15, 17, 28, 53, 130])
-# 0: sequences are (about) exactly their s_q new tokens, so all KV is new and
-# the causal boundary cuts through every Q tile; 1000: a long causal-free prefix
-# with the boundary in the last pages only.
+# 0: all KV is new tokens; 1000: long causal-free prefix.
 @pytest.mark.parametrize("kv_prefix", [0, 1000])
 # 16: one subgroup along KV, KV tile == page; 128: sub-page KV tiles.
 @pytest.mark.parametrize("block_size", [16, 128])
@@ -356,13 +337,7 @@ def test_flash_mla_decode_off_bucket_seq_len_q(
 
 @pytest.mark.arch("xe20", "xe35")
 def test_flash_mla_decode_workspace_scales_with_s_q():
-    """The split-KV workspace must grow with seq_len_q.
-
-    If seq_len_q stops being threaded into the workspace size, the kernel
-    writes partial O / exp_sum / max_logit past the buffer. GPU out-of-bounds
-    writes are often silent, so the correctness tests above cannot be relied
-    on to catch it. This check needs no kernel launch.
-    """
+    """The split-KV workspace must grow with seq_len_q (GPU OOB writes are silent)."""
     args = (4096, 4, 128, 64)
     ws_1 = flash_mla_decode_get_workspace_size(*args, num_kv_splits=8)
     ws_8 = flash_mla_decode_get_workspace_size(*args, num_kv_splits=8, seq_len_q=8)

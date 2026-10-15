@@ -199,7 +199,6 @@ class XeMlaEpilogue {
   }
 
   /// Invokes store(row, i) once for each valid query row owned by this thread.
-  /// Padding rows in a partial Q tile are skipped.
   template <class RedFragA, class FragO, class CoordO, class CoordFull, class QVCoord, class StoreFn>
   CUTLASS_DEVICE void for_each_row(
       RedFragA const& rA,   // Reduced O accumulator: (q,v)
@@ -314,8 +313,7 @@ class XeMlaEpilogue {
     auto tOrO = thr_copy_o.partition_sg_fragment_S(gO);
     auto tOgO = thr_copy_o.partition_D(gO);
 
-    // Step 2: Store the per-row softmax statistics for this split while rA_sum
-    // is still the raw denominator. One store per row, from the v == 0 column.
+    // Step 2: Store the per-row softmax statistics for this split.
     for_each_row(rA, tOrO, tOgO, cO, blk_qv, thr_id, int(size<0>(gExpSums)), [&](int row, int i) {
       gExpSums(row) = static_cast<ElementAcc>(broadcast<0>(rA_sum, rA, i));
       gMaxLogits(row) = static_cast<ElementAcc>(broadcast<0>(rA_max, rA, i));

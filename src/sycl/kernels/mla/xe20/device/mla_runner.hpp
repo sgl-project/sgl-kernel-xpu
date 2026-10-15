@@ -199,9 +199,7 @@ class MLA {
   // Prefill: 256 GRF — required to fit Q_TILE_M up to 256 without spill.
   // Decode:  128 GRF — Q_TILE_M=1 fits comfortably; halving GRF doubles
   //                    threads/EU and helps hide HBM latency.
-  //          256 GRF — Q_TILE_M>1 (multi-token decode): each subgroup holds
-  //                    two rows of the 512-wide fp32 O accumulator plus its
-  //                    K/V fragments, which spills at 128 GRF.
+  //          256 GRF — Q_TILE_M>1 spills at 128 GRF.
   static constexpr int kGrfSize =
       (Kernel::CollectiveMainloop::IsPrefill || int(Kernel::CollectiveMainloop::QK_BLK_M) > 1) ? 256 : 128;
 

@@ -57,8 +57,7 @@ __attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_S
 #ifdef SGL_MLA_JIT_ENTRY
 // Stable C ABI entry for the runtime-JIT path. Tensors cross the dlopen boundary
 // as at::Tensor* (both sides share <torch/all.h> -> identical layout). One config
-// (@ELEM_TAG@, @PAGE_SIZE@, q@Q_TILE@) per .so, so the fixed symbol name never
-// collides across AOT TUs.
+// per .so, so the fixed symbol name never collides across AOT TUs.
 extern "C" __attribute__((visibility("default"))) void sgl_mla_decode_entry(
     void* out,
     const void* lse,  // const std::optional<at::Tensor>*

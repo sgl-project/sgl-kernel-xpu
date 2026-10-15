@@ -99,37 +99,17 @@ struct FMlAProblemShape {
   FMlAProblemShape() = default;
 };
 
-//----------------- decode Q-tile (bucket) selection --------------------//
-// Largest (and only multi-token) instantiated Q tile: 4 subgroups x 2 query
-// rows each. Must agree with MLA_DECODE_Q_TILES in MlaDecodeXe{20,35}.cmake.
+//----------------- decode Q-tile selection --------------------//
+// Must agree with MLA_DECODE_Q_TILES in MlaDecodeXe{20,35}.cmake.
 inline constexpr int kMlaDecodeMaxQTile = 8;
 
-// Q-tile instantiation for a request with seq_len_q query tokens. Two tiles are
-// built: 1 for single-token decode and 8 for everything else. seq_len_q in 2..8
-// is padded up to 8; the padding rows read zeros, are masked out of the softmax
-// and are never stored (the Xe 2D block copies clamp to the tensor's real row
-// count). Above 8 the 8-row kernel is launched with ceil(seq_len_q / 8) Q
-// tiles, the last of which may be partial in the same way. Returns the tile for
-// any seq_len_q >= 1.
+// Q-tile instantiation for seq_len_q query tokens: 1 for a single token, else 8
+// (seq_len_q < 8 is padded; seq_len_q > 8 runs several Q tiles).
 inline int mla_decode_q_tile(int64_t seq_len_q) {
   return seq_len_q <= 1 ? 1 : kMlaDecodeMaxQTile;
 }
 
 //----------------- define MLA Xe configuration --------------------//
-// QTileM is the Q-tile height, mla_decode_q_tile(seq_len_q): 1 for a single
-// token, else 8. It is >= the request's seq_len_q for seq_len_q <= 8 (padding
-// rows are masked) and 8 with several Q tiles per request beyond that.
-//   1:  single-token decode. One Q row per subgroup (DPAS M=1); the PAGE_SIZE/16
-//       subgroups split the KV tile along N; 128-GRF launch. Unchanged path.
-//   >1: multi-token (MTP / speculative) decode. Two Q rows per subgroup (DPAS
-//       M=2) so each K/V fragment is shared by both rows. Subgroups are laid out
-//       (Q_TILE_M/2) x NumSubgroupsN with the product capped at kMaxSubgroups;
-//       when the cap shrinks NumSubgroupsN below PAGE_SIZE/16 the KV tile is a
-//       sub-page (16 * NumSubgroupsN) and the mainloop walks several tiles per
-//       page. Each subgroup thus keeps the same 16-column K/V footprint as the
-//       single-token kernel and only the O accumulator doubles -> 256-GRF
-//       launch (device::MLA::kGrfSize). The s_q tokens are the last s_q
-//       positions of the sequence and are causally masked among themselves.
 template <
     typename T,
     typename PageSizeOpt = PageSizeOption<64>,
@@ -147,15 +127,11 @@ struct MlaXe {
   static constexpr int RowsPerSubgroup = (Q_TILE_M == 1) ? 1 : 2;
   static_assert(Q_TILE_M % RowsPerSubgroup == 0, "Q tile must be a whole number of subgroup rows");
   static constexpr int NumSubgroupsM = Q_TILE_M / RowsPerSubgroup;
-  // Work-group cap: 8 subgroups (128 work-items), the single-token kernel's
-  // size at PAGE_SIZE=128. Keeps the epilogue's cross-subgroup SLM reduction
-  // buffer at <= 8 * (2 x 512) fp32 = 32 KB.
+  // 8 subgroups (128 work-items) bounds the epilogue's SLM reduction buffer at 32 KB.
   static constexpr int kMaxSubgroups = 8;
   static constexpr int NumSubgroupsNCap = kMaxSubgroups / NumSubgroupsM;
   static constexpr int NumSubgroupsN = (PAGE_SIZE / 16 < NumSubgroupsNCap) ? PAGE_SIZE / 16 : NumSubgroupsNCap;
   static_assert(NumSubgroupsN >= 1, "at least one subgroup along KV");
-  // Each subgroup owns 16 KV columns; the KV tile is a whole page for the
-  // single-token kernel and a page divisor for the multi-token variants.
   static constexpr int KV_TILE = NumSubgroupsN * 16;
   static_assert(PAGE_SIZE % KV_TILE == 0, "KV tile must evenly divide the page");
 
@@ -212,8 +188,7 @@ struct MlaXe {
   using TensorO = decltype(make_dummy_tensor_type(ElementO{}, StrideO{}));
   using TensorLSE = decltype(make_dummy_tensor_type(ElementLSE{}, StrideLSE{}));
 
-  // Single-token decode attends to all past KV (no mask). Multi-token decode
-  // masks the s_q new tokens among themselves: row q sees k <= seq_len_kv - s_q + q.
+  // Multi-token decode is causal among the s_q new tokens.
   static constexpr bool CausalMask = (Q_TILE_M > 1);
 
   // Collective Mainloop
@@ -231,10 +206,8 @@ struct MlaXe {
       GmemTiledCopyQ,
       GmemTiledCopyK,
       GmemTiledCopyV,
-      false>;  // IsPrefill: decode launches at 128 GRF for Q_TILE_M=1 (small
-               // footprint; doubles thread/EU occupancy for memory-bound
-               // decode) and 256 GRF for Q_TILE_M>1. Prefill defaults to
-               // true → 256 GRF. See device::MLA::kGrfSize.
+      false>;  // IsPrefill: decode launches at 128 GRF for Q_TILE_M=1 and
+               // 256 GRF for Q_TILE_M>1. Prefill defaults to true → 256 GRF.
 
   // Collective Epilogue
   using CollectiveEpilogue = cutlass::flash_attention::collective::
@@ -274,10 +247,6 @@ inline typename T::Fmla::Arguments args_from_options(
   // kv_cache: (num_blocks, block_size, head_dim) where head_dim = 576 (d_latent + d_rope)
   // out:    (bs, [s_q,] num_heads, v_head_dim)
   // lse:    (bs, [s_q,] num_heads)
-  // 3D tensors are single-token decode (s_q == 1); 4D carry any s_q >= 1, with
-  // runMla having checked that T::Q_TILE_M is the tile mla_decode_q_tile picks
-  // for it. Dims and strides are indexed from the back, which is valid for both
-  // ranks.
   int batch = q_nope.size(0);
   int seq_len_q = q_nope.dim() == 4 ? q_nope.size(1) : 1;
   int num_heads = q_nope.size(-2);
@@ -293,8 +262,6 @@ inline typename T::Fmla::Arguments args_from_options(
   problem_shape.batch = batch;
   problem_shape.num_heads_q = num_heads;
   problem_shape.num_heads_kv = 1;
-  // The real token count, not the tile: it sizes the Q/O/LSE tensors (so the 2D
-  // block copies clamp padding rows), the causal offset and the Q-tile grid.
   problem_shape.seq_len_qo = seq_len_q;
   problem_shape.seq_len_kv = max_seq_len;
   problem_shape.head_size_q_nope = v_head_dim;
@@ -315,9 +282,7 @@ inline typename T::Fmla::Arguments args_from_options(
   using ElementO = typename T::ElementO;
   using ElementLSE = typename T::ElementLSE;
 
-  // Kernel strides are (seq_q, dim, head, batch). stride(-3) is the s_q stride
-  // of a 4D tensor; on a 3D tensor it is the batch stride, which is harmless
-  // because seq_q == 1 there and the stride is never dereferenced.
+  // Kernel strides are (seq_q, dim, head, batch); stride(-3) is unused for 3D q (seq_q == 1).
   StrideQ stride_Q_nope = cute::make_stride(
       static_cast<int>(q_nope.stride(-3)),
       cute::_1{},
@@ -380,7 +345,6 @@ inline typename T::Fmla::Arguments args_from_options(
     auto* exp_sums_ptr = reinterpret_cast<float*>(ws_ptr + ws.exp_sums_offset);
     auto* max_logits_ptr = reinterpret_cast<float*>(ws_ptr + ws.max_logits_offset);
 
-    // Workspace layouts are [s_q][batch][head][split][...] (see SplitKVWorkspaceLayout).
     StrideO stride_O_accum = cute::make_stride(
         static_cast<int>(batch * problem_shape.num_heads_q * num_kv_splits * problem_shape.head_size_o),
         cute::_1{},
@@ -431,8 +395,6 @@ inline void runMlaImpl(
   CUTLASS_CHECK(fmla.run(arguments, workspace.data_ptr()));
 }
 
-// QTileM must be mla_decode_q_tile(seq_len_q) for the input's seq_len_q (1 for
-// 3D q, q.size(1) for 4D q); the host dispatcher (mla_decode.cpp) selects it.
 template <typename Element, typename PageSizeOpt, int QTileM = 1>
 inline void runMla(
     at::Tensor& out,

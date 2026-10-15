@@ -53,6 +53,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "kernels/lora/common/lora_debug_checks.hpp"
 #include "kernels/lora/device/gate_up_lora_b_fwd_dispatch.hpp"
 #include "sgl_kernel_export.h"
 
@@ -62,7 +63,7 @@ namespace {
 // gate/up LoRA-B is a K-thin (rank 16..64), memory-bandwidth-bound grouped GEMM.
 // As with QKV LoRA-B, a single tall/thin 32x512 workgroup tile is fastest across
 // the shape space, so tile selection currently has a single option (tall). Add
-// tiles to DISPATCH_GATE_UP_LORA_B_FWD_TILE (and to GateUpLoraBFwdXe20.cmake +
+// tiles to DISPATCH_GATE_UP_LORA_B_FWD_TILE (and to GateUpLoraBFwd.cmake +
 // gate_up_lora_b_fwd_dispatch.hpp + gate_up_lora_b_fwd_types.hpp) with a runtime
 // heuristic picking the tag.
 #define DISPATCH_GATE_UP_LORA_B_FWD_TILE(ELEM, ...)                                \
@@ -135,12 +136,7 @@ SGL_KERNEL_EXPORT void gate_up_lora_b_fwd(
       num_tokens_i64 == 0 || seg_indptr.numel() >= 2, "seg_indptr must have at least 2 elements when num_tokens > 0");
   const int64_t num_segments_i64 = seg_indptr.numel() - 1;
   TORCH_CHECK(weight_indices.numel() == num_segments_i64, "weight_indices.numel() must equal seg_indptr.numel() - 1");
-  if (num_segments_i64 > 0) {
-    auto [min_wi, max_wi] = torch::aminmax(weight_indices);
-    TORCH_CHECK(
-        min_wi.item<int64_t>() >= 0 && max_wi.item<int64_t>() < num_loras_i64,
-        "weight_indices values must be in [0, gate_up_lora_b.size(0))");
-  }
+  lora_debug_checks::check_weight_indices(weight_indices, num_loras_i64, "gate_up_lora_b");
   // Validate output tensor size and dtype.
   TORCH_CHECK(
       output.size(0) == num_tokens_i64 && output.size(1) == n_total_i64,
@@ -175,21 +171,12 @@ SGL_KERNEL_EXPORT void gate_up_lora_b_fwd(
     return;
   }
 
-  TORCH_CHECK(seg_indptr[0].item<int64_t>() == 0, "seg_indptr[0] must be 0");
-  TORCH_CHECK(
-      seg_indptr[seg_indptr.numel() - 1].item<int64_t>() == num_tokens_i64, "seg_indptr[-1] must equal num_tokens");
-  auto seg_len_tensor = seg_indptr.slice(0, 1) - seg_indptr.slice(0, 0, seg_indptr.size(0) - 1);
-  auto [seg_len_min, seg_len_max] = torch::aminmax(seg_len_tensor);
-  TORCH_CHECK(seg_len_min.item<int>() >= 0, "seg_indptr must be non-decreasing");
-  (void)seg_len_max;  // not needed: grouped GEMM handles variable M per group
+  lora_debug_checks::check_seg_indptr(seg_indptr, num_tokens_i64);
 
   // lora_ranks is only range-validated here; it does NOT shrink the per-segment
   // GEMM (every group computes the full K = max_rank reduction). The caller must
   // pre-zero weight columns beyond each adapter's rank R_l.
-  auto [min_lr, max_lr] = torch::aminmax(lora_ranks);
-  TORCH_CHECK(
-      min_lr.item<int64_t>() >= 0 && max_lr.item<int>() <= max_rank_i64,
-      "All values in lora_ranks must be within the range [0, max_rank]");
+  lora_debug_checks::check_lora_ranks(lora_ranks, max_rank_i64);
 
   // Cast index tensors to int32 for the device-side metadata build; the per-group
   // alpha buffer is derived from fp32 scalings.
@@ -205,7 +192,7 @@ SGL_KERNEL_EXPORT void gate_up_lora_b_fwd(
   const int num_segments = static_cast<int>(num_segments_i64);
 
   // Dispatch on dtype. Each launch symbol is defined in a separate generated
-  // translation unit (see GateUpLoraBFwdXe20.cmake).
+  // translation unit (see GateUpLoraBFwd.cmake).
   DISPATCH_GATE_UP_LORA_B_FWD_DTYPE(
       input_x,
       gate_up_lora_b,

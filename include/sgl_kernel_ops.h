@@ -1263,6 +1263,7 @@ void embedding_lora_a_fwd(
     const torch::Tensor& input_ids,  // [num_tokens,]
     const torch::Tensor& weights,    // [num_loras, max_rank, vocab_size]
     const int64_t vocab_size,
+    const int64_t max_len,                                 // longest segment
     const torch::Tensor& seg_indptr,                       // [num_segments + 1,]
     const torch::Tensor& weight_indices,                   // [num_segments,]
     const torch::Tensor& lora_ranks,                       // [num_loras,]

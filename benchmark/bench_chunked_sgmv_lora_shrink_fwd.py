@@ -13,6 +13,27 @@ TRITON_MAX_CHUNK_SIZE = 16
 
 DEFAULT_CASES: List[Dict[str, int]] = [
     {
+        "num_tokens": 50,
+        "num_loras": 8,
+        "max_rank": 16,
+        "input_dim": 4096,
+        "stack_num": 3,
+    },
+    {
+        "num_tokens": 95,
+        "num_loras": 8,
+        "max_rank": 16,
+        "input_dim": 4096,
+        "stack_num": 3,
+    },
+    {
+        "num_tokens": 122,
+        "num_loras": 8,
+        "max_rank": 20,
+        "input_dim": 4095,
+        "stack_num": 3,
+    },
+    {
         "num_tokens": 256,
         "num_loras": 8,
         "max_rank": 16,
@@ -77,9 +98,12 @@ def _derive_triton_chunk_size(num_tokens: int) -> int:
 
 # ---------------------------------------------------------------------------
 # Triton reference kernel (inlined so the benchmark is self-contained).
-# Copied verbatim from python/sglang/kernels/ops/gemm/chunked_sgmv_shrink.py
+# Copied verbatim from python/sglang/kernels/ops/lora/dense/chunked_sgmv_shrink.py
 # ---------------------------------------------------------------------------
-@triton.jit
+# do_not_specialize=["num_segs"] matches the deployed csgmv kernel: it keeps
+# num_segs a runtime arg so Triton does not recompile/specialize per segment
+# count, generating the same code the server runs.
+@triton.jit(do_not_specialize=["num_segs"])
 def _chunked_lora_shrink_kernel(
     x,
     weights,
@@ -371,7 +395,11 @@ def _run_triton_once(args: Dict[str, Any]):
         return output
 
     BLOCK_M = seg["block_m"]  # every segment fits in one M-block
-    BLOCK_N = triton.next_power_of_2(N)
+    # Deployed csgmv shrink block sizes. On Intel XPU sglang ships no tuned
+    # config, so get_lora_shrink_config falls back to these DEFAULT values
+    # (sglang/kernels/ops/lora/dense/lora_tuning_config.py::DEFAULT_SHRINK_CONFIG).
+    # Hardcoded here to keep the benchmark self-contained (no sglang import).
+    BLOCK_N = 16
     BLOCK_K = 256
 
     grid = (triton.cdiv(N, BLOCK_N), num_segs)

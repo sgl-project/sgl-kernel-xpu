@@ -7,6 +7,7 @@ def embedding_lora_a_fwd(
     input_ids: torch.Tensor,
     weights: torch.Tensor,
     vocab_size: int,
+    max_len: int,
     seg_indptr: torch.Tensor,
     weight_indices: torch.Tensor,
     lora_ranks: torch.Tensor,
@@ -35,6 +36,10 @@ def embedding_lora_a_fwd(
         Weight tensor for embeddings, shape ``(num_loras, max_rank, vocab_size)``.
     vocab_size : int
         Vocabulary size.
+    max_len : int
+        Length of the longest segment (``max(seg_indptr[s + 1] - seg_indptr[s])``).
+        It sizes the kernel launch, so passing it avoids a device-to-host read of
+        ``seg_indptr``. Rows past ``max_len`` in a longer segment are not computed.
     seg_indptr : torch.Tensor
         Segment index pointer tensor, shape ``(num_segments + 1,)``.
     weight_indices : torch.Tensor
@@ -68,6 +73,7 @@ def embedding_lora_a_fwd(
         input_ids,
         weights,
         vocab_size,
+        max_len,
         seg_indptr,
         weight_indices,
         lora_ranks,
@@ -490,11 +496,10 @@ def chunked_sgmv_lora_shrink_fwd(
     segmented grouped GEMM, where each segment ``s`` uses the adapter
     ``l = weight_indices[s]``.
 
-    This is the three-kernel decomposition, fused into a single C++ op:
-
-    1. **gather** ``x_sorted[i] = input_x[permutation[i]]`` — physical -> logical,
-    2. a dedicated small-N grouped GEMM on ``x_sorted`` -> ``out_sorted`` (logical order),
-    3. **scatter** ``output[permutation[i]] = out_sorted[i]`` — logical -> physical.
+    Rows of ``input_x`` are read through ``permutation`` and output rows are
+    written back through it inside a single gather-fused DPAS kernel (no sorted
+    copies are materialized). Pass one coalesced segment per adapter: the kernel
+    tiles M itself, so fixed-size chunking only adds partially filled tiles.
 
     ``seg_indptr`` / ``weight_indices`` describe the *logical* (adapter-grouped)
     layout; ``permutation`` (``logical -> physical``, a bijection over the token
@@ -574,13 +579,11 @@ def chunked_sgmv_lora_expand_fwd(
     :func:`chunked_sgmv_lora_shrink_fwd`, and the generic ``num_slices`` sibling
     of :func:`qkv_lora_b_fwd` / :func:`gate_up_lora_b_fwd`.
 
-    This is the three-kernel decomposition, fused into a single C++ op:
-
-    1. **gather** ``x_sorted[i] = input_x[permutation[i]]`` — physical -> logical
-       (``base_output`` is gathered the same way when supplied),
-    2. a per-slice grouped GEMM on ``x_sorted`` -> ``out_sorted`` (logical order),
-       applying the per-adapter scaling and the (fused) residual,
-    3. **scatter** ``output[permutation[i]] = out_sorted[i]`` — logical -> physical.
+    Rows of ``input_x`` (and ``base_output``) are read through ``permutation``
+    and the scaled (+ residual) result is written back through it inside a
+    single gather-fused DPAS kernel (no sorted copies are materialized). Pass one
+    coalesced segment per adapter: the kernel tiles M itself, so fixed-size
+    chunking only adds partially filled tiles.
 
     ``seg_indptr`` / ``weight_indices`` describe the *logical* (adapter-grouped)
     layout; ``permutation`` (``logical -> physical``, a bijection over the token

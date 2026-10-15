@@ -16,6 +16,27 @@ TRITON_MAX_CHUNK_SIZE = 16
 # `stack_num` slices (o_proj=1, gate_up=2, qkv=3). N_total = stack_num*output_dim.
 DEFAULT_CASES: List[Dict[str, int]] = [
     {
+        "num_tokens": 50,
+        "num_loras": 8,
+        "max_rank": 16,
+        "output_dim": 4096,
+        "stack_num": 3,
+    },
+    {
+        "num_tokens": 95,
+        "num_loras": 8,
+        "max_rank": 16,
+        "output_dim": 4096,
+        "stack_num": 3,
+    },
+    {
+        "num_tokens": 122,
+        "num_loras": 8,
+        "max_rank": 20,
+        "output_dim": 4095,
+        "stack_num": 3,
+    },
+    {
         "num_tokens": 256,
         "num_loras": 8,
         "max_rank": 16,
@@ -417,8 +438,12 @@ def _run_triton_once(args: Dict[str, Any]):
         return output
 
     BLOCK_M = seg["block_m"]  # every segment fits in one M-block
-    BLOCK_N = min(triton.next_power_of_2(output_dim), 256)
-    BLOCK_K = triton.next_power_of_2(max_rank)
+    # Deployed csgmv expand block sizes. On Intel XPU sglang ships no tuned
+    # config, so get_lora_expand_config falls back to these DEFAULT values
+    # (sglang/kernels/ops/lora/dense/lora_tuning_config.py::DEFAULT_EXPAND_CONFIG).
+    # Hardcoded here to keep the benchmark self-contained (no sglang import).
+    BLOCK_N = 64
+    BLOCK_K = 16
 
     grid = (triton.cdiv(output_dim, BLOCK_N), stack_num, num_segs)
     _chunked_lora_expand_kernel[grid](

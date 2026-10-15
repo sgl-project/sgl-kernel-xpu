@@ -37,6 +37,7 @@
 // parameter) so its kernel instantiations land in shared libraries separate
 // from the paged decode path. Non-paged decode supports bf16/fp16 queries only
 // (no fp8 KV cache, no split-KV).
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
 #include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"

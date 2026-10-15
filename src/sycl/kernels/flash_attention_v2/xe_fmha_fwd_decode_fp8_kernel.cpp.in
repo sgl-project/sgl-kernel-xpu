@@ -8,6 +8,7 @@
 // FP8 KV-cache decode path, split out of xe_fmha_fwd_decode_kernel.cpp.in so the
 // e4m3/e5m2 kernel instantiations compile in their own translation unit. This
 // keeps the peak compiler memory of the (bf16/fp16) paged decode TU low.
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"

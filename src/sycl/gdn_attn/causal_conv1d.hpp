@@ -72,8 +72,8 @@ struct causal_conv1d_kernel {
         act_mode(act_mode),
         pad_slot_id(pad_slot_id),
         batch_size(batch_size),
-        num_actual_tokens(num_actual_tokens),
         num_virtual_tokens(num_virtual_tokens),
+        num_actual_tokens(num_actual_tokens),
         num_k_heads(num_k_heads),
         head_k_dim(head_k_dim),
         num_v_heads(num_v_heads),
@@ -846,7 +846,7 @@ void kernel_launcher(
     const int& qkvz_elems,
     const int& conv_elems,
     const int& num_prefills,
-    const int& num_decodes,
+    [[maybe_unused]] const int& num_decodes,
     const int& num_spec_decodes,
     const int& num_spec_tokens) {
   // Spec path: state writeback happens inside the spec kernel, so we do not

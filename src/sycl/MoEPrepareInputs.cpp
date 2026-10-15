@@ -128,7 +128,7 @@ struct compute_expert_blockscale_offsets_sycl_K_T {
         atomic_buffer_(atomic_buffer),
         num_experts_(num_experts) {}
 
-  void operator()(sycl::nd_item<1> item) const {
+  void operator()([[maybe_unused]] sycl::nd_item<1> item) const {
     T tot_offset = 0;
     T tot_rounded_offset = 0;
     expert_offsets_[0] = 0;
@@ -387,7 +387,7 @@ void compute_arg_sorts_sycl_impl(
     const uint32_t num_experts) {
   // Guard dynamic SLM allocation based on the histogram element size.
   // Each expert uses sizeof(T) bytes in the SLM histogram.
-  constexpr uint32_t MAX_EXPERTS_SLM = 1024;
+  [[maybe_unused]] constexpr uint32_t MAX_EXPERTS_SLM = 1024;
   constexpr uint32_t SLM_BYTES_PER_WG = 64 * 1024;  // Xe2 (B60) SLM per work-group
   const uint32_t max_experts_slm = SLM_BYTES_PER_WG / static_cast<uint32_t>(sizeof(T));
   TORCH_CHECK(

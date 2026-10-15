@@ -181,7 +181,7 @@ SGL_KERNEL_EXPORT void multimodal_rotary_embedding(
     bool mrope_interleaved,
     bool mrope_interleaved_glm,
     bool is_neox_style,
-    const std::optional<at::Tensor>& axis_map) {
+    [[maybe_unused]] const std::optional<at::Tensor>& axis_map) {
   TORCH_CHECK(query.dim() == 2, "query must be 2D [num_tokens, num_heads * head_size]");
   TORCH_CHECK(key.dim() == 2, "key must be 2D [num_tokens, num_kv_heads * head_size]");
   TORCH_CHECK(mrope_section.size() == 3, "mrope_section must have 3 elements [t, h, w]");

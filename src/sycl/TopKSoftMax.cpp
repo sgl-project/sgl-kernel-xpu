@@ -620,7 +620,7 @@ topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gat
       n_topk);
 
   constexpr int64_t alignment = 8;
-  int64_t n_experts_aligned = div_up(n_experts, alignment) * alignment;  // align to 8
+  [[maybe_unused]] int64_t n_experts_aligned = div_up(n_experts, alignment) * alignment;  // align to 8
   constexpr int64_t kernel_max_topk = TopKSoftmaxImpl::FusedTopkSoftmax<float>::malloc_per_item;
   auto max_topk = n_experts < kernel_max_topk ? n_experts : kernel_max_topk;
   TORCH_CHECK(

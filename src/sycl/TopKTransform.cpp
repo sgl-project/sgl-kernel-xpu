@@ -381,7 +381,7 @@ struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
   FastTopKKernel(const FastTopKParams& p, int k) : params(p), topk(k) {}
 
-  void sycl_ker_config_convention(sycl::handler& cgh) {}
+  void sycl_ker_config_convention([[maybe_unused]] sycl::handler& cgh) {}
 
   [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
     const int64_t bid = static_cast<int64_t>(item.get_group(0));

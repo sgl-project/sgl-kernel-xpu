@@ -173,7 +173,7 @@ def test_topk_sigmoid(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("n_token", [2, 32])
 @pytest.mark.parametrize("n_topk", [10, 16])
-@pytest.mark.parametrize("n_expert", [111, 512])
+@pytest.mark.parametrize("n_expert", [127, 255])
 @pytest.mark.parametrize("renormalize", [False, True])
 @pytest.mark.parametrize("with_correction_bias", [False, True])
 @pytest.mark.parametrize("num_fused_shared_experts", [0, 1])

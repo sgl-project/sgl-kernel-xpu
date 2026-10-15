@@ -1054,6 +1054,21 @@ at::Tensor qsa_sparse_attention(
     const at::Tensor& token_slots,
     std::optional<double> softmax_scale);
 
+at::Tensor qsa_mqa_prefill(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& row_starts,
+    const at::Tensor& row_ends,
+    std::optional<double> score_scale);
+
+at::Tensor qsa_mqa_decode(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& context_lens,
+    int64_t max_model_len,
+    std::optional<double> score_scale);
+
 at::Tensor fast_topk_transform_fused(
     const at::Tensor& score,
     const at::Tensor& lengths,

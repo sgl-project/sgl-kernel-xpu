@@ -223,6 +223,7 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
     const torch::Tensor& input_ids,  // [num_tokens,]
     const torch::Tensor& weights,    // [num_loras, max_rank, vocab_size]
     const int64_t vocab_size,
+    const int64_t max_len,                                 // longest segment (>= every seg_indptr[s+1] - seg_indptr[s])
     const torch::Tensor& seg_indptr,                       // [num_segments + 1,]
     const torch::Tensor& weight_indices,                   // [num_segments,]
     const torch::Tensor& lora_ranks,                       // [num_loras,]
@@ -270,11 +271,11 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
   }
 
   lora_debug_checks::check_seg_indptr(seg_indptr, num_tokens_i64);
-  // max_len = longest segment. It sizes the launch grid (token blocks per segment),
-  // so this one device -> host sync is functional, not a check, and stays in every
-  // build.
-  auto seg_len_tensor = seg_indptr.slice(0, 1) - seg_indptr.slice(0, 0, seg_indptr.size(0) - 1);
-  const int max_len = static_cast<int>(seg_len_tensor.max().item<int64_t>());
+  // max_len sizes the launch grid (token blocks per segment). It comes from the
+  // caller, which already knows it, so no device -> host read of seg_indptr is
+  // needed; rows of a segment longer than max_len would be silently skipped.
+  TORCH_CHECK(max_len >= 0 && max_len <= num_tokens_i64, "max_len must be in [0, num_tokens]");
+  lora_debug_checks::check_max_seg_len(seg_indptr, max_len);
 
   if (extra_embeddings.has_value()) {
     TORCH_CHECK(extra_embeddings->dim() == 3, "extra_embeddings must be a 3D tensor");
@@ -325,7 +326,7 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
         max_rank,
         num_segments,
         num_extra_tokens,
-        max_len,
+        static_cast<int>(max_len),
         queue);
   } else if (weights.scalar_type() == torch::kHalf) {
     launch_embedding_lora_a_fwd<at::Half>(
@@ -341,7 +342,7 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
         max_rank,
         num_segments,
         num_extra_tokens,
-        max_len,
+        static_cast<int>(max_len),
         queue);
   } else if (weights.scalar_type() == torch::kBFloat16) {
     launch_embedding_lora_a_fwd<at::BFloat16>(
@@ -357,7 +358,7 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
         max_rank,
         num_segments,
         num_extra_tokens,
-        max_len,
+        static_cast<int>(max_len),
         queue);
   } else {
     TORCH_CHECK(false, "Unsupported data type for weights");

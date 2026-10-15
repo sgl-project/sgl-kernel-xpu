@@ -87,6 +87,21 @@ inline void check_seg_indptr(const torch::Tensor& seg_indptr, int64_t num_tokens
   }
 }
 
+// max_len >= every segment length. Kernels that size their launch grid from a
+// caller-supplied max_len would silently skip the rows past it.
+inline void check_max_seg_len(const torch::Tensor& seg_indptr, int64_t max_len) {
+  if constexpr (kEnabled) {
+    const int64_t n = seg_indptr.numel();
+    if (n < 2) {
+      return;
+    }
+    auto seg_lens = seg_indptr.slice(0, 1) - seg_indptr.slice(0, 0, n - 1);
+    TORCH_CHECK(
+        seg_lens.max().item<int64_t>() <= max_len,
+        "max_len must be >= the longest segment (seg_indptr[s+1] - seg_indptr[s])");
+  }
+}
+
 // lora_ranks[l] in [0, max_rank] for every adapter.
 inline void check_lora_ranks(const torch::Tensor& lora_ranks, int64_t max_rank) {
   if constexpr (kEnabled) {

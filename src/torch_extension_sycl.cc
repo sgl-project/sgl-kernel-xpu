@@ -674,7 +674,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
    * From LoRA
    */
   m.def(
-      "embedding_lora_a_fwd(Tensor! output, Tensor input_ids, Tensor weights, int vocab_size, Tensor seg_indptr, "
+      "embedding_lora_a_fwd(Tensor! output, Tensor input_ids, Tensor weights, int vocab_size, int max_len, "
+      "Tensor seg_indptr, "
       "Tensor weight_indices, "
       "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);

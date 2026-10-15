@@ -1,7 +1,7 @@
 # Generate chunked-SGMV LoRA shrink (gather-fused DPAS) kernel instantiation files.
 # Each (ELEM_TAG, TILE_TAG) combination is compiled as a separate
 # translation unit so the instantiations build in parallel, matching the
-# convention of the other Xe20 LoRA kernels (see SGEMMLoraAFwdXe20.cmake).
+# convention of the other LoRA kernels (see SGEMMLoraAFwd.cmake).
 #
 # To add a new tile, register both a tag name in
 # CHUNKED_SGMV_LORA_SHRINK_FWD_TILE_TAGS and the matching C++ option-tag type in

@@ -1047,6 +1047,13 @@ void top_p_sampling_from_probs(
 at::Tensor
 fast_topk(const at::Tensor& score, const at::Tensor& lengths, int64_t topk, std::optional<at::Tensor> row_starts_opt);
 
+at::Tensor qsa_sparse_attention(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& token_slots,
+    std::optional<double> softmax_scale);
+
 at::Tensor fast_topk_transform_fused(
     const at::Tensor& score,
     const at::Tensor& lengths,

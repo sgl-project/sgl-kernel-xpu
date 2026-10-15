@@ -338,7 +338,7 @@ inline typename T::Fmla::Arguments args_from_options(
   if constexpr (T::is_split_kv) {
     using cutlass::flash_attention::kernel::SplitKVWorkspaceLayout;
     SplitKVWorkspaceLayout ws(
-        batch, problem_shape.num_heads_q, num_kv_splits, problem_shape.head_size_o, sizeof(ElementO), T::Q_TILE_M);
+        batch, problem_shape.num_heads_q, num_kv_splits, problem_shape.head_size_o, sizeof(ElementO), seq_len_q);
 
     auto* ws_ptr = static_cast<char*>(workspace.data_ptr());
     auto* o_accum_ptr = reinterpret_cast<ElementO*>(ws_ptr + ws.o_accum_offset);

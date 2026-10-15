@@ -228,9 +228,21 @@ def _make_decode_inputs(bs, s_q, h_q, d, mean_seq_len, varlen, block_size, dtype
 
 
 def _check_multi_token_decode(
-    dtype, s_q, mean_seq_len, bs, varlen, block_size, num_heads, num_kv_splits
+    dtype,
+    s_q,
+    mean_seq_len,
+    bs,
+    varlen,
+    block_size,
+    num_heads,
+    num_kv_splits,
+    make_workspace=None,
 ):
-    """Run one multi-token decode case against ref_mla_multi_token."""
+    """Run one multi-token decode case against ref_mla_multi_token.
+
+    make_workspace(num_bytes) -> uint8 xpu tensor replaces the plain allocation
+    of the exact size the API reports (used to plant guard bytes around it).
+    """
     torch.random.manual_seed(42)
 
     dv, q_pe_dim = 512, 64
@@ -252,7 +264,11 @@ def _check_multi_token_decode(
         num_kv_splits=num_kv_splits,
         seq_len_q=s_q,
     )
-    workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
+    if make_workspace is None:
+        workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
+    else:
+        workspace = make_workspace(workspace_size)
+        assert workspace.numel() == workspace_size
 
     q_xpu = q.to(device)
     out, lse = flash_mla_decode(
@@ -343,6 +359,68 @@ def test_flash_mla_decode_workspace_scales_with_s_q():
     ws_8 = flash_mla_decode_get_workspace_size(*args, num_kv_splits=8, seq_len_q=8)
     assert ws_1 > 0
     assert ws_8 > ws_1
+
+
+@pytest.mark.arch("xe20", "xe35")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+# 2, 3, 7: one partial 8-row Q tile; 9, 16: two Q tiles.
+@pytest.mark.parametrize("s_q", [2, 3, 7, 9, 16])
+@pytest.mark.parametrize("block_size", [16, 128])
+def test_flash_mla_decode_split_kv_stays_within_workspace(
+    dtype: torch.dtype, s_q: int, block_size: int
+):
+    """Split-KV must confine its writes to the workspace sized for seq_len_q.
+
+    The split kernel and the reduction address O_accum / exp_sums / max_logits
+    through the same host-computed offsets, so offsets that disagree with the
+    allocation (e.g. derived from the kernel's 8-row Q tile instead of
+    seq_len_q) still produce the right output. Below the tile height the
+    statistics land silently past the buffer; above it they fold back onto
+    O_accum and corrupt the result. Hand the kernel an exact-size prefix of a
+    sentinel-filled buffer big enough to absorb the misplaced writes, then
+    check the guard bytes as well as the output.
+    """
+    bs, num_heads, num_kv_splits = 3, 16, 4
+    sentinel = 0xA5
+    planted = {}
+
+    def make_workspace(num_bytes):
+        # Twice the larger of s_q and the 8-row Q tile: a layout built from the
+        # tile height, even for two tiles, then lands in the guard rather than in
+        # some other allocation. max_seq_len only drives auto split selection,
+        # so any value sizes the explicit-split layout.
+        guard_rows = 2 * max(s_q, 8)
+        guarded = flash_mla_decode_get_workspace_size(
+            1024,
+            bs,
+            num_heads,
+            block_size,
+            num_kv_splits=num_kv_splits,
+            seq_len_q=guard_rows,
+        )
+        assert guarded > num_bytes
+        buf = torch.full((guarded,), sentinel, device=device, dtype=torch.uint8)
+        planted["buf"], planted["used"] = buf, num_bytes
+        return buf[:num_bytes]  # contiguous prefix: the kernel sees only num_bytes
+
+    _check_multi_token_decode(
+        dtype,
+        s_q,
+        mean_seq_len=1024,
+        bs=bs,
+        varlen=True,
+        block_size=block_size,
+        num_heads=num_heads,
+        num_kv_splits=num_kv_splits,
+        make_workspace=make_workspace,
+    )
+
+    guard = planted["buf"][planted["used"] :]
+    touched = (guard != sentinel).nonzero()
+    assert touched.numel() == 0, (
+        f"split-KV wrote {touched.numel()} byte(s) past the "
+        f"{planted['used']}-byte workspace (first at +{int(touched[0])})"
+    )
 
 
 if __name__ == "__main__":

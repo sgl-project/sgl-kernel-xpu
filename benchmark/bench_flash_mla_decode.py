@@ -167,6 +167,9 @@ def plot_data(df):
     if has_previous:
         try:
             df_prev = pd.read_csv(previous_csv_path)
+            if "seq_len_q" not in df_prev.columns:
+                # CSV from before multi-token decode: every row was seq_len_q=1.
+                df_prev["seq_len_q"] = 1
             df_prev["GB/s"] = df_prev["GB/s (median)"].astype(float)
             df_prev["run"] = "previous"
             all_dataframes.append(df_prev)
@@ -197,16 +200,16 @@ def plot_data(df):
     else:
         print("\nGenerating single-run plot...")
 
-    # Get unique configurations
-    block_sizes = combined_df["block_size"].unique()
-    seq_lens = combined_df["seq_len"].unique()
+    # Get unique configurations. Each (block_size, seq_len_q) pair gets its own
+    # row of subplots so that different query lengths never share a curve.
+    block_sizes = sorted(combined_df["block_size"].unique())
+    seq_len_qs = sorted(combined_df["seq_len_q"].unique())
+    seq_lens = sorted(combined_df["seq_len"].unique())
     runs = ["previous", "current"] if has_previous else ["current"]
 
     # Calculate subplot grid size
-    n_block_sizes = len(block_sizes)
-    n_seq_lens = len(seq_lens)
-    n_cols = n_seq_lens
-    n_rows = n_block_sizes
+    n_cols = len(seq_lens)
+    n_rows = len(block_sizes) * len(seq_len_qs)
 
     plt.figure(figsize=(8 * n_cols, 5 * n_rows))
 
@@ -215,17 +218,18 @@ def plot_data(df):
 
     subplot_idx = 1
 
-    for block_size in sorted(block_sizes):
+    for block_size, seq_len_q in itertools.product(block_sizes, seq_len_qs):
         kv_split = -1  # Assuming single kv_split value
         df_config = combined_df[
             (combined_df["block_size"] == block_size)
             & (combined_df["num_kv_splits"] == kv_split)
+            & (combined_df["seq_len_q"] == seq_len_q)
         ]
 
         if df_config.empty:
             continue
 
-        for seq_len in sorted(seq_lens):
+        for seq_len in seq_lens:
             df_seq = df_config[df_config["seq_len"] == seq_len]
 
             if df_seq.empty:
@@ -233,8 +237,11 @@ def plot_data(df):
 
             plt.subplot(n_rows, n_cols, subplot_idx)
 
-            # Get all unique batch sizes for this specific subplot to set proper x-axis
-            all_batch_sizes_in_subplot = set()
+            # One x position per batch size present in this subplot. Curves place
+            # their points by batch size, so a run that covers fewer batch sizes
+            # than another cannot shift under the tick labels.
+            actual_batch_sizes = sorted(df_seq["batch_size"].unique())
+            x_pos = {b: i for i, b in enumerate(actual_batch_sizes)}
 
             # Plot each run with different styling
             for run_name in runs:
@@ -254,11 +261,9 @@ def plot_data(df):
                 for num_heads in [128, 64, 32, 16]:
                     df_heads = df_run[df_run["num_heads"] == num_heads]
                     if not df_heads.empty:
-                        batch_sizes = df_heads["batch_size"].values
+                        df_heads = df_heads.sort_values("batch_size")
+                        xs = [x_pos[b] for b in df_heads["batch_size"]]
                         gbps_values = df_heads["GB/s"].values
-
-                        # Collect all batch sizes for this subplot
-                        all_batch_sizes_in_subplot.update(batch_sizes)
 
                         # Create label
                         label = f"{num_heads} heads"
@@ -266,7 +271,7 @@ def plot_data(df):
                             label += f" ({run_name})"
 
                         plt.plot(
-                            range(len(batch_sizes)),
+                            xs,
                             gbps_values,
                             color=colors[str(num_heads)],
                             marker=markers[str(num_heads)],
@@ -279,10 +284,9 @@ def plot_data(df):
 
             plt.xlabel("Batch Size")
             plt.ylabel("GB/s")
-            plt.title(f"block_size={block_size}, seq_len={seq_len}")
-
-            # Use only the actual batch sizes present in this subplot for x-axis labels
-            actual_batch_sizes = sorted(list(all_batch_sizes_in_subplot))
+            plt.title(
+                f"block_size={block_size}, seq_len_q={seq_len_q}, seq_len={seq_len}"
+            )
             plt.xticks(range(len(actual_batch_sizes)), actual_batch_sizes)
 
             if subplot_idx == 1:  # Only show legend on first subplot

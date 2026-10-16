@@ -437,6 +437,196 @@ template <typename scalar_t, typename weight_t>
 using GemmaAddRMSNormNoRstdForward =
     AddNoRstdForward<GemmaRMSNormNoRstdForward<scalar_t, weight_t>, scalar_t, weight_t>;
 
+// Strided last dim: each lane owns rows_per_lane adjacent rows, so accesses coalesce for a transposed input.
+template <typename scalar_t, typename weight_t, int rows_per_lane>
+struct GemmaRMSNormStridedPlaneKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
+  using accscalar_t = acc_type<scalar_t>;
+  using vec_t = aligned_vector_loop<scalar_t, rows_per_lane>;
+  static constexpr int kRowsPerGroup = NUM_REDUCE_STAGES * rows_per_lane;
+
+  GemmaRMSNormStridedPlaneKernelFunctor(
+      const scalar_t* X_data,
+      scalar_t* Y_data,
+      const weight_t* gamma_data,
+      accscalar_t eps,
+      int64_t Batch,
+      int Plane,
+      int num_sub_groups,
+      RowStrides input_rows,
+      RowStrides output_rows,
+      int64_t input_plane_stride,
+      int64_t output_plane_stride)
+      : X_data(X_data),
+        Y_data(Y_data),
+        gamma_data(gamma_data),
+        eps(eps),
+        Batch(Batch),
+        Plane(Plane),
+        num_sub_groups(num_sub_groups),
+        input_rows(input_rows),
+        output_rows(output_rows),
+        input_plane_stride(input_plane_stride),
+        output_plane_stride(output_plane_stride) {}
+
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    partial_sums = sycl::local_accessor<accscalar_t, 1>(num_sub_groups * kRowsPerGroup, cgh);
+  }
+
+  [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item) const {
+    const auto sg = item.get_sub_group();
+    const int lane = static_cast<int>(sg.get_local_linear_id());
+    const int sg_id = static_cast<int>(sg.get_group_linear_id());
+    // rows_per_lane divides size(-2), so a lane's rows are all valid or all out of range.
+    const int64_t row = static_cast<int64_t>(item.get_group(0)) * kRowsPerGroup + lane * rows_per_lane;
+    const bool valid = row < Batch;
+
+    const scalar_t* x_row = X_data;
+    if (valid) {
+      x_row += compute_row_offset<int64_t>(
+          row,
+          input_rows.batch_stride,
+          input_rows.inner0_size,
+          input_rows.inner0_stride,
+          input_rows.inner1_size,
+          input_rows.inner1_stride);
+    }
+    const int64_t x_step = num_sub_groups * input_plane_stride;
+
+    accscalar_t sum_value[rows_per_lane] = {};
+    if (valid) {
+      const scalar_t* x = x_row + sg_id * input_plane_stride;
+      for (int h = sg_id; h < Plane; h += num_sub_groups, x += x_step) {
+        const vec_t x_val = *reinterpret_cast<const vec_t*>(x);
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+          const accscalar_t v = static_cast<accscalar_t>(x_val[r]);
+          sum_value[r] += v * v;
+        }
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; ++r) {
+      partial_sums[(sg_id * NUM_REDUCE_STAGES + lane) * rows_per_lane + r] = sum_value[r];
+    }
+    sycl::group_barrier(item.get_group());
+    if (!valid) {
+      return;
+    }
+
+    accscalar_t rstd[rows_per_lane];
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; ++r) {
+      accscalar_t total = 0;
+      for (int s = 0; s < num_sub_groups; ++s) {
+        total += partial_sums[(s * NUM_REDUCE_STAGES + lane) * rows_per_lane + r];
+      }
+      rstd[r] = Numerics<accscalar_t>::rsqrt(total / static_cast<accscalar_t>(Plane) + static_cast<accscalar_t>(eps));
+    }
+
+    scalar_t* y = Y_data +
+                  compute_row_offset<int64_t>(
+                      row,
+                      output_rows.batch_stride,
+                      output_rows.inner0_size,
+                      output_rows.inner0_stride,
+                      output_rows.inner1_size,
+                      output_rows.inner1_stride) +
+                  sg_id * output_plane_stride;
+    const int64_t y_step = num_sub_groups * output_plane_stride;
+    const scalar_t* x = x_row + sg_id * input_plane_stride;
+    for (int h = sg_id; h < Plane; h += num_sub_groups, x += x_step, y += y_step) {
+      const vec_t x_val = *reinterpret_cast<const vec_t*>(x);
+      const accscalar_t gamma = static_cast<accscalar_t>(gamma_data[h]);
+      vec_t y_val;
+#pragma unroll
+      for (int r = 0; r < rows_per_lane; ++r) {
+        y_val[r] = GemmaRMSNormNoRstdForward<scalar_t, weight_t>::apply_weight(
+            static_cast<accscalar_t>(x_val[r]), rstd[r], gamma);
+      }
+      *reinterpret_cast<vec_t*>(y) = y_val;
+    }
+  }
+
+ private:
+  const scalar_t* X_data;
+  scalar_t* Y_data;
+  const weight_t* gamma_data;
+  accscalar_t eps;
+  int64_t Batch;
+  int Plane;
+  int num_sub_groups;
+  RowStrides input_rows;
+  RowStrides output_rows;
+  int64_t input_plane_stride;
+  int64_t output_plane_stride;
+  sycl::local_accessor<accscalar_t, 1> partial_sums;
+};
+
+// Widest aligned vector of adjacent rows (stride(-2) == 1) in t, up to vec_size.
+static inline int strided_plane_rows_vec_size(const Tensor& t, int vec_size) {
+  for (; vec_size > 1; vec_size >>= 1) {
+    bool ok = t.stride(-2) == 1 && t.size(-2) % vec_size == 0 && t.stride(-1) % vec_size == 0 &&
+              reinterpret_cast<uintptr_t>(t.data_ptr()) % (vec_size * t.element_size()) == 0;
+    for (int64_t d = 0; d < t.dim() - 2; ++d) {
+      ok = ok && t.stride(d) % vec_size == 0;
+    }
+    if (ok) {
+      break;
+    }
+  }
+  return vec_size;
+}
+
+template <typename scalar_t, typename weight_t>
+void launch_gemma_rmsnorm_strided_plane_kernel(
+    const Tensor& X,
+    const Tensor& gemma,
+    int64_t M,
+    int64_t N,
+    acc_type<scalar_t> eps,
+    Tensor& Y,
+    const RowStrides& input_rows,
+    const RowStrides& output_rows) {
+  const int num_sub_groups = static_cast<int>(std::min<int64_t>(kDefaultRowWorkgroupCap / NUM_REDUCE_STAGES, N));
+  constexpr int kMaxRowsPerLane = 16 / sizeof(scalar_t);
+  int rows_per_lane =
+      std::min(strided_plane_rows_vec_size(X, kMaxRowsPerLane), strided_plane_rows_vec_size(Y, kMaxRowsPerLane));
+  // At least one work-group per Xe-core; at small batches this beats a wider vector (measured on B60).
+  const int64_t min_groups = dpcppGpuSubsliceCount();
+  while (rows_per_lane > 1 && M / (NUM_REDUCE_STAGES * rows_per_lane) < min_groups) {
+    rows_per_lane >>= 1;
+  }
+
+  auto launch = [&](auto rows_per_lane_tag) {
+    using KernelFunctor = GemmaRMSNormStridedPlaneKernelFunctor<scalar_t, weight_t, decltype(rows_per_lane_tag)::value>;
+    constexpr int kRowsPerGroup = KernelFunctor::kRowsPerGroup;
+    const int64_t num_groups = (M + kRowsPerGroup - 1) / kRowsPerGroup;
+    KernelFunctor kfn(
+        X.data_ptr<scalar_t>(),
+        Y.data_ptr<scalar_t>(),
+        gemma.data_ptr<weight_t>(),
+        eps,
+        M,
+        static_cast<int>(N),
+        num_sub_groups,
+        input_rows,
+        output_rows,
+        X.stride(-1),
+        Y.stride(-1));
+    const int64_t local_range = static_cast<int64_t>(num_sub_groups) * NUM_REDUCE_STAGES;
+    sycl_kernel_submit(num_groups * local_range, local_range, at::xpu::getCurrentXPUStream().queue(), kfn);
+  };
+  if (rows_per_lane >= 8) {
+    launch(std::integral_constant<int, 8>{});
+  } else if (rows_per_lane == 4) {
+    launch(std::integral_constant<int, 4>{});
+  } else if (rows_per_lane == 2) {
+    launch(std::integral_constant<int, 2>{});
+  } else {
+    launch(std::integral_constant<int, 1>{});
+  }
+}
+
 template <
     typename scalar_t,
     typename weight_t,
@@ -907,11 +1097,13 @@ fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor wei
 SGL_KERNEL_EXPORT void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps) {
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
-  auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
+  auto [M, N] = _check_layer_norm_inputs(
+      input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias, /*allow_strided_last_dim=*/true);
 
   RowStrides in_strides = get_row_strides(input);
   RowStrides out_strides = get_row_strides(output);
   Tensor weight_ = (weight.dim() == 1) ? weight.reshape({N}) : weight;
+  const bool strided_plane = input.stride(-1) != 1 || output.stride(-1) != 1;
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
@@ -923,6 +1115,11 @@ SGL_KERNEL_EXPORT void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input
       at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
         SYCL_DISPATCH_WEIGHT_TYPES(
             at::ScalarType::Half, at::ScalarType::BFloat16, weight_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
+              if (strided_plane) {
+                launch_gemma_rmsnorm_strided_plane_kernel<scalar_t, weight_t>(
+                    input, weight_, M, N, static_cast<acc_type<scalar_t>>(eps), output, in_strides, out_strides);
+                return;
+              }
               GemmaRMSNormKernelImplInternal<scalar_t, weight_t>(
                   input,
                   weight_,

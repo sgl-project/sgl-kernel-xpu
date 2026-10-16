@@ -271,7 +271,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "moe_grouped_mm_nt_xe20(Tensor! output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
       "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, float gemm1_alpha=1.702, float "
-      "gemm1_limit=7.0) -> ()");
+      "gemm1_limit=7.0, bool gate_up_interleaved=True) -> ()");
   m.impl("moe_grouped_mm_nt_xe20", torch::kXPU, &moe_grouped_mm_nt_xe20);
 
   m.def(
@@ -281,7 +281,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   m.def(
       "moe_grouped_mm_nt_xe20_w8a16(Tensor! output, Tensor activations, Tensor weights, "
-      "Tensor weight_scales, Tensor? bias, Tensor total_rows_for_experts, int n_experts) -> ()");
+      "Tensor weight_scales, Tensor? bias, Tensor total_rows_for_experts, int n_experts) -> "
+      "()");
   m.impl("moe_grouped_mm_nt_xe20_w8a16", torch::kXPU, &moe_grouped_mm_nt_xe20_w8a16);
 #endif  // Xe20 only kernels
 

@@ -150,12 +150,10 @@ def test_rejects_unsupported_configuration():
     args = (qk, pos, cache, axis, weight, pos, slots, rope_pos, 4, 64, 1e-6, True)
     direct = torch.ops.sgl_kernel.qsa_index_q_norm_rope_store(*args, 6, torch.bfloat16)
     assert direct.shape == (1, 6, 128)
-    with pytest.raises(NotImplementedError, match="BF16 output only"):
-        sgl_kernel.qsa_index_q_norm_rope_store(*args, out_dtype=torch.float8_e4m3fn)
-    with pytest.raises(RuntimeError, match="BF16 output only"):
-        torch.ops.sgl_kernel.qsa_index_q_norm_rope_store(
-            *args, None, torch.float8_e4m3fn
-        )
+    with pytest.raises(NotImplementedError, match="BF16 or float8_e4m3fn"):
+        sgl_kernel.qsa_index_q_norm_rope_store(*args, out_dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="BF16 or float8_e4m3fn"):
+        torch.ops.sgl_kernel.qsa_index_q_norm_rope_store(*args, None, torch.float16)
     with pytest.raises(RuntimeError, match="head count or buffer shapes"):
         sgl_kernel.qsa_index_q_norm_rope_store(*args, q_heads_padded=3)
     with pytest.raises(RuntimeError, match="BF16"):
@@ -169,7 +167,7 @@ def test_rejects_unsupported_configuration():
             axis,
             weight,
             torch.zeros(1, device="xpu", dtype=torch.int32),
-            torch.empty((2, 128), device="xpu", dtype=torch.float8_e4m3fn),
+            torch.empty((2, 128), device="xpu", dtype=torch.float16),
             2,
             64,
             1e-6,
@@ -215,3 +213,77 @@ def test_empty_rows_and_default_output_shape():
         True,
     )
     assert (dst == 1).all()
+
+
+@pytest.mark.parametrize("neox", [False, True])
+def test_fp8_query_and_compressed_key_storage(neox):
+    torch.manual_seed(407)
+    dim, rotary, heads = 128, 64, 4
+    qk = torch.randn(3, (heads + 1) * dim, device="xpu", dtype=torch.bfloat16)
+    weight = torch.zeros(dim, device="xpu", dtype=torch.bfloat16)
+    weight[rotary:] = 1000  # Exercise finite E4M3FN saturation.
+    qk[0, 0] = float("nan")
+    cos_sin = torch.zeros(10, rotary, device="xpu")
+    cos_sin[:, : rotary // 2] = 1
+    axis = torch.zeros(rotary // 2, device="xpu", dtype=torch.int32)
+    positions = torch.tensor([1, 2, 3], device="xpu")
+    locs = torch.tensor([2, -1, 4], device="xpu")
+    state = torch.full((8, dim), 7, device="xpu", dtype=torch.bfloat16)
+    rope_state = torch.full((8, 3), -1, device="xpu", dtype=torch.int64)
+    args = (
+        qk,
+        positions,
+        cos_sin,
+        axis,
+        weight,
+        locs,
+        state,
+        rope_state,
+        heads,
+        rotary,
+        1e-6,
+        neox,
+    )
+    fp8_q = sgl_kernel.qsa_index_q_norm_rope_store(
+        *args, q_heads_padded=6, out_dtype=torch.float8_e4m3fn
+    )
+    bf16_q = sgl_kernel.qsa_index_q_norm_rope_store(
+        *args, q_heads_padded=6, out_dtype=torch.bfloat16
+    )
+    assert fp8_q.dtype == torch.float8_e4m3fn
+    torch.testing.assert_close(
+        fp8_q.view(torch.uint8), bf16_q.to(fp8_q.dtype).view(torch.uint8)
+    )
+    assert fp8_q.view(torch.uint8)[0, 0, 0].item() & 0x7F == 0x7F
+    assert fp8_q.float().abs().nan_to_num().max().item() == 448
+    assert (fp8_q.view(torch.uint8)[:, heads:] == 0).all()
+    torch.testing.assert_close(state[2], qk[0, heads * dim :])
+    assert (state[0] == 7).all() and (rope_state[0] == -1).all()
+
+    groups = torch.tensor([[2, 4], [-1, 4]], device="xpu", dtype=torch.int32)
+    writes = torch.tensor([3, 5], device="xpu", dtype=torch.int32)
+    bf16_cache = torch.full((7, dim), 7, device="xpu", dtype=torch.bfloat16)
+    fp8_cache = torch.full((7, dim), 7, device="xpu", dtype=torch.float8_e4m3fn)
+    compression_args = (
+        state,
+        groups,
+        rope_state,
+        cos_sin,
+        axis,
+        weight,
+        writes,
+    )
+    sgl_kernel.qsa_index_k_compress_store(
+        *compression_args, bf16_cache, 2, rotary, 1e-6, neox
+    )
+    sgl_kernel.qsa_index_k_compress_store(
+        *compression_args, fp8_cache, 2, rotary, 1e-6, neox
+    )
+    torch.testing.assert_close(
+        fp8_cache.view(torch.uint8),
+        bf16_cache.to(torch.float8_e4m3fn).view(torch.uint8),
+    )
+    assert (
+        fp8_cache.view(torch.uint8)[5]
+        == torch.tensor(0x4E, device="xpu", dtype=torch.uint8)
+    ).all()

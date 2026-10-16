@@ -1,4 +1,4 @@
-"""Xe2 BF16 QSA preparation operators."""
+"""Xe2 QSA preparation operators."""
 
 from typing import Optional
 
@@ -23,11 +23,13 @@ def qsa_index_q_norm_rope_store(
 ) -> torch.Tensor:
     """Normalize and rotate Q; store raw K and three position axes at valid slots.
 
-    BF16 input, weight and output only. Negative or out-of-range cache slots
-    skip the state/position store without suppressing query output.
+    BF16 input, weight, and pending key state; BF16 or unscaled E4M3FN output.
+    Invalid cache slots skip the state/position store but still produce Q.
     """
-    if out_dtype is not None and out_dtype != torch.bfloat16:
-        raise NotImplementedError("Xe2 QSA preparation supports BF16 output only")
+    if out_dtype not in (None, torch.bfloat16, torch.float8_e4m3fn):
+        raise NotImplementedError(
+            "Xe2 QSA preparation supports BF16 or float8_e4m3fn output only"
+        )
     return torch.ops.sgl_kernel.qsa_index_q_norm_rope_store(
         qk,
         positions,
@@ -63,7 +65,8 @@ def qsa_index_k_compress_store(
     """Pool each completed group, normalize and rotate at its first slot.
 
     Invalid group members or output slots skip that group; other slots remain
-    unchanged. BF16 storage only; FP8 cache output is not supported.
+    unchanged. Pending key state is BF16; cache storage can be BF16 or
+    unscaled float8_e4m3fn.
     """
     torch.ops.sgl_kernel.qsa_index_k_compress_store(
         key_state_buffer,

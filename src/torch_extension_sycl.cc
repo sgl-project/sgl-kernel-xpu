@@ -117,6 +117,19 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("fast_topk(Tensor score, Tensor lengths, int topk, Tensor? row_starts) -> Tensor");
   m.impl("fast_topk", torch::kXPU, &fast_topk);
 
+#ifdef USE_QSA
+  m.def(
+      "qsa_sparse_attention(Tensor q, Tensor k_cache, Tensor v_cache, "
+      "Tensor token_slots, float? softmax_scale=None) -> Tensor");
+  m.impl("qsa_sparse_attention", torch::kXPU, &qsa_sparse_attention);
+  m.def("qsa_mqa_prefill(Tensor q, Tensor k, Tensor row_starts, Tensor row_ends, float? score_scale=None) -> Tensor");
+  m.impl("qsa_mqa_prefill", torch::kXPU, &qsa_mqa_prefill);
+  m.def(
+      "qsa_mqa_decode(Tensor q, Tensor k_cache, Tensor page_table, Tensor context_lens, "
+      "int max_model_len, float? score_scale=None) -> Tensor");
+  m.impl("qsa_mqa_decode", torch::kXPU, &qsa_mqa_decode);
+#endif
+
   m.def(
       "fast_topk_transform_fused(Tensor score, Tensor lengths, Tensor src_page_table, "
       "Tensor cu_seqlens_q, int topk, Tensor? row_starts) -> Tensor");

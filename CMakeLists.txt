@@ -128,6 +128,10 @@ FetchContent_MakeAvailable(repo-cutlass-sycl)
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+# -isystem: CuTe/sycl-tla emit ~10M warnings that are not actionable here and
+# would otherwise drown out (and, under SGL_WERROR, break) first-party code.
+include_directories(SYSTEM
     ${repo-cutlass-sycl_SOURCE_DIR}/include
     ${repo-cutlass-sycl_SOURCE_DIR}/tools/util/include
 )

@@ -438,7 +438,7 @@ void moe_fused_gate_kernel_dynamic(
     torch::Tensor& output,
     torch::Tensor& indices,
     int64_t num_rows,
-    int64_t num_expert_group,
+    [[maybe_unused]] int64_t num_expert_group,
     int64_t topk_group,
     int64_t topk,
     int64_t num_fused_shared_experts,

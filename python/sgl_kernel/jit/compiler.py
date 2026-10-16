@@ -24,6 +24,9 @@ from .utils import cache_once
 logger = logging.getLogger(__name__)
 
 # Default SYCL compilation flags matching sgl-kernel-xpu build
+# The hardening block mirrors SGL_SDL_WARNING_FLAGS/SGL_SDL_HARDENING_FLAGS in
+# cmake/BuildFlags.cmake and must be kept in sync by hand: this path builds its
+# command line independently of CMake.
 DEFAULT_SYCL_CFLAGS = [
     "-fsycl",
     "-sycl-std=2020",
@@ -39,6 +42,15 @@ DEFAULT_SYCL_CFLAGS = [
     "-fno-approx-func",
     "-no-ftz",
     "-fno-sycl-instrument-device-code",
+    # Hardening. -fcf-protection applies to the host pass only; the
+    # driver emits a -Woption-ignored note for the spir64 pass.
+    "-Wformat",
+    "-Wformat-security",
+    "-Werror=format-security",
+    "-fcf-protection=full",
+    "-fstack-protector-strong",
+    "-U_FORTIFY_SOURCE",
+    "-D_FORTIFY_SOURCE=2",
 ]
 
 
@@ -140,8 +152,11 @@ def _get_pytorch_sycl_lib_path() -> str:
 
 _PYTORCH_SYCL_LIB_PATH = _get_pytorch_sycl_lib_path()
 
+# Link hardening; -z,now is required alongside -z,relro for full RELRO.
+_SDL_LDFLAGS = ["-Wl,-z,noexecstack", "-Wl,-z,relro", "-Wl,-z,now"]
+
 # Link against PyTorch's SYCL runtime to avoid ABI mismatch
-DEFAULT_LDFLAGS = (
+DEFAULT_LDFLAGS = _SDL_LDFLAGS + (
     [f"-L{_PYTORCH_SYCL_LIB_PATH}", f"-Wl,-rpath,{_PYTORCH_SYCL_LIB_PATH}"]
     if _PYTORCH_SYCL_LIB_PATH
     else []

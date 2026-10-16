@@ -19,6 +19,7 @@ limitations under the License.
 // Naive SYCL fallback for small problem sizes.
 // Note: fp8_mqa_logits (prefill path) is implemented in pure Python via sgl_kernel.nsa.
 
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
 #include <ATen/ATen.h>

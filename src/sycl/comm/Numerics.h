@@ -151,10 +151,10 @@ struct Numerics<uint8_t> {
   static inline uint8_t pow(uint8_t a, uint8_t b) {
     return powi<uint8_t>(a, b);
   }
-  static inline bool isnan(uint8_t a) {
+  static inline bool isnan(uint8_t) {
     return false;
   }
-  static inline bool isinf(uint8_t a) {
+  static inline bool isinf(uint8_t) {
     return false;
   }
   static inline uint8_t min(uint8_t a, uint8_t b) {
@@ -210,10 +210,10 @@ struct Numerics<bool> {
   static inline bool abs(bool a) {
     return a;
   }
-  static inline bool isnan(bool a) {
+  static inline bool isnan(bool) {
     return false;
   }
-  static inline bool isinf(bool a) {
+  static inline bool isinf(bool) {
     return false;
   }
 };
@@ -282,10 +282,10 @@ struct Numerics<int8_t> {
   static inline int8_t pow(int8_t a, int8_t b) {
     return powi<int8_t>(a, b);
   }
-  static inline bool isnan(int8_t a) {
+  static inline bool isnan(int8_t) {
     return false;
   }
-  static inline bool isinf(int8_t a) {
+  static inline bool isinf(int8_t) {
     return false;
   }
   static inline int8_t min(int8_t a, int8_t b) {
@@ -360,10 +360,10 @@ struct Numerics<int16_t> {
   static inline int16_t pow(int16_t a, int16_t b) {
     return powi<int16_t>(a, b);
   }
-  static inline bool isnan(int16_t a) {
+  static inline bool isnan(int16_t) {
     return false;
   }
-  static inline bool isinf(int8_t a) {
+  static inline bool isinf(int8_t) {
     return false;
   }
   static inline int16_t sgn(int16_t a) {
@@ -441,10 +441,10 @@ struct Numerics<int32_t> {
   static inline int32_t pow(int32_t a, int32_t b) {
     return powi<int32_t>(a, b);
   }
-  static inline bool isnan(int32_t a) {
+  static inline bool isnan(int32_t) {
     return false;
   }
-  static inline bool isinf(int8_t a) {
+  static inline bool isinf(int8_t) {
     return false;
   }
   static inline int32_t sgn(int32_t a) {
@@ -522,10 +522,10 @@ struct Numerics<int64_t> {
   static inline int64_t pow(int64_t a, int64_t b) {
     return powi<int64_t>(a, b);
   }
-  static inline bool isnan(int64_t a) {
+  static inline bool isnan(int64_t) {
     return false;
   }
-  static inline bool isinf(int8_t a) {
+  static inline bool isinf(int8_t) {
     return false;
   }
   static inline int64_t sgn(int64_t a) {

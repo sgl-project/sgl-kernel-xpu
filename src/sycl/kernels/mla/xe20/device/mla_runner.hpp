@@ -145,7 +145,9 @@ class MLA {
   }
 
   cutlass::Status initialize(
-      Arguments const& args, void* workspace = nullptr, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
+      Arguments const& args,
+      void* workspace = nullptr,
+      [[maybe_unused]] sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     int split_kv = args.split_kv;
     if constexpr (!Kernel::is_split_kv) {
       // Non-split path
@@ -157,7 +159,7 @@ class MLA {
       // Construct split-KV main kernel arguments
       params_.fmla_params = Kernel::to_underlying_arguments(args, workspace);
 
-      using StrideO = typename Kernel::StrideO;
+      using StrideO [[maybe_unused]] = typename Kernel::StrideO;
 
       typename ReductionKernel::KernelArguments reduce_kernel_args{};
       reduce_kernel_args.shape = s;
@@ -201,7 +203,8 @@ class MLA {
   //                   threads/EU and helps hide HBM latency.
   static constexpr int kGrfSize = Kernel::CollectiveMainloop::IsPrefill ? 256 : 128;
 
-  static cutlass::Status run(Params& params, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
+  static cutlass::Status
+  run(Params& params, [[maybe_unused]] sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     if constexpr (!Kernel::is_split_kv) {
       // Non-split: launch main kernel only
       launch<Kernel, kGrfSize>(params.fmla_params);

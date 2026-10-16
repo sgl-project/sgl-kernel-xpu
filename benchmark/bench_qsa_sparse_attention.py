@@ -63,9 +63,7 @@ def main():
                 0, k.size(0), (rows, topk), device="xpu", dtype=torch.int32
             )
             ref = lambda: reference(q, k, v, slots, 0.0625)
-            kernel = lambda: torch.ops.sgl_kernel.qsa_sparse_attention(
-                q, k, v, slots, 0.0625
-            )
+            kernel = lambda: sgl_kernel.qsa_sparse_attention(q, k, v, slots, 0.0625)
             reference_ms = time_ms(ref, 5) if not args.skip_reference else float("nan")
             kernel_ms = time_ms(kernel, args.repetitions)
             flops = rows * q.size(1) * topk * q.size(2) * 4

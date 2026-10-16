@@ -31,6 +31,37 @@ def reference(q, k, v, slots, scale):
     return result
 
 
+def test_qsa_python_wrapper_forwards_to_native(monkeypatch):
+    native_op = torch.ops.sgl_kernel.qsa_sparse_attention
+    calls = []
+
+    def traced(*args):
+        calls.append(args)
+        return native_op(*args)
+
+    monkeypatch.setattr(torch.ops.sgl_kernel, "qsa_sparse_attention", traced)
+    q = torch.randn(1, 4, 256, device="xpu", dtype=torch.bfloat16)
+    k = torch.randn(8, 2, 256, device="xpu", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    slots = torch.tensor([[0, 3, -1]], device="xpu", dtype=torch.int32)
+
+    for scale in (None, 0.12):
+        calls.clear()
+        actual = sgl_kernel.qsa_sparse_attention(q, k, v, slots, scale)
+
+        assert len(calls) == 1
+        assert all(
+            arg is expected for arg, expected in zip(calls[0][:4], (q, k, v, slots))
+        )
+        assert calls[0][4] == scale
+        torch.testing.assert_close(
+            actual.cpu(),
+            reference(q.cpu(), k.cpu(), v.cpu(), slots.cpu(), scale or 0.0625),
+            atol=0.025,
+            rtol=0.025,
+        )
+
+
 @pytest.mark.parametrize(
     "rows,heads,kv_heads,topk,valid_count",
     [

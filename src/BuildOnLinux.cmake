@@ -59,7 +59,7 @@ macro(setup_common_libraries)
     common_ops
     MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI
     ${ATen_XPU_CPP_SRCS})
-  install(TARGETS common_ops LIBRARY DESTINATION sgl_kernel)
+  install(TARGETS common_ops LIBRARY DESTINATION ${SGL_ARCH_PKG_DIR})
   set_target_properties(common_ops PROPERTIES
     INSTALL_RPATH "$ORIGIN"
     BUILD_WITH_INSTALL_RPATH TRUE
@@ -68,6 +68,23 @@ macro(setup_common_libraries)
 endmacro()
 
 setup_common_libraries()
+
+# Architecture probe for the multi-arch wheel. Built independently of
+# SYCL_INTEL_TARGET and installed at the package root (not the per-arch dir) so
+# _arch.py can load it before deciding which backend to import. Deliberately not
+# linked into common_ops: it has to be loadable on its own.
+sycl_add_library(
+  sgl_arch_probe
+  ${SYCL_OFFLINE_COMPILER_FLAGS}
+  ${COMMON_DEVICE_LINK_FLAGS}
+  SHARED
+  SYCL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/arch/sgl_arch_probe.cpp)
+list(APPEND SGL_OPS_LIBRARIES sgl_arch_probe)
+install(TARGETS sgl_arch_probe LIBRARY DESTINATION sgl_kernel)
+set_target_properties(sgl_arch_probe PROPERTIES
+  INSTALL_RPATH "$ORIGIN"
+  BUILD_WITH_INSTALL_RPATH TRUE
+)
 
 # common kernels
 foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
@@ -83,7 +100,7 @@ foreach(sycl_src ${ATen_XPU_SYCL_COMMON})
   list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
 
   # Decouple with PyTorch cmake definition.
-  install(TARGETS ${sycl_lib} LIBRARY DESTINATION sgl_kernel)
+  install(TARGETS ${sycl_lib} LIBRARY DESTINATION ${SGL_ARCH_PKG_DIR})
   set_target_properties(${sycl_lib} PROPERTIES
     INSTALL_RPATH "$ORIGIN"
     BUILD_WITH_INSTALL_RPATH TRUE
@@ -224,7 +241,7 @@ foreach(sycl_src ${ATen_XPU_SYCL_XE20})
   list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
 
   # Decouple with PyTorch cmake definition.
-  install(TARGETS ${sycl_lib} LIBRARY DESTINATION sgl_kernel)
+  install(TARGETS ${sycl_lib} LIBRARY DESTINATION ${SGL_ARCH_PKG_DIR})
   set_target_properties(${sycl_lib} PROPERTIES
     INSTALL_RPATH "$ORIGIN"
     BUILD_WITH_INSTALL_RPATH TRUE
@@ -278,7 +295,7 @@ if(DPCPP_SYCL_TARGET MATCHES "cri")
     list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
 
     # Decouple with PyTorch cmake definition.
-    install(TARGETS ${sycl_lib} LIBRARY DESTINATION sgl_kernel)
+    install(TARGETS ${sycl_lib} LIBRARY DESTINATION ${SGL_ARCH_PKG_DIR})
     set_target_properties(${sycl_lib} PROPERTIES
       INSTALL_RPATH "$ORIGIN"
       BUILD_WITH_INSTALL_RPATH TRUE

@@ -3,29 +3,9 @@
 
 #include <sycl/sycl.hpp>
 
+#include "sgl_arch_query.h"
 #include "sgl_kernel_export.h"
 
-namespace syclex = sycl::ext::oneapi::experimental;
-
-static inline syclex::architecture get_device_architecture(at::DeviceIndex device_index = -1) {
-  auto device_id = (device_index == -1) ? c10::xpu::current_device() : device_index;
-  auto raw_device = c10::xpu::get_raw_device(device_id);
-  return raw_device.get_info<syclex::info::device::architecture>();
-}
-
 SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index = -1) {
-  auto device_arch = get_device_architecture(device_index);
-  switch (device_arch) {
-    case syclex::architecture::intel_gpu_bmg_g21:
-    case syclex::architecture::intel_gpu_bmg_g31:
-      return std::make_tuple(2, 0);
-// Need oneAPI 2026.2 (SYCL version 20260717) or later to support `architecture::intel_gpu_cri`.
-#if defined(__SYCL_COMPILER_VERSION) && __SYCL_COMPILER_VERSION >= 20260717
-    case syclex::architecture::intel_gpu_cri:
-      return std::make_tuple(3, 5);
-#endif
-    // more arch is coming soon
-    default:
-      throw std::runtime_error("Unsupported XPU architecture.");
-  }
+  return sgl::device_capability(device_index);
 }

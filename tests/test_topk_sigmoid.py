@@ -98,15 +98,19 @@ def fused_topk_sigmoid_torch_native(
 # call raised "not implemented for 'Float'". The kernel upcasts to float
 # internally, so fp32 in must match the float reference within the same
 # tolerance as the reduced-float path.
+# n_token / n_expert / n_topk lists expanded to cover PO topk_sigmoid CFGs.
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("n_token", [2, 32, 4096])
-@pytest.mark.parametrize("n_expert", [8, 32, 256])
+@pytest.mark.parametrize("n_token", [1, 2, 32, 128, 4096])
+@pytest.mark.parametrize("n_expert", [8, 32, 128, 256])
 @pytest.mark.parametrize("renormalize", [False, True])
 @pytest.mark.parametrize("with_correction_bias", [False, True])
 @pytest.mark.parametrize("routed_scaling_factor", [1.0, 2.5])
+# n_topk is paired with num_fused_shared_experts instead of swept separately:
+# routed_topk = n_topk - num_fused_shared_experts must stay > 0, so (1, 1) is
+# excluded. n_topk=8 from #193 is folded in here.
 @pytest.mark.parametrize(
     "n_topk,num_fused_shared_experts",
-    [(1, 0), (2, 0), (2, 1), (4, 0), (4, 1)],
+    [(1, 0), (2, 0), (2, 1), (4, 0), (4, 1), (8, 0), (8, 1)],
 )
 def test_topk_sigmoid(
     dtype,

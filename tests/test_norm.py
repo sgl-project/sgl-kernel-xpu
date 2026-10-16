@@ -67,8 +67,20 @@ def fused_add_rms_norm(x, residual, weight, eps):
     [
         *[
             (batch_size, hidden_size, dtype)
-            for batch_size in [1, 19, 99, 989]
-            for hidden_size in [111, 500, 1024, 2880, 3072, 3584, 4096, 8192, 16384]
+            for batch_size in [1, 19, 99, 128, 989]
+            for hidden_size in [
+                111,
+                500,
+                1024,
+                2048,
+                2880,
+                3072,
+                3584,
+                4096,
+                5120,
+                8192,
+                16384,
+            ]
             for dtype in [torch.float16, torch.bfloat16]
         ],
         # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
@@ -99,8 +111,20 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
     [
         *[
             (batch_size, hidden_size, dtype)
-            for batch_size in [1, 19, 99, 989]
-            for hidden_size in [111, 500, 1024, 2880, 3072, 3584, 4096, 8192, 16384]
+            for batch_size in [1, 19, 99, 128, 989]
+            for hidden_size in [
+                111,
+                500,
+                1024,
+                2048,
+                2880,
+                3072,
+                3584,
+                4096,
+                5120,
+                8192,
+                16384,
+            ]
             for dtype in [torch.float16, torch.bfloat16, torch.float32]
         ],
         # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
@@ -128,19 +152,12 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     )
 
 
+@pytest.mark.parametrize("batch_size", [1, 2, 19, 99, 128, 989])
 @pytest.mark.parametrize(
-    "batch_size, hidden_size, dtype",
-    [
-        *[
-            (batch_size, hidden_size, torch.float16)
-            for batch_size in [1, 19, 99, 989]
-            for hidden_size in [111, 500, 1024, 3072, 3584, 4096, 8192, 16384]
-        ],
-        (19, 1024, torch.bfloat16),
-        (19, 1024, torch.float32),
-        (2, 32768, torch.float16),
-    ],
+    "hidden_size",
+    [111, 500, 1024, 2048, 3072, 3584, 4096, 5120, 8192, 16384, 32768],
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
     x = torch.randn(batch_size, hidden_size).to(device).to(dtype)
@@ -156,19 +173,12 @@ def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
     torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
 
 
+@pytest.mark.parametrize("batch_size", [1, 2, 19, 99, 128, 989])
 @pytest.mark.parametrize(
-    "batch_size, hidden_size, dtype",
-    [
-        *[
-            (batch_size, hidden_size, torch.float16)
-            for batch_size in [1, 19, 99, 989]
-            for hidden_size in [111, 500, 1024, 3072, 3584, 4096, 8192, 16384]
-        ],
-        (19, 1024, torch.bfloat16),
-        (19, 1024, torch.float32),
-        (2, 32768, torch.float16),
-    ],
+    "hidden_size",
+    [111, 500, 1024, 2048, 3072, 3584, 4096, 5120, 8192, 16384, 32768],
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     eps = 1e-6
 

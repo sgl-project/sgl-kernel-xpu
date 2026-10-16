@@ -326,9 +326,23 @@ def sglang_per_token_group_quant_8bit_layer(
 configs = list(
     itertools.product(
         [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
-        [128, 256, 384, 512, 1024, 1536, 1664, 2048, 4096, 7168, 16384],  # hidden_dim
+        [
+            128,
+            256,
+            384,
+            512,
+            1024,
+            1536,
+            1664,
+            2048,
+            4096,
+            5120,
+            7168,
+            8192,
+            16384,
+        ],  # hidden_dim
         [16, 32, 64, 128],  # group_size
-        [None],  # num_ranks
+        [None, 1],  # num_ranks
         [fp8_type_, torch.int8],  # dtype
         [
             dict(
@@ -402,6 +416,34 @@ configs = list(
         ],
     )
 )
+
+
+# Stable IDs for parametrized configs: dtype/flags are indexed by their position
+# in a canonical list rather than by their row index in `configs` (which is what
+# pytest does by default when values have no clean repr, giving names like
+# `dst_dtype760`/`flags760`).
+_DST_DTYPE_ORDER = [fp8_type_, torch.int8]
+_FLAG_DICT_ORDER: list[dict] = []
+
+
+def _flag_index(f: dict) -> int:
+    for i, existing in enumerate(_FLAG_DICT_ORDER):
+        if f == existing:
+            return i
+    _FLAG_DICT_ORDER.append(f)
+    return len(_FLAG_DICT_ORDER) - 1
+
+
+def _config_id(config) -> str:
+    num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags = config
+    return (
+        f"{num_tokens}-{hidden_dim}-{group_size}-{num_ranks}"
+        f"-dst_dtype{_DST_DTYPE_ORDER.index(dst_dtype)}"
+        f"-flags{_flag_index(flags)}"
+    )
+
+
+_config_ids = [_config_id(c) for c in configs]
 
 
 # Pure PyTorch reference implementations
@@ -751,7 +793,9 @@ def pad_to_match(x, target_last_dim):
 
 
 @pytest.mark.parametrize(
-    "num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags", configs
+    "num_tokens, hidden_dim, group_size, num_ranks, dst_dtype, flags",
+    configs,
+    ids=_config_ids,
 )
 def test_per_token_group_quant_with_column_major(
     num_tokens,

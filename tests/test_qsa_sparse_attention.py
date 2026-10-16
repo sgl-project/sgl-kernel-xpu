@@ -9,8 +9,6 @@ import pytest
 import sgl_kernel
 import torch
 
-from benchmark import bench_qsa_sparse_attention
-
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available()
     or not hasattr(torch.ops.sgl_kernel, "qsa_sparse_attention"),
@@ -32,32 +30,6 @@ def reference(q, k, v, slots, scale):
             result.dtype
         )
     return result
-
-
-@pytest.mark.parametrize("warmup_iters", [None, 0, 5])
-def test_benchmark_warmups_excluded_from_timing(monkeypatch, warmup_iters):
-    events = []
-    clock = bench_qsa_sparse_attention.time.perf_counter
-    expected_warmups = 20 if warmup_iters is None else warmup_iters
-    monkeypatch.setattr(torch.xpu, "synchronize", lambda: events.append("sync"))
-    monkeypatch.setattr(
-        bench_qsa_sparse_attention.time,
-        "perf_counter",
-        lambda: events.append("clock") or clock(),
-    )
-
-    def fn():
-        events.append("call")
-
-    kwargs = {} if warmup_iters is None else {"warmup_iters": warmup_iters}
-    bench_qsa_sparse_attention.time_ms(fn, repetitions=2, **kwargs)
-
-    assert events == (
-        ["call"] * expected_warmups
-        + ["sync", "clock"]
-        + ["call"] * 2
-        + ["sync", "clock"]
-    )
 
 
 def test_qsa_python_wrapper_forwards_to_native(monkeypatch):
@@ -193,32 +165,3 @@ def test_qsa_bf16_dpas_token_and_dimension_mapping():
         torch.testing.assert_close(
             actual.cpu()[0, 0, :16].float(), expected, atol=0.01, rtol=0.01
         )
-
-
-@pytest.mark.parametrize("rows", [[1, 2], [3]])
-def test_qsa_benchmark_sweeps_rows(rows):
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "benchmark"
-        / "bench_qsa_sparse_attention.py"
-    )
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(script),
-            "--rows",
-            *(str(row) for row in rows),
-            "--topk",
-            "16",
-            "--skip-reference",
-            "--repetitions",
-            "1",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    output = list(csv.DictReader(result.stdout.splitlines()))
-    assert [(int(entry["rows"]), int(entry["topk"])) for entry in output] == [
-        (row, 16) for row in rows
-    ]

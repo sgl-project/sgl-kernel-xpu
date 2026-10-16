@@ -16,6 +16,7 @@ namespace {
 using bf16 = sycl::ext::oneapi::bfloat16;
 using Dpas = cute::XE_DPAS_TT<4, float, cute::bfloat16_t>;
 using DpasTraits = cute::MMA_Traits<Dpas>;
+// These parameters are for Qwen3.8-Flash-Next only
 constexpr int kHeads = 4;
 constexpr int kDim = 128;
 constexpr int kSubgroup = 16;

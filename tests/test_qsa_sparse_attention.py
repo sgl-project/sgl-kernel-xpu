@@ -3,10 +3,13 @@ import math
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import sgl_kernel
 import torch
+
+from benchmark import bench_qsa_sparse_attention
 
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available()
@@ -31,6 +34,32 @@ def reference(q, k, v, slots, scale):
     return result
 
 
+@pytest.mark.parametrize("warmup_iters", [None, 0, 5])
+def test_benchmark_warmups_excluded_from_timing(monkeypatch, warmup_iters):
+    events = []
+    clock = bench_qsa_sparse_attention.time.perf_counter
+    expected_warmups = 20 if warmup_iters is None else warmup_iters
+    monkeypatch.setattr(torch.xpu, "synchronize", lambda: events.append("sync"))
+    monkeypatch.setattr(
+        bench_qsa_sparse_attention.time,
+        "perf_counter",
+        lambda: events.append("clock") or clock(),
+    )
+
+    def fn():
+        events.append("call")
+
+    kwargs = {} if warmup_iters is None else {"warmup_iters": warmup_iters}
+    bench_qsa_sparse_attention.time_ms(fn, repetitions=2, **kwargs)
+
+    assert events == (
+        ["call"] * expected_warmups
+        + ["sync", "clock"]
+        + ["call"] * 2
+        + ["sync", "clock"]
+    )
+
+
 def test_qsa_python_wrapper_forwards_to_native(monkeypatch):
     native_op = torch.ops.sgl_kernel.qsa_sparse_attention
     calls = []
@@ -39,7 +68,13 @@ def test_qsa_python_wrapper_forwards_to_native(monkeypatch):
         calls.append(args)
         return native_op(*args)
 
-    monkeypatch.setattr(torch.ops.sgl_kernel, "qsa_sparse_attention", traced)
+    monkeypatch.setitem(
+        sgl_kernel.qsa_sparse_attention.__globals__,
+        "torch",
+        SimpleNamespace(
+            ops=SimpleNamespace(sgl_kernel=SimpleNamespace(qsa_sparse_attention=traced))
+        ),
+    )
     q = torch.randn(1, 4, 256, device="xpu", dtype=torch.bfloat16)
     k = torch.randn(8, 2, 256, device="xpu", dtype=torch.bfloat16)
     v = torch.randn_like(k)

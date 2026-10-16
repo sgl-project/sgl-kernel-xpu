@@ -72,10 +72,9 @@ struct QSASplitKernel {
       item.barrier(sycl::access::fence_space::local_space);
       const int d = dim_tile * kTileSize;
       const int query_dim = DpasTraits::ALayout{}(lane, 0);
-      const bf16 query_value = q[(row * heads + head) * kHeadDim + d + query_dim];
-      Bf16Dpas::AVector query;
-      __builtin_memcpy(&query, &query_value, sizeof(query_value));
-      uint16_t key_values[kTileSize];
+      const cute::bfloat16_t query_value =
+          sycl::bit_cast<cute::bfloat16_t>(q[(row * heads + head) * kHeadDim + d + query_dim]);
+      cute::bfloat16_t key_values[kTileSize];
       for (int j = 0; j < kTileSize; ++j) {
         // The DPAS B fragment interleaves reduction dimensions and token columns.
         const int coordinate = DpasTraits::BLayout{}(lane, j);
@@ -83,12 +82,15 @@ struct QSASplitKernel {
         const int key_dim = coordinate / kTileSize;
         const int32_t key_slot = selected[token_idx];
         const int64_t offset = (static_cast<int64_t>(key_slot) * kv_heads + kv_head) * kHeadDim;
-        key_values[j] = key_slot >= 0 ? sycl::bit_cast<uint16_t>(k[offset + d + key_dim]) : 0;
+        key_values[j] = key_slot >= 0 ? sycl::bit_cast<cute::bfloat16_t>(k[offset + d + key_dim]) : cute::bfloat16_t{};
       }
-      Bf16Dpas::BVector key;
-      __builtin_memcpy(&key, key_values, sizeof(key_values));
-      Bf16Dpas::DVector partial_score = 0.0f;
-      Bf16Dpas::fma(partial_score, query, key, partial_score);
+      float partial_score[1] = {};
+      auto query = cute::make_tensor(cute::make_rmem_ptr(&query_value), cute::make_layout(cute::Shape<cute::Int<1>>{}));
+      auto key =
+          cute::make_tensor(cute::make_rmem_ptr(key_values), cute::make_layout(cute::Shape<cute::Int<kTileSize>>{}));
+      auto score =
+          cute::make_tensor(cute::make_rmem_ptr(partial_score), cute::make_layout(cute::Shape<cute::Int<1>>{}));
+      cute::gemm(cute::MMA_Atom<Bf16Dpas>{}, query, key, score);
       partial_scores[dim_tile * kTileSize + DpasTraits::CLayout{}(lane, 0)] = partial_score[0];
       // Finish writing all subgroup QK partials before summing them into scores.
       item.barrier(sycl::access::fence_space::local_space);
@@ -125,22 +127,24 @@ struct QSASplitKernel {
       item.barrier(sycl::access::fence_space::local_space);
       numerator *= state[2];
       const int prob_idx = DpasTraits::ALayout{}(lane, 0);
-      const bf16 probability = static_cast<bf16>(weights[prob_idx]);
-      Bf16Dpas::AVector prob_fragment;
-      __builtin_memcpy(&prob_fragment, &probability, sizeof(probability));
-      uint16_t value_fragments[kTileSize];
+      const cute::bfloat16_t probability = sycl::bit_cast<cute::bfloat16_t>(static_cast<bf16>(weights[prob_idx]));
+      cute::bfloat16_t value_fragments[kTileSize];
       for (int j = 0; j < kTileSize; ++j) {
         const int coordinate = DpasTraits::BLayout{}(lane, j);
         const int token_idx = coordinate / kTileSize;
         const int value_dim = dim_tile * kTileSize + coordinate % kTileSize;
         const int32_t value_slot = selected[token_idx];
         const int64_t offset = (static_cast<int64_t>(value_slot) * kv_heads + kv_head) * kHeadDim;
-        value_fragments[j] = value_slot >= 0 ? sycl::bit_cast<uint16_t>(v[offset + value_dim]) : 0;
+        value_fragments[j] =
+            value_slot >= 0 ? sycl::bit_cast<cute::bfloat16_t>(v[offset + value_dim]) : cute::bfloat16_t{};
       }
-      Bf16Dpas::BVector values;
-      __builtin_memcpy(&values, value_fragments, sizeof(value_fragments));
-      Bf16Dpas::DVector weighted_value = 0.0f;
-      Bf16Dpas::fma(weighted_value, prob_fragment, values, weighted_value);
+      float weighted_value[1] = {};
+      auto prob = cute::make_tensor(cute::make_rmem_ptr(&probability), cute::make_layout(cute::Shape<cute::Int<1>>{}));
+      auto values = cute::make_tensor(
+          cute::make_rmem_ptr(value_fragments), cute::make_layout(cute::Shape<cute::Int<kTileSize>>{}));
+      auto value =
+          cute::make_tensor(cute::make_rmem_ptr(weighted_value), cute::make_layout(cute::Shape<cute::Int<1>>{}));
+      cute::gemm(cute::MMA_Atom<Bf16Dpas>{}, prob, values, value);
       numerator += weighted_value[0];
       // Finish reading shared slots and weights before the next tile overwrites them.
       if (start + kTileSize < end) item.barrier(sycl::access::fence_space::local_space);

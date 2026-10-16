@@ -36,40 +36,49 @@ struct QSAMqaPrefillKernel {
 
   [[sycl::reqd_sub_group_size(kSubgroup)]]
   void operator()(sycl::nd_item<1> item) const {
-    const int group = item.get_group(0);
-    const int first_row = (group / tiles) * kRowsPerTile;
-    const int first_col = (group % tiles) * kColumnsPerTile + (item.get_local_id(0) / kSubgroup) * kSubgroup;
-    const int col = first_col + item.get_local_id(0) % kSubgroup;
+    const int64_t group = item.get_group(0);
+    const int64_t first_row = (group / tiles) * kRowsPerTile;
+    const int64_t first_col = (group % tiles) * kColumnsPerTile + (item.get_local_id(0) / kSubgroup) * kSubgroup;
+    const int64_t col = first_col + item.get_local_id(0) % kSubgroup;
     const int lane = item.get_local_id(0) % kSubgroup;
     float totals[kRowsPerTile] = {};
-    // DPAS repeats four rows against each key tile; CuTe maps its B operand into VNNI order.
-    Dpas::BVector keys[kDim / kSubgroup];
+    const auto mma = cute::make_tiled_mma(cute::MMA_Atom<Dpas>{});
+    const auto thread_mma = mma.get_thread_slice(lane);
+    const auto a_shape = cute::make_shape(cute::Int<kRowsPerTile>{}, cute::Int<kSubgroup>{});
+    const auto b_shape = cute::make_shape(cute::Int<kSubgroup>{}, cute::Int<kSubgroup>{});
+    const auto a_coords = thread_mma.partition_A(cute::make_identity_tensor(a_shape));
+    const auto b_coords = thread_mma.partition_B(cute::make_identity_tensor(b_shape));
+    cute::bfloat16_t keys[kDim / kSubgroup][kSubgroup];
     for (int step = 0; step < kDim / kSubgroup; ++step) {
-      uint16_t key[kSubgroup];
+      const int64_t key_start = first_col < columns ? first_col : 0;
+      const auto g_keys = cute::make_tensor(
+          cute::make_gmem_ptr(k + key_start * kDim + step * kSubgroup),
+          cute::make_layout(b_shape, cute::make_stride(cute::Int<kDim>{}, cute::Int<1>{})));
+      const auto thread_keys = thread_mma.partition_B(g_keys);
       for (int j = 0; j < kSubgroup; ++j) {
-        const int coordinate = DpasTraits::BLayout{}(lane, j);
-        const int column = first_col + coordinate % kSubgroup;
-        const int dimension = step * kSubgroup + coordinate / kSubgroup;
-        key[j] = column < columns ? sycl::bit_cast<uint16_t>(k[column * kDim + dimension]) : 0;
+        const int64_t column = first_col + cute::get<0>(b_coords(j));
+        keys[step][j] = column < columns ? sycl::bit_cast<cute::bfloat16_t>(thread_keys(j)) : cute::bfloat16_t{};
       }
-      __builtin_memcpy(&keys[step], key, sizeof(key));
     }
 
     for (int head = 0; head < kHeads; ++head) {
-      Dpas::DVector score{};
+      float score[kRowsPerTile] = {};
+      auto c = cute::make_tensor(cute::make_rmem_ptr(score), cute::make_layout(cute::Shape<cute::Int<kRowsPerTile>>{}));
       for (int step = 0; step < kDim / kSubgroup; ++step) {
-        uint16_t query[kRowsPerTile];
+        const auto g_query = cute::make_tensor(
+            cute::make_gmem_ptr(q + (first_row * kHeads + head) * kDim + step * kSubgroup),
+            cute::make_layout(a_shape, cute::make_stride(cute::Int<kHeads * kDim>{}, cute::Int<1>{})));
+        const auto thread_query = thread_mma.partition_A(g_query);
+        cute::bfloat16_t query[kRowsPerTile];
         for (int row = 0; row < kRowsPerTile; ++row) {
-          const int coordinate = DpasTraits::ALayout{}(lane, row);
-          const int query_row = first_row + coordinate % kRowsPerTile;
-          query[row] = query_row < rows
-                           ? sycl::bit_cast<uint16_t>(
-                                 q[(query_row * kHeads + head) * kDim + step * kSubgroup + coordinate / kRowsPerTile])
-                           : 0;
+          const int64_t query_row = first_row + cute::get<0>(a_coords(row));
+          query[row] = query_row < rows ? sycl::bit_cast<cute::bfloat16_t>(thread_query(row)) : cute::bfloat16_t{};
         }
-        Dpas::AVector a;
-        __builtin_memcpy(&a, query, sizeof(query));
-        Dpas::fma(score, a, keys[step], score);
+        auto a =
+            cute::make_tensor(cute::make_rmem_ptr(query), cute::make_layout(cute::Shape<cute::Int<kRowsPerTile>>{}));
+        auto b =
+            cute::make_tensor(cute::make_rmem_ptr(keys[step]), cute::make_layout(cute::Shape<cute::Int<kSubgroup>>{}));
+        cute::gemm(cute::MMA_Atom<Dpas>{}, a, b, c);
       }
       for (int j = 0; j < kRowsPerTile; ++j) {
         const int coordinate = DpasTraits::CLayout{}(lane, j);
@@ -78,10 +87,9 @@ struct QSAMqaPrefillKernel {
     }
 
     for (int row = 0; row < kRowsPerTile; ++row) {
-      const int r = first_row + row;
+      const int64_t r = first_row + row;
       if (r < rows && col < columns)
-        logits[static_cast<int64_t>(r) * columns + col] =
-            col >= starts[r] && col < ends[r] ? totals[row] * inv_scale : -INFINITY;
+        logits[r * columns + col] = col >= starts[r] && col < ends[r] ? totals[row] * inv_scale : -INFINITY;
     }
   }
 };
@@ -102,36 +110,35 @@ struct QSAMqaDecodeKernel {
 
   [[sycl::reqd_sub_group_size(kSubgroup)]]
   void operator()(sycl::nd_item<1> item) const {
-    const int group = item.get_group(0);
-    const int row = group / tiles;
-    const int first_col = (group % tiles) * kColumnsPerTile + (item.get_local_id(0) / kSubgroup) * kSubgroup;
-    const int col = first_col + item.get_local_id(0) % kSubgroup;
+    const int64_t group = item.get_group(0);
+    const int64_t row = group / tiles;
+    const int64_t first_col = (group % tiles) * kColumnsPerTile + (item.get_local_id(0) / kSubgroup) * kSubgroup;
+    const int64_t col = first_col + item.get_local_id(0) % kSubgroup;
     const int lane = item.get_local_id(0) % kSubgroup;
-    Dpas::DVector score{};
+    float score[kHeads] = {};
+    auto c = cute::make_tensor(cute::make_rmem_ptr(score), cute::make_layout(cute::Shape<cute::Int<kHeads>>{}));
     for (int step = 0; step < kDim / kSubgroup; ++step) {
-      uint16_t query[kHeads];
+      cute::bfloat16_t query[kHeads];
       for (int head = 0; head < kHeads; ++head) {
         const int coordinate = DpasTraits::ALayout{}(lane, head);
-        query[head] = sycl::bit_cast<uint16_t>(
+        query[head] = sycl::bit_cast<cute::bfloat16_t>(
             q[(row * kHeads + coordinate % kHeads) * kDim + step * kSubgroup + coordinate / kHeads]);
       }
-      Dpas::AVector a;
-      __builtin_memcpy(&a, query, sizeof(query));
-      uint16_t key[kSubgroup];
+      cute::bfloat16_t key[kSubgroup];
       // Gather paged keys using the same VNNI layout as packed prefill keys.
       for (int j = 0; j < kSubgroup; ++j) {
         const int coordinate = DpasTraits::BLayout{}(lane, j);
-        const int column = first_col + coordinate % kSubgroup;
-        const int logical_page = column / page_size;
+        const int64_t column = first_col + coordinate % kSubgroup;
+        const int64_t logical_page = column / page_size;
         const int page = column < capacity && logical_page < table_width ? pages[row * table_width + logical_page] : -1;
         const bool valid = column < columns && column < lengths[row] && page >= 0 && page < num_pages;
         const int64_t index = (static_cast<int64_t>(page) * page_size + column % page_size) * kDim + step * kSubgroup +
                               coordinate / kSubgroup;
-        key[j] = valid ? sycl::bit_cast<uint16_t>(cache[index]) : 0;
+        key[j] = valid ? sycl::bit_cast<cute::bfloat16_t>(cache[index]) : cute::bfloat16_t{};
       }
-      Dpas::BVector b;
-      __builtin_memcpy(&b, key, sizeof(key));
-      Dpas::fma(score, a, b, score);
+      auto a = cute::make_tensor(cute::make_rmem_ptr(query), cute::make_layout(cute::Shape<cute::Int<kHeads>>{}));
+      auto b = cute::make_tensor(cute::make_rmem_ptr(key), cute::make_layout(cute::Shape<cute::Int<kSubgroup>>{}));
+      cute::gemm(cute::MMA_Atom<Dpas>{}, a, b, c);
     }
     if (col < columns) {
       float total = 0.0f;
@@ -139,7 +146,7 @@ struct QSAMqaDecodeKernel {
         total += sycl::fmax(score[head], 0.0f);
       const int page = col < capacity ? pages[row * table_width + col / page_size] : -1;
       const bool valid = col < lengths[row] && col < capacity && page >= 0 && page < num_pages;
-      logits[static_cast<int64_t>(row) * columns + col] = valid ? total * inv_scale : -INFINITY;
+      logits[row * columns + col] = valid ? total * inv_scale : -INFINITY;
     }
   }
 };

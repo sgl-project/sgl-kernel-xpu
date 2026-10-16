@@ -28,8 +28,8 @@ def reference(q, k, v, slots, scale):
     return torch.stack(result)
 
 
-def time_ms(fn, repetitions):
-    for _ in range(3):
+def time_ms(fn, repetitions, warmup_iters=20):
+    for _ in range(warmup_iters):
         fn()
     torch.xpu.synchronize()
     start = time.perf_counter()
@@ -44,12 +44,15 @@ def main():
     parser.add_argument("--rows", type=int, nargs="+", default=[1, 16, 128, 1024, 4096])
     parser.add_argument("--topk", type=int, nargs="+", default=[64, 512, 2051])
     parser.add_argument("--repetitions", type=int, default=50)
+    parser.add_argument("--warmup-iters", type=int, default=20)
     parser.add_argument("--skip-reference", action="store_true")
     args = parser.parse_args()
     if any(rows <= 0 for rows in args.rows):
         parser.error("--rows must contain positive integers")
     if args.repetitions <= 0:
         parser.error("--repetitions must be positive")
+    if args.warmup_iters < 0:
+        parser.error("--warmup-iters must be non-negative")
     if not torch.xpu.is_available():
         sys.exit("XPU required")
     torch.manual_seed(42)
@@ -64,8 +67,12 @@ def main():
             )
             ref = lambda: reference(q, k, v, slots, 0.0625)
             kernel = lambda: sgl_kernel.qsa_sparse_attention(q, k, v, slots, 0.0625)
-            reference_ms = time_ms(ref, 5) if not args.skip_reference else float("nan")
-            kernel_ms = time_ms(kernel, args.repetitions)
+            reference_ms = (
+                time_ms(ref, 5, args.warmup_iters)
+                if not args.skip_reference
+                else float("nan")
+            )
+            kernel_ms = time_ms(kernel, args.repetitions, args.warmup_iters)
             flops = rows * q.size(1) * topk * q.size(2) * 4
             logical_kv_bytes = rows * q.size(1) * topk * q.size(2) * 2 * 2
             print(

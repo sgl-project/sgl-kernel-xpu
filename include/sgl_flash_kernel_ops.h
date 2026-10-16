@@ -90,7 +90,7 @@ void mha_fwd(
 
 void flash_mla_decode(
     torch::Tensor& out,
-    const std::optional<torch::Tensor>& lse,  // (batch, num_heads) fp32; nullopt = skip
+    const std::optional<torch::Tensor>& lse,
     const torch::Tensor& q_nope,
     const torch::Tensor& q_pe,
     const torch::Tensor& kv_c_and_k_pe_cache,
@@ -101,7 +101,12 @@ void flash_mla_decode(
     int64_t num_kv_splits = -1);
 
 int64_t flash_mla_decode_get_workspace_size(
-    int64_t max_seq_len, int64_t num_batches, int64_t num_heads, int64_t page_size, int64_t num_kv_splits = -1);
+    int64_t max_seq_len,
+    int64_t num_batches,
+    int64_t num_heads,
+    int64_t page_size,
+    int64_t num_kv_splits = -1,
+    int64_t seq_len_q = 1);
 
 // DeepSeek V4 Sparse MLA decode (dual KV pools + attn_sink)
 void flash_mla_sparse_decode(

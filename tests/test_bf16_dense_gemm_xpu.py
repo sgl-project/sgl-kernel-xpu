@@ -29,6 +29,7 @@ def assert_reference_quality(actual, a, weight):
         (256, 1536, 6144),
         (256, 1536, 12288),
         (512, 1536, 6144),
+        (512, 1536, 12288),
         (257, 1536, 12288),
     ],
 )
@@ -42,7 +43,7 @@ def test_reference_and_partial_tiles(m, n, k):
     assert_reference_quality(actual, a, weight)
 
 
-@pytest.mark.parametrize("m,k", [(128, 12288), (256, 6144)])
+@pytest.mark.parametrize("m,k", [(128, 12288), (256, 6144), (512, 6144), (512, 12288)])
 def test_graph_replay_uses_current_inputs(m, k):
     a = torch.randn(m, k, device="xpu", dtype=torch.bfloat16)
     weight = torch.randn(1536, k, device="xpu", dtype=torch.bfloat16) * 0.02

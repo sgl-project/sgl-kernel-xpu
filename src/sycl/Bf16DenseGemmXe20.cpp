@@ -13,7 +13,7 @@
 #include "sgl_kernel_export.h"
 
 namespace {
-template <class Tile, bool Pipeline>
+template <class Tile, bool Pipeline, bool MFast>
 class Bf16DenseGemmXe20Name;
 }  // namespace
 
@@ -39,7 +39,7 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_gemm_xe20(const torch::Tensor& input,
   auto output = at::empty({m, n}, input.options());
   if (m == 0 || n == 0) return output;
 
-  auto launch = [&]<bool Pipeline>() {
+  auto launch = [&]<bool Pipeline, bool MFast = false>() {
     using namespace cute;
     using Element = cutlass::bfloat16_t;
     using Tile = Shape<_128, _64, _32>;
@@ -68,7 +68,7 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_gemm_xe20(const torch::Tensor& input,
         Element,
         void,
         Pipeline>;
-    using Kernel = sgl::gemm::Bf16DenseStatic<Base, MMA, Element>;
+    using Kernel = sgl::gemm::Bf16DenseStatic<Base, MMA, Element, MFast>;
     typename Kernel::Params params{
         static_cast<const Element*>(input.data_ptr()),
         static_cast<const Element*>(weight.data_ptr()),
@@ -90,13 +90,15 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_gemm_xe20(const torch::Tensor& input,
     sycl::range<3> local(1, 1, threads);
     sycl::range<3> global(1, groups, threads);
     queue.submit([&](sycl::handler& handler) {
-      handler.parallel_for<Bf16DenseGemmXe20Name<Tile, Pipeline>>(
+      handler.parallel_for<Bf16DenseGemmXe20Name<Tile, Pipeline, MFast>>(
           sycl::nd_range<3>(global, local), properties, [=](sycl::nd_item<3> item) { Kernel{}(params, item); });
     });
   };
   // Register prefetch benefits selected larger problems; retain the single-slot
   // mainloop for small batches and other geometries.
-  if (n == 1536 && ((m == 256 && k == 12288) || ((m == 256 || m == 512) && k == 6144))) {
+  if (n == 1536 && m == 512 && (k == 12288 || k == 6144)) {
+    launch.template operator()<true, true>();
+  } else if (n == 1536 && m == 256 && (k == 12288 || k == 6144)) {
     launch.template operator()<true>();
   } else {
     launch.template operator()<false>();

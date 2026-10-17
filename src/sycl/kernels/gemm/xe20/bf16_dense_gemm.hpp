@@ -6,7 +6,7 @@
 
 namespace sgl::gemm {
 
-template <class Base, class MMA, class Element>
+template <class Base, class MMA, class Element, bool MFast = false>
 struct Bf16DenseStatic {
   struct Params {
     const Element* a;
@@ -29,7 +29,8 @@ struct Bf16DenseStatic {
     auto bias = base.make_Bias_tensors(nullptr, p.n);
     for (int task = item.get_group_linear_id(); task < tiles_m * tiles_n; task += item.get_group_range(1)) {
       typename Base::CollectiveMainloop mainloop;
-      auto coordinate = make_coord(task / tiles_n, task % tiles_n, _, 0);
+      auto coordinate =
+          make_coord(MFast ? task % tiles_m : task / tiles_n, MFast ? task / tiles_m : task % tiles_n, _, 0);
       mainloop(a, get<0>(b), out, coordinate, p.mma, int(item.get_local_linear_id()), get<0>(bias));
     }
   }

@@ -2,6 +2,11 @@
 
 sglang-kernel-xpu is the official kernel library of the [SGLang](https://github.com/sgl-project/sglang) framework for Intel XPU, which delivers high-performance, production-ready compute primitives on Intel XPU platforms.
 
+Non-negotiable rules for this tree, including INT4 GPTQ kernel shape and
+hardware-truth testing on Kubernetes node `hal`, live in
+[`.specify/memory/constitution.md`](.specify/memory/constitution.md). Plans
+and kernel changes MUST pass that constitution.
+
 [![PyPI](https://img.shields.io/pypi/v/sgl-kernel)](https://pypi.org/project/sgl-kernel)
 
 ## Installation

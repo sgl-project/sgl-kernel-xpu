@@ -1,0 +1,46 @@
+# Torch 2.14.0+xpu, oneAPI 2026.1, and SGLang 0.5.22 are already in this image.
+# The checkpoint stays on the node at /tank/nas/models and is not copied here.
+# pip-installing this repo would replace sgl_kernel and drop FMHA and GDN.
+# Those stay in the base image. This image only adds the GPTQ op.
+FROM lmsysorg/sglang:v0.5.22-xpu
+
+COPY include /opt/sgl-kernel-xpu/include
+COPY src/sycl/gptq_gemm.cpp src/sycl/gptq_entry_probe.cpp src/sycl/gptq_register.cpp /opt/sgl-kernel-xpu/src/
+
+RUN set -eux; \
+    ICPX=/opt/intel/oneapi/compiler/2026.1/bin/icpx; \
+    TORCH="$(python -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent)')"; \
+    "$ICPX" -fsycl -fsycl-targets=spir64_gen \
+      -Xspirv-translator -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate \
+      -Xsycl-target-backend "-device bmg" \
+      -std=c++20 -O2 -fPIC -shared \
+      -I/opt/sgl-kernel-xpu/include \
+      -I"$TORCH/include" \
+      -I"$TORCH/include/torch/csrc/api/include" \
+      /opt/sgl-kernel-xpu/src/gptq_register.cpp \
+      /opt/sgl-kernel-xpu/src/gptq_gemm.cpp \
+      /opt/sgl-kernel-xpu/src/gptq_entry_probe.cpp \
+      -o /opt/sgl-kernel-xpu/sgl_gptq_ops.so \
+      -L"$TORCH/lib" -Wl,-rpath,"$TORCH/lib" \
+      -ltorch -ltorch_xpu -ltorch_cpu -lc10
+
+COPY python/sgl_kernel/gptq_loader.py /opt/sgl-kernel-xpu/python/gptq_loader.py
+COPY scripts /opt/sgl-kernel-xpu/scripts
+COPY deploy/sglang-gptq-xpu.patch deploy/sglang-qwen35-ba.patch deploy/sglang-qwen35-time.patch deploy/sglang-xpu-page.patch deploy/sglang-lmhead.patch deploy/sglang-loop-time.patch deploy/sglang-page1-graph.patch /opt/sgl-kernel-xpu/deploy/
+
+RUN set -eux; \
+    kernel="$(python -c 'import pathlib, sgl_kernel; print(pathlib.Path(sgl_kernel.__file__).parent)')"; \
+    cp /opt/sgl-kernel-xpu/python/gptq_loader.py "$kernel/gptq_loader.py"; \
+    printf '\nfrom sgl_kernel.gptq_loader import gptq_entry_probe, gptq_gemm\n' >> "$kernel/__init__.py"; \
+    site="$(python -c 'import pathlib, sglang; print(pathlib.Path(sglang.__file__).resolve().parent.parent)')"; \
+    patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-gptq-xpu.patch; \
+    patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-qwen35-ba.patch; \
+    patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-qwen35-time.patch; \
+    patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-xpu-page.patch; \
+    patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-lmhead.patch; \
+    patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-loop-time.patch; \
+    patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-page1-graph.patch; \
+    python /opt/sgl-kernel-xpu/scripts/check_sglang_version.py
+
+WORKDIR /opt/sgl-kernel-xpu
+CMD ["python3", "/opt/sgl-kernel-xpu/scripts/run_gptq_mode.py"]

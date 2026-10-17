@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: sgl-gptq-xpu-test
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      nodeName: hal
+      containers:
+        - name: gptq
+          image: ${IMAGE}:${TAG}
+          imagePullPolicy: Always
+          env:
+            - name: MODE
+              value: "${MODE}"
+            - name: STAGE
+              value: "${STAGE}"
+            - name: BASELINE_TPS
+              value: "${BASELINE_TPS}"
+            - name: SGL_GPTQ_PROFILE
+              value: "${SGL_GPTQ_PROFILE}"
+            - name: MAX_NEW_TOKENS
+              value: "${MAX_NEW_TOKENS}"
+            - name: SGL_GPTQ_STEP
+              value: "${SGL_GPTQ_STEP}"
+            - name: MODEL_DIR
+              value: "/tank/nas/models/Qwen3.8-27B-TURBO-DF735-882-NM-DAU-GPTQ-Int4-g128-tuned"
+          resources:
+            requests:
+              gpu.intel.com/xe: 1
+            limits:
+              gpu.intel.com/xe: 1
+          volumeMounts:
+            - name: models
+              mountPath: /tank/nas/models
+      volumes:
+        - name: models
+          hostPath:
+            path: /tank/nas/models
+            type: Directory

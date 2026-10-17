@@ -37,11 +37,6 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_rank_argmax_xe20(
       input.is_contiguous() && weight.is_contiguous() && comparison_ranks.is_contiguous(),
       name,
       " expects contiguous tensors");
-  TORCH_CHECK(
-      reinterpret_cast<std::uintptr_t>(input.data_ptr()) % 64 == 0 &&
-          reinterpret_cast<std::uintptr_t>(weight.data_ptr()) % 64 == 0,
-      name,
-      " requires 64-byte aligned input and weight base pointers");
   TORCH_CHECK(input.size(1) == weight.size(1), name, " K mismatch");
   const int64_t m = input.size(0), n = weight.size(0), k = input.size(1);
   TORCH_CHECK(
@@ -65,6 +60,11 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_rank_argmax_xe20(
   c10::DeviceGuard guard(input.device());
   auto output = at::empty({m}, input.options().dtype(at::kLong));
   if (m == 0) return output;
+  // Xe2 block-2D copy requires 64-byte base alignment. Preserve the public
+  // contiguous-tensor contract by copying only shifted, misaligned views.
+  // ATen clones use the guarded device/current stream and remain graph data.
+  auto aligned_input = reinterpret_cast<std::uintptr_t>(input.data_ptr()) % 64 == 0 ? input : input.clone();
+  auto aligned_weight = reinterpret_cast<std::uintptr_t>(weight.data_ptr()) % 64 == 0 ? weight : weight.clone();
   auto partial = at::empty({m, tiles_n}, input.options().dtype(at::kUInt32));
 
   using namespace cute;
@@ -82,8 +82,8 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_rank_argmax_xe20(
       MoE::MoEGEMM<Tile, SG, Tensor, Tensor, Tensor, Bias, MMA, MoE::ActivationType::GELU, false, false, Element>;
   using Kernel = sgl::gemm::Bf16DenseRankPartials<Base, MMA, Element>;
   typename Kernel::Params params{
-      static_cast<const Element*>(input.data_ptr()),
-      static_cast<const Element*>(weight.data_ptr()),
+      static_cast<const Element*>(aligned_input.data_ptr()),
+      static_cast<const Element*>(aligned_weight.data_ptr()),
       comparison_ranks.data_ptr<std::uint16_t>(),
       partial.data_ptr<std::uint32_t>(),
       int(m),

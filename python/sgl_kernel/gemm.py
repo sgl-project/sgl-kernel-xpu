@@ -29,7 +29,7 @@ def bf16_dense_rank_argmax_xe20(
 
     Input and weight must be contiguous BF16 matrices on one XPU, K must be
     positive and divisible by 32, and N positive and divisible by 128. Input
-    and weight base pointers must be aligned to 64 bytes. The
+    and weight with misaligned base pointers are copied before block-2D loads. The
     contiguous uint16 table must be on that same device. Output is int64 [M].
     """
     return torch.ops.sgl_kernel.bf16_dense_rank_argmax_xe20.default(
@@ -53,8 +53,6 @@ if hasattr(torch.ops.sgl_kernel, "bf16_dense_rank_argmax_xe20"):
             and weight.is_contiguous()
             and comparison_ranks.is_contiguous()
         )
-        torch._check(input.storage_offset() * input.element_size() % 64 == 0)
-        torch._check(weight.storage_offset() * weight.element_size() % 64 == 0)
         m, k = input.shape
         n = weight.shape[0]
         torch._check(k == weight.shape[1])

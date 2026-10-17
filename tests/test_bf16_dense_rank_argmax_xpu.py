@@ -231,7 +231,7 @@ def test_fake_block_2d_descriptor_boundaries_without_allocation(m, n, k, valid):
                 bf16_dense_rank_argmax_xe20(a, weight, table)
 
 
-@pytest.mark.parametrize("offset", [1, 32])
+@pytest.mark.parametrize("offset", [0, 1, 32])
 @pytest.mark.parametrize("operand", ["input", "weight"])
 @pytest.mark.parametrize("fake", [False, True])
 def test_block_2d_base_alignment(offset, operand, fake):
@@ -252,14 +252,49 @@ def test_block_2d_base_alignment(offset, operand, fake):
             weight = shifted
         table = torch.zeros(65536, device="xpu", dtype=torch.uint16)
         assert shifted.is_contiguous()
-        if offset == 1:
-            with pytest.raises(RuntimeError):
-                bf16_dense_rank_argmax_xe20(a, weight, table)
+        output = bf16_dense_rank_argmax_xe20(a, weight, table)
+        assert output.shape == (4,)
+        if not fake:
+            assert output.eq(0).all().item()
+
+
+@pytest.mark.parametrize("operand", ["input", "weight"])
+def test_misaligned_copy_is_live_in_capture_and_fullgraph(operand):
+    table = comparison_table(softcap=None)
+    compiled = torch.compile(
+        bf16_dense_rank_argmax_xe20, backend="eager", fullgraph=True
+    )
+    for offset in (32, 1, 0, 1):
+        a = torch.zeros(4, 32, device="xpu", dtype=torch.bfloat16)
+        a[:, 0] = 1
+        weight = torch.zeros(256, 32, device="xpu", dtype=torch.bfloat16)
+        weight[127, 0], weight[128, 0] = 4, -4
+        original = a if operand == "input" else weight
+        shifted = torch.empty(
+            original.numel() + offset, device="xpu", dtype=torch.bfloat16
+        )[offset:].view_as(original)
+        shifted.copy_(original)
+        if operand == "input":
+            a = shifted
         else:
+            weight = shifted
+        # One compiled callable receives different storage offsets across calls.
+        torch.testing.assert_close(
+            compiled(a, weight, table), reference_ids(a, weight, table), atol=0, rtol=0
+        )
+        bf16_dense_rank_argmax_xe20(a, weight, table)
+        torch.xpu.synchronize()
+        graph = torch.xpu.XPUGraph()
+        with torch.xpu.graph(graph):
             output = bf16_dense_rank_argmax_xe20(a, weight, table)
-            assert output.shape == (4,)
-            if not fake:
-                assert output.eq(0).all().item()
+        for _ in range(2):
+            shifted.neg_()
+            output.fill_(-123)
+            graph.replay()
+            torch.xpu.synchronize()
+            torch.testing.assert_close(
+                output, reference_ids(a, weight, table), atol=0, rtol=0
+            )
 
 
 if __name__ == "__main__":

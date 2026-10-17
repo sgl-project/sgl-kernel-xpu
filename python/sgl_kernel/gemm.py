@@ -4,6 +4,26 @@ import torch
 from sgl_kernel.utils import _get_cache_buf, get_xpu_stream
 
 
+def bf16_dense_gemm_xe20(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Compute BF16 ``input @ weight.T`` on Xe2 with FP32 accumulation.
+
+    Both tensors must be contiguous matrices on one XPU, with K divisible
+    by 32 and N divisible by 64. The kernel uses static dense tiles without
+    expert metadata or an atomic scheduler. Tile selection is fixed; callers
+    should retain their ordinary GEMM path for shapes that are faster there.
+    """
+    return torch.ops.sgl_kernel.bf16_dense_gemm_xe20.default(input, weight)
+
+
+if hasattr(torch.ops.sgl_kernel, "bf16_dense_gemm_xe20"):
+
+    @torch.library.register_fake("sgl_kernel::bf16_dense_gemm_xe20")
+    def _bf16_dense_gemm_xe20_fake(input, weight):
+        torch._check(input.ndim == 2 and weight.ndim == 2)
+        torch._check(input.shape[1] == weight.shape[1])
+        return input.new_empty((input.shape[0], weight.shape[0]))
+
+
 def awq_dequantize(
     qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor
 ) -> torch.ByteTensor:

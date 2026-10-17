@@ -248,6 +248,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor src_indices, Tensor dst_indices, int item_size, int dst_layout_dim, int num_layers) -> ()");
   m.impl("transfer_kv_mamba_lf_pf", torch::kXPU, &transfer_kv_mamba_lf_pf);
 
+#if SYCL_INTEL_TARGET == 20
+  m.def("bf16_dense_gemm_xe20(Tensor input, Tensor weight) -> Tensor");
+  m.impl("bf16_dense_gemm_xe20", torch::kXPU, &bf16_dense_gemm_xe20);
+  m.def("bf16_dense_gelu_tanh_mul_lut_xe20(Tensor input, Tensor weight, Tensor table) -> Tensor");
+  m.impl("bf16_dense_gelu_tanh_mul_lut_xe20", torch::kXPU, &bf16_dense_gelu_tanh_mul_lut_xe20);
+#endif
+
 #ifdef USE_MOE
   m.def(
       "moe_fused_gate(Tensor input, Tensor? bias, int num_expert_group, int topk_group, int topk, int "

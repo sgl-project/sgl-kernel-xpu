@@ -64,11 +64,12 @@ def capture(fn, banks, cycles):
         fn(banks[i % len(banks)])
     torch.xpu.synchronize()
     graph = torch.xpu.XPUGraph()
+    outputs = []
     with torch.xpu.graph(graph):
         for _ in range(cycles):
             for bank in banks:
-                output = fn(bank)
-    return graph, output
+                outputs.append(fn(bank))
+    return graph, outputs
 
 
 def measure(graph, calls, replays):
@@ -152,14 +153,18 @@ def run(args):
             name: capture(fn, banks, args.cycles) for name, fn in operations.items()
         }
         # Poison output and change inputs: an empty/stale capture must fail.
-        for name, (graph, output) in graphs.items():
+        for name, (graph, outputs) in graphs.items():
             for sign in (-1, -1):
                 a.mul_(sign)
-                expected = operations[name](banks[0])
-                output.fill_(-123)
+                expected = [operations[name](bank) for bank in banks]
+                for output in outputs:
+                    output.fill_(-123)
                 graph.replay()
                 torch.xpu.synchronize()
-                torch.testing.assert_close(output, expected, atol=0, rtol=0)
+                for index, output in enumerate(outputs):
+                    torch.testing.assert_close(
+                        output, expected[index % len(banks)], atol=0, rtol=0
+                    )
         native_ids = operations["native_rank_argmax"](banks[0])
         torch_ids = operations[label](banks[0])
         mismatches = int((native_ids != torch_ids).sum().item())

@@ -24,8 +24,6 @@ if hasattr(torch.ops.sgl_kernel, "bf16_dense_gemm_xe20"):
         torch._check(input.device == weight.device)
         torch._check(input.dtype == weight.dtype == torch.bfloat16)
         torch._check(input.is_contiguous() and weight.is_contiguous())
-        torch._check(input.storage_offset() * input.element_size() % 64 == 0)
-        torch._check(weight.storage_offset() * weight.element_size() % 64 == 0)
         m, k = input.shape
         n = weight.shape[0]
         torch._check(k == weight.shape[1])

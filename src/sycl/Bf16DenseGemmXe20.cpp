@@ -25,10 +25,6 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_gemm_xe20(const torch::Tensor& input,
       input.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16,
       "bf16_dense_gemm_xe20 expects BF16 tensors");
   TORCH_CHECK(input.is_contiguous() && weight.is_contiguous(), "bf16_dense_gemm_xe20 expects contiguous tensors");
-  TORCH_CHECK(
-      reinterpret_cast<std::uintptr_t>(input.data_ptr()) % 64 == 0 &&
-          reinterpret_cast<std::uintptr_t>(weight.data_ptr()) % 64 == 0,
-      "bf16_dense_gemm_xe20 requires 64-byte-aligned input and weight pointers");
   TORCH_CHECK(input.size(1) == weight.size(1), "bf16_dense_gemm_xe20 K mismatch");
   const int64_t m = input.size(0), n = weight.size(0), k = input.size(1);
   TORCH_CHECK(
@@ -49,6 +45,10 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_gemm_xe20(const torch::Tensor& input,
   c10::DeviceGuard guard(input.device());
   auto output = at::empty({m, n}, input.options());
   if (m == 0 || n == 0) return output;
+  // Contiguous views can have an unaligned storage offset. Preserve their
+  // contract with a bitwise copy on the current stream before block-2D loads.
+  auto aligned_input = reinterpret_cast<std::uintptr_t>(input.data_ptr()) % 64 == 0 ? input : input.clone();
+  auto aligned_weight = reinterpret_cast<std::uintptr_t>(weight.data_ptr()) % 64 == 0 ? weight : weight.clone();
 
   auto launch = [&]<bool Pipeline, bool MFast = false>() {
     using namespace cute;
@@ -81,8 +81,8 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_gemm_xe20(const torch::Tensor& input,
         Pipeline>;
     using Kernel = sgl::gemm::Bf16DenseStatic<Base, MMA, Element, MFast>;
     typename Kernel::Params params{
-        static_cast<const Element*>(input.data_ptr()),
-        static_cast<const Element*>(weight.data_ptr()),
+        static_cast<const Element*>(aligned_input.data_ptr()),
+        static_cast<const Element*>(aligned_weight.data_ptr()),
         static_cast<Element*>(output.data_ptr()),
         int(m),
         int(n),

@@ -166,14 +166,59 @@ def test_contiguous_storage_offset_alignment(operand, offset):
 
     with FakeTensorMode():
         a, weight = inputs()
-        if offset == 1:
-            with pytest.raises(RuntimeError):
-                bf16_dense_gemm_xe20(a, weight)
-        else:
-            assert bf16_dense_gemm_xe20(a, weight).shape == (4, 64)
+        assert bf16_dense_gemm_xe20(a, weight).shape == (4, 64)
     a, weight = inputs()
-    if offset == 1:
-        with pytest.raises(RuntimeError, match="64-byte-aligned"):
-            bf16_dense_gemm_xe20(a, weight)
-    else:
-        assert_reference_quality(bf16_dense_gemm_xe20(a, weight), a, weight)
+    assert_reference_quality(bf16_dense_gemm_xe20(a, weight), a, weight)
+
+
+def test_misaligned_graph_replay_copies_current_inputs_and_weight():
+    def misaligned(shape):
+        return torch.randn(shape[0] * shape[1] + 1, device="xpu", dtype=torch.bfloat16)[
+            1:
+        ].view(shape)
+
+    a, weight = misaligned((4, 32)), misaligned((64, 32))
+    bf16_dense_gemm_xe20(a, weight)
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        output = bf16_dense_gemm_xe20(a, weight)
+    for scale in (0.5, -1.0):
+        a.mul_(scale)
+        weight.mul_(0.75)
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.xpu.synchronize()
+        torch.testing.assert_close(
+            output, bf16_dense_gemm_xe20(a, weight), atol=0, rtol=0
+        )
+        assert_reference_quality(output, a, weight)
+
+
+def test_fullgraph_reuses_native_op_across_storage_offsets():
+    graphs = []
+
+    def backend(graph, example_inputs):
+        graphs.append(graph)
+        assert (
+            sum(
+                node.op == "call_function"
+                and node.target == torch.ops.sgl_kernel.bf16_dense_gemm_xe20.default
+                for node in graph.graph.nodes
+            )
+            == 1
+        )
+        return graph.forward
+
+    compiled = torch.compile(bf16_dense_gemm_xe20, backend=backend, fullgraph=True)
+    for offset in (32, 1, 0, 1, 32):
+        a = torch.randn(4 * 32 + offset, device="xpu", dtype=torch.bfloat16)[
+            offset:
+        ].view(4, 32)
+        weight = torch.randn(64 * 32 + offset, device="xpu", dtype=torch.bfloat16)[
+            offset:
+        ].view(64, 32)
+        torch.testing.assert_close(
+            compiled(a, weight), bf16_dense_gemm_xe20(a, weight), atol=0, rtol=0
+        )
+    assert graphs

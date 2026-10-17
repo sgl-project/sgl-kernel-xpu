@@ -243,11 +243,15 @@ def offset_operand(shape, offset, value):
 def test_prefill_specialization_binary_capability(monkeypatch):
     from types import SimpleNamespace
 
-    assert bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(4096, 12288, 1536)
-    assert bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(4096, 24576, 1536)
+    for m in (256, 1024, 2048, 4095, 4096):
+        for n in (12288, 24576):
+            assert bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(m, n, 1536)
     for shape in (
         (128, 24576, 1536),
-        (4095, 24576, 1536),
+        (255, 24576, 1536),
+        (257, 24576, 1536),
+        (512, 24576, 1536),
+        (2049, 24576, 1536),
         (4097, 24576, 1536),
         (4096, 6144, 1536),
         (4096, 16384, 1536),
@@ -266,8 +270,10 @@ def test_prefill_specialization_binary_capability(monkeypatch):
     assert not bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(4096, 24576, 1536)
 
 
+@pytest.mark.parametrize("m", [256, 1024, 2048, 4095, 4096])
 @pytest.mark.parametrize("n", [12288, 24576])
-def test_prefill_compilation_and_changed_operand_replay(gelu_table, n):
+def test_prefill_compilation_and_changed_operand_replay(gelu_table, m, n):
+    torch._dynamo.reset()
     intermediate = n // 2
     graphs = []
 
@@ -279,12 +285,12 @@ def test_prefill_compilation_and_changed_operand_replay(gelu_table, n):
         bf16_dense_gelu_tanh_mul_lut_xe20, backend=backend, fullgraph=True
     )
     table = gelu_table.clone()
-    rows = (torch.arange(4096, device="xpu") % 17 - 8).float() / 16
+    rows = (torch.arange(m, device="xpu") % 17 - 8).float() / 16
     gate = (torch.arange(intermediate, device="xpu") % 19 - 9).float() / 16
     up = (torch.arange(intermediate, device="xpu") % 23 - 11).float() / 32
 
     def operands(offset, scale_a, scale_w):
-        a = offset_operand((4096, 1536), offset, 0)
+        a = offset_operand((m, 1536), offset, 0)
         w = offset_operand((n, 1536), offset, 0)
         a[:, 0] = rows * scale_a
         w[:intermediate, 0] = gate * scale_w

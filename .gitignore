@@ -64,8 +64,10 @@ build
 benchmark/*.log
 
 # AI assistant scratch.
-# specs/ and .specify/ stay tracked. .claude/skills/ stays tracked.
+# Spec Kit plans stay local. .claude/skills/ stays tracked.
 # Ignore tool indexes, transcripts, and generation scratch only.
+.specify/
+specs/
 .cursor/
 .cursor-*/
 *.cursor-*

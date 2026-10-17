@@ -24,6 +24,38 @@ if hasattr(torch.ops.sgl_kernel, "bf16_dense_gemm_xe20"):
         return input.new_empty((input.shape[0], weight.shape[0]))
 
 
+def bf16_dense_gelu_tanh_mul_lut_xe20(
+    input: torch.Tensor, weight: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    """Fuse BF16 dense gate/up projection, native BF16 GELU(tanh), and multiply.
+
+    ``weight`` concatenates gate and up rows. Both FP32 GEMM accumulators
+    round to BF16 before activation. ``table`` has 65536 BF16 entries indexed
+    by the gate's BF16 bit pattern and must contain the exact activation
+    contract selected by the caller. For the native BF16 GELU contract, create
+    it outside graph capture with ``gelu_tanh_and_mul`` on every BF16 bit
+    pattern concatenated with ones. Keep the table alive for graph replay.
+
+    Matrices must be contiguous BF16 on one Xe2 XPU, with positive K divisible
+    by 32 and weight rows divisible by 64. Output has half the weight rows.
+    Static tiles favor selected shapes; callers should retain a fallback.
+    """
+    return torch.ops.sgl_kernel.bf16_dense_gelu_tanh_mul_lut_xe20.default(
+        input, weight, table
+    )
+
+
+if hasattr(torch.ops.sgl_kernel, "bf16_dense_gelu_tanh_mul_lut_xe20"):
+
+    @torch.library.register_fake("sgl_kernel::bf16_dense_gelu_tanh_mul_lut_xe20")
+    def _bf16_dense_gelu_tanh_mul_lut_xe20_fake(input, weight, table):
+        torch._check(input.ndim == 2 and weight.ndim == 2)
+        torch._check(input.shape[1] == weight.shape[1])
+        torch._check(weight.shape[0] % 64 == 0)
+        torch._check(table.ndim == 1 and table.shape[0] == 65536)
+        return input.new_empty((input.shape[0], weight.shape[0] // 2))
+
+
 def awq_dequantize(
     qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor
 ) -> torch.ByteTensor:

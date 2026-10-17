@@ -290,7 +290,15 @@ struct MoEMainloop<
     copy(tiled_copy_d, tCrD_final_sg_tensor, tCgD);
   }
 
-  template <typename Coord>
+  // Preserve the existing MoE activation arithmetic unless a dense caller
+  // explicitly supplies another compile-time activation policy.
+  struct DefaultFusedActivation {
+    CUTLASS_DEVICE float operator()(float gate, float up, float alpha, float limit) const {
+      return moe_xe20::apply_fused_activation<static_cast<int>(ActType)>(gate, up, alpha, limit);
+    }
+  };
+
+  template <typename Coord, typename Activation = DefaultFusedActivation>
   CUTLASS_DEVICE void operator()(
       ATensor& A,   // (M,K)
       BTensor& B0,  // (N/2,K)
@@ -302,7 +310,8 @@ struct MoEMainloop<
       BiasTensor Bias0,
       BiasTensor Bias1,
       float gemm1_alpha,
-      float gemm1_limit) {
+      float gemm1_limit,
+      Activation activation = {}) {
     auto wg_m = get<0>(blk_coord);
     auto wg_n = get<1>(blk_coord);
     auto wg_n1 = get<2>(blk_coord);
@@ -422,8 +431,7 @@ struct MoEMainloop<
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tCrC0.size(); ++i) {
-      tCrC0(i) =
-          moe_xe20::apply_fused_activation<static_cast<int>(ActType)>(tCrC0(i), tCrC1(i), gemm1_alpha, gemm1_limit);
+      tCrC0(i) = activation(tCrC0(i), tCrC1(i), gemm1_alpha, gemm1_limit);
     }
 
     reorder(tCrC0, tCrD_final_sg_tensor0);

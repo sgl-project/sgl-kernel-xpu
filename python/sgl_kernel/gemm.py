@@ -1,4 +1,4 @@
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 from sgl_kernel.utils import _get_cache_buf, get_xpu_stream
@@ -13,6 +13,59 @@ def bf16_dense_gemm_xe20(input: torch.Tensor, weight: torch.Tensor) -> torch.Ten
     should retain their ordinary GEMM path for shapes that are faster there.
     """
     return torch.ops.sgl_kernel.bf16_dense_gemm_xe20.default(input, weight)
+
+
+def bf16_dense_rank_argmax_xe20(
+    input: torch.Tensor, weight: torch.Tensor, comparison_ranks: torch.Tensor
+) -> torch.Tensor:
+    """Return first maximal comparison-class IDs for BF16 ``input @ weight.T``.
+
+    The Xe2 GEMM accumulates in FP32 and rounds to BF16 before lookup in the
+    caller's 65536-entry uint16 table, indexed by BF16 bits. Larger table
+    values win; equal values select the first global column. The caller owns
+    comparison semantics, including NaNs, signed zero and any softcap ties.
+    No logits are materialized. Native accumulation may differ from another
+    GEMM implementation, even when the comparison table is exact.
+
+    Input and weight must be contiguous BF16 matrices on one XPU, K must be
+    positive and divisible by 32, and N positive and divisible by 128. The
+    contiguous uint16 table must be on that same device. Output is int64 [M].
+    """
+    return torch.ops.sgl_kernel.bf16_dense_rank_argmax_xe20.default(
+        input, weight, comparison_ranks
+    )
+
+
+if hasattr(torch.ops.sgl_kernel, "bf16_dense_rank_argmax_xe20"):
+
+    @torch.library.register_fake("sgl_kernel::bf16_dense_rank_argmax_xe20")
+    def _bf16_dense_rank_argmax_xe20_fake(input, weight, comparison_ranks):
+        torch._check(input.ndim == 2 and weight.ndim == 2)
+        torch._check(input.device.type in ("xpu", "meta"))
+        torch._check(input.device == weight.device == comparison_ranks.device)
+        torch._check(input.dtype == weight.dtype == torch.bfloat16)
+        torch._check(comparison_ranks.dtype == torch.uint16)
+        torch._check(comparison_ranks.ndim == 1)
+        torch._check(comparison_ranks.numel() == 65536)
+        torch._check(
+            input.is_contiguous()
+            and weight.is_contiguous()
+            and comparison_ranks.is_contiguous()
+        )
+        m, k = input.shape
+        n = weight.shape[0]
+        torch._check(k == weight.shape[1])
+        torch._check(k > 0)
+        torch._check(k % 32 == 0)
+        torch._check(n > 0)
+        torch._check(n % 128 == 0)
+        torch._check(m <= 2147483520)
+        torch._check(n <= 2147483520)
+        torch._check(k <= 1073741823)
+        torch._check(m * k <= 2147483647)
+        torch._check(n * k <= 2147483647)
+        torch._check(((m + 127) // 128) * (n // 128) <= 2147483647)
+        return input.new_empty((m,), dtype=torch.int64)
 
 
 if hasattr(torch.ops.sgl_kernel, "bf16_dense_gemm_xe20"):

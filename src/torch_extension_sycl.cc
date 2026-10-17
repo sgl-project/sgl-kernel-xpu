@@ -251,6 +251,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 #if SYCL_INTEL_TARGET == 20
   m.def("bf16_dense_gemm_xe20(Tensor input, Tensor weight) -> Tensor");
   m.impl("bf16_dense_gemm_xe20", torch::kXPU, &bf16_dense_gemm_xe20);
+  m.def("bf16_dense_rank_argmax_xe20(Tensor input, Tensor weight, Tensor comparison_ranks) -> Tensor");
+  m.impl("bf16_dense_rank_argmax_xe20", torch::kXPU, &bf16_dense_rank_argmax_xe20);
 #endif
 
 #ifdef USE_MOE

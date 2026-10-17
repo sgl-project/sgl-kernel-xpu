@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <type_traits>
 
 #include "cutlass/kernel_hardware_info.h"
 #include "kernels/gemm/xe20/bf16_dense_gelu_tanh_mul_lut.hpp"
@@ -17,6 +18,12 @@ namespace {
 template <class Tile>
 class Bf16DenseGeluTanhMulLutXe20Name;
 }  // namespace
+
+// Availability of the optimized specialization, independent of device/dtype
+// eligibility. Callers can query once before compiling or capturing a forward.
+SGL_KERNEL_EXPORT bool bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(int64_t m, int64_t n, int64_t k) {
+  return m == 4096 && n == 24576 && k == 1536;
+}
 
 SGL_KERNEL_EXPORT torch::Tensor
 bf16_dense_gelu_tanh_mul_lut_xe20(const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& table) {
@@ -68,11 +75,14 @@ bf16_dense_gelu_tanh_mul_lut_xe20(const torch::Tensor& input, const torch::Tenso
   const auto aligned_input = reinterpret_cast<uintptr_t>(input.data_ptr()) % 64 == 0 ? input : input.clone();
   const auto aligned_weight = reinterpret_cast<uintptr_t>(weight.data_ptr()) % 64 == 0 ? weight : weight.clone();
 
-  auto launch = [&]() {
+  auto launch = [&]<bool Prefill>() {
     using namespace cute;
     using Element = cutlass::bfloat16_t;
-    using Tile = Shape<_128, _32, _32>;
-    using SG = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+    using Tile = std::conditional_t<Prefill, Shape<_128, _128, _32>, Shape<_128, _32, _32>>;
+    using SG = std::conditional_t<
+        Prefill,
+        Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>,
+        Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>>;
     auto dummy =
         make_tensor(make_gmem_ptr(static_cast<Element*>(nullptr)), make_layout(make_shape(1, 1), make_stride(1, _1{})));
     auto dummy_bias =
@@ -82,7 +92,7 @@ bf16_dense_gelu_tanh_mul_lut_xe20(const torch::Tensor& input, const torch::Tenso
     using MMA = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, Element>>, Layout<Tile>, SG>::TiledMMA;
     using Base =
         MoE::MoEGEMM<Tile, SG, Tensor, Tensor, Tensor, Bias, MMA, MoE::ActivationType::GELU, true, false, Element>;
-    using Kernel = sgl::gemm::Bf16DenseGeluTanhMulLut<Base, MMA, Element>;
+    using Kernel = sgl::gemm::Bf16DenseGeluTanhMulLut<Base, MMA, Element, Prefill>;
     typename Kernel::Params params{
         static_cast<const Element*>(aligned_input.data_ptr()),
         static_cast<const Element*>(aligned_weight.data_ptr()),
@@ -98,7 +108,8 @@ bf16_dense_gelu_tanh_mul_lut_xe20(const torch::Tensor& input, const torch::Tenso
     const auto device = queue.get_device();
     const int sms = device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
                     device.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
-    const int groups = std::min(int(tiles), sms * (512 / threads));
+    const int64_t selected_tiles = Prefill ? ((m + 127) / 128) * ((n / 2 + 127) / 128) : tiles;
+    const int groups = std::min(int(selected_tiles), sms * (512 / threads));
     namespace ex = sycl::ext::oneapi::experimental;
     namespace intel = sycl::ext::intel::experimental;
     ex::properties properties{ex::sub_group_size<16>, intel::grf_size<256>};
@@ -109,6 +120,10 @@ bf16_dense_gelu_tanh_mul_lut_xe20(const torch::Tensor& input, const torch::Tenso
           sycl::nd_range<3>(global, local), properties, [=](sycl::nd_item<3> item) { Kernel{}(params, item); });
     });
   };
-  launch();
+  if (bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(m, n, k)) {
+    launch.template operator()<true>();
+  } else {
+    launch.template operator()<false>();
+  }
   return output;
 }

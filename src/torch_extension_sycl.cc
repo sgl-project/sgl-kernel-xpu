@@ -253,6 +253,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("bf16_dense_gemm_xe20", torch::kXPU, &bf16_dense_gemm_xe20);
   m.def("bf16_dense_gelu_tanh_mul_lut_xe20(Tensor input, Tensor weight, Tensor table) -> Tensor");
   m.impl("bf16_dense_gelu_tanh_mul_lut_xe20", torch::kXPU, &bf16_dense_gelu_tanh_mul_lut_xe20);
+  m.def("bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(int m, int n, int k) -> bool");
+  m.impl("bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported", &bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported);
 #endif
 
 #ifdef USE_MOE

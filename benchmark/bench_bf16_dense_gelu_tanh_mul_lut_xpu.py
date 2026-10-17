@@ -4,9 +4,15 @@ Rotate at least 512 MiB of physical weight addresses to approximate separate
 transformer layers. Timings include graph replay device work only. No serving
 speedup can be inferred from this microbenchmark alone.
 
+The default invocation measures M128. To measure the optimized prefill shape:
+    python benchmark/bench_bf16_dense_gelu_tanh_mul_lut_xpu.py --m 4096 --n 24576 --k 1536
+The control here uses the native GELU activation. Comparing against a standalone
+lookup activation requires a separate benchmark with that implementation.
+
 """
 
 import argparse
+import hashlib
 import json
 import math
 import statistics
@@ -21,11 +27,12 @@ def capture(operation, count):
         operation(index)
     torch.xpu.synchronize()
     graph = torch.xpu.XPUGraph()
+    outputs = []
     with torch.xpu.graph(graph):
-        for _ in range(4):
-            for index in range(count):
-                output = operation(index)
-    return graph, output
+        for index in range(count):
+            outputs.append(operation(index))
+    assert len({output.data_ptr() for output in outputs}) == count
+    return graph, outputs
 
 
 def measure(graph, count):
@@ -40,7 +47,7 @@ def measure(graph, count):
         graph.replay()
     end.record()
     end.synchronize()
-    return start.elapsed_time(end) * 1000 / (10 * 4 * count)
+    return start.elapsed_time(end) * 1000 / (10 * count)
 
 
 def main():
@@ -49,12 +56,14 @@ def main():
     parser.add_argument("--n", type=int, default=24576)
     parser.add_argument("--k", type=int, default=1536)
     args = parser.parse_args()
+    torch.set_grad_enabled(False)
     torch.manual_seed(42)
     a = torch.randn(args.m, args.k, device="xpu", dtype=torch.bfloat16)
     weight = torch.randn(args.n, args.k, device="xpu", dtype=torch.bfloat16) * 0.02
     count = max(4, math.ceil(512 * 1024**2 / (weight.numel() * 2)))
     banks = [weight.clone() for _ in range(count)]
     assert len({w.data_ptr() for w in banks}) == count
+    assert all(torch.equal(bank, weight) for bank in banks)
     gates = (
         torch.arange(65536, dtype=torch.int32)
         .to(torch.int16)
@@ -76,14 +85,27 @@ def main():
         ),
     }
     graphs = {name: capture(operation, count) for name, operation in operations.items()}
-    for name, (graph, output) in graphs.items():
-        output.fill_(float("nan"))
-        graph.replay()
-        torch.xpu.synchronize()
-        assert (
-            torch.isfinite(output).all().item()
-        ), f"{name} graph did not write its output"
-        torch.testing.assert_close(output.float(), reference, atol=0.01, rtol=0.01)
+    replay_proof = []
+    original = a.clone()
+    for scale in (0.5, 1.0):
+        a.copy_(original * scale)
+        for name, (graph, outputs) in graphs.items():
+            expected = operations[name](0)
+            for output in outputs:
+                output.fill_(float("nan"))
+            graph.replay()
+            torch.xpu.synchronize()
+            hashes = []
+            for output in outputs:
+                assert torch.equal(output.view(torch.int16), expected.view(torch.int16))
+                hashes.append(
+                    hashlib.sha256(
+                        output.view(torch.uint8).cpu().numpy().tobytes()
+                    ).hexdigest()
+                )
+            replay_proof.append(
+                {"backend": name, "scale": scale, "output_sha256": hashes}
+            )
     rounds = [
         {"backend": name, "device_us": measure(graphs[name][0], count)}
         for name in (
@@ -106,6 +128,9 @@ def main():
                 "rotating_bytes": count * weight.numel() * 2,
                 "device": torch.xpu.get_device_name(),
                 "torch_version": torch.__version__,
+                "grad_enabled": torch.is_grad_enabled(),
+                "inference_mode": torch.is_inference_mode_enabled(),
+                "replay_proof": replay_proof,
                 "rounds": rounds,
                 "means_us": means,
                 "lower_percent": 100

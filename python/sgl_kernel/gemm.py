@@ -24,6 +24,23 @@ if hasattr(torch.ops.sgl_kernel, "bf16_dense_gemm_xe20"):
         return input.new_empty((input.shape[0], weight.shape[0]))
 
 
+def bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(m: int, n: int, k: int) -> bool:
+    """Whether this native binary has an optimized fused prefill specialization.
+
+    This checks specialization availability only. Callers own device, dtype,
+    backend and tensor eligibility, and should query outside compiled/captured
+    forwards. Older binaries expose the tensor API without this specialization;
+    an absent predicate returns False so they can retain their ordinary GEMM.
+    """
+    if not hasattr(
+        torch.ops.sgl_kernel, "bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported"
+    ):
+        return False
+    return torch.ops.sgl_kernel.bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported.default(
+        m, n, k
+    )
+
+
 def bf16_dense_gelu_tanh_mul_lut_xe20(
     input: torch.Tensor, weight: torch.Tensor, table: torch.Tensor
 ) -> torch.Tensor:
@@ -43,6 +60,9 @@ def bf16_dense_gelu_tanh_mul_lut_xe20(
     storage on the current stream. Input, weight and output element offsets
     must fit signed int32.
     Static tiles favor selected shapes; callers should retain a fallback.
+    Query ``bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported`` before
+    selecting the optimized prefill path, since older binaries expose this
+    tensor API with the previous, slower large-M implementation.
     """
     return torch.ops.sgl_kernel.bf16_dense_gelu_tanh_mul_lut_xe20.default(
         input, weight, table

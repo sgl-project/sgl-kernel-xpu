@@ -7,7 +7,9 @@
 
 namespace sgl::gemm {
 
-template <class Base, class MMA, class Element>
+// Large-prefill specialization can reuse each weight tile across M tiles.
+// Keep the previous traversal by default for all existing instantiations.
+template <class Base, class MMA, class Element, bool MFast = false>
 struct Bf16DenseGeluTanhMulLut {
   struct Params {
     const Element* a;
@@ -31,7 +33,9 @@ struct Bf16DenseGeluTanhMulLut {
     auto bias = base.make_Bias_tensors(nullptr, p.n);
     for (int task = item.get_group_linear_id(); task < tiles_m * tiles_n; task += item.get_group_range(1)) {
       typename Base::CollectiveMainloop mainloop;
-      auto coordinate = make_coord(task / tiles_n, task % tiles_n, task % tiles_n, 0);
+      const int tile_m = MFast ? task % tiles_m : task / tiles_n;
+      const int tile_n = MFast ? task / tiles_m : task % tiles_n;
+      auto coordinate = make_coord(tile_m, tile_n, tile_n, 0);
       mainloop(
           a,
           get<0>(b),

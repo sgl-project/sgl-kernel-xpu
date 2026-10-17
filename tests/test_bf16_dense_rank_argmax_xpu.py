@@ -10,12 +10,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def comparison_table():
+def comparison_table(softcap=30):
     # The operator accepts arbitrary caller-defined comparison classes. This
     # oracle exercises softcap saturation, signed-zero equality and first NaN.
     raw = torch.arange(65536, device="xpu", dtype=torch.int32)
     values = raw.to(torch.int16).view(torch.bfloat16).float()
-    values = (values / 30).tanh() * 30
+    if softcap:
+        values = (values / softcap).tanh() * softcap
     bits = values.view(torch.int32).to(torch.int64) & 0xFFFFFFFF
     ranks = torch.where(bits & 0x80000000 != 0, (~bits) & 0xFFFFFFFF, bits ^ 0x80000000)
     ranks = torch.where(values == 0, 0x80000000, ranks)
@@ -84,6 +85,31 @@ def test_random_projection():
         reference_ids(a, weight, table),
         atol=0,
         rtol=0,
+    )
+
+
+@pytest.mark.parametrize("m", [4, 128])
+@pytest.mark.parametrize("negative", [False, True])
+def test_subnormal_projection_uses_fp32_reference(m, negative):
+    # Some BF16 GEMM backends flush nonzero subnormal projections. The native
+    # DPAS contract preserves them; compare the FP32 projection rounded to BF16
+    # rather than assuming arbitrary GEMM implementations are bitwise equal.
+    table = comparison_table(softcap=None)
+    a = torch.zeros(m, 32, device="xpu", dtype=torch.bfloat16)
+    a[:, 0] = 1
+    weight = torch.zeros(256, 32, device="xpu", dtype=torch.bfloat16)
+    tiny = 2.0**-133
+    if negative:
+        weight[:, 0] = -tiny
+        weight[128, 0] = 0
+    else:
+        weight[128, 0] = tiny
+    projected = F.linear(a.float(), weight.float()).to(torch.bfloat16)
+    bits = projected.view(torch.int16).to(torch.int64) & 65535
+    expected = table.to(torch.int64)[bits].argmax(dim=-1)
+    assert expected.eq(128).all().item()
+    torch.testing.assert_close(
+        bf16_dense_rank_argmax_xe20(a, weight, table), expected, atol=0, rtol=0
     )
 
 

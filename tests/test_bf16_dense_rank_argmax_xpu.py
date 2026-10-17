@@ -204,5 +204,32 @@ def test_empty_rows_and_fake_contract():
             bf16_dense_rank_argmax_xe20(a, weight[:127], table)
 
 
+@pytest.mark.parametrize(
+    "m,n,k,valid",
+    [
+        (0xFFFFFF, 128, 32, True),
+        (0x1000000, 128, 32, False),
+        (1, 0xFFFF80, 32, True),
+        (1, 0x1000000, 32, False),
+        (1, 128, 8388576, True),
+        (1, 128, 8388608, False),
+    ],
+)
+def test_fake_block_2d_descriptor_boundaries_without_allocation(m, n, k, valid):
+    # Width/pitch bytes and heights have 24-bit hardware descriptor limits.
+    # FakeTensor covers the exact neighboring shapes without GiB allocations.
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        a = torch.empty(m, k, device="xpu", dtype=torch.bfloat16)
+        weight = torch.empty(n, k, device="xpu", dtype=torch.bfloat16)
+        table = torch.empty(65536, device="xpu", dtype=torch.uint16)
+        if valid:
+            assert bf16_dense_rank_argmax_xe20(a, weight, table).shape == (m,)
+        else:
+            with pytest.raises(RuntimeError):
+                bf16_dense_rank_argmax_xe20(a, weight, table)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

@@ -43,6 +43,12 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_rank_argmax_xe20(
       k > 0 && k % 32 == 0 && n > 0 && n % 128 == 0,
       name,
       " requires positive K divisible by 32 and positive N divisible by 128");
+  // The pinned Xe2 block-2D descriptor stores heights and byte widths/pitches
+  // in 24 bits. Both input and weight have BF16 row pitch 2*K.
+  TORCH_CHECK(
+      m <= 0xFFFFFF && n <= 0xFFFFFF && k <= 0xFFFFFF / 2,
+      name,
+      " exceeds the Xe2 block-2D height or BF16 byte-pitch limit");
   constexpr int64_t max_int = std::numeric_limits<int>::max();
   TORCH_CHECK(
       m <= max_int - 127 && n <= max_int - 127 && k <= max_int / 2,

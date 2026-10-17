@@ -12,7 +12,10 @@ TAG="${TAG:-dev}"
 MODE="${MODE:-smoke}"
 STAGE="${STAGE:-baseline}"
 BASELINE_TPS="${BASELINE_TPS:-}"
-export IMAGE TAG MODE STAGE BASELINE_TPS
+SGL_GPTQ_SPEC="${SGL_GPTQ_SPEC:-}"
+SGL_GPTQ_SPEC_STEPS="${SGL_GPTQ_SPEC_STEPS:-}"
+SGL_GPTQ_SPEC_DRAFT_TOKENS="${SGL_GPTQ_SPEC_DRAFT_TOKENS:-}"
+export IMAGE TAG MODE STAGE BASELINE_TPS SGL_GPTQ_SPEC SGL_GPTQ_SPEC_STEPS SGL_GPTQ_SPEC_DRAFT_TOKENS
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
@@ -29,7 +32,7 @@ import sys
 from pathlib import Path
 
 text = Path("deploy/k8s/test-job.yaml").read_text()
-for key in ("IMAGE", "TAG", "MODE", "STAGE", "BASELINE_TPS", "SGL_GPTQ_PROFILE", "MAX_NEW_TOKENS", "SGL_GPTQ_STEP"):
+for key in ("IMAGE", "TAG", "MODE", "STAGE", "BASELINE_TPS", "SGL_GPTQ_PROFILE", "MAX_NEW_TOKENS", "SGL_GPTQ_STEP", "SGL_GPTQ_SPEC", "SGL_GPTQ_SPEC_STEPS", "SGL_GPTQ_SPEC_DRAFT_TOKENS"):
     text = text.replace("${" + key + "}", os.environ.get(key, ""))
 Path(sys.argv[1]).write_text(text)
 PY

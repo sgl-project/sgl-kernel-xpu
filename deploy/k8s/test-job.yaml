@@ -25,6 +25,12 @@ spec:
               value: "${MAX_NEW_TOKENS}"
             - name: SGL_GPTQ_STEP
               value: "${SGL_GPTQ_STEP}"
+            - name: SGL_GPTQ_SPEC
+              value: "${SGL_GPTQ_SPEC}"
+            - name: SGL_GPTQ_SPEC_STEPS
+              value: "${SGL_GPTQ_SPEC_STEPS}"
+            - name: SGL_GPTQ_SPEC_DRAFT_TOKENS
+              value: "${SGL_GPTQ_SPEC_DRAFT_TOKENS}"
             - name: MODEL_DIR
               value: "/tank/nas/models/Qwen3.8-27B-TURBO-DF735-882-NM-DAU-GPTQ-Int4-g128-tuned"
           resources:

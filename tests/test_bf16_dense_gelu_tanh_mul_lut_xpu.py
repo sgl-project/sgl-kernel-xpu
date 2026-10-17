@@ -163,3 +163,125 @@ def test_torch_compile_fake_registration(gelu_table):
         bf16_dense_gelu_tanh_mul_lut_xe20, backend="eager", fullgraph=True
     )
     assert_bits_or_nan(compiled(a, w, gelu_table), gelu_tanh_and_mul(F.linear(a, w)))
+
+
+@pytest.mark.parametrize(
+    "m,n,k,valid",
+    [
+        (0xFFFFFF, 64, 32, True),
+        (1, 64, 8_388_576, True),
+        (1, 16_777_152, 32, True),
+        (0x1000000, 64, 32, False),
+        (1, 64, 8_388_608, False),
+        (1, 16_777_216, 32, False),
+        (8_388_608, 64, 256, False),
+        (1, 512, 8_388_576, False),
+        (65_536, 65_536, 32, False),
+    ],
+)
+def test_descriptor_and_offset_limits_without_allocation(m, n, k, valid):
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+    with FakeTensorMode():
+        a = torch.empty(m, k, device="xpu", dtype=torch.bfloat16)
+        w = torch.empty(n, k, device="xpu", dtype=torch.bfloat16)
+        table = torch.empty(65536, device="xpu", dtype=torch.bfloat16)
+        if valid:
+            result = bf16_dense_gelu_tanh_mul_lut_xe20(a, w, table)
+            assert isinstance(result, FakeTensor)
+            assert result.shape == (m, n // 2)
+        else:
+            with pytest.raises(RuntimeError):
+                bf16_dense_gelu_tanh_mul_lut_xe20(a, w, table)
+
+
+def test_host_descriptor_k_limit_with_empty_storage(gelu_table):
+    a = torch.empty(0, 8_388_576, device="xpu", dtype=torch.bfloat16)
+    w = torch.empty_like(a)
+    assert bf16_dense_gelu_tanh_mul_lut_xe20(a, w, gelu_table).shape == (0, 0)
+    a = torch.empty(0, 8_388_608, device="xpu", dtype=torch.bfloat16)
+    w = torch.empty_like(a)
+    with pytest.raises(RuntimeError, match="24-bit 2D descriptor"):
+        bf16_dense_gelu_tanh_mul_lut_xe20(a, w, gelu_table)
+
+
+@pytest.mark.parametrize(
+    "a_offset,w_offset", [(1, 0), (0, 1), (32, 0), (0, 32), (32, 32)]
+)
+def test_fake_contiguous_storage_offsets(a_offset, w_offset):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        a = torch.empty(32 + a_offset, device="xpu", dtype=torch.bfloat16)[
+            a_offset:
+        ].view(1, 32)
+        w = torch.empty(64 * 32 + w_offset, device="xpu", dtype=torch.bfloat16)[
+            w_offset:
+        ].view(64, 32)
+        table = torch.empty(65536, device="xpu", dtype=torch.bfloat16)
+        assert bf16_dense_gelu_tanh_mul_lut_xe20(a, w, table).shape == (1, 32)
+
+
+def offset_operand(shape, offset, value):
+    numel = shape[0] * shape[1]
+    return torch.full((numel + offset,), value, device="xpu", dtype=torch.bfloat16)[
+        offset:
+    ].view(shape)
+
+
+def test_compiled_callable_handles_changed_storage_offsets(gelu_table):
+    compiled = torch.compile(
+        bf16_dense_gelu_tanh_mul_lut_xe20, backend="eager", fullgraph=True
+    )
+    for a_offset, w_offset in ((0, 0), (1, 0), (0, 1), (1, 1), (32, 32), (0, 0)):
+        a = offset_operand((128, 32), a_offset, 0.25)
+        w = offset_operand((64, 32), w_offset, 0.0625)
+        actual = compiled(a, w, gelu_table)
+        assert_bits_or_nan(
+            actual, gelu_tanh_and_mul(F.linear(a.float(), w.float()).to(torch.bfloat16))
+        )
+
+
+@pytest.mark.parametrize("a_offset,w_offset", [(1, 0), (0, 1), (1, 1), (32, 32)])
+def test_captured_alignment_copies_read_current_operands(
+    gelu_table, a_offset, w_offset
+):
+    a = offset_operand((128, 32), a_offset, 0.25)
+    w = offset_operand((64, 32), w_offset, 0.0625)
+    bf16_dense_gelu_tanh_mul_lut_xe20(a, w, gelu_table)
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        output = bf16_dense_gelu_tanh_mul_lut_xe20(a, w, gelu_table)
+    for scale_a, scale_w in ((0.5, 2.0), (2.0, 0.25), (-1.0, 2.0)):
+        a.mul_(scale_a)
+        w.mul_(scale_w)
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.xpu.synchronize()
+        # Torch BF16 GEMM can misread the first row of offset-one views on
+        # affected XPU versions. FP32 projection preserves this exact dot product.
+        expected = gelu_tanh_and_mul(F.linear(a.float(), w.float()).to(torch.bfloat16))
+        assert_bits_or_nan(output, expected)
+        assert_bits_or_nan(
+            bf16_dense_gelu_tanh_mul_lut_xe20(a, w, gelu_table), expected
+        )
+        assert_bits_or_nan(gelu_tanh_and_mul(F.linear(a.clone(), w.clone())), expected)
+
+
+def test_existing_gelu_void_schema_fullgraph_reads_current_input():
+    def activation(input):
+        out = torch.empty(
+            (input.shape[0], input.shape[1] // 2),
+            device=input.device,
+            dtype=input.dtype,
+        )
+        result = torch.ops.sgl_kernel.gelu_tanh_and_mul(out, input)
+        assert result is None
+        return out
+
+    compiled = torch.compile(activation, backend="eager", fullgraph=True)
+    input = torch.ones(128, 64, device="xpu", dtype=torch.bfloat16) / 4
+    for scale in (0.5, 2.0, -1.0):
+        input.mul_(scale)
+        assert_bits_or_nan(compiled(input), gelu_tanh_and_mul(input))

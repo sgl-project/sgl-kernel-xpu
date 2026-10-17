@@ -6,6 +6,7 @@
 #include <torch/all.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 
 #include "cutlass/kernel_hardware_info.h"
@@ -30,18 +31,29 @@ bf16_dense_gelu_tanh_mul_lut_xe20(const torch::Tensor& input, const torch::Tenso
   TORCH_CHECK(input.size(1) == weight.size(1), "bf16_dense_gelu_tanh_mul_lut_xe20 K mismatch");
   TORCH_CHECK(
       table.device() == input.device() && table.scalar_type() == at::kBFloat16,
-      "bf16_dense_gelu_tanh_mul_lut_xe20 expects a BF16 table on the input device");
+      "bf16_dense_gelu_tanh_mul_lut_xe20 expects a BF16 table on the "
+      "input device");
   TORCH_CHECK(
       table.dim() == 1 && table.numel() == 65536 && table.is_contiguous(),
-      "bf16_dense_gelu_tanh_mul_lut_xe20 expects a contiguous 65536-entry table");
+      "bf16_dense_gelu_tanh_mul_lut_xe20 expects a contiguous "
+      "65536-entry table");
   const int64_t m = input.size(0), n = weight.size(0), k = input.size(1);
   TORCH_CHECK(
       k > 0 && k % 32 == 0 && n % 64 == 0,
-      "bf16_dense_gelu_tanh_mul_lut_xe20 requires positive K divisible by 32 and N divisible by 64");
+      "bf16_dense_gelu_tanh_mul_lut_xe20 requires positive K divisible "
+      "by 32 and N divisible by 64");
+  // TLA 2D descriptors encode byte width/pitch and row height in 24 bits.
+  // B0/B1 each have I=N/2 rows; D has I BF16 columns, so its byte width is N.
+  constexpr int64_t max_2d = 0xFFFFFF;
+  TORCH_CHECK(
+      m <= max_2d && k <= max_2d / 2 && n <= max_2d,
+      "bf16_dense_gelu_tanh_mul_lut_xe20 dimensions exceed the 24-bit "
+      "2D descriptor range");
   constexpr int64_t max_int = std::numeric_limits<int>::max();
   TORCH_CHECK(
       m <= max_int - 127 && n <= max_int - 63 && k <= max_int / 2,
-      "bf16_dense_gelu_tanh_mul_lut_xe20 dimensions exceed the supported integer range");
+      "bf16_dense_gelu_tanh_mul_lut_xe20 dimensions exceed the "
+      "supported integer range");
   TORCH_CHECK(
       input.numel() <= max_int && weight.numel() <= max_int && m * (n / 2) <= max_int,
       "bf16_dense_gelu_tanh_mul_lut_xe20 tensor offsets exceed int32");
@@ -50,6 +62,11 @@ bf16_dense_gelu_tanh_mul_lut_xe20(const torch::Tensor& input, const torch::Tenso
   c10::DeviceGuard guard(input.device());
   auto output = at::empty({m, n / 2}, input.options());
   if (m == 0 || n == 0) return output;
+
+  // TLA 2D loads require 64-byte bases. Contiguous offset views can have a
+  // misaligned base; clone only those operands on the current XPU stream.
+  const auto aligned_input = reinterpret_cast<uintptr_t>(input.data_ptr()) % 64 == 0 ? input : input.clone();
+  const auto aligned_weight = reinterpret_cast<uintptr_t>(weight.data_ptr()) % 64 == 0 ? weight : weight.clone();
 
   auto launch = [&]() {
     using namespace cute;
@@ -67,8 +84,8 @@ bf16_dense_gelu_tanh_mul_lut_xe20(const torch::Tensor& input, const torch::Tenso
         MoE::MoEGEMM<Tile, SG, Tensor, Tensor, Tensor, Bias, MMA, MoE::ActivationType::GELU, true, false, Element>;
     using Kernel = sgl::gemm::Bf16DenseGeluTanhMulLut<Base, MMA, Element>;
     typename Kernel::Params params{
-        static_cast<const Element*>(input.data_ptr()),
-        static_cast<const Element*>(weight.data_ptr()),
+        static_cast<const Element*>(aligned_input.data_ptr()),
+        static_cast<const Element*>(aligned_weight.data_ptr()),
         static_cast<Element*>(output.data_ptr()),
         static_cast<const Element*>(table.data_ptr()),
         int(m),

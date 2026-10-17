@@ -38,6 +38,10 @@ def bf16_dense_gelu_tanh_mul_lut_xe20(
 
     Matrices must be contiguous BF16 on one Xe2 XPU, with positive K divisible
     by 32 and weight rows divisible by 64. Output has half the weight rows.
+    The 2D descriptor requires M, K*2 and the weight row count to fit in
+    24 bits. Misaligned contiguous input or weight bases are copied to aligned
+    storage on the current stream. Input, weight and output element offsets
+    must fit signed int32.
     Static tiles favor selected shapes; callers should retain a fallback.
     """
     return torch.ops.sgl_kernel.bf16_dense_gelu_tanh_mul_lut_xe20.default(
@@ -52,6 +56,14 @@ if hasattr(torch.ops.sgl_kernel, "bf16_dense_gelu_tanh_mul_lut_xe20"):
         torch._check(input.ndim == 2 and weight.ndim == 2)
         torch._check(input.shape[1] == weight.shape[1])
         torch._check(weight.shape[0] % 64 == 0)
+        torch._check(input.shape[1] > 0)
+        torch._check(input.shape[1] % 32 == 0)
+        torch._check(input.shape[0] <= 0xFFFFFF)
+        torch._check(input.shape[1] <= 0xFFFFFF // 2)
+        torch._check(weight.shape[0] <= 0xFFFFFF)
+        torch._check(input.numel() <= 0x7FFFFFFF)
+        torch._check(weight.numel() <= 0x7FFFFFFF)
+        torch._check(input.shape[0] * (weight.shape[0] // 2) <= 0x7FFFFFFF)
         torch._check(table.ndim == 1 and table.shape[0] == 65536)
         return input.new_empty((input.shape[0], weight.shape[0] // 2))
 

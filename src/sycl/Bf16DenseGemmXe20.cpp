@@ -98,7 +98,8 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_gemm_xe20(const torch::Tensor& input,
   // mainloop for small batches and other geometries.
   if (n == 1536 && m == 512 && (k == 12288 || k == 6144)) {
     launch.template operator()<true, true>();
-  } else if (n == 1536 && m == 256 && (k == 12288 || k == 6144)) {
+  } else if (
+      m == 256 && ((n == 1536 && (k == 12288 || k == 6144 || k == 2048 || k == 4096)) || (n == 2560 && k == 1536))) {
     launch.template operator()<true>();
   } else {
     launch.template operator()<false>();

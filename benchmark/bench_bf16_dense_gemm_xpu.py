@@ -3,6 +3,11 @@
 Rotate at least 512 MiB of physical weight addresses to approximate separate
 transformer layers. Timings include graph replay device work only. No serving
 speedup can be inferred from this microbenchmark alone.
+
+Attention projection cases (M=256):
+  python benchmark/bench_bf16_dense_gemm_xpu.py --m 256 --n 2560 --k 1536
+  python benchmark/bench_bf16_dense_gemm_xpu.py --m 256 --n 1536 --k 2048
+  python benchmark/bench_bf16_dense_gemm_xpu.py --m 256 --n 1536 --k 4096
 """
 
 import argparse

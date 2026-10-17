@@ -22,7 +22,7 @@ class Bf16DenseGeluTanhMulLutXe20Name;
 // Availability of the optimized specialization, independent of device/dtype
 // eligibility. Callers can query once before compiling or capturing a forward.
 SGL_KERNEL_EXPORT bool bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(int64_t m, int64_t n, int64_t k) {
-  return m == 4096 && n == 24576 && k == 1536;
+  return m == 4096 && (n == 12288 || n == 24576) && k == 1536;
 }
 
 SGL_KERNEL_EXPORT torch::Tensor

@@ -118,3 +118,62 @@ def test_fake_and_compile():
     torch.testing.assert_close(
         compiled(a, weight), bf16_dense_gemm_xe20(a, weight), atol=0, rtol=0
     )
+
+
+@pytest.mark.parametrize(
+    "m,n,k,valid",
+    [
+        (0xFFFFFF, 64, 32, True),
+        (0x1000000, 64, 32, False),
+        (1, 8388544, 32, True),
+        (1, 8388608, 32, False),
+        (1, 64, 8388576, True),
+        (1, 64, 8388608, False),
+        # Rank-two block loads use separate coordinates, so total matrix size
+        # may exceed int32 without overflowing a flattened element offset.
+        (65536, 65536, 65536, True),
+        (16777215, 8388544, 32, False),
+    ],
+)
+def test_fake_descriptor_boundaries_without_allocation(m, n, k, valid):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        a = torch.empty(m, k, device="xpu", dtype=torch.bfloat16)
+        weight = torch.empty(n, k, device="xpu", dtype=torch.bfloat16)
+        if valid:
+            assert bf16_dense_gemm_xe20(a, weight).shape == (m, n)
+        else:
+            with pytest.raises(RuntimeError):
+                bf16_dense_gemm_xe20(a, weight)
+
+
+@pytest.mark.parametrize("operand", ["input", "weight"])
+@pytest.mark.parametrize("offset", [1, 32])
+def test_contiguous_storage_offset_alignment(operand, offset):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    def inputs():
+        a = torch.randn(4, 32, device="xpu", dtype=torch.bfloat16)
+        weight = torch.randn(64, 32, device="xpu", dtype=torch.bfloat16) * 0.02
+        shape = a.shape if operand == "input" else weight.shape
+        storage = torch.randn(
+            shape.numel() + offset, device="xpu", dtype=torch.bfloat16
+        )
+        view = storage[offset:].view(shape)
+        assert view.is_contiguous() and view.storage_offset() == offset
+        return (view, weight) if operand == "input" else (a, view)
+
+    with FakeTensorMode():
+        a, weight = inputs()
+        if offset == 1:
+            with pytest.raises(RuntimeError):
+                bf16_dense_gemm_xe20(a, weight)
+        else:
+            assert bf16_dense_gemm_xe20(a, weight).shape == (4, 64)
+    a, weight = inputs()
+    if offset == 1:
+        with pytest.raises(RuntimeError, match="64-byte-aligned"):
+            bf16_dense_gemm_xe20(a, weight)
+    else:
+        assert_reference_quality(bf16_dense_gemm_xe20(a, weight), a, weight)

@@ -20,8 +20,27 @@ if hasattr(torch.ops.sgl_kernel, "bf16_dense_gemm_xe20"):
     @torch.library.register_fake("sgl_kernel::bf16_dense_gemm_xe20")
     def _bf16_dense_gemm_xe20_fake(input, weight):
         torch._check(input.ndim == 2 and weight.ndim == 2)
-        torch._check(input.shape[1] == weight.shape[1])
-        return input.new_empty((input.shape[0], weight.shape[0]))
+        torch._check(input.device.type in ("xpu", "meta"))
+        torch._check(input.device == weight.device)
+        torch._check(input.dtype == weight.dtype == torch.bfloat16)
+        torch._check(input.is_contiguous() and weight.is_contiguous())
+        torch._check(input.storage_offset() * input.element_size() % 64 == 0)
+        torch._check(weight.storage_offset() * weight.element_size() % 64 == 0)
+        m, k = input.shape
+        n = weight.shape[0]
+        torch._check(k == weight.shape[1])
+        torch._check(k > 0)
+        torch._check(k % 32 == 0)
+        torch._check(n % 64 == 0)
+        torch._check(m <= 2147483520)
+        torch._check(n <= 2147483584)
+        torch._check(k <= 1073741823)
+        torch._check(m <= 0xFFFFFF)
+        torch._check(n <= 0xFFFFFF)
+        torch._check(2 * k <= 0xFFFFFF)
+        torch._check(2 * n <= 0xFFFFFF)
+        torch._check(((m + 127) // 128) * ((n + 63) // 64) <= 2147483647)
+        return input.new_empty((m, n))
 
 
 def awq_dequantize(

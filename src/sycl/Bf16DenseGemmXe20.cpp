@@ -6,6 +6,7 @@
 #include <torch/all.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <limits>
 
 #include "cutlass/kernel_hardware_info.h"
@@ -24,6 +25,10 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_gemm_xe20(const torch::Tensor& input,
       input.scalar_type() == at::kBFloat16 && weight.scalar_type() == at::kBFloat16,
       "bf16_dense_gemm_xe20 expects BF16 tensors");
   TORCH_CHECK(input.is_contiguous() && weight.is_contiguous(), "bf16_dense_gemm_xe20 expects contiguous tensors");
+  TORCH_CHECK(
+      reinterpret_cast<std::uintptr_t>(input.data_ptr()) % 64 == 0 &&
+          reinterpret_cast<std::uintptr_t>(weight.data_ptr()) % 64 == 0,
+      "bf16_dense_gemm_xe20 requires 64-byte-aligned input and weight pointers");
   TORCH_CHECK(input.size(1) == weight.size(1), "bf16_dense_gemm_xe20 K mismatch");
   const int64_t m = input.size(0), n = weight.size(0), k = input.size(1);
   TORCH_CHECK(
@@ -33,6 +38,12 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_gemm_xe20(const torch::Tensor& input,
   TORCH_CHECK(
       m <= max_int - 127 && n <= max_int - 63 && k <= max_int / 2,
       "bf16_dense_gemm_xe20 dimensions exceed the supported integer range");
+  // Xe2 block-2D descriptors encode byte width/pitch and row height in 24 bits.
+  // A/B are [M/N, K]; the BF16 output is [M, N].
+  constexpr int64_t max_2d = 0xFFFFFF;
+  TORCH_CHECK(
+      m <= max_2d && n <= max_2d && 2 * k <= max_2d && 2 * n <= max_2d,
+      "bf16_dense_gemm_xe20 dimensions exceed the Xe2 block-2D descriptor range");
   const int64_t tiles = ((m + 127) / 128) * ((n + 63) / 64);
   TORCH_CHECK(tiles <= max_int, "bf16_dense_gemm_xe20 tile count exceeds int32");
   c10::DeviceGuard guard(input.device());

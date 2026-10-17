@@ -278,10 +278,21 @@ def test_misaligned_copy_is_live_in_capture_and_fullgraph(operand):
             a = shifted
         else:
             weight = shifted
-        # One compiled callable receives different storage offsets across calls.
+
+        def expected_ids():
+            # This constructed one-hot projection is exact in FP32. Some BF16
+            # backends mishandle offset1 views, so do not use their projection
+            # as an oracle for the native operator's misaligned copy contract.
+            projected = F.linear(a.float(), weight.float()).to(torch.bfloat16)
+            bits = projected.view(torch.int16).to(torch.int64) & 65535
+            return table.to(torch.int64)[bits].argmax(dim=-1)
+
+        expected = expected_ids()
         torch.testing.assert_close(
-            compiled(a, weight, table), reference_ids(a, weight, table), atol=0, rtol=0
+            bf16_dense_rank_argmax_xe20(a, weight, table), expected, atol=0, rtol=0
         )
+        # One compiled callable receives different storage offsets across calls.
+        torch.testing.assert_close(compiled(a, weight, table), expected, atol=0, rtol=0)
         bf16_dense_rank_argmax_xe20(a, weight, table)
         torch.xpu.synchronize()
         graph = torch.xpu.XPUGraph()
@@ -292,9 +303,7 @@ def test_misaligned_copy_is_live_in_capture_and_fullgraph(operand):
             output.fill_(-123)
             graph.replay()
             torch.xpu.synchronize()
-            torch.testing.assert_close(
-                output, reference_ids(a, weight, table), atol=0, rtol=0
-            )
+            torch.testing.assert_close(output, expected_ids(), atol=0, rtol=0)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ RUN set -eux; \
 
 COPY python/sgl_kernel/gptq_loader.py /opt/sgl-kernel-xpu/python/gptq_loader.py
 COPY scripts /opt/sgl-kernel-xpu/scripts
-COPY deploy/sglang-gptq-xpu.patch deploy/sglang-qwen35-ba.patch deploy/sglang-qwen35-time.patch deploy/sglang-xpu-page.patch deploy/sglang-lmhead.patch deploy/sglang-loop-time.patch deploy/sglang-page1-graph.patch deploy/sglang-stream-token-ids.patch /opt/sgl-kernel-xpu/deploy/
+COPY deploy/sglang-gptq-xpu.patch deploy/sglang-qwen35-ba.patch deploy/sglang-qwen35-time.patch deploy/sglang-xpu-page.patch deploy/sglang-mamba-page.patch deploy/sglang-xpu-gdn-page.patch deploy/sglang-lmhead.patch deploy/sglang-loop-time.patch deploy/sglang-page1-graph.patch deploy/sglang-stream-token-ids.patch /opt/sgl-kernel-xpu/deploy/
 
 RUN set -eux; \
     kernel="$(python -c 'import pathlib, sgl_kernel; print(pathlib.Path(sgl_kernel.__file__).parent)')"; \
@@ -37,6 +37,8 @@ RUN set -eux; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-qwen35-ba.patch; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-qwen35-time.patch; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-xpu-page.patch; \
+    patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-mamba-page.patch; \
+    patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-xpu-gdn-page.patch; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-lmhead.patch; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-loop-time.patch; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-page1-graph.patch; \

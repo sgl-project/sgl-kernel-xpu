@@ -21,6 +21,17 @@ MODEL_DIR = os.environ.get(
 RECORD_PREFIX = "SGL_GPTQ_GENERATION_RECORD"
 
 
+def _int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw else default
+
+
+# 64 and 128 are the paged XPU kernel sizes. 1 stays available for the
+# token-addressed no_buffer cache. Context matches the live server.
+PAGE_SIZE = _int_env("SGL_GPTQ_PAGE_SIZE", 64)
+CONTEXT_LENGTH = _int_env("SGL_GPTQ_CONTEXT_LENGTH", 131072)
+
+
 def fail(message: str) -> None:
     print(message, file=sys.stderr)
     raise SystemExit(1)
@@ -321,17 +332,23 @@ def generation_record(stage: str) -> dict:
         sgl_kernel.gptq_gemm = timed_gptq_gemm
 
     prompt = os.environ.get("SGL_GPTQ_PROMPT", PROMPT)
-    # Page size stays 1: the linear cache is token-addressed. Context is
-    # capped so the captured page-1 gather is a short fixed row.
-    engine = Engine(
+    # Page size > 1 selects the extra_buffer GDN checkpoints. The fused
+    # kernel still owns the live state, and the paged attention kernel
+    # captures decode without a boolean page-table index.
+    engine_kwargs = dict(
         model_path=MODEL_DIR,
         device="xpu",
         trust_remote_code=True,
         dtype="bfloat16",
         attention_backend="intel_xpu",
         linear_attn_backend="intel_xpu",
-        page_size=1,
-        context_length=1024,
+        page_size=PAGE_SIZE,
+        context_length=CONTEXT_LENGTH,
+    )
+    if PAGE_SIZE > 1:
+        engine_kwargs["mamba_radix_cache_strategy"] = "extra_buffer"
+    engine = Engine(
+        **engine_kwargs,
         chunked_prefill_size=8192,
         max_prefill_tokens=8192,
         mem_fraction_static=0.85,
@@ -370,6 +387,8 @@ def generation_record(stage: str) -> dict:
         "prompt": prompt,
         "max_new_tokens": MAX_NEW_TOKENS,
         "temperature": 0,
+        "page_size": PAGE_SIZE,
+        "context_length": CONTEXT_LENGTH,
         "text": text,
         "tokens_per_second": MAX_NEW_TOKENS / elapsed,
         "node": "hal",
@@ -411,9 +430,9 @@ def benchy() -> None:
         "--linear-attn-backend",
         "intel_xpu",
         "--page-size",
-        "1",
+        str(PAGE_SIZE),
         "--context-length",
-        "1024",
+        str(CONTEXT_LENGTH),
         "--chunked-prefill-size",
         "8192",
         "--max-prefill-tokens",
@@ -425,19 +444,23 @@ def benchy() -> None:
         "full",
         "--cuda-graph-bs-decode",
         "1",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        port,
     ]
+    if PAGE_SIZE > 1:
+        cmd.extend(["--mamba-radix-cache-strategy", "extra_buffer"])
+    cmd.extend(["--host", "127.0.0.1", "--port", port])
     server_env = os.environ.copy()
     server_env["PYTHONUNBUFFERED"] = "1"
     server_env.pop("SGL_GPTQ_STEP", None)
     server_env.pop("SGL_GPTQ_PROFILE", None)
+    server_env.pop("SGL_GPTQ_SPEC", None)
+    print(
+        f"SGL_GPTQ_PAGE_SIZE {PAGE_SIZE} context_length {CONTEXT_LENGTH}",
+        flush=True,
+    )
     server = subprocess.Popen(cmd, env=server_env)
     base = f"http://127.0.0.1:{port}"
     try:
-        deadline = time.perf_counter() + 900
+        deadline = time.perf_counter() + 2400
         while time.perf_counter() < deadline:
             if server.poll() is not None:
                 fail(f"sglang server exited {server.returncode}")
@@ -449,6 +472,41 @@ def benchy() -> None:
                 time.sleep(2)
         else:
             fail("sglang server did not become healthy")
+        with urllib.request.urlopen(base + "/server_info", timeout=30) as resp:
+            info = json.load(resp)
+        print(
+            "SGL_GPTQ_SERVER_INFO "
+            + json.dumps(
+                {
+                    "page_size": info.get("page_size"),
+                    "context_length": info.get("context_length"),
+                    "mamba_radix_cache_strategy": info.get(
+                        "mamba_radix_cache_strategy"
+                    ),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        proof_body = json.dumps(
+            {
+                "model": MODEL_DIR,
+                "prompt": PROMPT,
+                "max_tokens": 32,
+                "temperature": 0,
+            }
+        ).encode()
+        proof_req = urllib.request.Request(
+            base + "/v1/completions",
+            data=proof_body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(proof_req, timeout=600) as resp:
+            proof = json.load(resp)
+        proof_text = proof["choices"][0]["text"]
+        print("SGL_GPTQ_PAGE_PROOF " + json.dumps(proof_text), flush=True)
+        if collapsed(proof_text):
+            fail(f"generation collapsed to {proof_text!r}")
         subprocess.check_call(
             [sys.executable, "-m", "pip", "install", "--quiet", "llama-benchy==0.4.0"]
         )

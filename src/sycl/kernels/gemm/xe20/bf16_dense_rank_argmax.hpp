@@ -82,8 +82,11 @@ struct Bf16DenseRankPartials {
     auto prefetch_b = make_block_2d_prefetch(copy_b);
     const int ktiles = ceil_div(shape<1>(A), get<2>(tile));
     constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
-    for (int task = int(item.get_group_linear_id()); task < tiles_m * tiles_n; task += int(item.get_group_range(1))) {
-      const int tile_m = task % tiles_m, tile_n = task / tiles_m;
+    for (std::int64_t task = item.get_group_linear_id(); task < tiles_m * tiles_n; task += item.get_group_range(1)) {
+      // The launcher bounds valid tile indices to int32. Keep tile-coordinate
+      // division in that range, but widen the increment past the final tile.
+      const int task_index = static_cast<int>(task);
+      const int tile_m = task_index % tiles_m, tile_n = task_index / tiles_m;
       auto gA = local_tile(cA, select<0, 2>(tile), make_coord(tile_m, _));
       auto gB = local_tile(cB, select<1, 2>(tile), make_coord(tile_n, _));
       auto gD = local_tile(cD, tile, make_coord(tile_m, tile_n, 0), Step<_1, _1, X>{});

@@ -37,6 +37,11 @@ SGL_KERNEL_EXPORT torch::Tensor bf16_dense_rank_argmax_xe20(
       input.is_contiguous() && weight.is_contiguous() && comparison_ranks.is_contiguous(),
       name,
       " expects contiguous tensors");
+  TORCH_CHECK(
+      reinterpret_cast<std::uintptr_t>(input.data_ptr()) % 64 == 0 &&
+          reinterpret_cast<std::uintptr_t>(weight.data_ptr()) % 64 == 0,
+      name,
+      " requires 64-byte aligned input and weight base pointers");
   TORCH_CHECK(input.size(1) == weight.size(1), name, " K mismatch");
   const int64_t m = input.size(0), n = weight.size(0), k = input.size(1);
   TORCH_CHECK(

@@ -231,5 +231,36 @@ def test_fake_block_2d_descriptor_boundaries_without_allocation(m, n, k, valid):
                 bf16_dense_rank_argmax_xe20(a, weight, table)
 
 
+@pytest.mark.parametrize("offset", [1, 32])
+@pytest.mark.parametrize("operand", ["input", "weight"])
+@pytest.mark.parametrize("fake", [False, True])
+def test_block_2d_base_alignment(offset, operand, fake):
+    from contextlib import nullcontext
+
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode() if fake else nullcontext():
+        a = torch.zeros(4, 32, device="xpu", dtype=torch.bfloat16)
+        weight = torch.zeros(128, 32, device="xpu", dtype=torch.bfloat16)
+        shape = a.shape if operand == "input" else weight.shape
+        shifted = torch.zeros(
+            shape.numel() + offset, device="xpu", dtype=torch.bfloat16
+        )[offset:].view(shape)
+        if operand == "input":
+            a = shifted
+        else:
+            weight = shifted
+        table = torch.zeros(65536, device="xpu", dtype=torch.uint16)
+        assert shifted.is_contiguous()
+        if offset == 1:
+            with pytest.raises(RuntimeError):
+                bf16_dense_rank_argmax_xe20(a, weight, table)
+        else:
+            output = bf16_dense_rank_argmax_xe20(a, weight, table)
+            assert output.shape == (4,)
+            if not fake:
+                assert output.eq(0).all().item()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

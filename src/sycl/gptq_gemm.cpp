@@ -1,5 +1,6 @@
 #include <torch/all.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -805,6 +806,56 @@ void launch_lm_head_row(sycl::queue& queue, const T* hidden, const T* weight, T*
   });
 }
 
+// Several hidden rows share one vocabulary. One pass over each weight row
+// keeps that matrix off the bus for every row in the tile.
+template <typename T, int kSlots>
+struct LmHeadMulti {
+  static constexpr int kWork = 64;
+
+  const T* hidden;
+  const T* weight;
+  T* out;
+  int K;
+  int N;
+  int M;
+
+  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
+    const int n = static_cast<int>(item.get_group(0));
+    const int lid = static_cast<int>(item.get_local_id(0));
+    float acc[kSlots];
+    for (int slot = 0; slot < kSlots; ++slot) {
+      acc[slot] = 0.f;
+    }
+    if (n < N) {
+      const T* row = weight + static_cast<int64_t>(n) * K;
+      for (int k = lid; k < K; k += kWork) {
+        const float w = static_cast<float>(row[k]);
+        for (int slot = 0; slot < kSlots; ++slot) {
+          if (slot < M) {
+            acc[slot] += w * static_cast<float>(hidden[static_cast<int64_t>(slot) * K + k]);
+          }
+        }
+      }
+    }
+    for (int slot = 0; slot < kSlots; ++slot) {
+      const float sum = sycl::reduce_over_group(item.get_group(), acc[slot], sycl::plus<float>());
+      if (n < N && lid == 0 && slot < M) {
+        out[static_cast<int64_t>(slot) * N + n] = static_cast<T>(sum);
+      }
+    }
+  }
+};
+
+template <typename T>
+void launch_lm_head_multi(sycl::queue& queue, const T* hidden, const T* weight, T* out, int M, int K, int N) {
+  constexpr int kWork = LmHeadMulti<T, 8>::kWork;
+  const size_t rows = static_cast<size_t>(N);
+  queue.submit([&](sycl::handler& cgh) {
+    LmHeadMulti<T, 8> fn{hidden, weight, out, K, N, M};
+    cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * kWork), sycl::range<1>(kWork)), fn);
+  });
+}
+
 }  // namespace
 
 SGL_KERNEL_EXPORT torch::Tensor lm_head_gemv(torch::Tensor hidden, torch::Tensor weight) {
@@ -830,16 +881,28 @@ SGL_KERNEL_EXPORT torch::Tensor lm_head_gemv(torch::Tensor hidden, torch::Tensor
     const auto* h = reinterpret_cast<const sycl::half*>(hidden.data_ptr<at::Half>());
     const auto* w = reinterpret_cast<const sycl::half*>(weight.data_ptr<at::Half>());
     auto* o = reinterpret_cast<sycl::half*>(out.data_ptr<at::Half>());
-    for (int m = 0; m < M; ++m) {
-      launch_lm_head_row<sycl::half>(queue, h + static_cast<int64_t>(m) * K, w, o + static_cast<int64_t>(m) * N, K, N);
+    if (M == 1) {
+      launch_lm_head_row<sycl::half>(queue, h, w, o, K, N);
+    } else {
+      for (int m0 = 0; m0 < M; m0 += 8) {
+        const int tile = std::min(8, M - m0);
+        launch_lm_head_multi<sycl::half>(
+            queue, h + static_cast<int64_t>(m0) * K, w, o + static_cast<int64_t>(m0) * N, tile, K, N);
+      }
     }
   } else {
     using bf16 = sycl::ext::oneapi::bfloat16;
     const auto* h = reinterpret_cast<const bf16*>(hidden.data_ptr<at::BFloat16>());
     const auto* w = reinterpret_cast<const bf16*>(weight.data_ptr<at::BFloat16>());
     auto* o = reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>());
-    for (int m = 0; m < M; ++m) {
-      launch_lm_head_row<bf16>(queue, h + static_cast<int64_t>(m) * K, w, o + static_cast<int64_t>(m) * N, K, N);
+    if (M == 1) {
+      launch_lm_head_row<bf16>(queue, h, w, o, K, N);
+    } else {
+      for (int m0 = 0; m0 < M; m0 += 8) {
+        const int tile = std::min(8, M - m0);
+        launch_lm_head_multi<bf16>(
+            queue, h + static_cast<int64_t>(m0) * K, w, o + static_cast<int64_t>(m0) * N, tile, K, N);
+      }
     }
   }
   return out;

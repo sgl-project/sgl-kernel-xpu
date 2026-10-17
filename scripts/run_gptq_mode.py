@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One entrypoint for the hal Job. MODE selects smoke, numeric, generate, or bench."""
+"""One entrypoint for the hal Job. MODE selects smoke, numeric, generate, bench, or benchy."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 MARKER = "SGL_KERNEL_XPU_GPTQ_ENTRY"
 PROMPT = "Write a one-sentence hardware note."
@@ -386,6 +387,112 @@ def generate() -> None:
         fail(f"generation collapsed to {record['text']!r}")
 
 
+def benchy() -> None:
+    import subprocess
+    import urllib.error
+    import urllib.request
+
+    port = os.environ.get("SGL_GPTQ_PORT", "30000")
+    pp = os.environ.get("SGL_GPTQ_PP", "512")
+    tg = os.environ.get("SGL_GPTQ_TG", "128")
+    cmd = [
+        sys.executable,
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        MODEL_DIR,
+        "--device",
+        "xpu",
+        "--trust-remote-code",
+        "--dtype",
+        "bfloat16",
+        "--attention-backend",
+        "intel_xpu",
+        "--linear-attn-backend",
+        "intel_xpu",
+        "--page-size",
+        "1",
+        "--context-length",
+        "1024",
+        "--chunked-prefill-size",
+        "8192",
+        "--max-prefill-tokens",
+        "8192",
+        "--mem-fraction-static",
+        "0.85",
+        "--skip-server-warmup",
+        "--cuda-graph-backend-decode",
+        "full",
+        "--cuda-graph-bs-decode",
+        "1",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        port,
+    ]
+    server_env = os.environ.copy()
+    server_env["PYTHONUNBUFFERED"] = "1"
+    server_env.pop("SGL_GPTQ_STEP", None)
+    server_env.pop("SGL_GPTQ_PROFILE", None)
+    server = subprocess.Popen(cmd, env=server_env)
+    base = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.perf_counter() + 900
+        while time.perf_counter() < deadline:
+            if server.poll() is not None:
+                fail(f"sglang server exited {server.returncode}")
+            try:
+                with urllib.request.urlopen(base + "/health", timeout=2) as resp:
+                    if resp.status == 200:
+                        break
+            except (urllib.error.URLError, TimeoutError):
+                time.sleep(2)
+        else:
+            fail("sglang server did not become healthy")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet", "llama-benchy==0.4.0"]
+        )
+        version = subprocess.check_output(
+            [sys.executable, "-m", "pip", "show", "llama-benchy"], text=True
+        )
+        for line in version.splitlines():
+            if line.startswith("Version:"):
+                print(line, flush=True)
+        report = os.environ.get("SGL_GPTQ_BENCHY_REPORT", "/tmp/llama-benchy.md")
+        subprocess.check_call(
+            [
+                "llama-benchy",
+                "--base-url",
+                base + "/v1",
+                "--model",
+                MODEL_DIR,
+                "--tokenizer",
+                MODEL_DIR,
+                "--pp",
+                pp,
+                "--tg",
+                tg,
+                "--runs",
+                "1",
+                "--latency-mode",
+                "none",
+                "--skip-coherence",
+                "--no-cache",
+                "--format",
+                "md",
+                "--save-result",
+                report,
+            ]
+        )
+        print(Path(report).read_text())
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+
 def bench() -> None:
     stage = os.environ.get("STAGE", "baseline")
     record = generation_record(stage)
@@ -414,6 +521,8 @@ def main() -> None:
         bench()
     elif mode == "kernel":
         kernel_bench()
+    elif mode == "benchy":
+        benchy()
     else:
         fail(f"unknown mode: {mode}")
 

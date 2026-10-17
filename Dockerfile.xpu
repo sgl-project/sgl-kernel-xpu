@@ -26,7 +26,7 @@ RUN set -eux; \
 
 COPY python/sgl_kernel/gptq_loader.py /opt/sgl-kernel-xpu/python/gptq_loader.py
 COPY scripts /opt/sgl-kernel-xpu/scripts
-COPY deploy/sglang-gptq-xpu.patch deploy/sglang-qwen35-ba.patch deploy/sglang-qwen35-time.patch deploy/sglang-xpu-page.patch deploy/sglang-lmhead.patch deploy/sglang-loop-time.patch deploy/sglang-page1-graph.patch /opt/sgl-kernel-xpu/deploy/
+COPY deploy/sglang-gptq-xpu.patch deploy/sglang-qwen35-ba.patch deploy/sglang-qwen35-time.patch deploy/sglang-xpu-page.patch deploy/sglang-lmhead.patch deploy/sglang-loop-time.patch deploy/sglang-page1-graph.patch deploy/sglang-stream-token-ids.patch /opt/sgl-kernel-xpu/deploy/
 
 RUN set -eux; \
     kernel="$(python -c 'import pathlib, sgl_kernel; print(pathlib.Path(sgl_kernel.__file__).parent)')"; \
@@ -40,6 +40,7 @@ RUN set -eux; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-lmhead.patch; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-loop-time.patch; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-page1-graph.patch; \
+    patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-stream-token-ids.patch; \
     python /opt/sgl-kernel-xpu/scripts/check_sglang_version.py
 
 WORKDIR /opt/sgl-kernel-xpu

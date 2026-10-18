@@ -259,7 +259,11 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w4a16(
   // The imported kernel resets this persistent work-stealing counter itself.
   // Avoid a separate four-byte memset launch, which is material for decode.
 
-  const int avg_m = total_m / static_cast<int>(n_experts);
+  // Round up: a truncating division reports 0 rows per expert whenever
+  // total_m < n_experts, which is every decode step (4 routed rows over 128
+  // experts). It selects the same tile as a correct 1 -- both take the avg_m <= 8
+  // branch -- so this is a latent bug, not a decode regression.
+  const int avg_m = (total_m + static_cast<int>(n_experts) - 1) / static_cast<int>(n_experts);
   const int policy_id = select_w4a16_policy_id(avg_m, gemm_n, gemm_k);
   const bool is_fp16_act = activations.scalar_type() == at::ScalarType::Half;
 

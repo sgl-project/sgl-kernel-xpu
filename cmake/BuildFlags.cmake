@@ -62,6 +62,13 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   list(APPEND SYCL_HOST_FLAGS -Wno-deprecated)
   list(APPEND SYCL_HOST_FLAGS -Wno-attributes)
   list(APPEND SYCL_HOST_FLAGS -Wno-sign-compare)
+  # Kernel sources are compiled twice: once by icpx for the device and once by
+  # the -fsycl-host-compiler (gcc) for the host. `#pragma unroll` and
+  # `#pragma clang diagnostic` are consumed by the device pass, but gcc cannot
+  # act on either (its unroll spelling is `#pragma GCC unroll N`) and warns on
+  # every occurrence -- ~34k diagnostics, none actionable. The device pass still
+  # honours the pragmas, so nothing is lost by silencing the host pass.
+  list(APPEND SYCL_HOST_FLAGS -Wno-unknown-pragmas)
   list(APPEND SYCL_HOST_FLAGS -fvisibility=hidden)
   list(APPEND SYCL_HOST_FLAGS -fvisibility-inlines-hidden)
 

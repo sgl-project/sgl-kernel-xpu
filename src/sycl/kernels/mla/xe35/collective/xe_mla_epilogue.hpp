@@ -138,9 +138,9 @@ class XeMlaEpilogue {
   //
 
   CUTLASS_HOST_DEVICE
-  XeMlaEpilogue(Params const& params_, SharedStorage& shared_) : shared(shared_) {}
+  XeMlaEpilogue([[maybe_unused]] Params const& params_, SharedStorage& shared_) : shared(shared_) {}
 
-  static constexpr Params to_underlying_arguments(Arguments const& args, void* /* workspace */) {
+  static constexpr Params to_underlying_arguments([[maybe_unused]] Arguments const& args, void* /* workspace */) {
     return {};
   }
 

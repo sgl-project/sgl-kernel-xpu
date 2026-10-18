@@ -462,6 +462,79 @@ def fused_qk_norm_rope(
     )
 
 
+# Kernel-supported head dims and dtypes for rmsnorm_heads_inplace (the
+# fused_qk_norm_rope head-dim / dtype dispatch).
+_RMSNORM_HEADS_HEAD_DIMS = (64, 128, 256)
+_RMSNORM_HEADS_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+# rotary_dim=0 leaves position ids unread, but the op requires int32 [num_tokens].
+_RMSNORM_HEADS_POS: dict = {}
+
+
+def rmsnorm_heads_inplace_supported(
+    row_width: int, num_heads: int, head_dim: int, dtype: torch.dtype
+) -> bool:
+    """Whether :func:`rmsnorm_heads_inplace` accepts this row geometry and dtype."""
+    return (
+        head_dim in _RMSNORM_HEADS_HEAD_DIMS
+        and dtype in _RMSNORM_HEADS_DTYPES
+        and 0 < num_heads * head_dim <= row_width
+        and row_width % head_dim == 0
+    )
+
+
+def rmsnorm_heads_inplace(
+    x: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+    weight: torch.Tensor,
+    eps: float,
+) -> None:
+    r"""RMSNorm the leading ``num_heads`` heads of each packed row, in place.
+
+    ``x`` is ``[num_tokens, row_width]`` and contiguous, e.g. a packed QKV row
+    ``[q | k | v | ...]``. Columns ``[0, num_heads * head_dim)`` are normalized
+    per ``head_dim`` group with ``weight``; every column after them is left
+    bit-for-bit untouched. Normalizing the leading slice in place avoids the
+    compaction copy that reshaping a strided ``q`` slice to
+    ``(tokens * heads, head_dim)`` would force.
+
+    Runs :func:`fused_qk_norm_rope` with rotary off (``rotary_dim=0``), no K
+    heads, and the rest of the row declared as untouched V heads: the op strides
+    rows by all of its head counts but only reads and writes the Q and K heads.
+    That requires the remainder to be a whole number of heads, so check
+    :func:`rmsnorm_heads_inplace_supported` first.
+    """
+    assert x.dim() == 2 and x.is_contiguous(), f"{x.shape=} {x.stride()=}"
+    row_width = x.size(1)
+    assert rmsnorm_heads_inplace_supported(
+        row_width, num_heads, head_dim, x.dtype
+    ), f"unsupported geometry: {row_width=} {num_heads=} {head_dim=} {x.dtype=}"
+    num_tokens = x.size(0)
+    pos = _RMSNORM_HEADS_POS.get(x.device)
+    if pos is None or pos.numel() < num_tokens:
+        pos = torch.zeros(num_tokens, dtype=torch.int32, device=x.device)
+        _RMSNORM_HEADS_POS[x.device] = pos
+    weight = weight.to(x.dtype)
+    torch.ops.sgl_kernel.fused_qk_norm_rope(
+        x,
+        num_heads,
+        0,  # num_heads_k
+        row_width // head_dim - num_heads,  # the rest of the row, as V heads
+        head_dim,
+        eps,
+        weight,
+        weight,  # k_weight, unread with no K heads
+        1.0e4,  # base, unread with rotary off
+        False,  # is_neox=False skips the power-of-2 lane check rotary_dim=0 fails
+        pos[:num_tokens],
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        0,  # rotary_dim
+    )
+
+
 def fused_qk_rope(
     qkv: torch.Tensor,
     num_heads_q: int,

@@ -154,6 +154,9 @@ def numeric() -> None:
     from sgl_kernel import gptq_gemm
 
     device = torch.device("xpu")
+    # Transpose is cached by storage address. The caching allocator recycles
+    # those addresses, so every probe tensor has to stay alive until the end.
+    hold = []
     k, n = 256, 32
     groups = k // 128
     contiguous = torch.arange(k) // 128
@@ -162,11 +165,11 @@ def numeric() -> None:
         (1, torch.float16, contiguous, 1, "contiguous"),
         (8, torch.float16, contiguous, 1, "contiguous"),
         (1, torch.bfloat16, contiguous, 1, "contiguous"),
-        (8, torch.bfloat16, contiguous, 1, "contiguous"),
+        (4, torch.bfloat16, contiguous, 1, "contiguous"),
         (1, torch.float16, reversed_idx, 1, "noncontiguous"),
         (4, torch.bfloat16, reversed_idx, 2, "noncontiguous"),
         (1, torch.float16, contiguous, 2, "contiguous"),
-        (8, torch.bfloat16, contiguous, 2, "contiguous"),
+        (4, torch.bfloat16, contiguous, 2, "contiguous"),
     ]
     passed = 0
     failed = 0
@@ -185,6 +188,7 @@ def numeric() -> None:
         )
         out = gptq_gemm(act, qweight, qzeros, scales, g, False, 4, zero_format)
         torch.xpu.synchronize()
+        hold.append((act, qweight, qzeros, scales, g, out))
         if within_tolerance(out, ref):
             passed += 1
             print(f"numeric {label} pass")
@@ -199,9 +203,40 @@ def numeric() -> None:
                 f"got={got.flatten()[:4].tolist()} ref={expect.flatten()[:4].tolist()}"
             )
 
+    # K=2048 hits only the 4-wide pipeline. K=2176 also hits its tail.
+    for wide_k, wide_m in ((2048, 4), (2176, 4), (2048, 2)):
+        wide_idx = torch.arange(wide_k) // 128
+        label = f"bfloat16 M={wide_m} K={wide_k} pipeline"
+        act, qweight, qzeros, scales, g, ref = make_case(
+            wide_m,
+            64,
+            wide_k,
+            torch.bfloat16,
+            device,
+            wide_idx,
+            1,
+            seed=3000 + wide_k + wide_m,
+        )
+        out = gptq_gemm(act, qweight, qzeros, scales, g, False, 4, 1)
+        torch.xpu.synchronize()
+        hold.append((act, qweight, qzeros, scales, g, out))
+        if within_tolerance(out, ref):
+            passed += 1
+            print(f"numeric {label} pass")
+        else:
+            failed += 1
+            got = out.float().cpu()
+            expect = ref.float().cpu()
+            diff = (got - expect).abs()
+            print(
+                f"numeric {label} fail max={float(diff.max()):.6g} "
+                f"mean={float(diff.mean()):.6g}"
+            )
+
     act, qweight, qzeros, scales, g, _ = make_case(
         1, n, k, torch.float16, device, contiguous, 1, seed=7
     )
+    hold.append((act, qweight, qzeros, scales, g))
     try:
         gptq_gemm(act, qweight, qzeros, scales, g, False, 4, 3)
     except Exception as exc:
@@ -224,9 +259,56 @@ def numeric() -> None:
         failed += 1
         print("numeric mismatched zeros did not raise")
 
+    # Contiguous bf16 M>=8 is the one-pass XMX GEMM. M=16 stays the first
+    # launch. Round weights to bf16 so the reference matches the tensor-core
+    # product. N=64 is the aligned DPAS tile; N=32 takes the SLM path.
+    for m, n, k, zero_format, seed in (
+        (16, 32, 256, 1, 11),
+        (8, 64, 256, 1, 17),
+        (8, 32, 256, 1, 18),
+        (12, 64, 256, 1, 19),
+        (16, 64, 256, 1, 20),
+        (20, 32, 256, 1, 12),
+        (32, 64, 256, 1, 13),
+        (128, 128, 256, 2, 14),
+        (512, 64, 256, 1, 15),
+        (512, 128, 256, 1, 16),
+    ):
+        label = f"xmx bf16 M={m} K={k} N={n} zero_format={zero_format} seed={seed}"
+        g = torch.arange(k) // 128
+        act, qweight, qzeros, scales, g_idx, ref = make_case(
+            m,
+            n,
+            k,
+            torch.bfloat16,
+            device,
+            g,
+            zero_format,
+            seed=seed,
+            round_weights=True,
+        )
+        out = gptq_gemm(act, qweight, qzeros, scales, g_idx, False, 4, zero_format)
+        torch.xpu.synchronize()
+        hold.append((act, qweight, qzeros, scales, g_idx, out))
+        if within_tolerance(out, ref):
+            passed += 1
+            print(f"numeric {label} pass")
+        else:
+            failed += 1
+            got = out.float().cpu()
+            expect = ref.float().cpu()
+            diff = (got - expect).abs()
+            print(
+                f"numeric {label} fail max={float(diff.max()):.6g} "
+                f"mean={float(diff.mean()):.6g} "
+                f"got={got.flatten()[:4].tolist()} ref={expect.flatten()[:4].tolist()}"
+            )
+
     for m, n, k, dtype in (
         (1, 128, 5120, torch.bfloat16),
         (2, 64, 17, torch.bfloat16),
+        (4, 128, 5120, torch.bfloat16),
+        (4, 32, 17, torch.bfloat16),
         (1, 32, 256, torch.float16),
     ):
         hidden = torch.randn(m, k, device=device, dtype=dtype)
@@ -406,14 +488,80 @@ def generate() -> None:
         fail(f"generation collapsed to {record['text']!r}")
 
 
+def batch_report(base: str) -> None:
+    import threading
+    import urllib.request
+
+    widths = [
+        int(part)
+        for part in os.environ.get("SGL_GPTQ_BATCH_WIDTHS", "1,2,4").split(",")
+        if part.strip()
+    ]
+    new_tokens = int(os.environ.get("SGL_GPTQ_BATCH_TOKENS", "64"))
+
+    def one(index: int) -> tuple[int, float]:
+        body = json.dumps(
+            {
+                "model": MODEL_DIR,
+                "prompt": PROMPT,
+                "max_tokens": new_tokens,
+                "temperature": 0,
+            }
+        ).encode()
+        req = urllib.request.Request(
+            base + "/v1/completions",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        started = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            payload = json.load(resp)
+        elapsed = time.perf_counter() - started
+        text = payload["choices"][0]["text"]
+        if collapsed(text):
+            fail(f"batch request {index} collapsed to {text!r}")
+        tokens = int(payload.get("usage", {}).get("completion_tokens", new_tokens))
+        return tokens, elapsed
+
+    for width in widths:
+        results: list[tuple[int, float] | None] = [None] * width
+        errors: list[BaseException] = []
+
+        def run(index: int) -> None:
+            try:
+                results[index] = one(index)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        started = time.perf_counter()
+        threads = [threading.Thread(target=run, args=(i,)) for i in range(width)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        wall = time.perf_counter() - started
+        if errors:
+            fail(f"batch width {width} failed: {errors[0]}")
+        tokens = [item[0] for item in results if item is not None]
+        per = [item[0] / item[1] for item in results if item is not None and item[1] > 0]
+        total = sum(tokens)
+        print(
+            "SGL_GPTQ_BATCH "
+            f"width={width} tokens={total} wall={wall:.3f} "
+            f"aggregate_tok_s={total / wall:.2f} "
+            f"per_request_tok_s={sum(per) / len(per):.2f}",
+            flush=True,
+        )
+
+
 def benchy() -> None:
     import subprocess
     import urllib.error
     import urllib.request
 
     port = os.environ.get("SGL_GPTQ_PORT", "30000")
-    pp = os.environ.get("SGL_GPTQ_PP", "512")
-    tg = os.environ.get("SGL_GPTQ_TG", "128")
+    pp = os.environ.get("SGL_GPTQ_PP", "").strip() or "512"
+    tg = os.environ.get("SGL_GPTQ_TG", "").strip() or "128"
     cmd = [
         sys.executable,
         "-m",
@@ -438,23 +586,57 @@ def benchy() -> None:
         "--max-prefill-tokens",
         "8192",
         "--mem-fraction-static",
-        "0.85",
+        os.environ.get("SGL_GPTQ_MEM_FRACTION", "").strip()
+        or ("0.92" if os.environ.get("SGL_GPTQ_SPEC") == "1" else "0.85"),
         "--skip-server-warmup",
         "--cuda-graph-backend-decode",
         "full",
         "--cuda-graph-bs-decode",
-        "1",
+        *[
+            part.strip()
+            for part in (os.environ.get("SGL_GPTQ_GRAPH_BS", "").strip() or "1").split(",")
+            if part.strip()
+        ],
     ]
     if PAGE_SIZE > 1:
         cmd.extend(["--mamba-radix-cache-strategy", "extra_buffer"])
+    if os.environ.get("SGL_GPTQ_SPEC") != "1":
+        max_running = os.environ.get("SGL_GPTQ_MAX_RUNNING", "").strip()
+        if max_running:
+            cmd.extend(["--max-running-requests", max_running])
+        mamba_cache = os.environ.get("SGL_GPTQ_MAMBA_CACHE", "").strip()
+        if mamba_cache:
+            cmd.extend(["--max-mamba-cache-size", mamba_cache])
+    if os.environ.get("SGL_GPTQ_SPEC") == "1":
+        # MTP draft lives in this checkpoint. Verify must stay on the SYCL path.
+        cmd.extend(
+            [
+                "--speculative-algorithm",
+                "NEXTN",
+                "--speculative-draft-model-path",
+                MODEL_DIR,
+                # topk=1 forces draft tokens to num_steps+1, which is the verify M.
+                "--speculative-num-steps",
+                str(_int_env("SGL_GPTQ_SPEC_STEPS", 3)),
+                "--speculative-eagle-topk",
+                "1",
+                "--speculative-num-draft-tokens",
+                str(_int_env("SGL_GPTQ_SPEC_DRAFT_TOKENS", 4)),
+                "--max-running-requests",
+                "1",
+                "--max-mamba-cache-size",
+                str(_int_env("SGL_GPTQ_MAMBA_CACHE", 8)),
+            ]
+        )
     cmd.extend(["--host", "127.0.0.1", "--port", port])
     server_env = os.environ.copy()
     server_env["PYTHONUNBUFFERED"] = "1"
-    server_env.pop("SGL_GPTQ_STEP", None)
+    if os.environ.get("SGL_GPTQ_STEP") != "1":
+        server_env.pop("SGL_GPTQ_STEP", None)
     server_env.pop("SGL_GPTQ_PROFILE", None)
-    server_env.pop("SGL_GPTQ_SPEC", None)
     print(
-        f"SGL_GPTQ_PAGE_SIZE {PAGE_SIZE} context_length {CONTEXT_LENGTH}",
+        f"SGL_GPTQ_PAGE_SIZE {PAGE_SIZE} context_length {CONTEXT_LENGTH} "
+        f"spec={os.environ.get('SGL_GPTQ_SPEC', '')}",
         flush=True,
     )
     server = subprocess.Popen(cmd, env=server_env)
@@ -543,6 +725,8 @@ def benchy() -> None:
             ]
         )
         print(Path(report).read_text())
+        if os.environ.get("SGL_GPTQ_BATCH") == "1":
+            batch_report(base)
     finally:
         server.terminate()
         try:

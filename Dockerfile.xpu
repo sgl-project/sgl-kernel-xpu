@@ -5,7 +5,9 @@
 FROM lmsysorg/sglang:v0.5.22-xpu
 
 COPY include /opt/sgl-kernel-xpu/include
-COPY src/sycl/gptq_gemm.cpp src/sycl/gptq_entry_probe.cpp src/sycl/gptq_register.cpp /opt/sgl-kernel-xpu/src/
+COPY src/sycl/gptq_gemm.cpp src/sycl/gptq_entry_probe.cpp src/sycl/gptq_register.cpp src/sycl/gdn_verify_entry.cpp src/sycl/causal_conv1d.cpp src/sycl/causal_conv1d_verify.hpp src/sycl/causal_conv1d_token_parallel.hpp src/sycl/Utils.h src/sycl/SYCLHelpers.h src/sycl/SGLKernelPerf.h /opt/sgl-kernel-xpu/src/
+COPY src/sycl/gdn_attn/gated_delta_rule.hpp /opt/sgl-kernel-xpu/src/gdn_attn/gated_delta_rule.hpp
+COPY src/jit/jit_arch.h /opt/sgl-kernel-xpu/src/jit/jit_arch.h
 
 RUN set -eux; \
     ICPX=/opt/intel/oneapi/compiler/2026.1/bin/icpx; \
@@ -15,18 +17,21 @@ RUN set -eux; \
       -Xsycl-target-backend "-device bmg" \
       -std=c++20 -O2 -fPIC -shared \
       -I/opt/sgl-kernel-xpu/include \
+      -I/opt/sgl-kernel-xpu/src \
       -I"$TORCH/include" \
       -I"$TORCH/include/torch/csrc/api/include" \
       /opt/sgl-kernel-xpu/src/gptq_register.cpp \
       /opt/sgl-kernel-xpu/src/gptq_gemm.cpp \
       /opt/sgl-kernel-xpu/src/gptq_entry_probe.cpp \
+      /opt/sgl-kernel-xpu/src/gdn_verify_entry.cpp \
+      /opt/sgl-kernel-xpu/src/causal_conv1d.cpp \
       -o /opt/sgl-kernel-xpu/sgl_gptq_ops.so \
       -L"$TORCH/lib" -Wl,-rpath,"$TORCH/lib" \
       -ltorch -ltorch_xpu -ltorch_cpu -lc10
 
 COPY python/sgl_kernel/gptq_loader.py /opt/sgl-kernel-xpu/python/gptq_loader.py
 COPY scripts /opt/sgl-kernel-xpu/scripts
-COPY deploy/sglang-gptq-xpu.patch deploy/sglang-qwen35-ba.patch deploy/sglang-qwen35-time.patch deploy/sglang-xpu-page.patch deploy/sglang-mamba-page.patch deploy/sglang-xpu-gdn-page.patch deploy/sglang-lmhead.patch deploy/sglang-loop-time.patch deploy/sglang-page1-graph.patch deploy/sglang-stream-token-ids.patch /opt/sgl-kernel-xpu/deploy/
+COPY deploy/sglang-gptq-xpu.patch deploy/sglang-qwen35-ba.patch deploy/sglang-qwen35-time.patch deploy/sglang-xpu-page.patch deploy/sglang-mamba-page.patch deploy/sglang-xpu-gdn-page.patch deploy/sglang-lmhead.patch deploy/sglang-loop-time.patch deploy/sglang-page1-graph.patch deploy/sglang-stream-token-ids.patch deploy/sglang-gdn-verify.patch /opt/sgl-kernel-xpu/deploy/
 
 RUN set -eux; \
     kernel="$(python -c 'import pathlib, sgl_kernel; print(pathlib.Path(sgl_kernel.__file__).parent)')"; \
@@ -39,6 +44,7 @@ RUN set -eux; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-xpu-page.patch; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-mamba-page.patch; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-xpu-gdn-page.patch; \
+    patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-gdn-verify.patch; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-lmhead.patch; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-loop-time.patch; \
     patch -p2 -d "$site" < /opt/sgl-kernel-xpu/deploy/sglang-page1-graph.patch; \

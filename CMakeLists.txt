@@ -136,6 +136,21 @@ include_directories(SYSTEM
     ${repo-cutlass-sycl_SOURCE_DIR}/tools/util/include
 )
 
+# Every third-party header root, in one list. The SYCL kernel libraries are not
+# built by CMake's own compile rules but by the custom FindSYCL wrapper, which
+# flattens a target's INCLUDE_DIRECTORIES property into plain -I and so silently
+# drops the SYSTEM marking set above and in src/BuildOnLinux.cmake. FindSYCL
+# forwards this list to run_sycl.cmake, which re-applies it as -isystem on both
+# the device and the -fsycl-host-compiler passes. Keep it in sync with the
+# SYSTEM target_include_directories() calls in src/BuildOnLinux.cmake.
+set(SGL_SYSTEM_INCLUDE_DIRS
+    ${repo-cutlass-sycl_SOURCE_DIR}/include
+    ${repo-cutlass-sycl_SOURCE_DIR}/tools/util/include
+    ${SYCL_INCLUDE_DIR}
+    ${TORCH_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS}
+)
+
 add_subdirectory(${SGL_OPS_XPU_ROOT}/src)
 
 # Install JIT kernel headers for sglang JIT compilation

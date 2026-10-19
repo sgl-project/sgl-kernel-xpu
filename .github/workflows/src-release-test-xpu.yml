@@ -1,0 +1,237 @@
+name: Source Release Test (XPU)
+run-name: Source Release Test PY ${{ inputs.python_version }} (XPU) @ ${{ inputs.ref }}
+
+# Build the kernel from source of a given ref in a fresh conda env of the
+# requested Python, then run that ref's per-commit kernel tests + benchmarks.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch/tag/SHA to build and test (e.g. release/v0.2.0)'
+        required: true
+        type: string
+        default: 'release/v0.2.0'
+      python_version:
+        description: 'Python version for the build/test env'
+        required: true
+        type: choice
+        options: ['3.10', '3.11', '3.12']
+        default: '3.10'
+      torch_version:
+        description: 'torch version to build and test against'
+        required: true
+        type: string
+        default: '2.13.0'
+      image:
+        description: 'Base image (provides driver, oneAPI, conda)'
+        required: false
+        type: string
+        default: 'intel/sgl-kernel-xpu-dev:latest'
+      run_tests:
+        type: boolean
+        default: true
+      run_benchmarks:
+        type: boolean
+        default: true
+
+concurrency:
+  group: src-release-test-xpu-${{ github.run_id }}
+  cancel-in-progress: false
+
+env:
+  CONTAINER: src_release_test_xpu_${{ github.run_id }}
+  PY_ENV: src-py${{ inputs.python_version }}
+  KERNEL_DIR: /root/sglang/sgl-kernel-xpu
+
+jobs:
+  src-release-test:
+    runs-on: sglang-bmg
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout ${{ inputs.ref }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+
+      - name: Start container
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          docker pull "$IMAGE"
+          docker run -dt --device /dev/dri/ --name "$CONTAINER" \
+            -e HF_TOKEN="$(cat ~/huggingface_token.txt)" "$IMAGE"
+
+      - name: Replace image-baked sgl-kernel with ${{ inputs.ref }} source
+        # The image ships a kernel and build/ tree from main; drop both so only the ref is built.
+        run: |
+          docker exec "$CONTAINER" /bin/bash -c '
+            set -ex
+            /miniforge3/envs/py3.12/bin/python3 -m pip uninstall -y sglang-kernel-xpu sgl-kernel || true
+            rm -rf /root/sglang/sgl-kernel-xpu
+          '
+          docker cp . "$CONTAINER:$KERNEL_DIR"
+
+      - name: Create Python ${{ inputs.python_version }} env and build kernel
+        timeout-minutes: 120
+        env:
+          PY: ${{ inputs.python_version }}
+          TORCH: ${{ inputs.torch_version }}
+        run: |
+          docker exec -w "$KERNEL_DIR" -e PY -e TORCH -e PY_ENV "$CONTAINER" /bin/bash -c '
+            set -exo pipefail
+            . /miniforge3/bin/activate
+            conda create -y -n "$PY_ENV" python="$PY"
+            conda activate "$PY_ENV"
+            pip install --upgrade pip
+            pip install --timeout 300 --retries 10 "torch==$TORCH" torchvision triton-xpu \
+              --index-url https://download.pytorch.org/whl/xpu
+            # No build isolation, so the kernel is built against the torch above.
+            pip install "scikit-build-core>=0.10" wheel cmake ninja
+            # Prepend torch; keep the image's oneAPI entries.
+            export CMAKE_PREFIX_PATH="$(python -c "import torch; print(torch.utils.cmake_prefix_path)")${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+            pip install -v --no-build-isolation --no-deps .
+            pip install pytest expecttest ray huggingface_hub scipy tabulate pandas matplotlib einops numpy
+            hf auth login --token "$HF_TOKEN"
+            # tests/test_utils.py spawns bare "python3".
+            ln -sf "/miniforge3/envs/$PY_ENV/bin/python3" /usr/bin/python3
+            pip list | grep -i sglang-kernel
+          '
+          echo "SRC_VERSION=$(grep -m1 '^version' pyproject.toml | cut -d'"' -f2)" >> "$GITHUB_ENV"
+
+      - name: Verify sgl_kernel comes from the ${{ inputs.ref }} build
+        run: |
+          docker exec -i -w /root/sglang/sgl-kernel-xpu/tests -e PY_ENV -e SRC_VERSION "$CONTAINER" \
+            "/miniforge3/envs/$PY_ENV/bin/python3" - <<'EOF' | tee kernel_info.txt
+          import os, sys, importlib.metadata as md
+          import torch, sgl_kernel
+          env_prefix = f"/miniforge3/envs/{os.environ['PY_ENV']}/"
+          src_ver = os.environ["SRC_VERSION"]
+          dist_ver = md.version("sglang-kernel-xpu")
+          print("python     :", sys.version.split()[0])
+          print("torch      :", torch.__version__, "xpu:", torch.xpu.is_available())
+          print("sgl_kernel :", sgl_kernel.__file__)
+          print("src/dist   :", src_ver, "/", dist_ver)
+          assert sgl_kernel.__file__.startswith(env_prefix), "sgl_kernel not loaded from test env"
+          assert dist_ver == src_ver, "installed version does not match pyproject.toml"
+          assert torch.xpu.is_available(), "XPU not visible"
+          EOF
+
+      - name: Write per-file runner
+        # The suite runners stop at the first failing file; run one entry at a
+        # time so every file gets a status and duration.
+        run: |
+          cat > "$RUNNER_TEMP/run_per_file.sh" <<'EOF'
+          #!/usr/bin/env bash
+          # Usage: run_per_file.sh <tests|benchmark> <suite label>
+          set -uo pipefail
+          dir=$1; label=$2
+          mapfile -t names < <(docker exec -w "$KERNEL_DIR/$dir" "$CONTAINER" \
+            "/miniforge3/envs/$PY_ENV/bin/python3" -c \
+            'import run_suite as r; print("\n".join(f.name for f in r.suites["per-commit"]))')
+          if [ ${#names[@]} -eq 0 ]; then echo "::error::no $label files found"; exit 1; fi
+          failed=0
+          for i in "${!names[@]}"; do
+            start=$(date +%s)
+            if docker exec -w "$KERNEL_DIR/$dir" "$CONTAINER" /bin/bash -c \
+                ". /miniforge3/bin/activate $PY_ENV && python3 run_suite.py --suite per-commit --range-begin $i --range-end $((i + 1))" </dev/null; then
+              status=pass
+            else
+              status=fail; failed=$((failed + 1))
+            fi
+            echo "${names[$i]},$label,$status,$(( $(date +%s) - start ))" >> "$GITHUB_WORKSPACE/results.csv"
+          done
+          echo "$label: $failed of ${#names[@]} file(s) failed"
+          [ "$failed" -eq 0 ]
+          EOF
+          chmod +x "$RUNNER_TEMP/run_per_file.sh"
+
+      - name: Kernel tests (per-commit suite)
+        if: inputs.run_tests
+        timeout-minutes: 120
+        run: $RUNNER_TEMP/run_per_file.sh tests test
+
+      - name: Kernel benchmarks (per-commit suite)
+        if: ${{ inputs.run_benchmarks && !cancelled() }}
+        timeout-minutes: 90
+        run: $RUNNER_TEMP/run_per_file.sh benchmark benchmark
+
+      - name: Compare against ${{ inputs.ref }} baseline.json
+        if: ${{ inputs.run_benchmarks && !cancelled() }}
+        run: |
+          mkdir -p bench_logs
+          docker cp "$CONTAINER:$KERNEL_DIR/benchmark/." bench_logs/ || true
+          cp bench_logs/fused_moe.log bench_logs/flash.log . 2>/dev/null || true
+          python3 benchmark/update_baseline_from_log.py || true
+
+      - name: Summary
+        if: always()
+        env:
+          REF: ${{ inputs.ref }}
+          PY: ${{ inputs.python_version }}
+          TORCH: ${{ inputs.torch_version }}
+        run: |
+          export SHA=$(git rev-parse --short HEAD)
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import csv, os
+          env = os.environ
+          rows = list(csv.reader(open("results.csv"))) if os.path.exists("results.csv") else []
+          with open(f"results_py{env['PY']}.csv", "w", newline="") as f:
+              w = csv.writer(f)
+              w.writerow(["File Name", "Suite", "Status", "Duration(Sec.)"])
+              w.writerows(rows)
+
+          print(f"### Source build test: Python {env['PY']}\n")
+          print(f"- Ref: `{env['REF']}` ({env['SHA']})")
+          print(f"- Kernel: sglang-kernel-xpu {env.get('SRC_VERSION', '?')} built from source")
+          print(f"- torch: {env['TORCH']}\n")
+          if os.path.exists("kernel_info.txt"):
+              print("```\n" + open("kernel_info.txt").read().strip() + "\n```\n")
+
+          print("| Suite | Total | Pass | Fail | Duration(Sec.) |")
+          print("|---|---:|---:|---:|---:|")
+          for suite in ("test", "benchmark"):
+              sel = [r for r in rows if r[1] == suite]
+              npass = sum(r[2] == "pass" for r in sel)
+              total_s = sum(int(r[3]) for r in sel)
+              print(f"| {suite} | {len(sel)} | {npass} | {len(sel) - npass} | {total_s} |")
+          print()
+
+          if os.path.exists("ci_pr_body.md"):
+              print("<details><summary>Benchmark vs baseline.json (flash_attn, fused_moe)</summary>\n")
+              print(open("ci_pr_body.md").read())
+              print("\n</details>\n")
+
+          print("| File Name | Suite | Status | Duration(Sec.) |")
+          print("|---|---|---|---:|")
+          for name, suite, status, dur in rows:
+              shown = status if status == "pass" else f"**{status.upper()}**"
+              print(f"| {name} | {suite} | {shown} | {dur} |")
+          EOF
+
+      - name: Upload logs and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: src-release-test-py${{ inputs.python_version }}-${{ github.run_id }}
+          path: |
+            results_py*.csv
+            kernel_info.txt
+            bench_logs/*.log
+            ci_pr_body.md
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup container
+        # Kept on failure for debugging; see the next step.
+        if: ${{ success() || cancelled() }}
+        run: docker rm -f "$CONTAINER" || true
+
+      - name: Keep container for debugging
+        if: failure()
+        run: |
+          msg="Container \`$CONTAINER\` kept on the runner for debugging. Inspect: \`docker exec -it $CONTAINER bash\`. Remove: \`docker rm -f $CONTAINER\`."
+          echo "::warning::$msg"
+          printf '\n> [!WARNING]\n> %s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"

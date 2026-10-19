@@ -252,7 +252,7 @@ inline typename T::Fmla::Arguments args_from_options(
   int num_heads = q_nope.size(-2);
   int v_head_dim = q_nope.size(-1);
   int q_pe_dim = q_pe.size(-1);
-  int head_dim = kv_c_and_k_pe_cache.size(2);
+  [[maybe_unused]] int head_dim = kv_c_and_k_pe_cache.size(2);
   int page_size = kv_c_and_k_pe_cache.size(1);
   int page_count_per_seq = page_table.size(1);
   int max_seq_len = page_size * page_count_per_seq;

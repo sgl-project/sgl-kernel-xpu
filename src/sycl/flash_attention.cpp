@@ -29,6 +29,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+// Overrides the build-wide -DSYCL_INTEL_TARGET; cutlass.h re-derives it from
+// __SYCL_TARGET_INTEL_GPU_*__ on first include.
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -298,15 +301,15 @@ void mha_fwd(
     const at::Tensor& cu_seqlens_k,         // b+1
     int max_seqlen_q,
     int max_seqlen_k,
-    std::optional<const at::Tensor>& page_table,       // (b_k, max_num_pages_per_seq)
-    std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
-    std::optional<const at::Tensor>& leftpad_k_,       // b
-    std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& rotary_sin_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& seqlens_rotary_,  // b
-    std::optional<at::Tensor>& q_descale_,             // (b, h_k), not (b, h)
-    std::optional<at::Tensor>& k_descale_,             // (b, h_k)
-    std::optional<at::Tensor>& v_descale_,             // (b, h_k)
+    std::optional<const at::Tensor>& page_table,             // (b_k, max_num_pages_per_seq)
+    std::optional<const at::Tensor>& kv_batch_idx_,          // b. indices to index into the KV cache
+    std::optional<const at::Tensor>& leftpad_k_,             // b
+    std::optional<const at::Tensor>& rotary_cos_,            // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& rotary_sin_,            // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& seqlens_rotary_,        // b
+    [[maybe_unused]] std::optional<at::Tensor>& q_descale_,  // (b, h_k), not (b, h)
+    std::optional<at::Tensor>& k_descale_,                   // (b, h_k)
+    std::optional<at::Tensor>& v_descale_,                   // (b, h_k)
     const float softmax_scale_,
     std::optional<const at::Tensor>& sinks_,
     bool is_causal,
@@ -314,10 +317,10 @@ void mha_fwd(
     int window_size_right,
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-    std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
+    [[maybe_unused]] std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
     int num_kv_splits,
-    std::optional<bool> pack_gqa_,
-    int const sm_margin,
+    [[maybe_unused]] std::optional<bool> pack_gqa_,
+    [[maybe_unused]] int const sm_margin,
     // Caller-provided output buffers written in place: ``out`` receives the
     // attention result and ``softmax_lse`` the logsumexp when present. A
     // per-batch skip mask (length = batch, chunkprefill two-launch path) selects
@@ -388,7 +391,7 @@ void mha_fwd(
   CHECK_INPUT(cu_seqlens_k);
   TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
 
-  auto const sizes = q.sizes();
+  [[maybe_unused]] auto const sizes = q.sizes();
   const int batch_size = cu_seqlens_q.size(0) - 1;
   int seqlen_q = max_seqlen_q;
   int total_q = q.size(0);
@@ -539,7 +542,8 @@ void mha_fwd(
     params.max_logits_ptr = max_logits.data_ptr();
   }
   int const head_size_rounded = round_up_headdim(head_size);
-  int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
+  [[maybe_unused]] int const head_size_v_rounded =
+      head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
 
   // Otherwise the kernel will be launched from cuda:0 device
   // Cast to char to avoid compiler warning about narrowing
@@ -982,15 +986,15 @@ void mha_fwd(
     const at::Tensor& cu_seqlens_k,         // b+1
     int max_seqlen_q,
     int max_seqlen_k,
-    std::optional<const at::Tensor>& page_table,       // (b_k, max_num_pages_per_seq)
-    std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
-    std::optional<const at::Tensor>& leftpad_k_,       // b
-    std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& rotary_sin_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& seqlens_rotary_,  // b
-    std::optional<at::Tensor>& q_descale_,             // (b, h_k), not (b, h)
-    std::optional<at::Tensor>& k_descale_,             // (b, h_k)
-    std::optional<at::Tensor>& v_descale_,             // (b, h_k)
+    std::optional<const at::Tensor>& page_table,             // (b_k, max_num_pages_per_seq)
+    std::optional<const at::Tensor>& kv_batch_idx_,          // b. indices to index into the KV cache
+    std::optional<const at::Tensor>& leftpad_k_,             // b
+    std::optional<const at::Tensor>& rotary_cos_,            // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& rotary_sin_,            // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& seqlens_rotary_,        // b
+    [[maybe_unused]] std::optional<at::Tensor>& q_descale_,  // (b, h_k), not (b, h)
+    std::optional<at::Tensor>& k_descale_,                   // (b, h_k)
+    std::optional<at::Tensor>& v_descale_,                   // (b, h_k)
     const float softmax_scale_,
     std::optional<const at::Tensor>& sinks_,
     bool is_causal,
@@ -998,10 +1002,10 @@ void mha_fwd(
     int window_size_right,
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-    std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
-    int num_splits,
-    std::optional<bool> pack_gqa_,
-    int const sm_margin,
+    [[maybe_unused]] std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
+    [[maybe_unused]] int num_splits,
+    [[maybe_unused]] std::optional<bool> pack_gqa_,
+    [[maybe_unused]] int const sm_margin,
     // Caller-provided output buffers written in place: ``out`` receives the
     // attention result and ``softmax_lse`` the logsumexp when present. A
     // per-batch skip mask (length = batch, chunkprefill two-launch path) selects
@@ -1070,7 +1074,7 @@ void mha_fwd(
   CHECK_INPUT(cu_seqlens_k);
   TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
 
-  auto const sizes = q.sizes();
+  [[maybe_unused]] auto const sizes = q.sizes();
   const int batch_size = cu_seqlens_q.size(0) - 1;
   int seqlen_q = max_seqlen_q;
   int total_q = q.size(0);
@@ -1143,7 +1147,8 @@ void mha_fwd(
   bool const return_softmax_lse = softmax_lse.has_value();
 
   int const head_size_rounded = round_up_headdim(head_size);
-  int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
+  [[maybe_unused]] int const head_size_v_rounded =
+      head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
 
   // Otherwise the kernel will be launched from cuda:0 device
   // Cast to char to avoid compiler warning about narrowing

@@ -32,6 +32,7 @@
     \brief SGEMM LoRA A Forward Kernel
 */
 
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
 #include <ATen/ATen.h>
@@ -84,7 +85,7 @@ SGL_KERNEL_EXPORT void sgemm_lora_a_fwd(
     const torch::Tensor& seg_indptr,      // [num_segments + 1,]
     const torch::Tensor& weight_indices,  // [num_segments,]
     const torch::Tensor& lora_ranks,      // [num_loras,]
-    const std::optional<torch::Tensor>&
+    [[maybe_unused]] const std::optional<torch::Tensor>&
         seg_lens  // [num_segments,] optional; currently unused, reserved for future per-segment optimizations
 ) {
   CHECK_INPUT(input_x);

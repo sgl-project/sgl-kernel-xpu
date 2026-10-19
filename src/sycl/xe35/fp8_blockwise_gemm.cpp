@@ -17,6 +17,7 @@
              out: [M, N] in bfloat16 or float16
 */
 
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 35
 
 // clang-format off

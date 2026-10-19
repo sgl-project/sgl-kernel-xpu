@@ -1,0 +1,86 @@
+name: Release Docker Images (sgl-kernel-xpu rel)
+on:
+  workflow_dispatch:
+    inputs:
+      wheel_url:
+        description: 'S3 URL of the pre-built sgl-kernel-xpu wheel to bake into the image'
+        required: true
+        default: 'https://sgl-kernel-xpu.s3.us-east-1.amazonaws.com/wheels/release-v0.1.0/sglang_kernel_xpu-0.1.0-cp310-abi3-manylinux_2_38_x86_64.whl'
+      version:
+        description: 'Release version tag (e.g. v0.1.0). Used as part of the image tag.'
+        required: true
+        default: 'v0.1.0'
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.repository == 'sgl-project/sgl-kernel-xpu'
+    runs-on: sglang-bmg
+    environment: 'prod'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: sgl-kernel-xpu-rel-build
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: image_meta
+        run: |
+          cd sgl-kernel-xpu-rel-build
+          commit_hash=$(git rev-parse --short=7 HEAD)
+          if [ -z "${commit_hash}" ]; then
+            echo "::error::Could not resolve commit hash"
+            exit 1
+          fi
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            version="${GITHUB_REF_NAME}"
+            wheel_url="https://sgl-kernel-xpu.s3.us-east-1.amazonaws.com/wheels/release-${version}/sglang_kernel_xpu-${version#v}-cp310-abi3-manylinux_2_38_x86_64.whl"
+          else
+            version="${{ inputs.version }}"
+            wheel_url="${{ inputs.wheel_url }}"
+          fi
+          image_tag="${version}-${commit_hash}"
+          echo "commit_hash=${commit_hash}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=${image_tag}" >> $GITHUB_ENV
+          echo "WHEEL_URL=${wheel_url}" >> $GITHUB_ENV
+          echo "Image tag: ${image_tag}"
+          echo "Wheel URL: ${wheel_url}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub (Intel)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+
+      - name: Build intel/sgl-kernel-xpu-rel
+        run: |
+          echo "Building intel/sgl-kernel-xpu-rel:${{ env.IMAGE_TAG }} from ${{ env.WHEEL_URL }}"
+          docker build sgl-kernel-xpu-rel-build \
+            -f sgl-kernel-xpu-rel-build/Dockerfile.rel_xpu_kernel \
+            --build-arg WHEEL_URL="${{ env.WHEEL_URL }}" \
+            --no-cache --progress=plain \
+            -t "intel/sgl-kernel-xpu-rel:${{ env.IMAGE_TAG }}" \
+            -t "intel/sgl-kernel-xpu-rel:rel"
+
+      - name: Push intel/sgl-kernel-xpu-rel
+        run: |
+          push_with_retry() {
+            for i in 1 2 3 4 5; do
+              docker push "$1" && return 0
+              echo "push failed (attempt $i), retrying in $((i*15))s..."
+              sleep $((i*15))
+            done
+            return 1
+          }
+          push_with_retry "intel/sgl-kernel-xpu-rel:${{ env.IMAGE_TAG }}"
+          push_with_retry "intel/sgl-kernel-xpu-rel:rel"

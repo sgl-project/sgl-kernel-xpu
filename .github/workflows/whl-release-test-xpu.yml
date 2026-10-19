@@ -246,5 +246,13 @@ jobs:
           retention-days: 14
 
       - name: Cleanup container
-        if: always()
+        # Kept on failure for debugging; see the next step.
+        if: ${{ success() || cancelled() }}
         run: docker rm -f "$CONTAINER" || true
+
+      - name: Keep container for debugging
+        if: failure()
+        run: |
+          msg="Container \`$CONTAINER\` kept on the runner for debugging. Inspect: \`docker exec -it $CONTAINER bash\`. Remove: \`docker rm -f $CONTAINER\`."
+          echo "::warning::$msg"
+          printf '\n> [!WARNING]\n> %s\n' "$msg" >> "$GITHUB_STEP_SUMMARY"

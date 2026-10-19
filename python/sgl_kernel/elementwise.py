@@ -270,6 +270,22 @@ def gelu_tanh_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Te
     return out
 
 
+# Older wheels can omit this symbol or already provide a Meta implementation.
+# Its native schema mutates the supplied output and returns no value.
+if hasattr(torch.ops.sgl_kernel, "gelu_tanh_and_mul") and not (
+    torch._C._dispatch_has_kernel_for_dispatch_key(
+        "sgl_kernel::gelu_tanh_and_mul", "Meta"
+    )
+    or torch._C._dispatch_has_kernel_for_dispatch_key(
+        "sgl_kernel::gelu_tanh_and_mul", "CompositeImplicitAutograd"
+    )
+):
+
+    @torch.library.register_fake("sgl_kernel::gelu_tanh_and_mul")
+    def _gelu_tanh_and_mul_fake(out: torch.Tensor, input: torch.Tensor) -> None:
+        return None
+
+
 def gelu_and_mul(input: torch.Tensor, out: torch.Tensor = None) -> torch.Tensor:
     if input.shape[-1] * input.dtype.itemsize % 16 != 0:
         raise ValueError("The pointers must be multiple of 16 bytes.")

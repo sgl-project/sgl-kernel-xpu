@@ -1,4 +1,5 @@
 name: Wheel Release Test (XPU)
+run-name: Wheel Release Test PY ${{ inputs.python_version }} (XPU) @ ${{ inputs.ref }}
 
 # Run the per-commit kernel tests + benchmarks of a given ref against a prebuilt
 # wheel, in a fresh conda env of the requested Python. Nothing is built from source.

@@ -1,4 +1,4 @@
-name: Wheel Test (XPU)
+name: Wheel Release Test (XPU)
 
 # Run the per-commit kernel tests + benchmarks of a given ref against a prebuilt
 # wheel, in a fresh conda env of the requested Python. Nothing is built from source.
@@ -39,16 +39,16 @@ on:
         default: true
 
 concurrency:
-  group: whl-test-xpu-${{ github.run_id }}
+  group: whl-release-test-xpu-${{ github.run_id }}
   cancel-in-progress: false
 
 env:
-  CONTAINER: whl_test_xpu_${{ github.run_id }}
+  CONTAINER: whl_release_test_xpu_${{ github.run_id }}
   PY_ENV: whl-py${{ inputs.python_version }}
   KERNEL_DIR: /root/sglang/sgl-kernel-xpu
 
 jobs:
-  whl-test:
+  whl-release-test:
     runs-on: sglang-bmg
     permissions:
       contents: read
@@ -235,7 +235,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: whl-test-py${{ inputs.python_version }}-${{ github.run_id }}
+          name: whl-release-test-py${{ inputs.python_version }}-${{ github.run_id }}
           path: |
             results_py*.csv
             kernel_info.txt

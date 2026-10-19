@@ -1,7 +1,6 @@
 #ifdef SYCL_INTEL_TARGET
 #undef SYCL_INTEL_TARGET
 #endif
-#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET @SYCL_INTEL_TARGET@
 
 #include <ATen/ATen.h>

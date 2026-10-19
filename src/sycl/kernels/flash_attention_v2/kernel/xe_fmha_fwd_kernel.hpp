@@ -1370,6 +1370,7 @@ class XeFMHAFwdSplitKVKernel {
 
       [[maybe_unused]] int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       int offset_exp_sums = 0, offset_max_logits = 0;
+      // Query-token index in the (num_heads_q, total_q) softmax_lse output. For
       // decode seq_len_qo == 1, so each (batch) maps to a single token.
       int lse_q_base = 0;
       if constexpr (LSE) {

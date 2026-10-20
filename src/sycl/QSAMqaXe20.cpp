@@ -9,6 +9,7 @@
 #include <sycl/sycl.hpp>
 #include <type_traits>
 
+#include "SYCLHelpers.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
 #include "sgl_kernel_export.h"
@@ -28,7 +29,7 @@ constexpr int kRowsPerTile = 4;
 constexpr int kColumnsPerTile = kThreads;
 
 template <typename T>
-cute::bfloat16_t as_dpas(T value) {
+cute::bfloat16_t as_bf16(T value) {
   if constexpr (std::is_same_v<T, bf16>)
     return sycl::bit_cast<cute::bfloat16_t>(value);
   else
@@ -70,7 +71,7 @@ struct QSAMqaPrefillKernel {
       const auto thread_keys = thread_mma.partition_B(g_keys);
       for (int j = 0; j < kSubgroup; ++j) {
         const int64_t column = first_col + cute::get<0>(b_coords(j));
-        keys[step][j] = column < columns ? as_dpas(thread_keys(j)) : cute::bfloat16_t{};
+        keys[step][j] = column < columns ? as_bf16(thread_keys(j)) : cute::bfloat16_t{};
       }
     }
 
@@ -85,7 +86,7 @@ struct QSAMqaPrefillKernel {
         cute::bfloat16_t query[kRowsPerTile];
         for (int row = 0; row < kRowsPerTile; ++row) {
           const int64_t query_row = first_row + cute::get<0>(a_coords(row));
-          query[row] = query_row < rows ? as_dpas(thread_query(row)) : cute::bfloat16_t{};
+          query[row] = query_row < rows ? as_bf16(thread_query(row)) : cute::bfloat16_t{};
         }
         auto a =
             cute::make_tensor(cute::make_rmem_ptr(query), cute::make_layout(cute::Shape<cute::Int<kRowsPerTile>>{}));
@@ -135,7 +136,7 @@ struct QSAMqaDecodeKernel {
       cute::bfloat16_t query[kHeads];
       for (int head = 0; head < kHeads; ++head) {
         const int coordinate = DpasTraits::ALayout{}(lane, head);
-        query[head] = as_dpas(q[(row * kHeads + coordinate % kHeads) * kDim + step * kSubgroup + coordinate / kHeads]);
+        query[head] = as_bf16(q[(row * kHeads + coordinate % kHeads) * kDim + step * kSubgroup + coordinate / kHeads]);
       }
       cute::bfloat16_t key[kSubgroup];
       // Gather paged keys using the same VNNI layout as packed prefill keys.
@@ -147,7 +148,7 @@ struct QSAMqaDecodeKernel {
         const bool valid = column < columns && column < lengths[row] && page >= 0 && page < num_pages;
         const int64_t index = (static_cast<int64_t>(page) * page_size + column % page_size) * kDim + step * kSubgroup +
                               coordinate / kSubgroup;
-        key[j] = valid ? as_dpas(cache[index]) : cute::bfloat16_t{};
+        key[j] = valid ? as_bf16(cache[index]) : cute::bfloat16_t{};
       }
       auto a = cute::make_tensor(cute::make_rmem_ptr(query), cute::make_layout(cute::Shape<cute::Int<kHeads>>{}));
       auto b = cute::make_tensor(cute::make_rmem_ptr(key), cute::make_layout(cute::Shape<cute::Int<kSubgroup>>{}));
@@ -212,20 +213,20 @@ SGL_KERNEL_EXPORT at::Tensor qsa_mqa_prefill(
   auto& queue = at::xpu::getCurrentXPUStream().queue();
   auto launch = [&](auto* input) {
     using T = std::remove_pointer_t<decltype(input)>;
-    queue.submit([&](sycl::handler& cgh) {
-      cgh.parallel_for(
-          sycl::nd_range<1>(static_cast<size_t>((rows - 1) / kRowsPerTile + 1) * tiles * kThreads, kThreads),
-          QSAMqaPrefillKernel<T>{
-              reinterpret_cast<const T*>(q.data_ptr()),
-              reinterpret_cast<const T*>(k.data_ptr()),
-              row_starts.data_ptr<int32_t>(),
-              row_ends.data_ptr<int32_t>(),
-              out.data_ptr<float>(),
-              rows,
-              columns,
-              tiles,
-              scale});
-    });
+    sycl_kernel_submit(
+        static_cast<int64_t>((rows - 1) / kRowsPerTile + 1) * tiles * kThreads,
+        static_cast<int64_t>(kThreads),
+        queue,
+        QSAMqaPrefillKernel<T>{
+            reinterpret_cast<const T*>(q.data_ptr()),
+            reinterpret_cast<const T*>(k.data_ptr()),
+            row_starts.data_ptr<int32_t>(),
+            row_ends.data_ptr<int32_t>(),
+            out.data_ptr<float>(),
+            rows,
+            columns,
+            tiles,
+            scale});
   };
   if (q.scalar_type() == at::kBFloat16)
     launch(static_cast<bf16*>(nullptr));
@@ -272,23 +273,23 @@ SGL_KERNEL_EXPORT at::Tensor qsa_mqa_decode(
   auto& queue = at::xpu::getCurrentXPUStream().queue();
   auto launch = [&](auto* input) {
     using T = std::remove_pointer_t<decltype(input)>;
-    queue.submit([&](sycl::handler& cgh) {
-      cgh.parallel_for(
-          sycl::nd_range<1>(static_cast<size_t>(rows) * tiles * kThreads, kThreads),
-          QSAMqaDecodeKernel<T>{
-              reinterpret_cast<const T*>(q.data_ptr()),
-              reinterpret_cast<const T*>(k_cache.data_ptr()),
-              page_table.data_ptr<int32_t>(),
-              context_lens.data_ptr<int32_t>(),
-              out.data_ptr<float>(),
-              columns,
-              width * page_size,
-              page_size,
-              width,
-              static_cast<int>(k_cache.size(0)),
-              tiles,
-              scale});
-    });
+    sycl_kernel_submit(
+        static_cast<int64_t>(rows) * tiles * kThreads,
+        static_cast<int64_t>(kThreads),
+        queue,
+        QSAMqaDecodeKernel<T>{
+            reinterpret_cast<const T*>(q.data_ptr()),
+            reinterpret_cast<const T*>(k_cache.data_ptr()),
+            page_table.data_ptr<int32_t>(),
+            context_lens.data_ptr<int32_t>(),
+            out.data_ptr<float>(),
+            columns,
+            width * page_size,
+            page_size,
+            width,
+            static_cast<int>(k_cache.size(0)),
+            tiles,
+            scale});
   };
   if (q.scalar_type() == at::kBFloat16)
     launch(static_cast<bf16*>(nullptr));

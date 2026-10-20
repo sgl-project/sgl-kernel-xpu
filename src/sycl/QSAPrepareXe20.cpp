@@ -8,6 +8,7 @@
 #include <sycl/sycl.hpp>
 #include <type_traits>
 
+#include "SYCLHelpers.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
 #include "sgl_kernel_export.h"
@@ -18,6 +19,7 @@ using bf16 = sycl::ext::oneapi::bfloat16;
 using fp8 = cutlass::float_e4m3_t;
 constexpr int kSubgroup = 16;
 constexpr int kThreads = 128;
+constexpr int kTasksPerGroup = kThreads / kSubgroup;
 
 template <typename T>
 struct TypeTag {
@@ -36,6 +38,8 @@ Output encode(bf16 x) {
     return fp8(float(x));
 }
 
+// ROPE: Rotate each dimension pair: (a, b) -> (a cos - b sin, b cos + a sin).
+// Read the selected MRoPE axis and cast the result to the index storage dtype.
 struct Rope {
   const float* cache;
   const int32_t* axes;
@@ -63,6 +67,8 @@ struct Rope {
   }
 };
 
+// Per token and head, apply Gemma RMSNorm and RoPE to index Q.
+// Also save raw BF16 K and RoPE positions once per token for group compression.
 template <typename Output>
 struct QPrep {
   const bf16* qk;
@@ -80,7 +86,7 @@ struct QPrep {
 
   [[sycl::reqd_sub_group_size(kSubgroup)]]
   void operator()(sycl::nd_item<1> item) const {
-    const int task = item.get_group(0) * (kThreads / kSubgroup) + item.get_local_id(0) / kSubgroup;
+    const int task = item.get_group(0) * kTasksPerGroup + item.get_local_id(0) / kSubgroup;
     const int token = task / padded;
     const int head = task % padded;
     const int lane = item.get_local_id(0) % kSubgroup;
@@ -124,6 +130,8 @@ struct QPrep {
   }
 };
 
+// Average raw keys over a completed group, then apply Gemma RMSNorm and RoPE.
+// Store one compressed index K at the group's first token position.
 template <typename Output>
 struct KCompress {
   const bf16* state;
@@ -145,7 +153,7 @@ struct KCompress {
 
   [[sycl::reqd_sub_group_size(kSubgroup)]]
   void operator()(sycl::nd_item<1> item) const {
-    const int group = item.get_group(0) * (kThreads / kSubgroup) + item.get_local_id(0) / kSubgroup;
+    const int group = item.get_group(0) * kTasksPerGroup + item.get_local_id(0) / kSubgroup;
     const int lane = item.get_local_id(0) % kSubgroup;
     if (group >= count || writes[group] < 0 || writes[group] >= out_slots) return;
     for (int r = 0; r < ratio; ++r)
@@ -187,7 +195,8 @@ void check_common(
     int64_t dim,
     int64_t rotary,
     double eps) {
-  TORCH_CHECK(anchor.device().is_xpu() && anchor.scalar_type() == at::kBFloat16, "QSA prep requires XPU BF16");
+  CHECK_INPUT(anchor);
+  TORCH_CHECK(anchor.scalar_type() == at::kBFloat16, "QSA prep requires BF16");
   TORCH_CHECK(dim == 64 || dim == 128 || dim == 256, "QSA prep requires head_dim 64, 128 or 256");
   TORCH_CHECK(rotary > 0 && rotary <= dim && rotary % 2 == 0, "QSA prep invalid rotary_dim");
   TORCH_CHECK(std::isfinite(eps) && eps >= 0, "QSA prep invalid eps");
@@ -259,27 +268,27 @@ SGL_KERNEL_EXPORT at::Tensor qsa_index_q_norm_rope_store(
   const size_t tasks = static_cast<size_t>(tokens) * padded;
   auto launch = [&](auto output_type) {
     using Output = typename decltype(output_type)::type;
-    at::xpu::getCurrentXPUStream().queue().submit([&](sycl::handler& h) {
-      h.parallel_for(
-          sycl::nd_range<1>(((tasks + 7) / 8) * kThreads, kThreads),
-          QPrep<Output>{
-              reinterpret_cast<const bf16*>(qk.data_ptr<at::BFloat16>()),
-              positions.data_ptr<int64_t>(),
-              positions.dim() == 1 ? 0 : positions.stride(0),
-              static_cast<int>(positions.dim() == 1 ? 1 : positions.size(0)),
-              reinterpret_cast<const bf16*>(weight.data_ptr<at::BFloat16>()),
-              cache_loc.data_ptr<int64_t>(),
-              reinterpret_cast<bf16*>(key_state_buffer.data_ptr<at::BFloat16>()),
-              rope_position_buffer.data_ptr<int64_t>(),
-              reinterpret_cast<Output*>(out.data_ptr()),
-              rope_args(cos_sin_cache, axis_map, rotary_dim, is_neox_style),
-              static_cast<int>(tokens),
-              static_cast<int>(num_q_heads),
-              static_cast<int>(padded),
-              static_cast<int>(dim),
-              static_cast<int>(key_state_buffer.size(0)),
-              static_cast<float>(eps)});
-    });
+    sycl_kernel_submit(
+        static_cast<int64_t>((tasks + kTasksPerGroup - 1) / kTasksPerGroup) * kThreads,
+        static_cast<int64_t>(kThreads),
+        at::xpu::getCurrentXPUStream().queue(),
+        QPrep<Output>{
+            reinterpret_cast<const bf16*>(qk.data_ptr<at::BFloat16>()),
+            positions.data_ptr<int64_t>(),
+            positions.dim() == 1 ? 0 : positions.stride(0),
+            static_cast<int>(positions.dim() == 1 ? 1 : positions.size(0)),
+            reinterpret_cast<const bf16*>(weight.data_ptr<at::BFloat16>()),
+            cache_loc.data_ptr<int64_t>(),
+            reinterpret_cast<bf16*>(key_state_buffer.data_ptr<at::BFloat16>()),
+            rope_position_buffer.data_ptr<int64_t>(),
+            reinterpret_cast<Output*>(out.data_ptr()),
+            rope_args(cos_sin_cache, axis_map, rotary_dim, is_neox_style),
+            static_cast<int>(tokens),
+            static_cast<int>(num_q_heads),
+            static_cast<int>(padded),
+            static_cast<int>(dim),
+            static_cast<int>(key_state_buffer.size(0)),
+            static_cast<float>(eps)});
   };
   if (dtype == at::kBFloat16)
     launch(TypeTag<bf16>{});
@@ -327,24 +336,24 @@ SGL_KERNEL_EXPORT void qsa_index_k_compress_store(
   const size_t groups = group_locs.size(0);
   auto launch = [&](auto output_type) {
     using Output = typename decltype(output_type)::type;
-    at::xpu::getCurrentXPUStream().queue().submit([&](sycl::handler& h) {
-      h.parallel_for(
-          sycl::nd_range<1>(((groups + 7) / 8) * kThreads, kThreads),
-          KCompress<Output>{
-              reinterpret_cast<const bf16*>(key_state_buffer.data_ptr<at::BFloat16>()),
-              group_locs.data_ptr<int32_t>(),
-              rope_position_buffer.data_ptr<int64_t>(),
-              reinterpret_cast<const bf16*>(weight.data_ptr<at::BFloat16>()),
-              write_locs.data_ptr<int32_t>(),
-              reinterpret_cast<Output*>(compressed_k_buffer.data_ptr()),
-              rope_args(cos_sin_cache, axis_map, rotary_dim, is_neox_style),
-              static_cast<int>(groups),
-              static_cast<int>(compress_ratio),
-              static_cast<int>(dim),
-              static_cast<int>(key_state_buffer.size(0)),
-              static_cast<int>(compressed_k_buffer.size(0)),
-              static_cast<float>(eps)});
-    });
+    sycl_kernel_submit(
+        static_cast<int64_t>((groups + kTasksPerGroup - 1) / kTasksPerGroup) * kThreads,
+        static_cast<int64_t>(kThreads),
+        at::xpu::getCurrentXPUStream().queue(),
+        KCompress<Output>{
+            reinterpret_cast<const bf16*>(key_state_buffer.data_ptr<at::BFloat16>()),
+            group_locs.data_ptr<int32_t>(),
+            rope_position_buffer.data_ptr<int64_t>(),
+            reinterpret_cast<const bf16*>(weight.data_ptr<at::BFloat16>()),
+            write_locs.data_ptr<int32_t>(),
+            reinterpret_cast<Output*>(compressed_k_buffer.data_ptr()),
+            rope_args(cos_sin_cache, axis_map, rotary_dim, is_neox_style),
+            static_cast<int>(groups),
+            static_cast<int>(compress_ratio),
+            static_cast<int>(dim),
+            static_cast<int>(key_state_buffer.size(0)),
+            static_cast<int>(compressed_k_buffer.size(0)),
+            static_cast<float>(eps)});
   };
   if (compressed_k_buffer.scalar_type() == at::kBFloat16)
     launch(TypeTag<bf16>{});

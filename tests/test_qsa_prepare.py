@@ -215,6 +215,60 @@ def test_empty_rows_and_default_output_shape():
     assert (dst == 1).all()
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_query_and_compress_across_workgroup_boundary(dtype):
+    dim, rotary = 64, 32
+    weight = torch.zeros(dim, device="xpu", dtype=torch.bfloat16)
+    cos_sin = torch.cat(
+        [
+            torch.ones(1, rotary // 2, device="xpu"),
+            torch.zeros(1, rotary // 2, device="xpu"),
+        ],
+        dim=1,
+    )
+    axis = torch.zeros(rotary // 2, device="xpu", dtype=torch.int32)
+    positions = torch.zeros(3, device="xpu", dtype=torch.int64)
+    state = torch.ones(36, dim, device="xpu", dtype=torch.bfloat16)
+    rope_state = torch.zeros(36, 3, device="xpu", dtype=torch.int64)
+    q = sgl_kernel.qsa_index_q_norm_rope_store(
+        torch.ones(3, 5 * dim, device="xpu", dtype=torch.bfloat16),
+        positions,
+        cos_sin,
+        axis,
+        weight,
+        torch.arange(3, device="xpu", dtype=torch.int64),
+        state,
+        rope_state,
+        4,
+        rotary,
+        1e-6,
+        True,
+        out_dtype=dtype,
+    )
+    torch.testing.assert_close(q.float(), torch.ones_like(q.float()))
+
+    compressed = torch.zeros(11, dim, device="xpu", dtype=dtype)
+    sgl_kernel.qsa_index_k_compress_store(
+        state,
+        torch.arange(36, device="xpu", dtype=torch.int32).reshape(9, 4),
+        rope_state,
+        cos_sin,
+        axis,
+        weight,
+        torch.arange(1, 10, device="xpu", dtype=torch.int32),
+        compressed,
+        4,
+        rotary,
+        1e-6,
+        True,
+    )
+    torch.testing.assert_close(
+        compressed[1:10].float(), torch.ones_like(compressed[1:10].float())
+    )
+    assert (compressed[0].float() == 0).all()
+    assert (compressed[10].float() == 0).all()
+
+
 @pytest.mark.parametrize("neox", [False, True])
 def test_fp8_query_and_compressed_key_storage(neox):
     torch.manual_seed(407)

@@ -17,6 +17,10 @@ def pytest_configure(config):
         "is skipped unless the live device is one of them. No mark = "
         "arch-agnostic (runs on any device).",
     )
+    config.addinivalue_line(
+        "markers",
+        "non_device: CPU or schema check; not Intel Arc Pro B70 evidence",
+    )
 
 
 def pytest_runtest_setup(item):

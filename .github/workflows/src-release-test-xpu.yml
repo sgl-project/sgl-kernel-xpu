@@ -123,7 +123,6 @@ jobs:
           EOF
 
       - name: Write per-file runner
-        id: runner
         # The suite runners stop at the first failing file; run one entry at a
         # time so every file gets a status and duration.
         run: |
@@ -162,12 +161,12 @@ jobs:
         run: $RUNNER_TEMP/run_per_file.sh tests test
 
       - name: Kernel benchmarks (per-commit suite)
-        if: ${{ inputs.run_benchmarks && !cancelled() && steps.runner.outcome == 'success' }}
+        if: ${{ inputs.run_benchmarks && !cancelled() }}
         timeout-minutes: 90
         run: $RUNNER_TEMP/run_per_file.sh benchmark benchmark
 
       - name: Compare against ${{ inputs.ref }} baseline.json
-        if: ${{ inputs.run_benchmarks && !cancelled() && steps.runner.outcome == 'success' }}
+        if: ${{ inputs.run_benchmarks && !cancelled() }}
         run: |
           mkdir -p bench_logs
           docker cp "$CONTAINER:$KERNEL_DIR/benchmark/." bench_logs/ || true

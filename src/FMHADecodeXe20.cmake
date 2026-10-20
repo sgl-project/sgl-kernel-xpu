@@ -16,29 +16,29 @@ set(FMHA_DECODE_NP_HEAD_DIMS 64 72 80 96 128 192 256 512)
 set(FMHA_DECODE_PAGE_SIZES 64 128)
 
 # The non-paged decode KV-tile size now lives in the shared header
-# sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h (decode_tiled_kv_np),
+# sycl/kernels/flash_attention_v2/xe20/fmha_tile_dispatch.h (decode_tiled_kv_np),
 # consumed both by the AOT template (compile-time lookup by HEAD_DIM) and the
 # runtime-JIT wrapper.
 
 # Paged decode (FmhaDecodeRunner) and non-paged decode (FmhaDecodeNpRunner).
 set(FMHA_DECODE_TEMPLATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_kernel.cpp.in")
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe20/xe_fmha_fwd_decode_kernel.cpp.in")
 
 set(FMHA_DECODE_NOPAGE_TEMPLATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_nopage_kernel.cpp.in")
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe20/xe_fmha_fwd_decode_nopage_kernel.cpp.in")
 
 set(FMHA_SPLIT_DECODE_TEMPLATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_split_decode_kernel.cpp.in")
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe20/xe_fmha_fwd_split_decode_kernel.cpp.in")
 
 # FP8 KV-cache paths are split into dedicated runner TUs (FmhaDecodeFp8Runner /
 # FmhaSplitDecodeFp8Runner) so their heavy e4m3/e5m2 kernel instantiations do not
 # inflate the 16-bit-KV decode / split-decode TUs' peak compiler memory. The KV
 # cache is fp8 while the query dtype is bf16 or fp16 (each its own TU / .so).
 set(FMHA_DECODE_FP8_TEMPLATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_fp8_kernel.cpp.in")
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe20/xe_fmha_fwd_decode_fp8_kernel.cpp.in")
 
 set(FMHA_SPLIT_DECODE_FP8_TEMPLATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_split_decode_fp8_kernel.cpp.in")
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe20/xe_fmha_fwd_split_decode_fp8_kernel.cpp.in")
 
 # 16-bit query element tags. Each tag produces INDEPENDENT shared libraries for
 # the decode / split-decode / non-paged paths so bf16 and fp16 do not share a

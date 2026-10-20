@@ -21,6 +21,10 @@ limitations under the License.
 #include <torch/library.h>
 #include <torch/torch.h>
 
+#if SYCL_INTEL_TARGET == 35
+#include "sgl_kernel/xe35/memory_ops.h"
+#endif
+
 #include <optional>
 #include <sycl/sycl.hpp>
 #include <tuple>

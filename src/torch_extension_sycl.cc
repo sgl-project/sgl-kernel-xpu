@@ -58,6 +58,30 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("hadamard_transform(Tensor input, float scale=1.0) -> Tensor");
   m.impl("hadamard_transform", torch::kXPU, &at::native::xpu::hadamard_transform);
 
+#if SYCL_INTEL_TARGET == 35
+  m.def(
+      "write_req_to_token_pool_xe35(Tensor(a!) req_to_token, Tensor req_pool_indices, Tensor prefix_pointers, "
+      "Tensor prefix_lens, Tensor seq_lens, Tensor extend_lens, Tensor out_cache_loc) -> ()");
+  m.impl("write_req_to_token_pool_xe35", torch::kXPU, &at::native::xpu::write_req_to_token_pool_xe35);
+
+  m.def(
+      "paged_alloc_extend_xe35(Tensor prefix_lens, Tensor seq_lens, Tensor last_loc, Tensor free_pages, Tensor! "
+      "out_indices, int page_size) -> ()");
+  m.impl("paged_alloc_extend_xe35", torch::kXPU, &at::native::xpu::paged_alloc_extend_xe35);
+
+  m.def(
+      "paged_alloc_extend_and_write_xe35(Tensor prefix_lens, Tensor seq_lens, Tensor last_loc, Tensor free_pages, "
+      "Tensor(a!) out_indices, Tensor(b!) req_to_token, Tensor req_pool_indices, Tensor prefix_pointers, int "
+      "page_size) -> ()");
+  m.impl("paged_alloc_extend_and_write_xe35", torch::kXPU, &at::native::xpu::paged_alloc_extend_and_write_xe35);
+
+  m.def(
+      "paged_alloc_decode_xe35(Tensor seq_lens, Tensor last_loc, Tensor free_pages, Tensor! out_indices, int page_size) -> "
+      "()");
+  m.impl("paged_alloc_decode_xe35", torch::kXPU, &at::native::xpu::paged_alloc_decode_xe35);
+
+#endif
+
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 

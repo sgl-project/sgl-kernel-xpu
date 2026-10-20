@@ -166,7 +166,7 @@ struct EmbeddingLoRAAFwd : public __SYCL_KER_CONFIG_CONVENTION__ {
     }
   }
 
-  void sycl_ker_config_convention(sycl::handler& cgh) const {}
+  void sycl_ker_config_convention([[maybe_unused]] sycl::handler& cgh) const {}
 };
 
 //----------------- Kernel launch --------------------//
@@ -226,7 +226,7 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
     const torch::Tensor& weight_indices,                   // [num_segments,]
     const torch::Tensor& lora_ranks,                       // [num_loras,]
     const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
-    const std::optional<torch::Tensor>&
+    [[maybe_unused]] const std::optional<torch::Tensor>&
         seg_lens  // [num_segments,] optional; currently unused, reserved for future per-segment optimizations
 ) {
   CHECK_INPUT(input_ids);

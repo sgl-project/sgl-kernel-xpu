@@ -274,10 +274,10 @@ class XeFMHAFwdKernel {
   }
 
   static cutlass::Status initialize_workspace(
-      Arguments const& args,
-      void* workspace = nullptr,
-      cudaStream_t stream = nullptr,
-      CudaHostAdapter* cuda_adapter = nullptr) {
+      [[maybe_unused]] Arguments const& args,
+      [[maybe_unused]] void* workspace = nullptr,
+      [[maybe_unused]] cudaStream_t stream = nullptr,
+      [[maybe_unused]] CudaHostAdapter* cuda_adapter = nullptr) {
     return Status::kSuccess;
   }
 
@@ -328,7 +328,7 @@ class XeFMHAFwdKernel {
     int head_group_q = s.num_heads_q / s.num_heads_kv;
 
     int thr_id = int(ThreadIdxX());
-    int sub_group_id = thr_id / intel::sg_size;
+    [[maybe_unused]] int sub_group_id = thr_id / intel::sg_size;
     int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
 
     auto cS = make_identity_tensor(take<0, 2>(TiledMMAQK{}.tile_mnk()));
@@ -412,11 +412,11 @@ class XeFMHAFwdKernel {
         }
       }
 
-      int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
+      [[maybe_unused]] int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       int offset_k_cache = 0, offset_v_cache = 0;
       if constexpr (is_var_len) {
         auto qo_cumulative = s.seq_len_qo.cumulative_length;
-        auto kv_cumulative = s.seq_len_kv.cumulative_length;
+        [[maybe_unused]] auto kv_cumulative = s.seq_len_kv.cumulative_length;
         offset_q = get<0>(p.dQ) * qo_cumulative[idx_b];
         // offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
         // offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
@@ -1283,15 +1283,15 @@ class XeFMHAFwdSplitKVKernel {
     return CollectiveMainloop::can_implement(args.mainloop) && CollectiveEpilogue::can_implement(args.epilogue);
   }
 
-  static int get_workspace_size(Arguments const& args) {
+  static int get_workspace_size([[maybe_unused]] Arguments const& args) {
     return 0;
   }
 
   static cutlass::Status initialize_workspace(
-      Arguments const& args,
-      void* workspace = nullptr,
-      cudaStream_t stream = nullptr,
-      CudaHostAdapter* cuda_adapter = nullptr) {
+      [[maybe_unused]] Arguments const& args,
+      [[maybe_unused]] void* workspace = nullptr,
+      [[maybe_unused]] cudaStream_t stream = nullptr,
+      [[maybe_unused]] CudaHostAdapter* cuda_adapter = nullptr) {
     return Status::kSuccess;
   }
 
@@ -1325,8 +1325,8 @@ class XeFMHAFwdSplitKVKernel {
     int head_group_q = s.num_heads_q / s.num_heads_kv;
 
     int thr_id = int(ThreadIdxX());
-    int sub_group_id = thr_id / intel::sg_size;
-    int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
+    [[maybe_unused]] int sub_group_id = thr_id / intel::sg_size;
+    [[maybe_unused]] int q_sg_tile = get<0>(shape_div(TileShapeQK{}, shape(SubgroupLayoutQK{})));
 
     auto cS = make_identity_tensor(take<0, 2>(TiledMMAQK{}.tile_mnk()));
     auto tScS = TiledMMAQK{}.get_slice(thr_id).partition_C(cS);
@@ -1368,7 +1368,7 @@ class XeFMHAFwdSplitKVKernel {
       const int k_blocks = cute::ceil_div(seq_len, get<1>(TileShapeQK{}));
       const int windowed_k_blocks = k_blocks - k_block0;
 
-      int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
+      [[maybe_unused]] int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       int offset_exp_sums = 0, offset_max_logits = 0;
       // Query-token index in the (num_heads_q, total_q) softmax_lse output. For
       // decode seq_len_qo == 1, so each (batch) maps to a single token.

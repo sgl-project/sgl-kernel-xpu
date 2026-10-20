@@ -32,7 +32,7 @@ namespace at::native::xpu {
 // Works with 32-wide sub-groups but reduces within 16-thread quantization groups
 // Each 32-wide sub-group contains two 16-thread quantization groups
 template <typename T>
-inline T QuantGroupReduceMax(T val, sycl::nd_item<1> item, int lane_id_in_quant_group) {
+inline T QuantGroupReduceMax(T val, sycl::nd_item<1> item, [[maybe_unused]] int lane_id_in_quant_group) {
   auto sg = item.get_sub_group();
 
   // Perform butterfly reduction with XOR pattern within 16-thread groups
@@ -105,7 +105,7 @@ struct PerTokenGroupQuant8bitKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         num_groups_per_row(num_groups_per_row),
         scale_stride(scale_stride) {}
 
-  void sycl_ker_config_convention(sycl::handler& cgh) {}
+  void sycl_ker_config_convention([[maybe_unused]] sycl::handler& cgh) {}
 
   [[sycl::reqd_sub_group_size(SUB_GROUP_SIZE)]] void operator()(sycl::nd_item<1> item) const {
     // all the variable names refer to CUDA nomenclature for easier mapping

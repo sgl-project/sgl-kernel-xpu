@@ -39,13 +39,59 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   # # -- Host flags (SYCL_CXX_FLAGS)
   list(APPEND SYCL_HOST_FLAGS -fPIC)
   list(APPEND SYCL_HOST_FLAGS -std=c++20)
+  # Security-baseline diagnostics. Must stay ahead of the -Wno-* block below:
+  # last flag wins, so the SYCL/torch header suppressions have to sit to the
+  # right of -Wall/-Wextra. -Wconversion is deliberately excluded -- CuTe/sycl-tla index
+  # arithmetic emits it by the thousand from headers we do not own.
+  set(SGL_SDL_WARNING_FLAGS
+    -Wall
+    -Wextra
+    -Wimplicit-fallthrough
+    -Wformat
+    -Wformat-security
+    -Werror=format-security)
+  # Opt-in regression gate. Requires the SYSTEM include dirs (CMakeLists.txt,
+  # src/BuildOnLinux.cmake) so only first-party diagnostics are fatal.
+  option(SGL_WERROR "Treat compiler warnings in first-party sources as errors" OFF)
+  if(SGL_WERROR)
+    list(APPEND SGL_SDL_WARNING_FLAGS -Werror)
+  endif()
+  list(APPEND SYCL_HOST_FLAGS ${SGL_SDL_WARNING_FLAGS})
   # SYCL headers warnings
   list(APPEND SYCL_HOST_FLAGS -Wno-deprecated-declarations)
   list(APPEND SYCL_HOST_FLAGS -Wno-deprecated)
   list(APPEND SYCL_HOST_FLAGS -Wno-attributes)
   list(APPEND SYCL_HOST_FLAGS -Wno-sign-compare)
+  # Kernel sources are compiled twice: once by icpx for the device and once by
+  # the -fsycl-host-compiler (gcc) for the host. `#pragma unroll` and
+  # `#pragma clang diagnostic` are consumed by the device pass, but gcc cannot
+  # act on either (its unroll spelling is `#pragma GCC unroll N`) and warns on
+  # every occurrence -- ~34k diagnostics, none actionable. The device pass still
+  # honours the pragmas, so nothing is lost by silencing the host pass.
+  list(APPEND SYCL_HOST_FLAGS -Wno-unknown-pragmas)
   list(APPEND SYCL_HOST_FLAGS -fvisibility=hidden)
   list(APPEND SYCL_HOST_FLAGS -fvisibility-inlines-hidden)
+
+  # Host-code hardening. x86-only: the driver warns and ignores
+  # -fcf-protection for spir64, so these must never reach SYCL_KERNEL_OPTIONS.
+  # Probed because the accepted set moves between oneAPI releases and the
+  # runtime-JIT compile reuses this list verbatim.
+  set(SGL_SDL_HARDENING_FLAGS)
+  foreach(_sdl_flag -fcf-protection=full -fstack-protector-strong)
+    string(MAKE_C_IDENTIFIER "SGL_SUPPORTS_${_sdl_flag}" _sdl_flag_var)
+    CHECK_SYCL_FLAG("${_sdl_flag}" ${_sdl_flag_var})
+    if(${_sdl_flag_var})
+      list(APPEND SGL_SDL_HARDENING_FLAGS ${_sdl_flag})
+    else()
+      message(WARNING "Compiler rejects '${_sdl_flag}'; hardening is incomplete for this build.")
+    endif()
+  endforeach()
+  # _FORTIFY_SOURCE is a no-op below -O1 and warns at -O0. -U first because the
+  # oneAPI/conda toolchain may already define it.
+  if(NOT CMAKE_BUILD_TYPE MATCHES Debug)
+    list(APPEND SGL_SDL_HARDENING_FLAGS -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2)
+  endif()
+  list(APPEND SYCL_HOST_FLAGS ${SGL_SDL_HARDENING_FLAGS})
 
   if(CMAKE_BUILD_TYPE MATCHES Debug)
     list(APPEND SYCL_HOST_FLAGS -g -fno-omit-frame-pointer -O0)
@@ -92,8 +138,18 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-associative-math)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-approx-func)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -Wno-absolute-value)
+  # Mirrors the host-pass suppression above. nd_item::barrier(fence_space) is
+  # __SYCL2020_DEPRECATED in favour of sycl::group_barrier(), but group_barrier
+  # also fences CrossWorkgroupMemory, so the swap is a perf change and is
+  # deferred until it can be benchmarked.
+  set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -Wno-deprecated-declarations)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -no-ftz)
   set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -fno-sycl-instrument-device-code)
+  # The device pass only carries clang's default-on diagnostics, not -Wall/-Wextra;
+  # the gate keeps those (e.g. -Wmacro-redefined) from regressing.
+  if(SGL_WERROR)
+    set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -Werror)
+  endif()
 
   if(CMAKE_BUILD_TYPE MATCHES Debug)
     set(SYCL_KERNEL_OPTIONS ${SYCL_KERNEL_OPTIONS} -g -O0 -Rno-debug-disables-optimization)
@@ -114,6 +170,14 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   endif()
 
   set(TORCH_XPU_OPS_FLAGS ${SYCL_HOST_FLAGS})
+
+  # -- Link hardening, applied per target in src/BuildOnLinux.cmake.
+  # -z,now is required on top of -z,relro for *full* RELRO; -z,relro alone leaves
+  # the lazily-bound GOT writable. No -pie: every target here is a shared library.
+  set(SGL_SDL_LINK_FLAGS
+    -Wl,-z,noexecstack
+    -Wl,-z,relro
+    -Wl,-z,now)
 
   # -- SYCL device object linkage flags
   include(ProcessorCount)

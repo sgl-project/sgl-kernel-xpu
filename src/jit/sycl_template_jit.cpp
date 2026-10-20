@@ -245,6 +245,8 @@ void* get_or_compile(const CompileSpec& spec, const JitConfig& config, std::stri
     key_material += "\n" + f;
   for (const auto& d : config.include_dirs)
     key_material += "\nI:" + d;
+  for (const auto& d : config.system_include_dirs)
+    key_material += "\nisystem:" + d;
   for (const auto& l : config.link_flags)
     key_material += "\nL:" + l;
   key_material += "\nENTRY:" + spec.entry_symbol;
@@ -326,6 +328,8 @@ void* get_or_compile(const CompileSpec& spec, const JitConfig& config, std::stri
         cmd += " " + shell_quote(f);
       for (const auto& d : config.include_dirs)
         cmd += " -I " + shell_quote(d);
+      for (const auto& d : config.system_include_dirs)
+        cmd += " -isystem " + shell_quote(d);
       cmd += " " + shell_quote(tmp_cpp);
       cmd += " -o " + shell_quote(tmp_so);
       for (const auto& l : config.link_flags)
@@ -463,7 +467,7 @@ const JitConfig& default_config() {
       if (path_exists(base + "/tools/util/include")) cutlass.push_back(base + "/tools/util/include");
     }
     for (auto& d : cutlass)
-      c.include_dirs.push_back(d);
+      c.system_include_dirs.push_back(d);
 
     // torch include + lib are supplied by Python at import (only Python knows
     // torch's install location).
@@ -474,7 +478,7 @@ const JitConfig& default_config() {
       return c;
     }
     for (auto& d : torch_inc)
-      c.include_dirs.push_back(d);
+      c.system_include_dirs.push_back(d);
 
     std::string torch_lib = env_or_empty("SGL_JIT_TORCH_LIB");
     if (torch_lib.empty()) {

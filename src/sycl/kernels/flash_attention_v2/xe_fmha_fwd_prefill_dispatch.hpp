@@ -47,9 +47,10 @@ namespace prefill {
   extern template struct FmhaPrefillNpRunner<HD>; \
   extern template struct FmhaPrefillNpRunner<HD, cutlass::half_t>;
 
-// Paged prefill runners: paged head dims only (64, 96, 128, 192, 256, 512).
+// Paged prefill runners: paged head dims only (64, 80, 96, 128, 192, 256, 512).
 // 16-bit query: bf16 + fp16.
 EXTERN_FMHA_PREFILL_RUNNER(64)
+EXTERN_FMHA_PREFILL_RUNNER(80)
 EXTERN_FMHA_PREFILL_RUNNER(96)
 EXTERN_FMHA_PREFILL_RUNNER(128)
 EXTERN_FMHA_PREFILL_RUNNER(192)

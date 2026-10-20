@@ -44,6 +44,9 @@ constexpr PrefillTile prefill_paged_tile(int hd) {
   switch (hd) {
     case 64:
       return {128, 64, 8, true};
+    case 80:
+      // Mirrors the tuned non-paged HD=80 tile; unvalidated for the paged path.
+      return {256, 64, 16, true};
     case 96:
       return {128, 64, 8, true};
     case 128:

@@ -144,7 +144,7 @@ struct KCompress {
   int count, ratio, dim, slots, out_slots;
   float eps;
 
-  float pooled(int group, int d) const {
+  float pooled(int64_t group, int d) const {
     float sum = 0.0f;
     for (int r = 0; r < ratio; ++r)
       sum += float(state[static_cast<int64_t>(groups[group * ratio + r]) * dim + d]);
@@ -153,7 +153,7 @@ struct KCompress {
 
   [[sycl::reqd_sub_group_size(kSubgroup)]]
   void operator()(sycl::nd_item<1> item) const {
-    const int group = item.get_group(0) * kTasksPerGroup + item.get_local_id(0) / kSubgroup;
+    const int64_t group = item.get_group(0) * kTasksPerGroup + item.get_local_id(0) / kSubgroup;
     const int lane = item.get_local_id(0) % kSubgroup;
     if (group >= count || writes[group] < 0 || writes[group] >= out_slots) return;
     for (int r = 0; r < ratio; ++r)

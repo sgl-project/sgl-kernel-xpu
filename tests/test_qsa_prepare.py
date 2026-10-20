@@ -305,8 +305,10 @@ def test_fp8_query_and_compressed_key_storage(neox):
         *args, q_heads_padded=6, out_dtype=torch.bfloat16
     )
     assert fp8_q.dtype == torch.float8_e4m3fn
+    FP8_MIN, FP8_MAX = -448, 448
     torch.testing.assert_close(
-        fp8_q.view(torch.uint8), bf16_q.to(fp8_q.dtype).view(torch.uint8)
+        fp8_q.view(torch.uint8),
+        bf16_q.clamp(FP8_MIN, FP8_MAX).to(fp8_q.dtype).view(torch.uint8),
     )
     assert fp8_q.view(torch.uint8)[0, 0, 0].item() & 0x7F == 0x7F
     assert fp8_q.float().abs().nan_to_num().max().item() == 448
@@ -335,7 +337,7 @@ def test_fp8_query_and_compressed_key_storage(neox):
     )
     torch.testing.assert_close(
         fp8_cache.view(torch.uint8),
-        bf16_cache.to(torch.float8_e4m3fn).view(torch.uint8),
+        bf16_cache.clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn).view(torch.uint8),
     )
     assert (
         fp8_cache.view(torch.uint8)[5]

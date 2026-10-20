@@ -37,8 +37,8 @@
 #define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 1
 #endif
 
-#include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
-#include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_runner.hpp"
+#include "sycl/kernels/flash_attention_v2/xe20/fmha_tile_dispatch.h"
+#include "sycl/kernels/flash_attention_v2/xe20/xe_fmha_fwd_prefill_runner.hpp"
 
 namespace prefill {
 

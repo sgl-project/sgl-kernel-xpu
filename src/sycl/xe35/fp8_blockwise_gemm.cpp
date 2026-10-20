@@ -81,9 +81,7 @@ struct Fp8BlockwiseGemmConfig {
   // Software block-scaled path: fp8 DPAS, apply fp32 scaleA*scaleB per group.
   static constexpr int PipelineStages = 2;
   using GroupSizeMNK = cute::tuple<cute::_1, cute::Int<128>, cute::Int<128>>;
-  // ...BlockScaledImpl (not the ...BlockScaled alias): the alias takes an `int`
-  // GroupSize, while the per-MNK group shape here is a type.
-  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16BlockScaledImpl<PipelineStages, GroupSizeMNK>;
+  using GEMMDispatchPolicy = cutlass::gemm::MainloopIntelXeXMX16BlockScaled<PipelineStages, GroupSizeMNK>;
   using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeGeneric;
 
   using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<

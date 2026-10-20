@@ -40,8 +40,8 @@
 #undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
-#include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
-#include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
+#include "sycl/kernels/flash_attention_v2/xe20/fmha_tile_dispatch.h"
+#include "sycl/kernels/flash_attention_v2/xe20/xe_fmha_fwd_decode_runner.hpp"
 
 namespace decode {
 

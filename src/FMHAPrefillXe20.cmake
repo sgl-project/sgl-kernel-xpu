@@ -15,20 +15,20 @@ set(FMHA_PREFILL_NP_HEAD_DIMS 64 72 80 96 128 192 256 512)
 
 # Paged prefill (FmhaPrefillRunner) and non-paged prefill (FmhaPrefillNpRunner).
 set(FMHA_PREFILL_TEMPLATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_kernel.cpp.in")
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe20/xe_fmha_fwd_prefill_kernel.cpp.in")
 
 set(FMHA_PREFILL_NOPAGE_TEMPLATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_nopage_kernel.cpp.in")
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe20/xe_fmha_fwd_prefill_nopage_kernel.cpp.in")
 
 # FP8 KV-cache prefill path is split into a dedicated runner TU
 # (FmhaPrefillFp8Runner) so its heavy e4m3/e5m2 kernel instantiations do not
 # inflate the 16-bit-KV prefill TU's peak compiler memory. The KV cache is fp8
 # while the query dtype is bf16 or fp16 (each its own TU / .so).
 set(FMHA_PREFILL_FP8_TEMPLATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe_fmha_fwd_prefill_fp8_kernel.cpp.in")
+    "${CMAKE_CURRENT_SOURCE_DIR}/sycl/kernels/flash_attention_v2/xe20/xe_fmha_fwd_prefill_fp8_kernel.cpp.in")
 
 # Per-HEAD_DIM prefill tile shapes (paged and non-paged) now live in the shared
-# header sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h, consumed both by
+# header sycl/kernels/flash_attention_v2/xe20/fmha_tile_dispatch.h, consumed both by
 # the AOT kernel templates (compile-time lookup by HEAD_DIM) and the runtime-JIT
 # wrapper. Only the ENABLE_SCORE_BLOCK2D build option remains here.
 option(

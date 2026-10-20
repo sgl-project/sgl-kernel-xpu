@@ -68,7 +68,7 @@ if(USE_GDN)
     add_compile_definitions(USE_GDN)
 endif()
 if(USE_FMHA AND USE_SYCL_JIT)
-    # Route decode/prefill dispatch (flash_attention.cpp) through the runtime-JIT
+    # Route decode/prefill dispatch (flash_attentionXe20.cpp) through the runtime-JIT
     # path; the AOT FMHA instances are not generated (see include() guard below).
     add_compile_definitions(USE_FMHA_JIT)
 endif()
@@ -105,12 +105,15 @@ file(GLOB_RECURSE device_cpp "sycl/*.cpp" "sycl/*.sycl")
 file(GLOB host_cpp "./*.cpp" "./*.cc")
 
 # Filter out source files belonging to disabled features BEFORE splitting them
-# into common/Xe20 buckets. The disabled base sources (flash_attention.cpp,
+# into common/Xe20 buckets. The disabled base sources (flash_attentionXe20.cpp,
 # mla_*.cpp) are non-Xe20 and would otherwise land in device_cpp_common, which
 # is never filtered; removing them from device_cpp up front is the only way to
 # keep them out of the build.
-if(NOT USE_FMHA)
-    list(FILTER device_cpp EXCLUDE REGEX "/flash_attention\\.cpp$")
+if(NOT USE_FMHA OR DPCPP_SYCL_TARGET MATCHES "cri")
+    list(FILTER device_cpp EXCLUDE REGEX "/flash_attentionXe20\\.cpp$")
+endif()
+if(NOT USE_FMHA OR NOT DPCPP_SYCL_TARGET MATCHES "cri")
+    list(FILTER device_cpp EXCLUDE REGEX "/flash_attentionXe35\\.cpp$")
 endif()
 if(NOT USE_GDN)
     list(FILTER device_cpp EXCLUDE REGEX "/gdn_attention\\.cpp$")
@@ -159,9 +162,13 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/GateUpLoraBFwdXe20.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/ChunkedSgmvLoraShrinkFwdXe20.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/ChunkedSgmvLoraExpandFwdXe20.cmake)
 if(USE_FMHA)
-    if(NOT USE_SYCL_JIT)
+    if(NOT USE_SYCL_JIT AND NOT DPCPP_SYCL_TARGET MATCHES "cri")
         include(FMHADecodeXe20.cmake)
         include(FMHAPrefillXe20.cmake)
+    endif()
+    if(DPCPP_SYCL_TARGET MATCHES "cri")
+        include(FMHADecodeXe35.cmake)
+        include(FMHAPrefillXe35.cmake)
     endif()
 endif()
 if(USE_MLA)

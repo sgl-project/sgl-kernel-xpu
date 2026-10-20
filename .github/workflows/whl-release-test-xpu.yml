@@ -115,6 +115,9 @@ jobs:
               --index-url https://download.pytorch.org/whl/xpu
             pip install --no-deps --force-reinstall "/tmp/whl/$WHEEL_FILE"
             pip install pytest expecttest ray huggingface_hub scipy tabulate pandas matplotlib einops numpy
+            # Same extras as the pr-test-xpu.yml image (benchmark/utils.py needs transformers);
+            # torch pinned so the resolver cannot swap it.
+            pip install "torch==$TORCH" transformers msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser aiohttp
             hf auth login --token "$HF_TOKEN"
             # tests/test_utils.py spawns bare "python3".
             ln -sf "/miniforge3/envs/$PY_ENV/bin/python3" /usr/bin/python3
@@ -154,6 +157,8 @@ jobs:
           if [ ${#names[@]} -eq 0 ]; then echo "::error::no $label files found"; exit 1; fi
           failed=0
           for i in "${!names[@]}"; do
+            # run_suite.py only sees a one-file slice, so its own counter is always 0/0.
+            echo "::group::[$((i + 1))/${#names[@]}] $label: ${names[$i]}"
             start=$(date +%s)
             if docker exec -w "$KERNEL_DIR/$dir" "$CONTAINER" /bin/bash -c \
                 ". /miniforge3/bin/activate $PY_ENV && python3 run_suite.py --suite per-commit --range-begin $i --range-end $((i + 1))" </dev/null; then
@@ -162,6 +167,8 @@ jobs:
               status=fail; failed=$((failed + 1))
             fi
             echo "${names[$i]},$label,$status,$(( $(date +%s) - start ))" >> "$GITHUB_WORKSPACE/results.csv"
+            echo "::endgroup::"
+            [ "$status" = pass ] || echo "::error::[$((i + 1))/${#names[@]}] $label failed: ${names[$i]}"
           done
           echo "$label: $failed of ${#names[@]} file(s) failed"
           [ "$failed" -eq 0 ]

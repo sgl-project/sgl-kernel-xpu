@@ -41,6 +41,7 @@ if os.path.exists(cuda_path):
     ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)
 
 from sgl_kernel import common_ops
+from sgl_kernel.residual_norm import fused_post_norm_residual_pre_norm_xe35
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     flash_mla_decode,

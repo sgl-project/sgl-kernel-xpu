@@ -1,6 +1,8 @@
 # Adapted from https://github.com/flashinfer-ai/flashinfer/blob/4e8eb1879f9c3ba6d75511e5893183bf8f289a62/tests/test_norm.py
 
+import gc
 import sys
+import time
 
 import pytest
 import sgl_kernel
@@ -870,6 +872,288 @@ def test_gemma_fused_add_rmsnorm_mixed_dtype(
     tol = 1e-2 if input_dtype == torch.bfloat16 else 1e-3
     torch.testing.assert_close(x_fused, x_native, rtol=tol, atol=tol)
     torch.testing.assert_close(residual_fused, residual_native, rtol=tol, atol=tol)
+
+
+POST_EPS = 1e-8
+PRE_EPS = 1e-5
+
+
+def is_residual_norm_available_xe35():
+    if not torch.xpu.is_available():
+        return False
+    from sgl_kernel.utils import is_xe3_arch
+
+    return is_xe3_arch() and hasattr(
+        torch.ops.sgl_kernel, "fused_post_norm_residual_pre_norm_xe35"
+    )
+
+
+def round_bfloat16_xe35(values: torch.Tensor) -> torch.Tensor:
+    """Round an independent FP64 oracle directly to BF16, without an FP32 double-round."""
+    high = values.float()
+    midpoint = ((high.view(torch.int32) & 0xFFFF) == 0x8000) & (values != high.double())
+    if midpoint.any():
+        direction = torch.where(
+            values[midpoint] > high[midpoint].double(), float("inf"), float("-inf")
+        ).float()
+        high[midpoint] = torch.nextafter(high[midpoint], direction)
+    return high.bfloat16()
+
+
+def reference_xe35(
+    branch: torch.Tensor,
+    stream: torch.Tensor,
+    post_weight: torch.Tensor,
+    pre_weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    post_norm_input_scale: bool,
+    round_pre_norm_input: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Independent FP64 mathematics with the model's BF16 boundaries and FP32 stream store."""
+    post_input = branch.double()
+    if post_weight.numel() and post_norm_input_scale:
+        post_input = round_bfloat16_xe35(post_input * post_weight.double()).double()
+    post_eps = torch.tensor(POST_EPS, dtype=torch.float32, device="cpu").double()
+    pre_eps = torch.tensor(PRE_EPS, dtype=torch.float32, device="cpu").double()
+    post_rstd = torch.rsqrt(post_input.square().mean(dim=-1, keepdim=True) + post_eps)
+    normed_branch = post_input * post_rstd
+    if post_weight.numel() and not post_norm_input_scale:
+        normed_branch = normed_branch * post_weight.double()
+    normed_branch = round_bfloat16_xe35(normed_branch)
+    rounded_post_norm = normed_branch.float()
+    new_stream = (
+        alpha.double() * stream.double() + beta.double() * rounded_post_norm.double()
+    ).float()
+    pre_norm_input = (
+        new_stream.bfloat16().double() if round_pre_norm_input else new_stream.double()
+    )
+    pre_rstd = torch.rsqrt(pre_norm_input.square().mean(dim=-1, keepdim=True) + pre_eps)
+    output = (pre_norm_input * pre_rstd * pre_weight.double()).float()
+    return output, new_stream, normed_branch
+
+
+def run_op_xe35(
+    branch: torch.Tensor,
+    stream: torch.Tensor,
+    post_weight: torch.Tensor,
+    pre_weight: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    post_norm_input_scale: bool = False,
+    round_pre_norm_input: bool = False,
+    output_fp32: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output = torch.empty_like(branch)
+    new_stream = torch.empty_like(stream)
+    sgl_kernel.fused_post_norm_residual_pre_norm_xe35(
+        branch,
+        stream,
+        post_weight,
+        pre_weight,
+        alpha,
+        beta,
+        output,
+        new_stream,
+        POST_EPS,
+        PRE_EPS,
+        post_norm_input_scale,
+        round_pre_norm_input,
+        output_fp32,
+    )
+    return output, new_stream
+
+
+@pytest.mark.skipif(
+    not is_residual_norm_available_xe35(),
+    reason="Xe35 compute capability 3.5 and dedicated op required",
+)
+def test_round_bfloat16_reference_midpoints_xe35():
+    midpoint = 1.30859375
+    values = torch.tensor(
+        [midpoint - 2**-40, midpoint, midpoint + 2**-40], dtype=torch.float64
+    )
+    expected = torch.tensor([1.3046875, 1.3125, 1.3125], dtype=torch.bfloat16)
+    torch.testing.assert_close(round_bfloat16_xe35(values), expected, rtol=0, atol=0)
+    torch.testing.assert_close(round_bfloat16_xe35(-values), -expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not is_residual_norm_available_xe35(),
+    reason="Xe35 compute capability 3.5 and dedicated op required",
+)
+def test_fused_norm_residual_fp32_fma_boundary_xe35():
+    device = torch.device("xpu")
+    branch = -torch.ones(1, 8, dtype=torch.bfloat16, device=device)
+    stream = torch.full((1, 8), 1 - 2**-23, dtype=torch.float32, device=device)
+    alpha = torch.full((8,), 1 + 2**-23, dtype=torch.float32, device=device)
+    beta = torch.ones_like(alpha)
+    post = torch.empty(0, dtype=torch.bfloat16, device=device)
+    pre = torch.ones(8, dtype=torch.bfloat16, device=device)
+    _, updated = run_op_xe35(branch, stream, post, pre, alpha, beta)
+    torch.testing.assert_close(
+        updated.cpu(), torch.full((1, 8), -(2**-46)), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("rows", [1, 37, 257])
+@pytest.mark.parametrize("hidden_size", [4096, 8192, 16384])
+@pytest.mark.parametrize("post_mode", ["none", "weight", "input_scale"])
+@pytest.mark.parametrize("round_pre_norm_input", [False, True])
+@pytest.mark.skipif(
+    not is_residual_norm_available_xe35(),
+    reason="Xe35 compute capability 3.5 and dedicated op required",
+)
+def test_fused_norm_residual_xe35(
+    rows: int, hidden_size: int, post_mode: str, round_pre_norm_input: bool
+) -> None:
+    torch.manual_seed(1234 + rows)
+    device = torch.device("xpu")
+    branch = torch.randn(rows, hidden_size, device=device, dtype=torch.bfloat16)
+    stream = torch.randn(rows, hidden_size, device=device, dtype=torch.float32)
+    post_weight = (
+        torch.empty(0, device=device, dtype=torch.bfloat16)
+        if post_mode == "none"
+        else torch.randn(hidden_size, device=device, dtype=torch.bfloat16)
+    )
+    pre_weight = torch.randn(hidden_size, device=device, dtype=torch.bfloat16)
+    alpha = torch.rand(hidden_size, device=device, dtype=torch.float32)
+    beta = torch.rand(hidden_size, device=device, dtype=torch.float32)
+
+    post_weight_cpu, pre_weight_cpu = post_weight.cpu(), pre_weight.cpu()
+    alpha_cpu, beta_cpu = alpha.cpu(), beta.cpu()
+    actual_output, actual_stream = run_op_xe35(
+        branch,
+        stream,
+        post_weight,
+        pre_weight,
+        alpha,
+        beta,
+        post_mode == "input_scale",
+        round_pre_norm_input,
+    )
+
+    for start in range(0, rows, 512):
+        expected_output, expected_stream, _ = reference_xe35(
+            branch[start : start + 512].cpu(),
+            stream[start : start + 512].cpu(),
+            post_weight_cpu,
+            pre_weight_cpu,
+            alpha_cpu,
+            beta_cpu,
+            post_mode == "input_scale",
+            round_pre_norm_input,
+        )
+        torch.testing.assert_close(
+            actual_output[start : start + 512].cpu().float(),
+            expected_output,
+            rtol=5e-3,
+            atol=5e-3,
+        )
+        torch.testing.assert_close(
+            actual_stream[start : start + 512].cpu(),
+            expected_stream,
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+    output_fp32 = torch.empty_like(stream)
+    widened_output, widened_stream = run_op_xe35(
+        branch,
+        stream,
+        post_weight,
+        pre_weight,
+        alpha,
+        beta,
+        post_mode == "input_scale",
+        round_pre_norm_input,
+        output_fp32,
+    )
+    for start in range(0, rows, 512):
+        torch.testing.assert_close(
+            widened_output[start : start + 512].cpu(),
+            actual_output[start : start + 512].cpu(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            widened_stream[start : start + 512].cpu(),
+            actual_stream[start : start + 512].cpu(),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            output_fp32[start : start + 512].cpu(),
+            actual_output[start : start + 512].cpu().float(),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.skipif(
+    not is_residual_norm_available_xe35(),
+    reason="Xe35 compute capability 3.5 and dedicated op required",
+)
+def test_fused_norm_residual_hidden_tail_rows_boundary_xe35() -> None:
+    test_fused_norm_residual_xe35(385, 8200, "none", True)
+
+
+@pytest.mark.parametrize("hidden_size", [8, 32768])
+@pytest.mark.skipif(
+    not is_residual_norm_available_xe35(),
+    reason="Xe35 compute capability 3.5 and dedicated op required",
+)
+def test_fused_norm_residual_hidden_limits_xe35(hidden_size):
+    test_fused_norm_residual_xe35(1, hidden_size, "weight", False)
+
+
+@pytest.mark.skipif(
+    not is_residual_norm_available_xe35(),
+    reason="Xe35 compute capability 3.5 and dedicated op required",
+)
+def test_fused_norm_residual_empty_rows_xe35():
+    branch = torch.empty(0, 8, device="xpu", dtype=torch.bfloat16)
+    stream = torch.empty(0, 8, device="xpu", dtype=torch.float32)
+    post = torch.empty(0, device="xpu", dtype=torch.bfloat16)
+    pre = torch.ones(8, device="xpu", dtype=torch.bfloat16)
+    alpha = torch.ones(8, device="xpu", dtype=torch.float32)
+    output, updated = run_op_xe35(branch, stream, post, pre, alpha, alpha)
+    assert output.shape == updated.shape == (0, 8)
+
+
+@pytest.mark.skipif(
+    not is_residual_norm_available_xe35(),
+    reason="Xe35 compute capability 3.5 and dedicated op required",
+)
+def test_fused_norm_residual_reject_fp16_xe35():
+    branch = torch.ones(1, 8, device="xpu", dtype=torch.float16)
+    stream = torch.ones(1, 8, device="xpu", dtype=torch.float32)
+    post = torch.empty(0, device="xpu", dtype=torch.bfloat16)
+    pre = torch.ones(8, device="xpu", dtype=torch.bfloat16)
+    alpha = torch.ones(8, device="xpu", dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="branch must be bfloat16"):
+        run_op_xe35(branch, stream, post, pre, alpha, alpha)
+
+
+@pytest.mark.parametrize("rows", [8, 32768])
+@pytest.mark.parametrize("post_mode", ["none", "weight", "input_scale"])
+@pytest.mark.parametrize("round_pre_norm_input", [False, True])
+@pytest.mark.skipif(
+    not is_residual_norm_available_xe35(),
+    reason="Xe35 compute capability 3.5 and dedicated op required",
+)
+def test_fused_norm_residual_production_shapes_xe35(rows, post_mode, round_pre_norm_input):
+    test_fused_norm_residual_xe35(rows, 8192, post_mode, round_pre_norm_input)
+
+
+@pytest.fixture(autouse=True)
+def cool_residual_norm_case_xe35(request):
+    yield
+    if request.node.function.__name__.endswith("_xe35"):
+        torch.xpu.synchronize()
+        gc.collect()
+        torch.xpu.empty_cache()
+        time.sleep(2)
 
 
 if __name__ == "__main__":

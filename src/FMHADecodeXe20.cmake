@@ -11,7 +11,7 @@
 # The paged and non-paged KV paths support INDEPENDENT sets of head dimensions.
 # Non-paged decode supports 16-bit KV only (no fp8 KV cache, no split-KV).
 set(FMHA_DECODE_QG_SIZES 1 2 4 8 16)
-set(FMHA_DECODE_PAGED_HEAD_DIMS 64 96 128 192 256 512)
+set(FMHA_DECODE_PAGED_HEAD_DIMS 64 80 96 128 192 256 512)
 set(FMHA_DECODE_NP_HEAD_DIMS 64 72 80 96 128 192 256 512)
 set(FMHA_DECODE_PAGE_SIZES 64 128)
 

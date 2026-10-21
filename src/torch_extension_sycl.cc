@@ -58,6 +58,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("hadamard_transform(Tensor input, float scale=1.0) -> Tensor");
   m.impl("hadamard_transform", torch::kXPU, &at::native::xpu::hadamard_transform);
 
+#if SYCL_INTEL_TARGET == 35
+  m.def(
+      "compute_position_xe35(Tensor! positions, Tensor! extend_start_loc, Tensor prefix_lens, Tensor seq_lens) -> ()");
+  m.impl("compute_position_xe35", torch::kXPU, &at::native::xpu::compute_position_xe35);
+
+  m.def(
+      "compute_position_with_hint_xe35(Tensor! positions, Tensor! extend_start_loc, "
+      "Tensor prefix_lens, Tensor seq_lens, int max_seq_len_hint) -> ()");
+  m.impl("compute_position_with_hint_xe35", torch::kXPU, &at::native::xpu::compute_position_with_hint_xe35);
+
+#endif
+
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 

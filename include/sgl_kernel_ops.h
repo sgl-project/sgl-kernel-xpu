@@ -1575,3 +1575,7 @@ std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_table(
     int64_t page_size);
 
 #pragma GCC visibility pop
+
+#if SYCL_INTEL_TARGET == 35
+#include "sgl_kernel/xe35/mxfp4_w4a4.h"
+#endif

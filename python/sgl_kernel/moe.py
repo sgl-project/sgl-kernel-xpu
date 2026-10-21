@@ -1587,6 +1587,72 @@ def cutlass_fused_experts_fp8(
     apply_shuffle_mul_sum(c2.to(out_dtype), output, c_map, topk_weights.to(out_dtype))
     return output
 
+def mxfp4_moe_scale_to_mn_major_xe35(out, input, rows_per_expert):
+    """Relayout per-token MXFP4 scales for moe_grouped_mm_nt_mxfp4_w4a4_xe35.
+
+    `input` is the [M, k // 32] row-major surface `sgl_per_token_group_quant_fp4`
+    emits, with rows already grouped by expert; `out` is the per-expert MN-major,
+    M-padded-to-4 surface the grouped GEMM reads, and needs
+    `sum(round_up(rows_i, 4))` rows (zero it first if any row count is not a
+    multiple of 4). `rows_per_expert` must be contiguous int32 on device.
+    The caller must provide nonnegative counts whose sum fits the input and
+    size the padded output accordingly. Only shape metadata is checked; device
+    counts are not copied to the host, preserving graph capture and collectives.
+    """
+    torch.ops.sgl_kernel.mxfp4_moe_scale_to_mn_major_xe35.default(
+        out, input, rows_per_expert
+    )
+
+
+def moe_grouped_mm_nt_mxfp4_w4a4_xe35(
+    output,
+    a,
+    a_scale,
+    b,
+    b_scale,
+    rows_per_expert,
+    n,
+    k,
+    num_experts,
+    bias=None,
+):
+    """MXFP4-A x MXFP4-B (W4A4) MoE grouped GEMM using the vLLM Xe3 collective.
+
+    Needs no pointer tables and no host-visible problem sizes: the per-expert row
+    counts stay on device and the strides are rebuilt from (n, k, num_experts), so
+    the layout contract is fixed:
+
+      a         [total_M, k // 2]   packed e2m1, row-major, contiguous
+      a_scale   [padded_M, k // 32] e8m0, contiguous, each expert's M rounded up to 4;
+                within an expert's block the scales are MN-major, i.e. that block is
+                filled as `blk.view(k // 32, ru4(M_i))[:, :M_i] = scales.transpose(0, 1)`
+      b         [num_experts, n, k // 2] packed e2m1, contiguous
+      b_scale   contiguous [num_experts, k // 32, n] e8m0, or its
+                [num_experts, n, k // 32] transpose view; storage offset is
+                `expert * n * (k // 32) + group * n + channel`
+      output    [total_M, n]        bfloat16
+      rows_per_expert [num_experts] contiguous int32, on device
+
+    The caller must provide nonnegative counts whose sum fits `a`, and
+    `sum(round_up(rows_i, 4))` a_scale rows. Only shape metadata is checked;
+    device counts are not copied to the host, preserving graph capture and collectives.
+    """
+    assert (
+        is_xe3_arch()
+    ), "moe_grouped_mm_nt_mxfp4_w4a4_xe35 is only supported on CRI (Xe3P) devices"
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_mxfp4_w4a4_xe35.default(
+        output,
+        a,
+        a_scale,
+        b,
+        b_scale,
+        bias,
+        rows_per_expert,
+        n,
+        k,
+        num_experts,
+    )
+
 
 _MXFP4_BLOCK_SIZE = 32
 

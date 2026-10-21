@@ -794,3 +794,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 }
 
 REGISTER_EXTENSION(common_ops)
+
+#if SYCL_INTEL_TARGET == 35 && defined(USE_MOE)
+TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def("moe_grouped_mm_nt_mxfp4_w4a4_xe35(Tensor! output, Tensor a, Tensor a_scale, Tensor b, Tensor b_scale, Tensor? bias, Tensor rows_per_expert, int n, int k, int num_experts) -> ()");
+  m.impl("moe_grouped_mm_nt_mxfp4_w4a4_xe35", torch::kXPU, &moe_grouped_mm_nt_mxfp4_w4a4_xe35);
+  m.def("mxfp4_moe_scale_to_mn_major_xe35(Tensor! out, Tensor input, Tensor rows_per_expert) -> ()");
+  m.impl("mxfp4_moe_scale_to_mn_major_xe35", torch::kXPU, &mxfp4_moe_scale_to_mn_major_xe35);
+}
+#endif

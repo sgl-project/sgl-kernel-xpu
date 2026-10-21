@@ -268,9 +268,13 @@ if(DPCPP_SYCL_TARGET MATCHES "cri")
   foreach(sycl_src ${ATen_XPU_SYCL_XE35})
     get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
     set(sycl_lib sgl-ops-sycl-${name})
+    set(sycl_src_flags "${XE35_OFFLINE_COMPILER_FLAGS}")
+    if(sycl_src MATCHES "moe_grouped_mm_mxfp4_w4a4")
+      string(APPEND sycl_src_flags " -internal_options -cl-intel-512-GRF-per-thread")
+    endif()
     sycl_add_library(
       ${sycl_lib}
-      ${XE35_OFFLINE_COMPILER_FLAGS}
+      ${sycl_src_flags}
       ${COMMON_DEVICE_LINK_FLAGS}
       SHARED
       SYCL_SOURCES ${sycl_src})

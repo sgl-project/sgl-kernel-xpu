@@ -245,3 +245,8 @@ from sgl_kernel.version import __version__
 build_tree_kernel = (
     None  # TODO(ying): remove this after updating the sglang python code.
 )
+
+from sgl_kernel.moe import (
+    moe_grouped_mm_nt_mxfp4_w4a4_xe35,
+    mxfp4_moe_scale_to_mn_major_xe35,
+)

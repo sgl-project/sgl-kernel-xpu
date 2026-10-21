@@ -1,0 +1,328 @@
+/***************************************************************************************************
+ * Copyright (c) 2024 - 2025 Codeplay Software Ltd. All rights reserved.
+ * Copyright (C) 2025 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
+
+#pragma once
+
+#include "cutlass/cutlass.h"
+#include "cutlass/fast_math.h"
+#include "cutlass/kernel_hardware_info.h"
+
+namespace cutlass::fmha_xe35::kernel {
+namespace detail {
+struct EmptyDivmod_xe35 {};
+}  // namespace detail
+
+template <
+    bool OneBatch = false,
+    bool NoGQA = false,
+    bool CausalMask = false,
+    bool GqaFusion = false,
+    bool CacheOnly = false,
+    int GqaFusionSize = 0>
+struct XeFHMAIndividualTileScheduler_xe35 {
+  static constexpr bool kGqaFusion = GqaFusion;
+  static constexpr bool kCacheOnly = CacheOnly;
+  static constexpr int kGqaFusionSize = GqaFusionSize;
+  using NumHeadsDivmod = cute::conditional_t<OneBatch, detail::EmptyDivmod_xe35, FastDivmod>;
+  using HeadGroupDivmod =
+      cute::conditional_t<NoGQA || (GqaFusion && GqaFusionSize == 0), detail::EmptyDivmod_xe35, FastDivmod>;
+
+  struct Params {
+    dim3 grid;
+    NumHeadsDivmod divmod_num_heads;
+    HeadGroupDivmod divmod_head_group_q;
+    int gqa_group_size;
+    int num_kv_splits = -1;
+    FastDivmod divmod_batch;
+  };
+
+  bool valid_ = true;
+  Params params;
+
+  CUTLASS_DEVICE
+  XeFHMAIndividualTileScheduler_xe35(Params const& params) : params(params) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params to_underlying_arguments(
+      ProblemShape const& shape,
+      KernelHardwareInfo hw_info,
+      TileShape const& tile_shape,
+      const int& num_kv_splits = -1) {
+    using namespace cute;
+
+    int heads_in_grid = shape.num_heads_q;
+    if (num_kv_splits >= 1 || (GqaFusion && GqaFusionSize == 0)) {
+      heads_in_grid = shape.num_heads_kv;
+    } else if constexpr (GqaFusion) {
+      heads_in_grid = shape.num_heads_q / kGqaFusionSize;
+    }
+
+    dim3 grid;
+    if (num_kv_splits >= 1) {
+      // Split-KV: always use (V, Q, batch*heads_kv*splits) layout so that
+      // BlockIdxY() is the Q-tile index regardless of CausalMask.
+      grid = dim3(
+          size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),   // V
+          size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),     // Q
+          size(shape.batch * shape.num_heads_kv) * num_kv_splits);  // (h,b,split)
+    } else if constexpr (CausalMask) {
+      // Causal: grid layout (V, batch*heads, Q) groups all heads for the same
+      // Q tile adjacent, enabling wave-level load balancing under causal mask.
+      grid = dim3(
+          size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),  // V
+          size(shape.batch * heads_in_grid),                       // (h,b)
+          size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))));   // Q
+    } else {
+      // Non-causal: original grid layout (V, Q, batch*heads).
+      grid = dim3(
+          size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),  // V
+          size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),    // Q
+          size(shape.batch * heads_in_grid));                      // (h,b)
+    }
+    Params p{};
+    p.grid = grid;
+    p.gqa_group_size = shape.num_heads_q / shape.num_heads_kv;
+    p.num_kv_splits = num_kv_splits;
+    if (num_kv_splits >= 1) {
+      p.divmod_batch = FastDivmod(shape.batch * shape.num_heads_kv);
+    }
+    if constexpr (!OneBatch) {
+      p.divmod_num_heads = FastDivmod(heads_in_grid);
+    }
+    if constexpr (!NoGQA && !(GqaFusion && GqaFusionSize == 0)) {
+      p.divmod_head_group_q = FastDivmod(shape.num_heads_q / shape.num_heads_kv);
+    }
+    return p;
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    int head;
+    int idx_b;
+    int idx_kv_split = -1;
+    if (params.num_kv_splits >= 1) {
+      // In-place decomposition (same pattern as Xe2):
+      //   idx_kv_split = BlockIdxZ / (batch * heads_kv)
+      //   idx_b        = (BlockIdxZ % (batch * heads_kv)) / heads_kv
+      //   head         = (BlockIdxZ % (batch * heads_kv)) % heads_kv
+      int batch_head;
+      int split_z = BlockIdxZ();
+      params.divmod_batch(idx_kv_split, batch_head, split_z);
+      params.divmod_num_heads(idx_b, head, batch_head);
+      return make_coord(int(BlockIdxY()), int(BlockIdxX()), head, idx_b, idx_kv_split);
+    }
+    if constexpr (CausalMask) {
+      // Causal grid layout: (V, batch*heads, Q).
+      if constexpr (OneBatch) {
+        // Single batch: grid.y == num_heads_q. No divmod needed.
+        head = BlockIdxY();
+        idx_b = 0;
+      } else {
+        idx_b = BlockIdxY();
+        params.divmod_num_heads(idx_b, head, idx_b);
+      }
+      // Reverse Q dispatch: last Q tile first (causal mask: later Q tiles have more K-blocks)
+      int q_tile = params.grid.z - 1 - int(BlockIdxZ());
+      return make_coord(q_tile, int(BlockIdxX()), head, idx_b, idx_kv_split);
+    } else {
+      // Non-causal grid layout: (V, Q, batch*heads).
+      if constexpr (OneBatch) {
+        // Single batch: grid.z == num_heads_q. No divmod needed.
+        head = BlockIdxZ();
+        idx_b = 0;
+      } else {
+        idx_b = BlockIdxZ();
+        params.divmod_num_heads(idx_b, head, idx_b);
+      }
+      // Non-causal follows forward Q dispatch order.
+      return make_coord(int(BlockIdxY()), int(BlockIdxX()), head, idx_b, idx_kv_split);
+    }
+  }
+
+  CUTLASS_DEVICE
+  int divide_head_group(int head_q) const {
+    if constexpr (NoGQA || (GqaFusion && GqaFusionSize == 0)) {
+      return head_q;
+    } else if constexpr (GqaFusion) {
+      return params.divmod_head_group_q.div(head_q * kGqaFusionSize);
+    } else {
+      return params.divmod_head_group_q.div(head_q);
+    }
+  }
+
+  CUTLASS_DEVICE
+  int get_gqa_group_size() const {
+    if constexpr (GqaFusion && GqaFusionSize > 0) {
+      return kGqaFusionSize;
+    }
+    return params.gqa_group_size;
+  }
+
+  CUTLASS_DEVICE
+  int get_gqa_q_head_start(int fused_head) const {
+    if constexpr (GqaFusion && GqaFusionSize > 0) {
+      return fused_head * kGqaFusionSize;
+    } else if constexpr (GqaFusion) {
+      return fused_head * params.gqa_group_size;
+    }
+    return fused_head;
+  }
+
+  CUTLASS_DEVICE
+  XeFHMAIndividualTileScheduler_xe35& operator++() {
+    valid_ = false;
+    return *this;
+  }
+};
+
+struct XeReduceSplitKTileScheduler_xe35 {
+  struct Params {
+    dim3 grid;
+    FastDivmod divmod_num_heads;
+    int num_kv_splits = -1;
+  };
+
+  bool valid_ = true;
+  Params params;
+
+  CUTLASS_DEVICE
+  XeReduceSplitKTileScheduler_xe35(Params const& params) : params(params) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params to_underlying_arguments(
+      ProblemShape const& shape, KernelHardwareInfo, TileShape const&, const int& num_kv_splits = -1) {
+    using namespace cute;
+    return Params{dim3(shape.seq_len_qo, shape.num_heads_q, shape.batch), {shape.num_heads_q}, num_kv_splits};
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE auto get_block_coord() {
+    using namespace cute;
+    return make_coord(BlockIdxX(), BlockIdxY(), BlockIdxZ());
+  }
+
+  CUTLASS_DEVICE XeReduceSplitKTileScheduler_xe35& operator++() {
+    valid_ = false;
+    return *this;
+  }
+};
+
+struct XeFHMAIndividualPersistentTileScheduler_xe35 {
+  struct Params {
+    dim3 grid;
+    FastDivmod divmod_num_heads;
+    FastDivmod divmod_head_group_q;
+  };
+
+  bool valid_ = true;
+  Params params;
+  int kv_tile_size_;
+  // num of kv blocks for each head
+  int local_num_kv_blocks_;
+  int num_batch_heads_;
+
+  CUTLASS_DEVICE
+  XeFHMAIndividualPersistentTileScheduler_xe35(
+      Params const& params, int kv_tile_size, int local_num_kv_blocks, int num_batch_heads)
+      : params(params),
+        kv_tile_size_(kv_tile_size),
+        local_num_kv_blocks_(local_num_kv_blocks),
+        num_batch_heads_(num_batch_heads) {}
+
+  template <class ProblemShape, class TileShape>
+  static Params
+  to_underlying_arguments(ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape) {
+    using namespace cute;
+
+    dim3 grid(
+        size(ceil_div(shape.head_size_vo, get<1>(tile_shape))),  // V
+        size(ceil_div(shape.seq_len_qo, get<0>(tile_shape))),    // Q
+        size(shape.batch * shape.num_heads_q));                  // (h,b) -- split later
+    int num_heads = shape.num_heads_q;
+    grid.z = hw_info.sm_count / 2;
+
+    return Params{grid, {num_heads}, {shape.num_heads_q / shape.num_heads_kv}};
+  }
+
+  template <int Num_SGs>
+  static dim3 get_grid_shape(Params const& params) {
+    return params.grid;
+  }
+
+  CUTLASS_DEVICE
+  bool is_valid() {
+    return valid_;
+  }
+
+  CUTLASS_DEVICE
+  auto get_block_coord() {
+    using namespace cute;
+    int wg_id = BlockIdxZ();
+
+    // total number of blocks need to be processed across all wgs
+    int total_num_kv_blocks = local_num_kv_blocks_ * num_batch_heads_;
+    // guarantee all wg process similar number of blocks of KV (load balance)
+    int num_blocks_per_wg = cute::ceil_div(total_num_kv_blocks, GridDimZ());
+
+    // compute start batch head id for current wg
+    int start_batch_head_id = wg_id * num_blocks_per_wg / local_num_kv_blocks_;
+
+    return make_coord(BlockIdxY(), BlockIdxX(), start_batch_head_id);
+  }
+
+  CUTLASS_DEVICE
+  XeFHMAIndividualPersistentTileScheduler_xe35& operator++() {
+    valid_ = false;
+    return *this;
+  }
+};
+
+}  // namespace cutlass::fmha_xe35::kernel

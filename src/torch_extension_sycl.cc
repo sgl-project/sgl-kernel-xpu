@@ -287,6 +287,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
 // Xe35 (CRI) only kernels
 #if SYCL_INTEL_TARGET == 35
+  m.def("nvfp4_woq_prep_xe35(Tensor! out_c, Tensor! out_sfmx, Tensor w_s, Tensor w_gs) -> ()");
+  m.impl("nvfp4_woq_prep_xe35", torch::kXPU, &at::native::xpu::nvfp4_woq_prep_xe35);
+  m.def(
+      "nvfp4_woq_bf16_grouped_mm_xe35(Tensor! output, Tensor a, Tensor b, Tensor sfmx_b, "
+      "Tensor c_b, Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> ()");
+  m.impl("nvfp4_woq_bf16_grouped_mm_xe35", torch::kXPU, &nvfp4_woq_bf16_grouped_mm_xe35);
+  m.def(
+      "nvfp4_woq_mxfp8_scaled_grouped_mm_xe35(Tensor! output, Tensor a, Tensor b, Tensor scales_a, "
+      "Tensor sfmx_b, Tensor c_b, Tensor problem_sizes, Tensor expert_offsets, Tensor workspace) -> ()");
+  m.impl("nvfp4_woq_mxfp8_scaled_grouped_mm_xe35", torch::kXPU, &nvfp4_woq_mxfp8_scaled_grouped_mm_xe35);
   m.def(
       "moe_grouped_mm_nt_xe35(Tensor! output, Tensor activations, Tensor weights, Tensor? bias, Tensor "
       "total_rows_for_experts, int n_experts, int activation_type, bool fuse_act, "

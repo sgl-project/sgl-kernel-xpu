@@ -268,9 +268,13 @@ if(DPCPP_SYCL_TARGET MATCHES "cri")
   foreach(sycl_src ${ATen_XPU_SYCL_XE35})
     get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
     set(sycl_lib sgl-ops-sycl-${name})
+    set(sycl_src_flags "${XE35_OFFLINE_COMPILER_FLAGS}")
+    if(name STREQUAL "blockwise_moe_nvfp4_woq")
+      string(APPEND sycl_src_flags " -internal_options -cl-intel-512-GRF-per-thread")
+    endif()
     sycl_add_library(
       ${sycl_lib}
-      ${XE35_OFFLINE_COMPILER_FLAGS}
+      ${sycl_src_flags}
       ${COMMON_DEVICE_LINK_FLAGS}
       SHARED
       SYCL_SOURCES ${sycl_src})
@@ -287,6 +291,11 @@ if(DPCPP_SYCL_TARGET MATCHES "cri")
 endif()
 
 set(SYCL_LINK_LIBRARIES_KEYWORD)
+
+if(USE_MOE AND DPCPP_SYCL_TARGET MATCHES "cri")
+  target_link_libraries(sgl-ops-sycl-blockwise_moe_nvfp4_woq PRIVATE
+    sgl-ops-sycl-nvfp4_woq_scale_layout)
+endif()
 
 foreach(lib ${SGL_OPS_LIBRARIES})
   # Align with PyTorch compile options PYTORCH_SRC_DIR/cmake/public/utils.cmake

@@ -22,6 +22,10 @@ limitations under the License.
 #include <torch/torch.h>
 
 #include <optional>
+
+#if defined(USE_MOE) && SYCL_INTEL_TARGET == 35
+#include <sgl_kernel/xe35/nvfp4_woq.h>
+#endif
 #include <sycl/sycl.hpp>
 #include <tuple>
 #include <vector>

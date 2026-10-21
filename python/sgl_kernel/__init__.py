@@ -41,6 +41,15 @@ if os.path.exists(cuda_path):
     ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)
 
 from sgl_kernel import common_ops
+from sgl_kernel.nvfp4 import (
+    nvfp4_woq_bf16_grouped_mm_xe35,
+    nvfp4_woq_mxfp8_scaled_grouped_mm_xe35,
+    nvfp4_woq_prep_xe35,
+)
+from sgl_kernel.nvfp4_moe import (
+    cutlass_fused_experts_nvfp4_woq_xe35,
+    nvfp4_woq_prepare_weights_xe35,
+)
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     flash_mla_decode,

@@ -11,6 +11,7 @@ from _xpu import KNOWN_ARCHS, current_arch
 #         ...
 #
 def pytest_configure(config):
+    config.addinivalue_line("markers", "long_test: production-size or slow kernel case")
     config.addinivalue_line(
         "markers",
         "arch(*names): XPU arches this op supports (xe20, xe35). The test "

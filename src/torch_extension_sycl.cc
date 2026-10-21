@@ -58,6 +58,22 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("hadamard_transform(Tensor input, float scale=1.0) -> Tensor");
   m.impl("hadamard_transform", torch::kXPU, &at::native::xpu::hadamard_transform);
 
+#if SYCL_INTEL_TARGET == 35
+  m.def(
+      "vocab_mask_xe35(Tensor input, int org_start, int org_end, int num_org_padding, int added_start, "
+      "int added_end) -> (Tensor, Tensor)");
+  m.impl("vocab_mask_xe35", torch::kXPU, &at::native::xpu::vocab_mask_xe35);
+
+  m.def(
+      "vocab_parallel_embedding_xe35(Tensor input, Tensor weight, Tensor! output, int org_start, "
+      "int org_end, int num_org_padding, int added_start, int added_end) -> ()");
+  m.impl("vocab_parallel_embedding_xe35", torch::kXPU, &at::native::xpu::vocab_parallel_embedding_xe35);
+
+  m.def("softcap_logits_xe35(Tensor(a!) logits, float cap) -> ()");
+  m.impl("softcap_logits_xe35", torch::kXPU, &at::native::xpu::softcap_logits_xe35);
+
+#endif
+
   m.def("topk_softmax(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize) -> ()");
   m.impl("topk_softmax", torch::kXPU, &at::native::xpu::topk_softmax);
 

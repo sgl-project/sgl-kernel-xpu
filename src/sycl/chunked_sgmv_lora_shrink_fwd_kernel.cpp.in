@@ -59,3 +59,5 @@ __attribute__((visibility("default"))) void launch_chunked_sgmv_lora_shrink_fwd_
 }
 
 }  // namespace chunked_sgmv_lora_shrink_fwd_impl
+
+#undef SYCL_INTEL_TARGET

@@ -245,3 +245,11 @@ from sgl_kernel.version import __version__
 build_tree_kernel = (
     None  # TODO(ying): remove this after updating the sglang python code.
 )
+
+from sgl_kernel.routing_quant import (
+    muse_spark_moe_routing_xe35,
+    mxfp4_moe_scale_to_mn_major_xe35,
+    sgl_per_token_group_quant_fp4_xe35,
+    sgl_padded_gather_per_token_group_quant_fp4_xe35,
+    topk_sigmoid_xe35,
+)

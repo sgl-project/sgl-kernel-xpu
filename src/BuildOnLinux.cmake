@@ -268,6 +268,9 @@ if(DPCPP_SYCL_TARGET MATCHES "cri")
   foreach(sycl_src ${ATen_XPU_SYCL_XE35})
     get_filename_component(name ${sycl_src} NAME_WLE REALPATH)
     set(sycl_lib sgl-ops-sycl-${name})
+    if(name STREQUAL "per_token_group_quant_fp4")
+      set(sycl_lib sgl-ops-sycl-${name}_xe35)
+    endif()
     sycl_add_library(
       ${sycl_lib}
       ${XE35_OFFLINE_COMPILER_FLAGS}

@@ -794,3 +794,30 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 }
 
 REGISTER_EXTENSION(common_ops)
+
+#if SYCL_INTEL_TARGET == 35
+TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def(
+      "muse_spark_moe_routing_xe35(Tensor! topk_weights, Tensor! topk_ids, Tensor gating_output, Tensor? correction_bias, "
+      "float router_output_multiplier, float route_scale, float division_eps, Tensor? local_expert_mapping, Tensor? "
+      "num_valid_tokens) -> ()");
+  m.impl("muse_spark_moe_routing_xe35", torch::kXPU, &at::native::xpu::muse_spark_moe_routing_xe35);
+  m.def("mxfp4_moe_scale_to_mn_major_xe35(Tensor! out, Tensor input, Tensor rows_per_expert) -> ()");
+  m.impl("mxfp4_moe_scale_to_mn_major_xe35", torch::kXPU, &mxfp4_moe_scale_to_mn_major_xe35);
+  m.def(
+      "sgl_per_token_group_quant_fp4_xe35(Tensor input, Tensor output_q, Tensor output_s, int group_size,"
+      " float eps, bool fuse_silu_and_mul, Tensor? scale_map=None) -> ()");
+  m.impl("sgl_per_token_group_quant_fp4_xe35", torch::kXPU, &at::native::xpu::sgl_per_token_group_quant_fp4_xe35);
+  m.def(
+      "sgl_padded_gather_per_token_group_quant_fp4_xe35(Tensor input, Tensor row_map, Tensor output_q,"
+      " Tensor output_s, int group_size, float eps, Tensor? scale_map=None) -> ()");
+  m.impl(
+      "sgl_padded_gather_per_token_group_quant_fp4_xe35",
+      torch::kXPU,
+      &at::native::xpu::sgl_padded_gather_per_token_group_quant_fp4_xe35);
+  m.def(
+      "topk_sigmoid_xe35(Tensor! topk_weights, Tensor! topk_indices, Tensor gating_output, bool renormalize, Tensor? "
+      "correction_bias) -> ()");
+  m.impl("topk_sigmoid_xe35", torch::kXPU, &at::native::xpu::topk_sigmoid_xe35);
+}
+#endif

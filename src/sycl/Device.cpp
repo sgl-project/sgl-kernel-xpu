@@ -22,7 +22,8 @@ SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index
 // Need oneAPI 2026.2 or later to support `architecture::intel_gpu_cri`. Check the release
 // (__INTEL_LLVM_COMPILER) rather than the build date (__SYCL_COMPILER_VERSION): 2026.1.x
 // patch releases (e.g. 2026.1.3, 20260724) are built later but still lack this enum.
-#if defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200
+#if (defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200) || \
+    (defined(__INTEL_LLVM_COMPILER_VERSION) && __INTEL_LLVM_COMPILER_VERSION >= 20260200)
     case syclex::architecture::intel_gpu_cri:
       return std::make_tuple(3, 5);
 #endif

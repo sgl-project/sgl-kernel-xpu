@@ -26,7 +26,7 @@ function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
 endfunction()
 
 # Support GCC on Linux.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
   message(STATUS "sgl-kernel-xpu build type: ${CMAKE_BUILD_TYPE}")
   set(SYCL_HOST_FLAGS)
   set(SYCL_KERNEL_OPTIONS)
@@ -185,6 +185,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 
   set(SYCL_OFFLINE_COMPILER_FLAGS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
 else()
-  message("Not compiling with XPU. Currently only support GCC compiler on Linux as CXX compiler.")
+  message("Not compiling with XPU. Currently only support GNU or IntelLLVM compiler on Linux as CXX compiler.")
   return()
 endif()

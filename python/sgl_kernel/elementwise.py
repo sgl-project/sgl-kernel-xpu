@@ -108,6 +108,41 @@ def gemma_rmsnorm(
     return out
 
 
+def grouped_gemma_rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Grouped Gemma-style RMSNorm.
+
+    The last dim is split into slices of ``group_size`` elements; each slice is
+    normalized independently: ``out = x * rsqrt(mean(x^2) + eps) * (1 + weight)``,
+    with ``weight`` indexed over the full hidden size.
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        BF16/FP16 contiguous tensor, shape ``(..., hidden_size)``. Unlike the
+        SGLang CUDA wrapper, non-contiguous inputs are rejected; callers must
+        call ``.contiguous()`` first.
+    weight: torch.Tensor
+        Same dtype as ``input``, shape ``(hidden_size,)``.
+    group_size: int
+        Elements per group. Must divide ``hidden_size`` and be a multiple of 8.
+    eps: float
+        Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        Pre-allocated contiguous output, same shape and dtype as ``input``.
+        May alias ``input`` for an in-place update.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    torch.ops.sgl_kernel.grouped_gemma_rmsnorm(out, input, weight, eps, group_size)
+    return out
+
+
 def gemma_fused_add_rmsnorm(
     input: torch.Tensor,
     residual: torch.Tensor,

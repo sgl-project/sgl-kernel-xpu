@@ -99,6 +99,12 @@ And if you build the sgl-kernel-xpu with cmake, you need to add `CMAKE_BUILD_PAR
 CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) python -m uv build --wheel -Cbuild-dir=build --color=always .
 ```
 
+SYCL device-link parallelism inside each compiler invocation defaults to one
+job, independently of Ninja's outer build parallelism. This avoids multiplying
+the outer job count by every host CPU during large AOT builds. To override it
+explicitly, pass `-DSYCL_MAX_PARALLEL_LINK_JOBS=N` to CMake or
+`--config-settings=cmake.define.SYCL_MAX_PARALLEL_LINK_JOBS=N` to `pip`.
+
 ### Kernel Development
 
 Steps to add a new kernel:
@@ -108,6 +114,55 @@ Steps to add a new kernel:
 3. Create torch extension in [csrc/common_extension.cc](https://github.com/sgl-project/sgl-kernel-xpu/blob/main/src/torch_extension_sycl.cc)
 4. Update [CMakeLists.txt](https://github.com/sgl-project/sgl-kernel-xpu/blob/main/CMakeLists.txt) to include new source files
 5. Expose Python interface in [python](https://github.com/sgl-project/sgl-kernel-xpu/blob/main/python/sgl_kernel)
+
+### Xe35 Small MXFP4 Permutation
+
+`sgl_kernel.mxfp4_small_permutation_xe35` writes padded expert counts, source
+rows, the expanded-to-permuted map, and the signed scale-layout map in one
+launch. It requires `DPCPP_SYCL_TARGET=cri` and `USE_MOE=ON`. All outputs are
+preallocated contiguous XPU int32 tensors; input expert IDs may be int32 or
+int64 and must be in range. The interface supports up to 256 pairs,
+power-of-two expert counts through 1024, and alignment from 1 through 64.
+
+```bash
+pytest -q tests/test_mxfp4_small_permutation.py
+python benchmark/bench_mxfp4_small_permutation.py \
+  --baseline-source /path/to/sglang/srt/layers/quantization/mxfp4.py
+```
+
+The benchmark uses B8/topk8 and defaults to E256/alignment4. It loads the
+unchanged `_get_xpu_w4a4_small_permutation_kernel` factory from the supplied
+historical SGLang source, reports its SHA256, checks all four outputs exactly,
+and alternates candidate and baseline XPU-event measurements over five rounds.
+Both paths exclude output allocation and use the same inputs and capacities.
+Each measurement has a synchronized two-second cooldown. A candidate median
+above the baseline median fails by default; `--max-regression` explicitly
+changes that gate. `--routing` and `--index-dtype` select routing distributions
+and paired index dtypes. The serving scope is B8/ISL4096/OSL1024/TP4/EP1; this
+is an operator benchmark, not an end-to-end model run.
+
+For comparison against the older sgl-kernel `mxfp4_small_permutation` operator,
+use separate Python environments with normally installed complete packages:
+
+```bash
+"$OLD_PYTHON" benchmark/bench_mxfp4_small_permutation.py \
+  --installed-operator legacy --routing balanced --index-dtype int32 \
+  --result-file results/r0-int32-balanced-legacy.json
+"$NEW_PYTHON" benchmark/bench_mxfp4_small_permutation.py \
+  --installed-operator candidate --routing balanced --index-dtype int32 \
+  --result-file results/r0-int32-balanced-candidate.json
+python benchmark/compare_mxfp4_small_permutation_packages.py --results-dir results
+```
+
+Create the results directory first. Collect rounds 0–4, alternating package
+order per round, for both index dtypes and all three routing distributions.
+The worker records 201 XPU-profiler kernel durations, package/library provenance,
+inputs and all four outputs. The comparison checks exact inputs and outputs
+across packages and rounds, then rejects any median kernel-time regression.
+Use the same idle GPU and exclusive GPU lock throughout the paired sweep.
+Keep each package's compatible PyTorch/SYCL dependencies isolated and report
+their versions; profiler kernel durations and event-bracketed operator latency
+are different metrics and must not be compared against each other.
 
 ### Development Tips
 

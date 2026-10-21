@@ -26,7 +26,7 @@ function(CHECK_SYCL_FLAG FLAG VARIABLE_NAME)
 endfunction()
 
 # Support GCC on Linux.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "IntelLLVM")
   message(STATUS "sgl-kernel-xpu build type: ${CMAKE_BUILD_TYPE}")
   set(SYCL_HOST_FLAGS)
   set(SYCL_KERNEL_OPTIONS)
@@ -116,12 +116,10 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(TORCH_XPU_OPS_FLAGS ${SYCL_HOST_FLAGS})
 
   # -- SYCL device object linkage flags
-  include(ProcessorCount)
-  ProcessorCount(proc_cnt)
-  if((DEFINED ENV{MAX_JOBS}) AND ("$ENV{MAX_JOBS}" LESS_EQUAL ${proc_cnt}))
-    set(SYCL_MAX_PARALLEL_LINK_JOBS $ENV{MAX_JOBS})
-  else()
-    set(SYCL_MAX_PARALLEL_LINK_JOBS ${proc_cnt})
+  set(SYCL_MAX_PARALLEL_LINK_JOBS "1" CACHE STRING
+      "Maximum parallel device-link jobs inside each SYCL compiler invocation")
+  if(NOT SYCL_MAX_PARALLEL_LINK_JOBS MATCHES "^[1-9][0-9]*$")
+    message(FATAL_ERROR "SYCL_MAX_PARALLEL_LINK_JOBS must be a positive integer")
   endif()
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} -fsycl-max-parallel-link-jobs=${SYCL_MAX_PARALLEL_LINK_JOBS})
   set(SYCL_DEVICE_LINK_FLAGS ${SYCL_DEVICE_LINK_FLAGS} --offload-compress)
@@ -185,6 +183,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 
   set(SYCL_OFFLINE_COMPILER_FLAGS "${SYCL_OFFLINE_COMPILER_AOT_OPTIONS}${SYCL_OFFLINE_COMPILER_CG_OPTIONS}")
 else()
-  message("Not compiling with XPU. Currently only support GCC compiler on Linux as CXX compiler.")
+  message("Not compiling with XPU. Currently only support GNU or IntelLLVM compiler on Linux as CXX compiler.")
   return()
 endif()

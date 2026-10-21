@@ -20,6 +20,13 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 #include "sgl_kernel_torch_shim.h"
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+#if SYCL_INTEL_TARGET == 35 && defined(USE_MOE)
+  m.def(
+      "mxfp4_small_permutation_xe35(Tensor topk_ids, Tensor(a!) padded_counts, "
+      "Tensor(b!) perm_src, Tensor(c!) expanded_to_permuted, Tensor(d!) scale_map, "
+      "int alignment) -> ()");
+  m.impl("mxfp4_small_permutation_xe35", torch::kXPU, &at::native::xpu::mxfp4_small_permutation_xe35);
+#endif
   m.def("weak_ref_tensor(Tensor(a) tensor) -> Tensor(a)");
   m.impl("weak_ref_tensor", torch::kXPU, &weak_ref_tensor);
 

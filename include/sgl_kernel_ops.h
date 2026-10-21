@@ -26,6 +26,10 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
+#if SYCL_INTEL_TARGET == 35 && defined(USE_MOE)
+#include "sgl_kernel/xe35/mxfp4_permutation_ops.h"
+#endif
+
 #define _CONCAT(A, B) A##B
 #define CONCAT(A, B) _CONCAT(A, B)
 

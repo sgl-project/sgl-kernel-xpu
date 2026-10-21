@@ -12,7 +12,7 @@ set(ATen_XPU_SYCL_COMMON)
 find_package(Python3 COMPONENTS Interpreter Development.Module ${SKBUILD_SABI_COMPONENT} REQUIRED)
 
 execute_process(
-  COMMAND ${PYTHON3_EXECUTABLE}
+  COMMAND ${Python3_EXECUTABLE}
           -c "import torch; print(torch.utils.cmake_prefix_path)"
   OUTPUT_VARIABLE TORCH_PY_PREFIX
   OUTPUT_STRIP_TRAILING_WHITESPACE

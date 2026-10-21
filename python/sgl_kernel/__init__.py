@@ -5,6 +5,8 @@ from typing import Optional
 
 import torch
 
+from sgl_kernel.moe_permutation import mxfp4_small_permutation_xe35
+
 SYSTEM_ARCH = platform.machine()
 
 

@@ -109,7 +109,11 @@ def _make_inputs(T, hidden_size, n_splits, device, seed=42):
 @pytest.mark.parametrize(
     "T", [1, 16, 48, 128, 512, 896, 1021, 1024, 1034, 1038, 1518, 2048]
 )
-@pytest.mark.parametrize("hidden_size", [4096, 7168])
+# hidden_size expanded to include the CRI-only 2048, 5120, 8192 to cover PO
+# hc_pre_fuse CFGs.
+@pytest.mark.parametrize(
+    "hidden_size", [4096, 7168] + utils.cri_only([2048, 5120, 8192])
+)
 @pytest.mark.parametrize("n_splits", [1, 16])
 @pytest.mark.parametrize("with_norm", [False, True])
 def test_hc_pre_big_fuse(T, hidden_size, n_splits, with_norm):

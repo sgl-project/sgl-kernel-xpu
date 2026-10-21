@@ -11,8 +11,11 @@ device = utils.get_device()
 ref_device = utils.get_reference_device()
 
 
-@pytest.mark.parametrize("dim", [128, 256, 512, 2048, 4096, 11008, 16384])
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize(
+    "dim",
+    [128, 256, 512, 2048, 4096, 11008, 16384] + utils.cri_only([768, 25600, 28672]),
+)
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16] + utils.cri_only([128]))
 @pytest.mark.parametrize("seq_len", [1, 2, 4, 8, 16, 32, 64, 128, 512])
 def test_fused_silu_mul(dim, batch_size, seq_len):
     x = torch.randn(batch_size, seq_len, 2 * dim).to(ref_device).to(torch.float16)

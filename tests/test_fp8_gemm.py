@@ -42,8 +42,13 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
 
 
 @pytest.mark.parametrize("M", [1, 128, 512, 1024, 4096])
-@pytest.mark.parametrize("N", [16, 128, 512, 1024, 4096])
-@pytest.mark.parametrize("K", [512, 1024, 4096, 8192, 16384])
+@pytest.mark.parametrize(
+    "N",
+    [16, 128, 512, 1024, 4096] + utils.cri_only([768, 2048, 5120, 8192, 25600, 28672]),
+)
+@pytest.mark.parametrize(
+    "K", [512, 1024, 4096, 8192, 16384] + utils.cri_only([2048, 5120])
+)
 @pytest.mark.parametrize("with_bias", [True, False])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_accuracy(M, N, K, with_bias, out_dtype):

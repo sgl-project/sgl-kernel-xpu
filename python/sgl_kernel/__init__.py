@@ -5,6 +5,8 @@ from typing import Optional
 
 import torch
 
+from sgl_kernel.bf16_gemm import bf16_gemm_nt_xe35, pack_bf16_gemm_weight_xe35
+
 SYSTEM_ARCH = platform.machine()
 
 

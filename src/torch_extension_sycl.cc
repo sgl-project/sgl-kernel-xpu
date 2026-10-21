@@ -301,6 +301,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("dsv3_router_gemm", torch::kXPU, &dsv3_router_gemm_xpu);
   m.def("dsv3_fused_a_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
   m.impl("dsv3_fused_a_gemm", torch::kXPU, &dsv3_fused_a_gemm_xpu);
+#if SYCL_INTEL_TARGET == 35
+  m.def("bf16_gemm_nt_xe35(Tensor! output, Tensor mat_a, Tensor mat_b, int config=0) -> ()");
+  m.impl("bf16_gemm_nt_xe35", torch::kXPU, &bf16_gemm_nt_xpu_xe35);
+#endif
   m.def(
       "fp8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
       "bias) -> Tensor");

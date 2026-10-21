@@ -68,6 +68,7 @@ from sgl_kernel.elementwise import (
     fused_k_norm_rope_flashmla,
     fused_q_norm_rope,
     fused_qk_norm_rope,
+    fused_qk_norm_rope_xe35,
     fused_qk_rope,
     fused_qk_rope_with_cos_sin_cache_inplace,
     gelu_and_mul,

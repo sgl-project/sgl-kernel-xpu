@@ -67,7 +67,10 @@ struct FusedHCHeadKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     slm_ = sycl::local_accessor<float, 1>(slm_size, cgh);
   }
 
-  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]] void
+#ifdef __SYCL_DEVICE_ONLY__
+  [[sycl::reqd_work_group_size(WG_SIZE)]] [[sycl::reqd_sub_group_size(SG_SIZE)]]
+#endif
+  void
   operator()(sycl::nd_item<1> item) const {
     const int token_id = static_cast<int>(item.get_group(0));
     const int tid = static_cast<int>(item.get_local_id(0));

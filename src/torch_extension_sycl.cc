@@ -537,6 +537,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "float eps, Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
       "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
   m.impl("fused_qk_norm_rope", torch::kXPU, &at::native::xpu::fused_qk_norm_rope);
+#if SYCL_INTEL_TARGET == 35
+  m.def(
+      "fused_qk_norm_rope_xe35(Tensor! qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, "
+      "float eps, Tensor! q_weight, Tensor! k_weight, float base, bool is_neox, Tensor! position_ids, "
+      "float factor, float low, float high, float attention_factor, int rotary_dim) -> ()");
+  m.impl("fused_qk_norm_rope_xe35", torch::kXPU, &at::native::xpu::fused_qk_norm_rope_xe35);
+#endif
   m.def(
       "fused_inplace_qknorm_rope(Tensor! q, Tensor! k, Tensor q_weight, Tensor k_weight, "
       "Tensor cos_sin_cache, Tensor positions, bool is_neox, float eps, int head_dim=0, int rope_dim=0) -> ()");

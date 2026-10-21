@@ -22,6 +22,7 @@
 #include "Utils.h"
 #include "cutlass/float8.h"
 #include "sgl_kernel_export.h"
+#include "sgl_kernel_ops.h"
 
 // TODO: Remove this when sycl float8 is supported
 using cutlass::float_e4m3_t;
@@ -522,6 +523,15 @@ SGL_KERNEL_EXPORT void fused_qk_norm_rope(
     double high,
     double attention_factor,
     int64_t rotary_dim) {
+#if SYCL_INTEL_TARGET == 35
+  if (qkv.scalar_type() == at::ScalarType::Half || qkv.scalar_type() == at::ScalarType::BFloat16 ||
+      qkv.scalar_type() == at::ScalarType::Float8_e4m3fn) {
+    fused_qk_norm_rope_xe35(
+        qkv, num_heads_q, num_heads_k, num_heads_v, head_dim, eps, q_weight, k_weight, base, is_neox,
+        position_ids, factor, low, high, attention_factor, rotary_dim);
+    return;
+  }
+#endif
   // Input validation
   TORCH_CHECK(qkv.dim() == 2, "QKV tensor must be 2D: [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]");
   TORCH_CHECK(position_ids.dim() == 1, "Position IDs must be 1D: [num_tokens]");

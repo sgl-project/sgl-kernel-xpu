@@ -1148,5 +1148,181 @@ def test_fused_k_norm_rope_flashmla_zero_batch():
     )
 
 
+@pytest.mark.arch("xe35")
+@pytest.mark.parametrize("num_tokens", [1, 8, 64, 129, 4096])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("generic", [False, True])
+def test_fused_qk_norm_only_xe35(num_tokens, dtype, generic):
+    """rotary_dim=0 is a plain QK RMSNorm (Muse NoPE layers, rope_theta=0).
+
+    Muse TP4 rank heads: Q32/K4 with V4 plus a 32-head output gate carried as
+    extra V heads, D64. Covers both the baseline and the Xe35 wide kernels;
+    V and gate heads must stay untouched.
+    """
+    torch.random.manual_seed(7)
+    num_heads_q, num_heads_k, num_heads_v, head_dim = 32, 4, 4 + 32, 64
+    eps = 1e-5
+    total_heads = num_heads_q + num_heads_k + num_heads_v
+    qkv = torch.randn(num_tokens, total_heads * head_dim, dtype=dtype, device=device)
+    weight = torch.ones(head_dim, dtype=dtype, device=device)
+    position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
+    heads = qkv.float().cpu().view(num_tokens, total_heads, head_dim)
+    expected = torch.cat(
+        [
+            llama_rms_norm(heads[:, : num_heads_q + num_heads_k], weight.cpu(), eps),
+            heads[:, num_heads_q + num_heads_k :],
+        ],
+        dim=1,
+    ).view(num_tokens, -1)
+    original_v = qkv[:, (num_heads_q + num_heads_k) * head_dim :].clone()
+
+    entry = (
+        sgl_kernel.fused_qk_norm_rope if generic else sgl_kernel.fused_qk_norm_rope_xe35
+    )
+    entry(
+        qkv,
+        num_heads_q,
+        num_heads_k,
+        num_heads_v,
+        head_dim,
+        eps,
+        weight,
+        weight,
+        1.0,
+        False,
+        position_ids,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        0,
+    )
+
+    assert torch.equal(qkv[:, (num_heads_q + num_heads_k) * head_dim :], original_v)
+    torch.testing.assert_close(
+        qkv.float().cpu(), expected, rtol=precision[dtype], atol=precision[dtype]
+    )
+
+
+@pytest.mark.arch("xe35")
+@pytest.mark.parametrize("tokens", [8, 32768])
+def test_production_reference_xe35(tokens):
+    import subprocess
+    import time
+    from pathlib import Path
+
+    benchmark = Path(__file__).resolve().parents[1] / "benchmark"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(benchmark / "validate_qk_norm_rope_b8.py"),
+            "--tokens",
+            str(tokens),
+            "--entry",
+            "xe35",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    print(result.stdout)
+    assert result.returncode == 0, result.stdout + result.stderr
+    torch.xpu.synchronize()
+    time.sleep(2)
+
+
+@pytest.mark.arch("xe35")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("execution", ["cold_graph", "streams"])
+def test_frequency_lifetime_and_generic_dispatch_xe35(dtype, execution):
+    import time
+
+    torch.manual_seed(127)
+    tokens, dim = 8, 64
+    original = torch.randn(tokens, 288 * dim, device="xpu:0", dtype=dtype)
+    weights_q = torch.full(
+        (dim,), 43.7840518911 / dim**0.5, device="xpu:0", dtype=dtype
+    )
+    weights_k = torch.ones(dim, device="xpu:0", dtype=dtype)
+    positions = torch.tensor(
+        [0, 1, 255, 1023, 2047, 4094, 4095, 4095], device="xpu:0", dtype=torch.int32
+    )
+    base = (
+        130003.0
+        + (16 if dtype == torch.float16 else 0)
+        + (10000 if execution == "streams" else 0)
+    )
+    buffers = [original.clone(), original.clone()]
+
+    def invoke_xe35(buffer, generic=False):
+        entry = (
+            sgl_kernel.fused_qk_norm_rope
+            if generic
+            else sgl_kernel.fused_qk_norm_rope_xe35
+        )
+        entry(
+            buffer,
+            128,
+            16,
+            144,
+            dim,
+            1e-5,
+            weights_q,
+            weights_k,
+            base,
+            False,
+            positions,
+            rotary_dim=dim,
+        )
+
+    if execution == "cold_graph":
+        graph = torch.xpu.XPUGraph()
+        with torch.xpu.graph(graph):
+            invoke_xe35(buffers[0])
+        graph.replay()
+        invoke_xe35(buffers[1], generic=True)
+    else:
+        streams = [torch.xpu.Stream(), torch.xpu.Stream()]
+        for stream, buffer in zip(streams, buffers):
+            stream.wait_stream(torch.xpu.current_stream())
+            with torch.xpu.stream(stream):
+                invoke_xe35(buffer, generic=buffer is buffers[1])
+    torch.xpu.synchronize()
+    frequencies = (
+        base ** (-torch.arange(0, dim, 2, dtype=torch.float64) / dim)
+    ).float()
+    theta = positions.cpu().float()[:, None] * frequencies[None, :]
+    cosine, sine = theta.cos()[:, None, :], theta.sin()[:, None, :]
+    rows = original.cpu().reshape(tokens, 288, dim).float()
+    active = rows[:, :144]
+    weights = torch.cat(
+        (
+            weights_q.cpu().float().expand(128, dim),
+            weights_k.cpu().float().expand(16, dim),
+        )
+    )
+    normalized = (
+        active * torch.rsqrt(active.square().mean(-1, keepdim=True) + 1e-5) * weights
+    )
+    even, odd = normalized[..., ::2], normalized[..., 1::2]
+    expected = torch.stack(
+        (even * cosine - odd * sine, odd * cosine + even * sine), -1
+    ).flatten(-2)
+    tolerance = 5e-3 if dtype == torch.bfloat16 else 1e-3
+    for buffer in buffers:
+        actual = buffer.cpu().reshape(tokens, 288, dim)
+        torch.testing.assert_close(
+            actual[:, :144].float(), expected, atol=tolerance, rtol=tolerance
+        )
+        assert torch.equal(
+            actual[:, 144:].view(torch.uint16),
+            original.cpu().reshape(tokens, 288, dim)[:, 144:].view(torch.uint16),
+        )
+    assert torch.equal(
+        buffers[0].cpu().view(torch.uint16), buffers[1].cpu().view(torch.uint16)
+    )
+    torch.xpu.synchronize()
+    time.sleep(2)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

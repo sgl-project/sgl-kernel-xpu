@@ -89,7 +89,7 @@ def get_benchmark(providers, warmup_iters: int, device: str = "xpu"):
             f"logical_kv_gbps={logical_kv_bytes / (ms * 1e6):.1f}"
         )
 
-        return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+        return ms, max_ms, min_ms
 
     return benchmark
 

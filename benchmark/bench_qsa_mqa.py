@@ -111,7 +111,7 @@ def get_benchmark(page_size: int, device: str = "xpu"):
             f"provider={provider:5} ms={ms:.3f}"
         )
 
-        return 1000 * ms, 1000 * max_ms, 1000 * min_ms
+        return ms, max_ms, min_ms
 
     return benchmark
 

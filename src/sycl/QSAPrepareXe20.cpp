@@ -20,6 +20,10 @@ using fp8 = cutlass::float_e4m3_t;
 constexpr int kSubgroup = 16;
 constexpr int kThreads = 128;
 constexpr int kTasksPerGroup = kThreads / kSubgroup;
+// dim <= 256: at most dim / 2 RoPE pairs, and dim - 2 tail elements (rotary_dim >= 2).
+constexpr int kMaxDim = 256;
+constexpr int kMaxPairsPerLane = kMaxDim / 2 / kSubgroup;
+constexpr int kMaxTailPerLane = kMaxDim / kSubgroup;
 
 template <typename T>
 struct TypeTag {
@@ -159,26 +163,52 @@ struct KCompress {
     for (int r = 0; r < ratio; ++r)
       if (groups[group * ratio + r] < 0 || groups[group * ratio + r] >= slots) return;
     const auto sg = item.get_sub_group();
+    // Each lane pools only the elements it later writes, keeping them in registers
+    // so the sum-of-squares pass and the output pass share one pooled() evaluation.
+    float first_cache[kMaxPairsPerLane];
+    float second_cache[kMaxPairsPerLane];
+    float tail_cache[kMaxTailPerLane];
+    const int half = rope.rotary_dim / 2;
     float square = 0.0f;
-    for (int d = lane * 8; d < dim; d += kSubgroup * 8) {
-      for (int i = 0; i < 8 && d + i < dim; ++i) {
-        const float x = pooled(group, d + i);
-        square += x * x;
+#pragma unroll
+    for (int i = 0; i < kMaxPairsPerLane; ++i) {
+      const int pair = lane + i * kSubgroup;
+      if (pair < half) {
+        const int a = rope.neox ? pair : 2 * pair;
+        const int b = rope.neox ? pair + half : a + 1;
+        first_cache[i] = pooled(group, a);
+        second_cache[i] = pooled(group, b);
+        square += first_cache[i] * first_cache[i] + second_cache[i] * second_cache[i];
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < kMaxTailPerLane; ++i) {
+      const int d = rope.rotary_dim + lane + i * kSubgroup;
+      if (d < dim) {
+        tail_cache[i] = pooled(group, d);
+        square += tail_cache[i] * tail_cache[i];
       }
     }
     square = sycl::reduce_over_group(sg, square, sycl::plus<float>());
     const float scale = sycl::rsqrt(square / dim + eps);
     const int64_t* pos = rope_positions + static_cast<int64_t>(groups[group * ratio]) * 3;
     Output* dst = out + static_cast<int64_t>(writes[group]) * dim;
-    for (int pair = lane; pair < rope.rotary_dim / 2; pair += kSubgroup) {
-      const int a = rope.neox ? pair : 2 * pair;
-      const int b = rope.neox ? pair + rope.rotary_dim / 2 : a + 1;
-      const float first = rounded(pooled(group, a) * scale * (1.0f + float(weight[a])));
-      const float second = rounded(pooled(group, b) * scale * (1.0f + float(weight[b])));
-      rope.store(dst, pos, pair, first, second);
+#pragma unroll
+    for (int i = 0; i < kMaxPairsPerLane; ++i) {
+      const int pair = lane + i * kSubgroup;
+      if (pair < half) {
+        const int a = rope.neox ? pair : 2 * pair;
+        const int b = rope.neox ? pair + half : a + 1;
+        const float first = rounded(first_cache[i] * scale * (1.0f + float(weight[a])));
+        const float second = rounded(second_cache[i] * scale * (1.0f + float(weight[b])));
+        rope.store(dst, pos, pair, first, second);
+      }
     }
-    for (int d = rope.rotary_dim + lane; d < dim; d += kSubgroup)
-      dst[d] = encode<Output>(bf16(pooled(group, d) * scale * (1.0f + float(weight[d]))));
+#pragma unroll
+    for (int i = 0; i < kMaxTailPerLane; ++i) {
+      const int d = rope.rotary_dim + lane + i * kSubgroup;
+      if (d < dim) dst[d] = encode<Output>(bf16(tail_cache[i] * scale * (1.0f + float(weight[d]))));
+    }
   }
 };
 

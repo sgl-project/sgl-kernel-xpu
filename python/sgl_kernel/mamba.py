@@ -102,3 +102,70 @@ def causal_conv1d_update_verify_xpu(
         retrieve_parent_token,
         pad_slot_id,
     )
+
+
+def qwen4_short_conv_state(
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    x: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Qwen3.8-Flash-Next PLE decode short-conv state step.
+
+    Returns ``conv_input = cat([state[state_indices], x.unsqueeze(-1)], dim=-1)`` and advances
+    ``state[state_indices]`` in place to ``conv_input[:, :, 1:]``. Slot 0 is the CUDA-graph
+    padding slot: it may repeat and is never written. Other slots must be unique.
+
+    state: [slots, C, L] bfloat16 or float16 with 1 <= L <= 16, contiguous.
+    state_indices: [N] int64.
+    x: [N, C] with the same dtype as state.
+    out: optional [N, C, L + 1] output; must not overlap state or x.
+    """
+    if out is None:
+        out = torch.empty(
+            (x.shape[0], x.shape[1], state.shape[2] + 1),
+            dtype=x.dtype,
+            device=state.device,
+        )
+    torch.ops.sgl_kernel.qwen4_short_conv_state(out, state, state_indices, x)
+    return out
+
+
+def qwen4_verify_conv(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    valid: torch.Tensor,
+    width: int,
+    dilation: int,
+    intermediate: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Qwen3.8-Flash-Next PLE short convolution for a target-verify step.
+
+    Returns ``residual + silu(conv1d(cat([state[state_indices], x_r.T]), weight))`` per request,
+    zeroed where ``valid`` is false. state is not modified.
+
+    x, residual: [R * W, C] bfloat16, contiguous, with 1 <= W <= 32.
+    weight: [C, 1, K] bfloat16 depthwise kernel with (K - 1) * dilation == L.
+    state: [slots, C, L] bfloat16 or float32 (any strides).
+    state_indices: [R] int32 or int64.
+    valid: [R * W] bool.
+    intermediate: optional [>=R, >=W, C, L] bfloat16 or float32 buffer; row [r, s] receives the
+        conv window after step s (zero for invalid steps).
+    """
+    output = torch.empty_like(x)
+    torch.ops.sgl_kernel.qwen4_verify_conv(
+        output,
+        intermediate,
+        x,
+        residual,
+        weight,
+        state,
+        state_indices,
+        valid,
+        width,
+        dilation,
+    )
+    return output

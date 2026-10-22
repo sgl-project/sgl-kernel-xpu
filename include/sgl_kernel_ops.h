@@ -1503,6 +1503,23 @@ at::Tensor causal_conv1d_update_verify(
     const std::optional<at::Tensor>& retrieve_parent_token,
     int64_t pad_slot_id);
 
+// Qwen3.8-Flash-Next PLE short convolution.
+namespace at::native::xpu {
+void qwen4_short_conv_state(
+    torch::Tensor& conv_input, torch::Tensor& state, torch::Tensor& state_indices, torch::Tensor& x);
+void qwen4_verify_conv(
+    torch::Tensor& output,
+    const std::optional<torch::Tensor>& intermediate,
+    torch::Tensor& x,
+    torch::Tensor& residual,
+    torch::Tensor& weight,
+    torch::Tensor& state,
+    torch::Tensor& state_indices,
+    torch::Tensor& valid,
+    int64_t width,
+    int64_t dilation);
+}  // namespace at::native::xpu
+
 // Xe35 only kernels
 #if SYCL_INTEL_TARGET == 35
 void dsv3_router_gemm_xpu(torch::Tensor& output, const torch::Tensor& mat_a, const torch::Tensor& mat_b);

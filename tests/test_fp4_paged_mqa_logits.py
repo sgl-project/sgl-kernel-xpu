@@ -1,8 +1,6 @@
 import pytest
 import torch
-
 from sgl_kernel import fp4_paged_mqa_logits
-
 
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available(), reason="XPU not available"
@@ -29,7 +27,9 @@ def _decode_scale(scale: torch.Tensor) -> torch.Tensor:
     return torch.pow(2.0, scale.to(torch.float32) - 127.0)
 
 
-def _reference(q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len, weight_scale):
+def _reference(
+    q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len, weight_scale
+):
     batch, heads = q.shape[:2]
     output = torch.zeros((batch, max_seq_len), device=q.device, dtype=torch.float32)
     page_bytes = cache[0].numel()
@@ -49,8 +49,12 @@ def _reference(q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len, 
                 k_code = torch.stack(
                     ((k_payload & 0x0F), (k_payload >> 4) & 0x0F), dim=-1
                 ).reshape(-1)
-                dot = (_decode_fp4(q_code) * _decode_scale(q_scale[b, head]).repeat_interleave(32) *
-                       _decode_fp4(k_code) * k_scales.repeat_interleave(32)).sum()
+                dot = (
+                    _decode_fp4(q_code)
+                    * _decode_scale(q_scale[b, head]).repeat_interleave(32)
+                    * _decode_fp4(k_code)
+                    * k_scales.repeat_interleave(32)
+                ).sum()
                 score += torch.relu(dot) * weights[b, head]
             output[b, token] = score * weight_scale
     return output
@@ -60,10 +64,14 @@ def _reference(q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len, 
 def test_fp4_paged_mqa_logits(batch, heads):
     device = torch.device("xpu")
     torch.manual_seed(batch + heads)
-    q = torch.randint(0, 256, (batch, heads, PACKED_DIM), device=device, dtype=torch.uint8)
-    q_scale = torch.tensor([127, 128, 126, 127], device=device, dtype=torch.uint8).expand(
-        batch, heads, GROUPS
-    ).contiguous()
+    q = torch.randint(
+        0, 256, (batch, heads, PACKED_DIM), device=device, dtype=torch.uint8
+    )
+    q_scale = (
+        torch.tensor([127, 128, 126, 127], device=device, dtype=torch.uint8)
+        .expand(batch, heads, GROUPS)
+        .contiguous()
+    )
     cache = torch.randint(
         0, 128, (4, PAGE_SIZE, 1, PACKED_DIM + GROUPS), device=device, dtype=torch.uint8
     )
@@ -72,7 +80,9 @@ def test_fp4_paged_mqa_logits(batch, heads):
         [127, 128, 126, 127], device=device, dtype=torch.uint8
     ).repeat(PAGE_SIZE)
     weight_scale = 0.75
-    weights = torch.randn(batch, heads, device=device, dtype=torch.float32) * weight_scale
+    weights = (
+        torch.randn(batch, heads, device=device, dtype=torch.float32) * weight_scale
+    )
     seq_lens = torch.tensor([5, 3][:batch], device=device, dtype=torch.int32)
     block_tables = torch.tensor(
         [[0, 1], [2, 3]][:batch], device=device, dtype=torch.int32
@@ -81,5 +91,7 @@ def test_fp4_paged_mqa_logits(batch, heads):
     got = fp4_paged_mqa_logits(
         (q, q_scale), cache, weights, seq_lens, block_tables, None, max_seq_len
     )
-    ref = _reference(q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len, 1.0)
+    ref = _reference(
+        q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len, 1.0
+    )
     torch.testing.assert_close(got.cpu(), ref.cpu(), rtol=1e-4, atol=1e-4)

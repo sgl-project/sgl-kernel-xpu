@@ -1,8 +1,6 @@
 import pytest
 import torch
-
 from sgl_kernel import fused_q_indexer_rope_hadamard_fp4_quant
-
 
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available(), reason="XPU not available"
@@ -53,9 +51,9 @@ def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     scale_exp = _ceil_ue8m0_exp_ref(scale_raw)
     scale = (scale_exp << 23).contiguous().view(torch.float32)
     codes = _fp4_e2m1_code_ref((groups / scale.unsqueeze(-1)).view(-1, HEAD_DIM))
-    packed = (codes[:, 0::2].to(torch.int16) | (codes[:, 1::2].to(torch.int16) << 4)).to(
-        torch.uint8
-    )
+    packed = (
+        codes[:, 0::2].to(torch.int16) | (codes[:, 1::2].to(torch.int16) << 4)
+    ).to(torch.uint8)
     packed_scale = scale_exp[:, 0].clone()
     for group_id in range(1, SCALE_GROUPS):
         packed_scale |= scale_exp[:, group_id] << (8 * group_id)
@@ -81,9 +79,15 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int):
     weight = torch.randn(batch_size, num_heads, device=device, dtype=torch.bfloat16)
     positions = (torch.arange(batch_size, device=device, dtype=torch.int32) * 7) % 63
     rope_cache = torch.view_as_real(_make_freqs_cis(64, device)).flatten(-2)
-    q_fp4 = torch.empty((batch_size, num_heads, FP4_DIM), device=device, dtype=torch.uint8)
-    q_scale = torch.empty((batch_size, num_heads, SCALE_GROUPS), device=device, dtype=torch.uint8)
-    weights_out = torch.empty((batch_size, num_heads, 1), device=device, dtype=torch.float32)
+    q_fp4 = torch.empty(
+        (batch_size, num_heads, FP4_DIM), device=device, dtype=torch.uint8
+    )
+    q_scale = torch.empty(
+        (batch_size, num_heads, SCALE_GROUPS), device=device, dtype=torch.uint8
+    )
+    weights_out = torch.empty(
+        (batch_size, num_heads, 1), device=device, dtype=torch.float32
+    )
 
     fused_q_indexer_rope_hadamard_fp4_quant(
         q_input,
@@ -102,16 +106,20 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int):
     rope = reference[..., -64:].view(batch_size, num_heads, 32, 2)
     real, imaginary = rope[..., 0], rope[..., 1]
     rotated = torch.stack(
-        [real * frequency[..., 0] - imaginary * frequency[..., 1],
-         real * frequency[..., 1] + imaginary * frequency[..., 0]],
+        [
+            real * frequency[..., 0] - imaginary * frequency[..., 1],
+            real * frequency[..., 1] + imaginary * frequency[..., 0],
+        ],
         dim=-1,
     ).flatten(-2)
     reference[..., -64:] = rotated
     reference = _fwht128(reference) * (HEAD_DIM**-0.5)
     ref_fp4, ref_scale = _ref_quantize_fp4_indexer(reference)
     ref_fp4 = ref_fp4.view(batch_size, num_heads, FP4_DIM)
-    ref_scale = ref_scale.view(batch_size, num_heads).view(torch.uint8).view(
-        batch_size, num_heads, SCALE_GROUPS
+    ref_scale = (
+        ref_scale.view(batch_size, num_heads)
+        .view(torch.uint8)
+        .view(batch_size, num_heads, SCALE_GROUPS)
     )
 
     torch.testing.assert_close(q_fp4.cpu(), ref_fp4.cpu())

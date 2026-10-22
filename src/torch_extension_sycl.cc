@@ -531,10 +531,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "fused_q_indexer_rope_hadamard_fp4_quant(Tensor q_input, Tensor(a!) q_fp4, Tensor(b!) q_scale, "
       "Tensor weight, Tensor(c!) weights_out, float weight_scale, Tensor rope_cache, Tensor positions) -> ()");
-  m.impl(
-      "fused_q_indexer_rope_hadamard_fp4_quant",
-      torch::kXPU,
-      &fused_q_indexer_rope_hadamard_fp4_quant);
+  m.impl("fused_q_indexer_rope_hadamard_fp4_quant", torch::kXPU, &fused_q_indexer_rope_hadamard_fp4_quant);
 
   /*
    * From fused qk norm rope

@@ -41,19 +41,15 @@ inline float subgroup_reduce_max(sycl::sub_group subgroup, float value) {
   return value;
 }
 
-inline void reduce_max_64(
-    float* reduction,
-    sycl::nd_item<1> item,
-    sycl::sub_group subgroup,
-    uint32_t local_id) {
+inline void reduce_max_64(float* reduction, sycl::nd_item<1> item, sycl::sub_group subgroup, uint32_t local_id) {
   const uint32_t lane_id = local_id & (kSubGroupSize - 1u);
   const uint32_t subgroup_id = local_id / kSubGroupSize;
   const float subgroup_max = subgroup_reduce_max(subgroup, reduction[local_id]);
   if (lane_id == 0) reduction[subgroup_id] = subgroup_max;
   item.barrier(sycl::access::fence_space::local_space);
   if (subgroup_id == 0) {
-    const float block_max = subgroup_reduce_max(
-        subgroup, lane_id < kBlockSize / kSubGroupSize ? reduction[lane_id] : 0.0f);
+    const float block_max =
+        subgroup_reduce_max(subgroup, lane_id < kBlockSize / kSubGroupSize ? reduction[lane_id] : 0.0f);
     if (lane_id == 0) reduction[0] = block_max;
   }
   item.barrier(sycl::access::fence_space::local_space);
@@ -126,8 +122,7 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
       reduction[local_id] = local_id < kGroupSize ? sycl::fabs(data[element]) : 0.0f;
       reduce_max_64(reduction, item, subgroup, local_id);
       if (local_id == 0) {
-        const uint8_t scale = at::native::xpu::castToUE8M0(
-            sycl::fmax(1.0e-4f, reduction[0]) / 6.0f);
+        const uint8_t scale = at::native::xpu::castToUE8M0(sycl::fmax(1.0e-4f, reduction[0]) / 6.0f);
         group_scale[group] = scale;
         group_inverse[group] = at::native::xpu::invScaleUE8M0(scale);
       }
@@ -136,10 +131,8 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
 
     const int64_t packed_dim0 = 2 * static_cast<int64_t>(local_id);
     const int64_t packed_dim1 = packed_dim0 + 1;
-    const uint8_t first_code = quant_fp4_e2m1(
-      data[packed_dim0] * group_inverse[packed_dim0 / kGroupSize]);
-    const uint8_t second_code = quant_fp4_e2m1(
-      data[packed_dim1] * group_inverse[packed_dim1 / kGroupSize]);
+    const uint8_t first_code = quant_fp4_e2m1(data[packed_dim0] * group_inverse[packed_dim0 / kGroupSize]);
+    const uint8_t second_code = quant_fp4_e2m1(data[packed_dim1] * group_inverse[packed_dim1 / kGroupSize]);
     q_fp4[static_cast<int64_t>(row_id) * kBlockSize + local_id] =
         static_cast<uint8_t>((first_code & 0x0F) | ((second_code & 0x0F) << 4));
     if (local_id < kNumGroups) q_scale[static_cast<int64_t>(row_id) * kNumGroups + local_id] = group_scale[local_id];
@@ -188,38 +181,64 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_fp4_quant(
   CHECK_DIM(2, rope_cache);
   CHECK_DIM(1, positions);
   TORCH_CHECK(q_input.size(2) == kHeadDim, "q_input head_dim must be 128");
-  TORCH_CHECK(q_fp4.size(0) == q_input.size(0) && q_fp4.size(1) == q_input.size(1) && q_fp4.size(2) == kBlockSize, "q_fp4 must be [B, H, 64]");
-  TORCH_CHECK(q_scale.size(0) == q_input.size(0) && q_scale.size(1) == q_input.size(1) && q_scale.size(2) == kNumGroups, "q_scale must be [B, H, 4]");
+  TORCH_CHECK(
+      q_fp4.size(0) == q_input.size(0) && q_fp4.size(1) == q_input.size(1) && q_fp4.size(2) == kBlockSize,
+      "q_fp4 must be [B, H, 64]");
+  TORCH_CHECK(
+      q_scale.size(0) == q_input.size(0) && q_scale.size(1) == q_input.size(1) && q_scale.size(2) == kNumGroups,
+      "q_scale must be [B, H, 4]");
   TORCH_CHECK(weight.size(0) == q_input.size(0) && weight.size(1) == q_input.size(1), "weight must be [B, H]");
-  TORCH_CHECK(weights_out.size(0) == q_input.size(0) && weights_out.size(1) == q_input.size(1) && weights_out.size(2) == 1, "weights_out must be [B, H, 1]");
-  TORCH_CHECK(rope_cache.size(1) == kRopeDim && positions.size(0) == q_input.size(0), "invalid rope_cache or positions shape");
-  TORCH_CHECK(q_input.scalar_type() == at::kBFloat16 || q_input.scalar_type() == at::kHalf, "q_input must be bf16 or fp16");
+  TORCH_CHECK(
+      weights_out.size(0) == q_input.size(0) && weights_out.size(1) == q_input.size(1) && weights_out.size(2) == 1,
+      "weights_out must be [B, H, 1]");
+  TORCH_CHECK(
+      rope_cache.size(1) == kRopeDim && positions.size(0) == q_input.size(0), "invalid rope_cache or positions shape");
+  TORCH_CHECK(
+      q_input.scalar_type() == at::kBFloat16 || q_input.scalar_type() == at::kHalf, "q_input must be bf16 or fp16");
   TORCH_CHECK(weight.scalar_type() == q_input.scalar_type(), "weight dtype must match q_input");
-  TORCH_CHECK(q_fp4.scalar_type() == at::kByte && q_scale.scalar_type() == at::kByte, "q_fp4 and q_scale must be uint8");
-  TORCH_CHECK(weights_out.scalar_type() == at::kFloat && rope_cache.scalar_type() == at::kFloat, "weights_out and rope_cache must be float32");
-  TORCH_CHECK(positions.scalar_type() == at::kInt || positions.scalar_type() == at::kLong, "positions must be int32 or int64");
-  TORCH_CHECK(q_input.is_contiguous() && q_fp4.is_contiguous() && q_scale.is_contiguous() && weight.is_contiguous() && weights_out.is_contiguous() && rope_cache.is_contiguous() && positions.is_contiguous(), "inputs and outputs must be contiguous");
+  TORCH_CHECK(
+      q_fp4.scalar_type() == at::kByte && q_scale.scalar_type() == at::kByte, "q_fp4 and q_scale must be uint8");
+  TORCH_CHECK(
+      weights_out.scalar_type() == at::kFloat && rope_cache.scalar_type() == at::kFloat,
+      "weights_out and rope_cache must be float32");
+  TORCH_CHECK(
+      positions.scalar_type() == at::kInt || positions.scalar_type() == at::kLong, "positions must be int32 or int64");
+  TORCH_CHECK(
+      q_input.is_contiguous() && q_fp4.is_contiguous() && q_scale.is_contiguous() && weight.is_contiguous() &&
+          weights_out.is_contiguous() && rope_cache.is_contiguous() && positions.is_contiguous(),
+      "inputs and outputs must be contiguous");
   if (q_input.numel() == 0) return;
 
   const uint32_t num_rows = static_cast<uint32_t>(q_input.size(0) * q_input.size(1));
   auto queue = c10::xpu::getCurrentXPUStream().queue();
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, q_input.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
-    using input_t = scalar_t;
-    AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
-      using position_t = index_t;
-      queue.submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> local_data(sycl::range<1>(kHeadDim), cgh);
-        sycl::local_accessor<float, 1> local_reduction(sycl::range<1>(kBlockSize), cgh);
-        sycl::local_accessor<float, 1> local_group_inverse(sycl::range<1>(kNumGroups), cgh);
-        sycl::local_accessor<uint8_t, 1> local_group_scale(sycl::range<1>(kNumGroups), cgh);
-        FusedQIndexerRopeHadamardFp4QuantKernel<input_t, position_t> kernel{
-            q_input.data_ptr<input_t>(), q_fp4.data_ptr<uint8_t>(), q_scale.data_ptr<uint8_t>(),
-            weight.data_ptr<input_t>(), weights_out.data_ptr<float>(), rope_cache.data_ptr<float>(),
-            positions.data_ptr<position_t>(), num_rows, static_cast<uint32_t>(q_input.size(1)),
-            static_cast<float>(weight_scale), local_data, local_reduction, local_group_inverse, local_group_scale};
-        cgh.parallel_for(
-            sycl::nd_range<1>(sycl::range<1>(num_rows * kBlockSize), sycl::range<1>(kBlockSize)), kernel);
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::kHalf, at::kBFloat16, q_input.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
+        using input_t = scalar_t;
+        AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
+          using position_t = index_t;
+          queue.submit([&](sycl::handler& cgh) {
+            sycl::local_accessor<float, 1> local_data(sycl::range<1>(kHeadDim), cgh);
+            sycl::local_accessor<float, 1> local_reduction(sycl::range<1>(kBlockSize), cgh);
+            sycl::local_accessor<float, 1> local_group_inverse(sycl::range<1>(kNumGroups), cgh);
+            sycl::local_accessor<uint8_t, 1> local_group_scale(sycl::range<1>(kNumGroups), cgh);
+            FusedQIndexerRopeHadamardFp4QuantKernel<input_t, position_t> kernel{
+                q_input.data_ptr<input_t>(),
+                q_fp4.data_ptr<uint8_t>(),
+                q_scale.data_ptr<uint8_t>(),
+                weight.data_ptr<input_t>(),
+                weights_out.data_ptr<float>(),
+                rope_cache.data_ptr<float>(),
+                positions.data_ptr<position_t>(),
+                num_rows,
+                static_cast<uint32_t>(q_input.size(1)),
+                static_cast<float>(weight_scale),
+                local_data,
+                local_reduction,
+                local_group_inverse,
+                local_group_scale};
+            cgh.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(num_rows * kBlockSize), sycl::range<1>(kBlockSize)), kernel);
+          });
+        });
       });
-    });
-  });
 }

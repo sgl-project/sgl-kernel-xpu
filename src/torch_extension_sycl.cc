@@ -51,6 +51,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
   m.def(
+      "qwen4_ngram_hash(Tensor! output, Tensor contexts, Tensor multipliers, Tensor vocab_sizes, Tensor offsets, "
+      "int eos_token_id) -> ()");
+  m.impl("qwen4_ngram_hash", torch::kXPU, &at::native::xpu::qwen4_ngram_hash);
+
+  m.def(
       "fused_scale_residual_norm_scale_shift(Tensor residual, Tensor x, Tensor? gate, Tensor? weight, "
       "Tensor? bias, Tensor scale, Tensor shift, float eps) -> (Tensor, Tensor)");
   m.impl("fused_scale_residual_norm_scale_shift", torch::kXPU, &at::native::xpu::fused_scale_residual_norm_scale_shift);

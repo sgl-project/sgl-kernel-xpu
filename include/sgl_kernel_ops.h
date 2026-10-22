@@ -122,6 +122,13 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void qwen4_ngram_hash(
+    torch::Tensor& output,
+    torch::Tensor& contexts,
+    torch::Tensor& multipliers,
+    torch::Tensor& vocab_sizes,
+    torch::Tensor& offsets,
+    int64_t eos_token_id);
 std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_norm_scale_shift(
     const torch::Tensor& residual,
     const torch::Tensor& x,

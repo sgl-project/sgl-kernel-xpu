@@ -615,6 +615,15 @@ void fused_q_indexer_rope_hadamard_quant(
     double weight_scale,
     const at::Tensor& rope_cache,
     const at::Tensor& positions);
+void fused_q_indexer_rope_hadamard_fp4_quant(
+    const at::Tensor& q_input,
+    at::Tensor& q_fp4,
+    at::Tensor& q_scale,
+    const at::Tensor& weight,
+    at::Tensor& weights_out,
+    double weight_scale,
+    const at::Tensor& rope_cache,
+    const at::Tensor& positions);
 void bmm_fp8(
     at::Tensor A,
     at::Tensor B,
@@ -632,6 +641,16 @@ void bmm_fp8(
 
 torch::Tensor fp8_paged_mqa_logits(
     const torch::Tensor& q_fp8,
+    const torch::Tensor& kv_cache,
+    const torch::Tensor& weights,
+    const torch::Tensor& seq_lens,
+    const torch::Tensor& block_tables,
+    const std::optional<torch::Tensor>& schedule_metadata,
+    int64_t max_seq_len,
+    bool clean_logits);
+torch::Tensor fp4_paged_mqa_logits(
+    const torch::Tensor& q_fp4,
+    const torch::Tensor& q_scale,
     const torch::Tensor& kv_cache,
     const torch::Tensor& weights,
     const torch::Tensor& seq_lens,

@@ -99,6 +99,9 @@ hadamard_transform = torch.ops.sgl_kernel.hadamard_transform
 fused_q_indexer_rope_hadamard_quant = (
     torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_quant
 )
+fused_q_indexer_rope_hadamard_fp4_quant = (
+    torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_fp4_quant
+)
 from sgl_kernel.gdn_attn import gdn_attention
 from sgl_kernel.gemm import (
     awq_dequantize,
@@ -208,7 +211,7 @@ from sgl_kernel.moe import (
     topk_sigmoid,
     topk_softmax,
 )
-from sgl_kernel.nsa import fp8_mqa_logits, fp8_paged_mqa_logits
+from sgl_kernel.nsa import fp4_paged_mqa_logits, fp8_mqa_logits, fp8_paged_mqa_logits
 from sgl_kernel.qsa_sparse_attention import qsa_sparse_attention
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,

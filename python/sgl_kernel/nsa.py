@@ -183,3 +183,35 @@ def fp8_paged_mqa_logits(
         max_seq_len,
         clean_logits,
     )
+
+
+def fp4_paged_mqa_logits(
+    q_fp4: tuple[torch.Tensor, torch.Tensor],
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    schedule_metadata: Optional[torch.Tensor],
+    max_seq_len: int,
+    clean_logits: bool = False,
+) -> torch.Tensor:
+    """FP4 E2M1/UE8M0 paged MQA logits on XPU."""
+    q_fp4, q_scale = q_fp4
+    if q_scale.dtype != torch.uint8:
+        heads = q_scale.shape[-1]
+        q_scale = q_scale.view(torch.uint8).reshape(*q_scale.shape[:-1], heads, -1)
+    if q_fp4.dim() == 4:
+        q_fp4 = q_fp4.squeeze(1)
+    if q_scale.dim() == 4:
+        q_scale = q_scale.squeeze(1)
+    return torch.ops.sgl_kernel.fp4_paged_mqa_logits.default(
+        q_fp4,
+        q_scale,
+        kv_cache,
+        weights,
+        seq_lens,
+        block_tables,
+        schedule_metadata,
+        max_seq_len,
+        clean_logits,
+    )

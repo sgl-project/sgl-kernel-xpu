@@ -50,6 +50,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
+  m.def("qwen4_gate_value(Tensor! output, Tensor gate, Tensor value) -> ()");
+  m.impl("qwen4_gate_value", torch::kXPU, &at::native::xpu::qwen4_gate_value);
+
+  m.def("qwen4_gate_reduce(Tensor! output, Tensor key, Tensor query, Tensor value) -> ()");
+  m.impl("qwen4_gate_reduce", torch::kXPU, &at::native::xpu::qwen4_gate_reduce);
+
   m.def(
       "fused_scale_residual_norm_scale_shift(Tensor residual, Tensor x, Tensor? gate, Tensor? weight, "
       "Tensor? bias, Tensor scale, Tensor shift, float eps) -> (Tensor, Tensor)");

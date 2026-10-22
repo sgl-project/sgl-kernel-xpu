@@ -3,7 +3,7 @@
 #include "kernels/flash_attention_v2/xe35/xe_fmha_fwd_prefill_dispatch.hpp"
 #include "sgl_kernel_export.h"
 
-SGL_KERNEL_EXPORT void mha_fwd(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     const at::Tensor& q,
     const at::Tensor& k,
     const at::Tensor& v,
@@ -32,12 +32,12 @@ SGL_KERNEL_EXPORT void mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    at::Tensor& out,
-    std::optional<at::Tensor>& softmax_lse,
+    std::optional<at::Tensor>& out_,
+    bool return_softmax_lse,
     std::optional<const at::Tensor>& rel_bias_,
     bool rel_bias_is_sheared,
     std::optional<const at::Tensor>& bidirectional_block_ids_) {
-  TORCH_CHECK(!softmax_lse.has_value(), "flash_attentionXe35: softmax LSE is not supported");
+  TORCH_CHECK(!return_softmax_lse, "flash_attentionXe35: softmax LSE is not supported");
   TORCH_CHECK(!rel_bias_.has_value() && !rel_bias_is_sheared, "flash_attentionXe35: relative bias is not supported");
   TORCH_CHECK(!bidirectional_block_ids_.has_value(), "flash_attentionXe35: bidirectional blocks are not supported");
   const int batch = static_cast<int>(cu_seqlens_q.size(0) - 1);
@@ -177,6 +177,7 @@ SGL_KERNEL_EXPORT void mha_fwd(
       "flash_attentionXe35: non-paged attention supports head_dim 64 and 128; paged attention also supports 256");
 
   c10::DeviceGuard device_guard(q.device());
+  at::Tensor out = out_.has_value() ? *out_ : at::empty({total_q, num_heads_q, head_dim}, q.options());
   TORCH_CHECK(
       out.dim() == 3 && out.size(0) == total_q && out.size(1) == num_heads_q && out.size(2) == head_dim,
       "flash_attentionXe35: output shape must be [total_q, num_heads_q, head_dim]");
@@ -327,4 +328,5 @@ SGL_KERNEL_EXPORT void mha_fwd(
   if (is_fp8) {
     out.copy_(out_dense);
   }
+  return {out, c10::nullopt};
 }

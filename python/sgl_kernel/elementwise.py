@@ -158,7 +158,7 @@ def qwen4_gate_value(
         BF16 contiguous, shape ``(N, H)``; ``H`` must be a multiple of 8.
     out: Optional[torch.Tensor]
         Pre-allocated BF16 contiguous output of shape ``(N, HC, H)``; must not
-        overlap ``value``.
+        overlap ``gate`` or ``value``.
     """
     if out is None:
         out = torch.empty(
@@ -190,7 +190,9 @@ def qwen4_gate_reduce(
         BF16 contiguous, shape ``(N, H)``.
     out: Optional[torch.Tensor]
         Pre-allocated BF16 contiguous output with the shape of ``key``; must
-        not overlap ``value`` (overlapping ``key`` or ``query`` is fine).
+        not overlap ``value``. It may be the exact same tensor region as
+        ``key`` or ``query`` (in-place), but partial overlap with either is
+        rejected.
     """
     if out is None:
         out = torch.empty_like(key)

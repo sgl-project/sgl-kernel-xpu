@@ -134,6 +134,28 @@ void check_bf16_xpu(const torch::Tensor& t, const char* name) {
   TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % ALIGN_BYTES == 0, name, " must be 16-byte aligned");
 }
 
+// All tensors are contiguous, so each occupies one byte range.
+bool ranges_overlap(const torch::Tensor& a, const torch::Tensor& b) {
+  const auto a_begin = reinterpret_cast<uintptr_t>(a.data_ptr());
+  const auto b_begin = reinterpret_cast<uintptr_t>(b.data_ptr());
+  return a_begin < b_begin + b.nbytes() && b_begin < a_begin + a.nbytes();
+}
+
+void check_disjoint(const torch::Tensor& output, const torch::Tensor& other, const char* op, const char* name) {
+  TORCH_CHECK(!ranges_overlap(output, other), op, ": output must not overlap ", name);
+}
+
+// Same-shape tensors: exact aliasing is safe because each work-group reads its row before writing it.
+void check_disjoint_or_alias(
+    const torch::Tensor& output, const torch::Tensor& other, const char* op, const char* name) {
+  TORCH_CHECK(
+      !ranges_overlap(output, other) || output.data_ptr() == other.data_ptr(),
+      op,
+      ": output may only overlap ",
+      name,
+      " if they are the same tensor region");
+}
+
 }  // namespace
 
 namespace at::native::xpu {
@@ -153,6 +175,8 @@ SGL_KERNEL_EXPORT void qwen4_gate_value(torch::Tensor& output, torch::Tensor& ga
   TORCH_CHECK(
       gate.device() == value.device() && output.device() == value.device(),
       "gate, value and output must be on the same device");
+  check_disjoint(output, gate, "qwen4_gate_value", "gate");
+  check_disjoint(output, value, "qwen4_gate_value", "value");
   const int64_t rows = tokens * hc_count;
   if (rows == 0) {
     return;
@@ -186,6 +210,9 @@ qwen4_gate_reduce(torch::Tensor& output, torch::Tensor& key, torch::Tensor& quer
   TORCH_CHECK(
       query.device() == key.device() && value.device() == key.device() && output.device() == key.device(),
       "key, query, value and output must be on the same device");
+  check_disjoint_or_alias(output, key, "qwen4_gate_reduce", "key");
+  check_disjoint_or_alias(output, query, "qwen4_gate_reduce", "query");
+  check_disjoint(output, value, "qwen4_gate_reduce", "value");
   const int64_t rows = tokens * hc_count;
   if (rows == 0) {
     return;

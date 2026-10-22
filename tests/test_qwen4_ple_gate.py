@@ -227,5 +227,49 @@ def test_qwen4_gate_reduce_rejects_invalid(case):
         sgl_kernel.qwen4_gate_reduce(key, query, value, out=out)
 
 
+def test_qwen4_gate_value_rejects_output_overlap():
+    buf = rand_bf16(32)
+    value = rand_bf16(1, 8)
+    with pytest.raises(RuntimeError, match="must not overlap gate"):
+        sgl_kernel.qwen4_gate_value(buf[:4].view(1, 4, 1), value, out=buf.view(1, 4, 8))
+    gate = rand_bf16(1, 4, 1)
+    buf = rand_bf16(32)
+    with pytest.raises(RuntimeError, match="must not overlap value"):
+        sgl_kernel.qwen4_gate_value(gate, buf[:8].view(1, 8), out=buf.view(1, 4, 8))
+
+
+@pytest.mark.parametrize("operand", ["key", "query"])
+def test_qwen4_gate_reduce_rejects_partial_output_overlap(operand):
+    buf = rand_bf16(40)
+    key, query, value = rand_bf16(1, 4, 8), rand_bf16(1, 4, 8), rand_bf16(1, 8)
+    partial = buf[:32].view(1, 4, 8)
+    out = buf[8:].view(1, 4, 8)
+    if operand == "key":
+        key = partial
+    else:
+        query = partial
+    with pytest.raises(RuntimeError, match="same tensor region"):
+        sgl_kernel.qwen4_gate_reduce(key, query, value, out=out)
+
+
+def test_qwen4_gate_reduce_rejects_value_overlap():
+    buf = rand_bf16(32)
+    key, query = rand_bf16(1, 4, 8), rand_bf16(1, 4, 8)
+    with pytest.raises(RuntimeError, match="must not overlap value"):
+        sgl_kernel.qwen4_gate_reduce(
+            key, query, buf[:8].view(1, 8), out=buf.view(1, 4, 8)
+        )
+
+
+@pytest.mark.parametrize("operand", ["key", "query"])
+def test_qwen4_gate_reduce_in_place(operand):
+    key, query, value = rand_bf16(3, 4, 2560), rand_bf16(3, 4, 2560), rand_bf16(3, 2560)
+    expected = gate_reduce_ref(key, query, value)
+    target = key if operand == "key" else query
+    out = sgl_kernel.qwen4_gate_reduce(key, query, value, out=target)
+    assert out.data_ptr() == target.data_ptr()
+    torch.testing.assert_close(out, expected, **BF16_TOL)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

@@ -957,7 +957,7 @@ def test_grouped_gemma_rmsnorm_in_place():
 def test_grouped_gemma_rmsnorm_rejects_partial_input_overlap():
     base = torch.randn(24).to(device).to(torch.float16)
     w = torch.randn(8).to(device).to(torch.float16)
-    with pytest.raises(RuntimeError, match="same tensor region"):
+    with pytest.raises(RuntimeError, match="single memory location"):
         sgl_kernel.grouped_gemma_rmsnorm(
             base[:16].view(2, 8), w, 8, out=base[8:].view(2, 8)
         )
@@ -966,7 +966,7 @@ def test_grouped_gemma_rmsnorm_rejects_partial_input_overlap():
 def test_grouped_gemma_rmsnorm_rejects_weight_overlap():
     base = torch.randn(24).to(device).to(torch.float16)
     x = torch.randn(2, 8).to(device).to(torch.float16)
-    with pytest.raises(RuntimeError, match="must not overlap weight"):
+    with pytest.raises(RuntimeError, match="single memory location"):
         sgl_kernel.grouped_gemma_rmsnorm(x, base[8:16], 8, out=base[:16].view(2, 8))
 
 

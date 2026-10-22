@@ -230,11 +230,11 @@ def test_qwen4_gate_reduce_rejects_invalid(case):
 def test_qwen4_gate_value_rejects_output_overlap():
     buf = rand_bf16(32)
     value = rand_bf16(1, 8)
-    with pytest.raises(RuntimeError, match="must not overlap gate"):
+    with pytest.raises(RuntimeError, match="single memory location"):
         sgl_kernel.qwen4_gate_value(buf[:4].view(1, 4, 1), value, out=buf.view(1, 4, 8))
     gate = rand_bf16(1, 4, 1)
     buf = rand_bf16(32)
-    with pytest.raises(RuntimeError, match="must not overlap value"):
+    with pytest.raises(RuntimeError, match="single memory location"):
         sgl_kernel.qwen4_gate_value(gate, buf[:8].view(1, 8), out=buf.view(1, 4, 8))
 
 
@@ -248,14 +248,14 @@ def test_qwen4_gate_reduce_rejects_partial_output_overlap(operand):
         key = partial
     else:
         query = partial
-    with pytest.raises(RuntimeError, match="same tensor region"):
+    with pytest.raises(RuntimeError, match="single memory location"):
         sgl_kernel.qwen4_gate_reduce(key, query, value, out=out)
 
 
 def test_qwen4_gate_reduce_rejects_value_overlap():
     buf = rand_bf16(32)
     key, query = rand_bf16(1, 4, 8), rand_bf16(1, 4, 8)
-    with pytest.raises(RuntimeError, match="must not overlap value"):
+    with pytest.raises(RuntimeError, match="single memory location"):
         sgl_kernel.qwen4_gate_reduce(
             key, query, buf[:8].view(1, 8), out=buf.view(1, 4, 8)
         )

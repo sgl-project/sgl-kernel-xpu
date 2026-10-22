@@ -393,11 +393,13 @@ SGL_KERNEL_EXPORT void qwen4_verify_conv(
         inter.scalar_type() == at::kBFloat16 || inter.scalar_type() == at::kFloat,
         "intermediate must be bfloat16 or float32, got ",
         inter.scalar_type());
+    at::assert_no_internal_overlap(inter);
     for (const torch::Tensor* input : {&output, &x, &residual, &weight, &state}) {
       at::assert_no_overlap(inter, *input);
     }
   }
   // output may alias residual exactly: each element is read before it is written by the same thread.
+  at::assert_no_partial_overlap(output, residual);
   for (const torch::Tensor* input : {&x, &weight, &state}) {
     at::assert_no_overlap(output, *input);
   }

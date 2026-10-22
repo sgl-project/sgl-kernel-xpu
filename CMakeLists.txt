@@ -108,8 +108,8 @@ if(DPCPP_SYCL_TARGET MATCHES "bmg")
   set(CUTLASS_SYCL_REPO "https://github.com/intel/sycl-tla.git")
   set(CUTLASS_SYCL_TAG  "7b56b936b87f799f80dde60c2fd8d11c1128cebb")
 elseif(DPCPP_SYCL_TARGET MATCHES "cri")
-  set(CUTLASS_SYCL_REPO "https://github.com/intel/sycl-tla.git")
-  set(CUTLASS_SYCL_TAG  "7b56b936b87f799f80dde60c2fd8d11c1128cebb")
+  set(CUTLASS_SYCL_REPO "git@github.com:intel-innersource/libraries.ai.cutlass.internal.git")
+  set(CUTLASS_SYCL_TAG  "e87870bb7aacf83bfb3be9da685f148316b8df23")
 else()
   message(FATAL_ERROR
       "Unsupported DPCPP_SYCL_TARGET: ${DPCPP_SYCL_TARGET}. "

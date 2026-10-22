@@ -39,8 +39,8 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cute/util/sycl_vec.hpp"
 #include "cutlass/cutlass.h"
+#include "cutlass/gemm/collective/xe_mma_blockscaled_scale_traits.hpp"
 #include "cutlass/gemm/dispatch_policy.hpp"
-#include "cutlass/gemm/collective/xe_common_blockscaled_mxfp.hpp"
 #include "fmha_fusion.hpp"
 
 namespace cutlass::fmha {
@@ -581,6 +581,11 @@ struct FMHAFwdMainloop<
 
     /* Initialization steps for first block: Q/K prefetch, O init */
     /* TODO: limit D prefetch for large head size, and reorder K prefetches */
+    using PreparedK_t = decltype(prepare_payloads(copy_k, tKgK(_, _, _, 0, 0)));
+    using PreparedV_t = decltype(prepare_payloads(copy_v, tVgV(_, _, _, 0, 0)));
+    std::array<PreparedK_t, DTiles> prepared_k;
+    std::array<PreparedV_t, VTiles> prepared_v;
+
     int kblocks_cache = ceil_div(seq_len_kv_cache, get<1>(TileShapeQK{}));
 
     /* Preload + reorder Q once; reused across all K iterations. */
@@ -590,6 +595,17 @@ struct FMHAFwdMainloop<
       reorder(tQrQ, tSrQ_arr[d]);
     }
 
+    CUTLASS_PRAGMA_UNROLL
+    for (int d = 0; d < DTiles; d++) {
+      prepared_k[d] = prepare_payloads(copy_k, tKgK(_, _, _, 0, d));
+    }
+    CUTLASS_PRAGMA_UNROLL
+    for (int VV = 0; VV < VTiles; VV++) {
+      prepared_v[VV] = prepare_payloads(copy_v, tVgV(_, _, _, VV, 0));
+    }
+
+    [[maybe_unused]] auto prepared_pk = prepare_payloads(prefetch_k, pKgK(_, _, _, 0));
+    [[maybe_unused]] auto prepared_pv = prepare_payloads(prefetch_v, pVgV(_, _, _, 0));
     constexpr int kv_stride = get<1>(TileShapeQK{});
     [[maybe_unused]] int const tiles_per_page = params.page_size / kv_stride;
     [[maybe_unused]] int const batch_offset = l_coord * params.num_pages_per_seq;
@@ -599,8 +615,10 @@ struct FMHAFwdMainloop<
     auto k_seq_delta = [](auto n) { return make_coord(n, _0{}); };
     auto v_seq_delta = [](auto n) { return make_coord(_0{}, n); };
 
+    // Non-paged cached KV reads each tile by its logical block index at the copy
+    // sites below (mirroring the paged path); only paged needs per-stage physical
+    // tile tracking.
     std::array<int, Stages> physical_k_tiles_cache{};
-    const int k_start = (blk_k0 > kblocks_cache ? blk_k0 : kblocks_cache) - kblocks_cache;
 
     if constexpr (CachedKV && PagedKV) {
       CUTLASS_PRAGMA_UNROLL
@@ -612,14 +630,30 @@ struct FMHAFwdMainloop<
       }
     }
 
+    const int k_start = (blk_k0 > kblocks_cache ? blk_k0 : kblocks_cache) - kblocks_cache;
+    if (k_start > 0) {
+      const int k_start_delta = k_start * kv_stride;
+      CUTLASS_PRAGMA_UNROLL
+      for (int d = 0; d < DTiles; d++) {
+        prepared_k[d] += k_seq_delta(k_start_delta);
+      }
+      CUTLASS_PRAGMA_UNROLL
+      for (int VV = 0; VV < VTiles; VV++) {
+        prepared_v[VV] += v_seq_delta(k_start_delta);
+      }
+      prepared_pk += k_seq_delta(k_start_delta);
+      prepared_pv += v_seq_delta(k_start_delta);
+    }
     if constexpr (!GqaFusion) {
       CUTLASS_PRAGMA_UNROLL
       for (int K = 0; K < Stages; K++) {
-        prefetch(prefetch_k, pKgK(_, _, _, k_start + K));
+        prefetch(prefetch_k, prepared_pk);
+        prepared_pk += k_seq_delta(kv_stride);
       }
       CUTLASS_PRAGMA_UNROLL
       for (int K = 0; K < Stages; K++) {
-        prefetch(prefetch_v, pVgV(_, _, _, k_start + K));
+        prefetch(prefetch_v, prepared_pv);
+        prepared_pv += v_seq_delta(kv_stride);
       }
     }
     // Cache K prefetch init, still uses legacy API.
@@ -712,7 +746,8 @@ struct FMHAFwdMainloop<
 
       // V prefetch for next iteration (non-cache only; cache prefetch lives below).
       if constexpr (!is_cache && !GqaFusion) {
-        prefetch(prefetch_v, pVgV(_, _, _, k_idx + Stages));
+        prefetch(prefetch_v, prepared_pv);
+        prepared_pv += v_seq_delta(kv_stride);
       }
       /* GEMM 1: S = K * Q */
       CUTLASS_PRAGMA_UNROLL
@@ -790,7 +825,8 @@ struct FMHAFwdMainloop<
           prefetch(prefetch_v_cache, pVgV_cache(_, _, _, VV, k_idx));
         }
       } else if constexpr (!GqaFusion) {
-        prefetch(prefetch_k, pKgK(_, _, _, K + Stages - kblocks_cache));
+        prefetch(prefetch_k, prepared_pk);
+        prepared_pk += k_seq_delta(kv_stride);
       }
       // Prefetch V scale
       if constexpr (BlockScale) {

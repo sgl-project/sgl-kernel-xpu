@@ -17,6 +17,13 @@ constexpr int SG_SIZE = 16;
 constexpr int MAX_ITERS = 8;                                           // largest ITERS instantiated in dispatch_iters
 constexpr int64_t MAX_GRID_DIM = std::numeric_limits<int32_t>::max();  // SYCL id queries are 32-bit
 
+// Both tensors are contiguous, so each occupies one byte range.
+bool ranges_overlap(const torch::Tensor& a, const torch::Tensor& b) {
+  const auto a_begin = reinterpret_cast<uintptr_t>(a.data_ptr());
+  const auto b_begin = reinterpret_cast<uintptr_t>(b.data_ptr());
+  return a_begin < b_begin + b.nbytes() && b_begin < a_begin + a.nbytes();
+}
+
 template <typename T>
 struct alignas(sizeof(T) * VEC) Vec8 {
   T v[VEC];
@@ -167,6 +174,11 @@ SGL_KERNEL_EXPORT void grouped_gemma_rmsnorm(
   if (input.numel() == 0) {
     return;
   }
+  // Exact aliasing (out=input) is safe: each work-group reads its slice before writing it.
+  TORCH_CHECK(
+      !ranges_overlap(output, input) || output.data_ptr() == input.data_ptr(),
+      "grouped_gemma_rmsnorm: output may only overlap input if they are the same tensor region");
+  TORCH_CHECK(!ranges_overlap(output, weight), "grouped_gemma_rmsnorm: output must not overlap weight");
   const int64_t rows = input.numel() / hidden;
   const int64_t num_groups = hidden / group_size;
   TORCH_CHECK(

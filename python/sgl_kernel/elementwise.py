@@ -135,7 +135,8 @@ def grouped_gemma_rmsnorm(
         Epsilon for numerical stability.
     out: Optional[torch.Tensor]
         Pre-allocated contiguous output, same shape and dtype as ``input``.
-        May alias ``input`` for an in-place update.
+        May alias ``input`` exactly (same data pointer) for an in-place update;
+        partial overlap with ``input`` or any overlap with ``weight`` is rejected.
     """
     if out is None:
         out = torch.empty_like(input)

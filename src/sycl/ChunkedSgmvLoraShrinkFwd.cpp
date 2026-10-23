@@ -33,20 +33,21 @@
 
     Computes the LoRA-A projection D = x @ weights[l]^T as a segmented grouped
     GEMM, where each segment s uses adapter l = weight_indices[s]. Used in the
-    decode phase, where the batch interleaves adapters ("zigzag"), so tokens are
-    reordered to group rows by adapter (gather) before the GEMM and reordered
-    back (scatter) afterwards -- the three-kernel "Option A" fused into one op:
-
-      1. gather : x_sorted[i]       = x[permutation[i]]        (physical -> logical)
-      2. GEMM   : out_sorted        = x_sorted @ weights^T     (small-N grouped GEMM)
-      3. scatter: output[perm[i]]   = out_sorted[i]            (logical -> physical)
+    decode phase, where the batch interleaves adapters ("zigzag").
 
     seg_indptr / weight_indices describe the *logical* (adapter-grouped) layout;
     permutation (logical -> physical, a bijection over the token rows) maps that
     to the physical token order of x / output. When permutation is absent the
-    batch is already contiguous by adapter (prefill), so gather/scatter are
-    skipped and the GEMM runs in place and seg_indptr / weight_indices are
-    assumed to be in *physical* layout.
+    batch is already contiguous by adapter (prefill) and seg_indptr /
+    weight_indices are in *physical* layout.
+
+    Implementation (device/chunked_sgmv_lora_shrink_fwd_kernel.hpp, launched through
+    the generated per-(dtype, tile) launchers declared in
+    chunked_sgmv_lora_shrink_fwd_dispatch.hpp): a single DPAS kernel that reads
+    x rows through the permutation and scatters output rows through it, with an
+    intra-work-group split-K for the long K = input_dim reduction -- no sorted
+    copies, no host syncs. Any input_dim, N and pointer alignment is supported
+    (masked K tail; alignment-free loads where 16-byte block reads are not possible).
 */
 
 // These kernels use the Xe2 copy atoms, so the target is pinned to 20 even on
@@ -64,20 +65,19 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "kernels/lora/common/lora_debug_checks.hpp"
 #include "kernels/lora/device/chunked_sgmv_lora_shrink_fwd_dispatch.hpp"
-#include "kernels/lora/device/lora_permute_rows.hpp"
 #include "sgl_kernel_export.h"
 
 namespace {
 
 //----------------- Per-(dtype, tile) dispatch macros --------------------//
-// Tile selection currently has a single small-N option. Add tiles to
-// DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE (and to ChunkedSgmvLoraShrinkFwdXe20.cmake
-// + chunked_sgmv_lora_shrink_fwd_dispatch.hpp + chunked_sgmv_lora_shrink_fwd_types.hpp)
-// with a runtime heuristic (e.g. average M per segment) picking the tag.
-#define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE(ELEM, ...)                                           \
-  do {                                                                                                  \
-    chunked_sgmv_lora_shrink_fwd_impl::launch_chunked_sgmv_lora_shrink_fwd_##ELEM##_small(__VA_ARGS__); \
+// One tile (splitk) for now. Add tiles to DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE
+// (and to ChunkedSgmvLoraShrinkFwd.cmake + chunked_sgmv_lora_shrink_fwd_dispatch.hpp
+// + chunked_sgmv_lora_shrink_fwd_types.hpp) with a runtime heuristic picking the tag.
+#define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE(ELEM, ...)                                            \
+  do {                                                                                                   \
+    chunked_sgmv_lora_shrink_fwd_impl::launch_chunked_sgmv_lora_shrink_fwd_##ELEM##_splitk(__VA_ARGS__); \
   } while (0)
 
 #define DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_DTYPE(...)                                                               \
@@ -125,6 +125,10 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_fwd(
 
   TORCH_CHECK(num_slices > 0, "num_slices must be > 0");
   TORCH_CHECK(weights.size(1) % num_slices == 0, "weights.size(1) must be divisible by num_slices");
+  TORCH_CHECK(
+      weights.scalar_type() == torch::kHalf || weights.scalar_type() == torch::kBFloat16,
+      "Unsupported data type for chunked_sgmv_lora_shrink_fwd weights: ",
+      weights.scalar_type());
   TORCH_CHECK(weights.scalar_type() == x.scalar_type(), "x dtype must match weights dtype");
   TORCH_CHECK(weights.size(2) == x.size(1), "weights.size(2) must equal x.size(1)");
 
@@ -140,12 +144,6 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_fwd(
       num_tokens_i64 == 0 || seg_indptr.numel() >= 2, "seg_indptr must have at least 2 elements when num_tokens > 0");
   const int64_t num_segments_i64 = seg_indptr.numel() - 1;
   TORCH_CHECK(weight_indices.numel() == num_segments_i64, "weight_indices.numel() must equal seg_indptr.numel() - 1");
-  if (num_segments_i64 > 0) {
-    auto [min_wi, max_wi] = torch::aminmax(weight_indices);
-    TORCH_CHECK(
-        min_wi.item<int64_t>() >= 0 && max_wi.item<int64_t>() < num_loras_i64,
-        "weight_indices values must be in [0, weights.size(0))");
-  }
 
   // Validate the caller-allocated output tensor (physical token order).
   TORCH_CHECK(
@@ -163,24 +161,15 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_fwd(
     return;
   }
 
-  TORCH_CHECK(seg_indptr[0].item<int64_t>() == 0, "seg_indptr[0] must be 0");
-  TORCH_CHECK(
-      seg_indptr[seg_indptr.numel() - 1].item<int64_t>() == num_tokens_i64, "seg_indptr[-1] must equal num_tokens");
-  auto seg_len_tensor = seg_indptr.slice(0, 1) - seg_indptr.slice(0, 0, seg_indptr.size(0) - 1);
-  auto [seg_len_min, seg_len_max] = torch::aminmax(seg_len_tensor);
-  TORCH_CHECK(seg_len_min.item<int>() >= 0, "seg_indptr must be non-decreasing");
-  (void)seg_len_max;
+  // Value-level checks (each a device -> host sync) run in debug-check builds only.
+  lora_debug_checks::check_weight_indices(weight_indices, num_loras_i64, "weights");
+  lora_debug_checks::check_seg_indptr(seg_indptr, num_tokens_i64);
+  lora_debug_checks::check_lora_ranks(lora_ranks, max_rank_i64);
+  // lora_ranks does NOT shrink the per-segment GEMM (every segment computes the
+  // full N = num_slices * max_rank columns). The caller must pre-zero weight rows
+  // beyond each adapter's rank R_l so that the extra columns come out zero-padded.
 
-  // lora_ranks is only range-validated here; it does NOT shrink the per-segment
-  // GEMM (every segment computes the full N = num_slices * max_rank columns).
-  // The caller must pre-zero weight rows beyond each adapter's rank R_l so that
-  // the extra columns come out zero-padded. See build_grouped_gemm_meta().
-  auto [min_lr, max_lr] = torch::aminmax(lora_ranks);
-  TORCH_CHECK(
-      min_lr.item<int64_t>() >= 0 && max_lr.item<int>() <= max_rank_i64,
-      "All values in lora_ranks must be within the range [0, max_rank]");
-
-  // Cast index tensors to int32 for the device-side metadata build.
+  // Cast index tensors to int32 for the kernel's device-side tile scheduler.
   auto seg_indptr_i32 = seg_indptr.scalar_type() == torch::kInt32 ? seg_indptr : seg_indptr.to(torch::kInt32);
   auto weight_indices_i32 =
       weight_indices.scalar_type() == torch::kInt32 ? weight_indices : weight_indices.to(torch::kInt32);
@@ -188,39 +177,24 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_fwd(
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  const int max_rank = static_cast<int>(max_rank_i64);
   const int num_segments_ = static_cast<int>(num_segments_i64);
-  const int num_slices_ = static_cast<int>(num_slices);
-  (void)num_segments;  // derived from seg_indptr; the explicit arg is informational
 
-  if (!permutation.has_value()) {
-    // Prefill fast path: rows already contiguous by adapter, GEMM in place.
-    DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_DTYPE(
-        x, weights, seg_indptr_i32, weight_indices_i32, output, num_slices_, max_rank, num_segments_, queue);
-    return;
+  const int64_t* perm_ptr = nullptr;
+  torch::Tensor perm_i64;
+  if (permutation.has_value()) {
+    const auto& perm = permutation.value();
+    CHECK_INPUT(perm);
+    TORCH_CHECK(perm.dim() == 1, "permutation must be a 1D tensor");
+    TORCH_CHECK(perm.numel() == num_tokens_i64, "permutation.numel() must equal x.size(0)");
+    lora_debug_checks::check_permutation(perm, num_tokens_i64);
+    perm_i64 = perm.scalar_type() == torch::kInt64 ? perm : perm.to(torch::kInt64);
+    perm_ptr = perm_i64.data_ptr<int64_t>();
   }
 
-  // Decode path: gather physical -> logical, GEMM, scatter logical -> physical.
-  const auto& perm = permutation.value();
-  CHECK_INPUT(perm);
-  TORCH_CHECK(perm.dim() == 1, "permutation must be a 1D tensor");
-  TORCH_CHECK(perm.numel() == num_tokens_i64, "permutation.numel() must equal x.size(0)");
-  {
-    auto [min_p, max_p] = torch::aminmax(perm);
-    TORCH_CHECK(
-        min_p.item<int64_t>() >= 0 && max_p.item<int64_t>() < num_tokens_i64,
-        "permutation values must be in [0, x.size(0))");
-  }
-  auto perm_i64 = perm.scalar_type() == torch::kInt64 ? perm : perm.to(torch::kInt64);
-
-  auto x_sorted = torch::empty({num_tokens_i64, x.size(1)}, x.options());
-  lora_permute_rows_impl::permute_rows_dispatch</*GATHER=*/true>(x, x_sorted, perm_i64, queue);
-
-  auto out_sorted = torch::empty({num_tokens_i64, total_n_i64}, output.options());
+  // One gather-fused DPAS kernel: rows are read through the permutation and
+  // outputs scattered through it, so no sorted copies exist.
   DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_DTYPE(
-      x_sorted, weights, seg_indptr_i32, weight_indices_i32, out_sorted, num_slices_, max_rank, num_segments_, queue);
-
-  lora_permute_rows_impl::permute_rows_dispatch</*GATHER=*/false>(out_sorted, output, perm_i64, queue);
+      x, weights, output, seg_indptr_i32, weight_indices_i32, perm_ptr, num_segments_, queue);
 }
 
 #undef DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_TILE

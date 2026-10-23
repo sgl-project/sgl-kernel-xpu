@@ -1,5 +1,6 @@
 """Benchmark JIT per-token-group 8-bit quantization vs AOT implementation."""
 
+import argparse
 import itertools
 from typing import Tuple
 
@@ -115,22 +116,8 @@ configs = list(
 )
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch_size", "seq_len", "group_size", "dst_dtype"],
-        x_vals=configs,
-        line_arg="provider",
-        line_vals=["aot", "jit"],
-        line_names=["AOT (sgl_kernel)", "JIT (sglang)"],
-        styles=[("blue", "-"), ("green", "-")],
-        ylabel="us",
-        plot_name="aot-vs-jit-per-token-group-quant-8bit-performance",
-        args={},
-    )
-)
-def benchmark(batch_size, seq_len, group_size, dst_dtype, provider):
+def benchmark(batch_size, seq_len, group_size, dst_dtype, provider, hidden_dim=7168):
     device = torch.device("xpu")
-    hidden_dim = 7168
     num_tokens = batch_size * seq_len
 
     x = torch.randn(num_tokens, hidden_dim, device=device, dtype=torch.bfloat16)
@@ -170,7 +157,58 @@ def benchmark(batch_size, seq_len, group_size, dst_dtype, provider):
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
+def get_benchmark(configs=configs, hidden_dim=7168):
+    return triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["batch_size", "seq_len", "group_size", "dst_dtype"],
+            x_vals=configs,
+            line_arg="provider",
+            line_vals=["aot", "jit"],
+            line_names=["AOT (sgl_kernel)", "JIT (sglang)"],
+            styles=[("blue", "-"), ("green", "-")],
+            ylabel="us",
+            plot_name="aot-vs-jit-per-token-group-quant-8bit-performance",
+            args={"hidden_dim": hidden_dim},
+        )
+    )(benchmark)
+
+
+DST_DTYPE_MAP = {"int8": torch.int8, "fp8": fp8_type_}
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--seq-lens",
+        nargs="+",
+        type=int,
+        default=seq_len_range,
+        help="Sequence lengths to sweep",
+    )
+    parser.add_argument(
+        "--group-sizes",
+        nargs="+",
+        type=int,
+        default=group_size_range,
+        help="Quant group sizes to sweep",
+    )
+    parser.add_argument(
+        "--dst-dtypes",
+        nargs="+",
+        choices=list(DST_DTYPE_MAP),
+        default=["int8", "fp8"],
+        help="Output dtypes to sweep",
+    )
+    parser.add_argument("--hidden-dim", type=int, default=7168, help="Hidden dim")
+    args = parser.parse_args()
+
     if not HAS_AOT:
         print("ERROR: sgl_kernel (AOT) not available. Please install sgl-kernel-xpu.")
         exit(1)
@@ -183,7 +221,15 @@ if __name__ == "__main__":
     calculate_diff(num_tokens=512, group_size=64, dst_dtype=torch.int8)
     calculate_diff(num_tokens=64, group_size=128, dst_dtype=fp8_type_)
 
-    benchmark.run(print_data=True)
+    configs = list(
+        itertools.product(
+            args.batch_sizes,
+            args.seq_lens,
+            args.group_sizes,
+            [DST_DTYPE_MAP[d] for d in args.dst_dtypes],
+        )
+    )
+    get_benchmark(configs, args.hidden_dim).run(print_data=True)
 
     print("\n" + "=" * 80)
     print("Effective Bandwidth Results")

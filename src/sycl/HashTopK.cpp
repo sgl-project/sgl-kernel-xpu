@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -172,6 +173,17 @@ SGL_KERNEL_EXPORT void hash_topk(
   }
 
   auto& queue = dpcppGetCurrentQueue();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Hash-based topk fuses routed selection + weight scaling: ~3 flops per (token, expert).
+  const double flops = 3.0 * static_cast<double>(num_tokens) * static_cast<double>(num_routed_experts);
+  const double logits_elem = static_cast<double>(router_logits.element_size());
+  const double bytes = static_cast<double>(num_tokens) * static_cast<double>(num_routed_experts) * logits_elem +
+                       static_cast<double>(num_tokens) * 8.0 +
+                       static_cast<double>(num_tokens) * static_cast<double>(topk_fused) * (4.0 + 4.0);
+  SGL_KERNEL_PERF_SCOPE("hash_topk", queue, bytes, flops);
+#endif
+
   DISPATCH_FLOAT_TYPES(router_logits.scalar_type(), "hash_topk_xpu", [&] {
     launch_hash_topk<scalar_t>(
         queue,

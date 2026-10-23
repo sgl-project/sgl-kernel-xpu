@@ -612,7 +612,7 @@ void tiled_kernel_launcher(
     const ActMode& act_mode,
     const int& pad_slot_id,
     const int& batch_size,
-    const int& num_actual_tokens,
+    [[maybe_unused]] const int& num_actual_tokens,
     const int& num_virtual_tokens,
     const int& num_tiles,
     const int& num_k_heads,
@@ -622,7 +622,7 @@ void tiled_kernel_launcher(
     const int& qkvz_elems,
     const int& conv_elems,
     const int& num_prefills,
-    const int& num_decodes,
+    [[maybe_unused]] const int& num_decodes,
     const bool fuse_l2norm) {
   // Note: z_out, b_out, a_out, mixed_ba are passed through to the
   // ZBA reorder kernel below, not to the tiled conv1d kernel itself.

@@ -1,5 +1,6 @@
 """Benchmark JIT Timestep Embedding kernel vs PyTorch eager implementation."""
 
+import argparse
 import itertools
 
 import pandas as pd
@@ -68,16 +69,13 @@ def calculate_effective_bandwidth(batch_size, dim, time_ms):
 
 
 # Test configurations
-configs = list(
-    itertools.product(
-        [1, 8, 16, 32, 128, 256, 512, 1024],  # batch_size
-        [256, 512, 1024, 2048],  # dim
-    )
-)
+batch_size_range = [1, 8, 16, 32, 128, 256, 512, 1024]
+dim_range = [256, 512, 1024, 2048]
+configs = list(itertools.product(batch_size_range, dim_range))
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+def _benchmark_config(configs):
+    return triton.testing.Benchmark(
         x_names=["batch_size", "dim"],
         x_vals=configs,
         line_arg="provider",
@@ -88,7 +86,9 @@ configs = list(
         plot_name="jit-timestep-embedding-performance",
         args={},
     )
-)
+
+
+@triton.testing.perf_report(_benchmark_config(configs))
 def benchmark(batch_size, dim, provider):
     device = torch.device("xpu")
     dtype = torch.float32
@@ -146,6 +146,23 @@ def benchmark(batch_size, dim, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--dims",
+        nargs="+",
+        type=int,
+        default=dim_range,
+        help="Embedding dims to sweep",
+    )
+    args = parser.parse_args()
+
     print("Running Timestep Embedding benchmarks...")
     print("Reference: PyTorch eager implementation")
     print("JIT: sglang.jit_kernel.timestep_embedding (runtime JIT compilation)")
@@ -153,7 +170,10 @@ if __name__ == "__main__":
         "Note: No AOT Timestep Embedding available; comparing against PyTorch reference"
     )
     print("\n" + "=" * 80 + "\n")
-    benchmark.run(print_data=True)
+    sweep = list(itertools.product(args.batch_sizes, args.dims))
+    triton.testing.perf_report(_benchmark_config(sweep))(benchmark.fn).run(
+        print_data=True
+    )
 
     print("Benchmark finished!")
 

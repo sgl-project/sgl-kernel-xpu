@@ -1,3 +1,4 @@
+import argparse
 from itertools import product
 
 import pandas as pd
@@ -9,11 +10,16 @@ batch_size_range = [1, 99, 989]
 vocab_size_range = [1024, 32000, 128256]
 top_p_range = [0.1, 0.5, 0.9]
 
-configs = [
-    (bs, vocab_size, top_p)
-    for bs, vocab_size in product(batch_size_range, vocab_size_range)
-    for top_p in top_p_range
-]
+
+def get_configs(batch_sizes, vocab_sizes, top_ps):
+    return [
+        (bs, vocab_size, top_p)
+        for bs, vocab_size in product(batch_sizes, vocab_sizes)
+        for top_p in top_ps
+    ]
+
+
+configs = get_configs(batch_size_range, vocab_size_range, top_p_range)
 
 all_results = []
 
@@ -80,6 +86,29 @@ def benchmark(batch_size, vocab_size, top_p, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes",
+    )
+    parser.add_argument(
+        "--vocab-sizes",
+        nargs="+",
+        type=int,
+        default=vocab_size_range,
+        help="Vocab sizes",
+    )
+    parser.add_argument(
+        "--top-ps", nargs="+", type=float, default=top_p_range, help="top_p values"
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = get_configs(
+        args.batch_sizes, args.vocab_sizes, args.top_ps
+    )
+
     benchmark.run(print_data=False)
     print("Benchmark finished!")
 

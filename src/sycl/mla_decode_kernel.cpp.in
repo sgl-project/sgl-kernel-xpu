@@ -29,15 +29,18 @@
  *
  **************************************************************************************************/
 // Auto-generated from mla_decode_kernel.cpp.in
-// Template parameters: ELEM_TAG=@ELEM_TAG@, PAGE_SIZE=@PAGE_SIZE@
-#define SYCL_INTEL_TARGET 20
+// Template parameters: ELEM_TAG=@ELEM_TAG@, PAGE_SIZE=@PAGE_SIZE@, Q_TILE=@Q_TILE@, ARCH_TAG=@ARCH_TAG@
+// Undef first: the top-level CMakeLists also defines SYCL_INTEL_TARGET build-wide.
+#undef SYCL_INTEL_TARGET
+#define SYCL_INTEL_TARGET @SYCL_TARGET@
 
-#include "sycl/kernels/mla/device/mla_decode_types.hpp"
+#include "sycl/kernels/mla/@ARCH_TAG@/device/mla_decode_types.hpp"
 
 namespace mla_decode {
 
-__attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
+__attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@_q@Q_TILE@(
     at::Tensor& out,
+    const std::optional<at::Tensor>& lse,
     const at::Tensor& q_nope,
     const at::Tensor& q_pe,
     const at::Tensor& kv_c_and_k_pe_cache,
@@ -46,8 +49,8 @@ __attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_S
     at::Tensor& workspace,
     double sm_scale,
     int64_t num_kv_splits) {
-  runMla<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>>(
-      out, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table,
+  runMla<@ELEM_SYCL_TYPE@, PageSizeOption<@PAGE_SIZE@>, @Q_TILE@>(
+      out, lse, q_nope, q_pe, kv_c_and_k_pe_cache, seq_lens, page_table,
       workspace, sm_scale, num_kv_splits);
 }
 
@@ -56,9 +59,10 @@ __attribute__((visibility("default"))) void launch_mla_decode_@ELEM_TAG@_@PAGE_S
 #ifdef SGL_MLA_JIT_ENTRY
 // Stable C ABI entry for the runtime-JIT path. Tensors cross the dlopen boundary
 // as at::Tensor* (both sides share <torch/all.h> -> identical layout). One config
-// per .so, so the fixed symbol name never collides across AOT translation units.
+// per .so, so the fixed symbol name never collides across AOT TUs.
 extern "C" __attribute__((visibility("default"))) void sgl_mla_decode_entry(
     void* out,
+    const void* lse,  // const std::optional<at::Tensor>*
     const void* q_nope,
     const void* q_pe,
     const void* kv_c_and_k_pe_cache,
@@ -67,8 +71,9 @@ extern "C" __attribute__((visibility("default"))) void sgl_mla_decode_entry(
     void* workspace,
     double sm_scale,
     int64_t num_kv_splits) {
-  mla_decode::launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@(
+  mla_decode::launch_mla_decode_@ELEM_TAG@_@PAGE_SIZE@_q@Q_TILE@(
       *static_cast<at::Tensor*>(out),
+      *static_cast<const std::optional<at::Tensor>*>(lse),
       *static_cast<const at::Tensor*>(q_nope),
       *static_cast<const at::Tensor*>(q_pe),
       *static_cast<const at::Tensor*>(kv_c_and_k_pe_cache),

@@ -2,9 +2,25 @@
 
 #include <sycl/sycl.hpp>
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+#include "cutlass/util/sycl_event_manager.hpp"
+#endif
+
+// Track a SYCL event with CUTLASS's EventManager when SYCL profiling is
+// enabled at build time. This is what lets GPU_Clock / report_kernel_perf()
+// compute a non-zero elapsed time for any kernel launched through the
+// sycl_kernel_submit() helpers below. When profiling is off, this is a
+// pass-through with no runtime cost.
+static inline ::sycl::event __sglkernel_track_event(::sycl::event e) {
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  EventManager::getInstance().addEvent(e);
+#endif
+  return e;
+}
+
 template <typename ker_t, int dim>
-static inline void sycl_kernel_submit(::sycl::range<dim> range, ::sycl::queue q, ker_t ker) {
-  q.parallel_for<ker_t>(range, ker);
+static inline ::sycl::event sycl_kernel_submit(::sycl::range<dim> range, ::sycl::queue q, ker_t ker) {
+  return __sglkernel_track_event(q.parallel_for<ker_t>(range, ker));
 }
 
 // Additional convention of SYCL kernel configuration. Besides construct kernel
@@ -24,41 +40,41 @@ static inline void sycl_kernel_submit(::sycl::range<dim> range, ::sycl::queue q,
 struct __SYCL_KER_CONFIG_CONVENTION__ {};
 
 template <typename ker_t, int dim>
-static inline typename std::enable_if<std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, void>::type
+static inline typename std::enable_if<std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, ::sycl::event>::type
 sycl_kernel_submit(::sycl::range<dim> global_range, ::sycl::range<dim> local_range, ::sycl::queue q, ker_t ker) {
   auto cgf = [&](::sycl::handler& cgh) {
     ker.sycl_ker_config_convention(cgh);
     cgh.parallel_for<ker_t>(::sycl::nd_range<dim>(global_range, local_range), ker);
   };
-  q.submit(cgf);
+  return __sglkernel_track_event(q.submit(cgf));
 }
 
 template <typename ker_t, int dim>
-static inline typename std::enable_if<!std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, void>::type
+static inline typename std::enable_if<!std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, ::sycl::event>::type
 sycl_kernel_submit(::sycl::range<dim> global_range, ::sycl::range<dim> local_range, ::sycl::queue q, ker_t ker) {
   auto cgf = [&](::sycl::handler& cgh) {
     cgh.parallel_for<ker_t>(::sycl::nd_range<dim>(global_range, local_range), ker);
   };
-  q.submit(cgf);
+  return __sglkernel_track_event(q.submit(cgf));
 }
 
 template <typename ker_t>
-static inline typename std::enable_if<std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, void>::type
+static inline typename std::enable_if<std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, ::sycl::event>::type
 sycl_kernel_submit(int64_t global_range, int64_t local_range, ::sycl::queue q, ker_t ker) {
   auto cgf = [&](::sycl::handler& cgh) {
     ker.sycl_ker_config_convention(cgh);
     cgh.parallel_for<ker_t>(::sycl::nd_range<1>(::sycl::range<1>(global_range), ::sycl::range<1>(local_range)), ker);
   };
-  q.submit(cgf);
+  return __sglkernel_track_event(q.submit(cgf));
 }
 
 template <typename ker_t>
-static inline typename std::enable_if<!std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, void>::type
+static inline typename std::enable_if<!std::is_base_of_v<__SYCL_KER_CONFIG_CONVENTION__, ker_t>, ::sycl::event>::type
 sycl_kernel_submit(int64_t global_range, int64_t local_range, ::sycl::queue q, ker_t ker) {
   auto cgf = [&](::sycl::handler& cgh) {
     cgh.parallel_for<ker_t>(::sycl::nd_range<1>(::sycl::range<1>(global_range), ::sycl::range<1>(local_range)), ker);
   };
-  q.submit(cgf);
+  return __sglkernel_track_event(q.submit(cgf));
 }
 
 #define SYCL_KERNEL_STRING(var, str) static const __attribute__((opencl_constant)) char var[] = str;

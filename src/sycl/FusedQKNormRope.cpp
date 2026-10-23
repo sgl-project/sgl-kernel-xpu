@@ -17,6 +17,7 @@
 #include "MemoryAccess.h"
 #include "Norm.h"
 #include "QuantUtils.h"
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
@@ -561,6 +562,11 @@ SGL_KERNEL_EXPORT void fused_qk_norm_rope(
   auto queue = dpcppGetCurrentQueue();
   bool interleave = !is_neox;
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   dispatchFusedQKNormRopeScalarType<true>(qkv.scalar_type(), "fused_qk_norm_rope", [&](auto scalar_tag) {
     using scalar_t = typename decltype(scalar_tag)::type;
     dispatchFusedQKNormRopeHeadDim(head_dim, "fusedQKNormRope", [&](auto head_dim_tag) {
@@ -604,6 +610,19 @@ SGL_KERNEL_EXPORT void fused_qk_norm_rope(
       }
     });
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Per q/k head we do: RMSNorm (~4 * head_dim flops) + RoPE on rotary_dim lanes (~4 * rotary_dim flops).
+  const double qk_heads = static_cast<double>(num_heads_q) + static_cast<double>(num_heads_k);
+  const double flops = static_cast<double>(num_tokens) *
+                       (qk_heads * (4.0 * static_cast<double>(head_dim) + 4.0 * static_cast<double>(rotary_dim)));
+  const double qkv_elem = static_cast<double>(qkv.element_size());
+  const double w_elem = static_cast<double>(q_weight.element_size());
+  // Read+write q,k rows (v skipped); read q_weight/k_weight.
+  const double bytes = 2.0 * static_cast<double>(num_tokens) * qk_heads * static_cast<double>(head_dim) * qkv_elem +
+                       2.0 * static_cast<double>(head_dim) * w_elem;
+  ::sglkernel::report_kernel_perf("fused_qk_norm_rope", queue, timer, bytes, flops);
+#endif
 }
 
 // SYCL Kernel for Fused QK Norm + RoPE using a precomputed cos/sin cache
@@ -1272,6 +1291,11 @@ SGL_KERNEL_EXPORT void fused_q_norm_rope(
 
   auto queue = dpcppGetCurrentQueue();
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   dispatchFusedQKNormRopeScalarType<false>(q_input.scalar_type(), "fused_q_norm_rope", [&](auto scalar_tag) {
     using scalar_t = typename decltype(scalar_tag)::type;
     dispatchFusedQKNormRopePositionsType(positions.scalar_type(), "fused_q_norm_rope", [&](auto id_tag) {
@@ -1331,6 +1355,19 @@ SGL_KERNEL_EXPORT void fused_q_norm_rope(
       }
     });
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Q-only norm+rope: RMSNorm (~4*head_dim) + RoPE (~4*rope_dim) per token*head.
+  const double flops = static_cast<double>(num_tokens) * static_cast<double>(num_heads) *
+                       (4.0 * static_cast<double>(head_dim) + 4.0 * static_cast<double>(rope_dim));
+  const double q_in_elem = static_cast<double>(q_input.element_size());
+  const double q_out_elem = static_cast<double>(q_output.element_size());
+  const double freqs_elem = static_cast<double>(freqs_cis.element_size());
+  const double bytes = static_cast<double>(num_tokens) * static_cast<double>(num_heads) *
+                           static_cast<double>(head_dim) * (q_in_elem + q_out_elem) +
+                       static_cast<double>(num_tokens) * static_cast<double>(rope_dim) * freqs_elem;
+  ::sglkernel::report_kernel_perf("fused_q_norm_rope", queue, timer, bytes, flops);
+#endif
 }
 
 // ============================================================================
@@ -1688,6 +1725,11 @@ SGL_KERNEL_EXPORT void fused_k_norm_rope_flashmla(
   const int64_t kv_stride_batch = kv.stride(0);
   auto queue = dpcppGetCurrentQueue();
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   dispatchFusedQKNormRopeScalarType<false>(kv.scalar_type(), "fused_k_norm_rope_flashmla", [&](auto scalar_tag) {
     using scalar_t = typename decltype(scalar_tag)::type;
     dispatchFusedQKNormRopePositionsType(positions.scalar_type(), "fused_k_norm_rope_flashmla", [&](auto id_tag) {
@@ -1718,6 +1760,22 @@ SGL_KERNEL_EXPORT void fused_k_norm_rope_flashmla(
           queue);
     });
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // K norm+rope + fp8 store into paged cache. Norm ~4 flops per head_dim, rope ~4 per rope_dim,
+  // plus fp8 quant for nope lane values (~2 flops per elem).
+  const double flops =
+      static_cast<double>(num_tokens) *
+      (4.0 * static_cast<double>(head_dim) + 4.0 * static_cast<double>(rope_dim) + 2.0 * static_cast<double>(nope_dim));
+  const double kv_elem = static_cast<double>(kv.element_size());
+  const double freqs_elem = static_cast<double>(freqs_cis.element_size());
+  // Read kv, read kv_weight, read freqs, write kvcache page slice (value_bytes+scale_bytes per token).
+  const double bytes = static_cast<double>(num_tokens) * static_cast<double>(head_dim) * kv_elem +
+                       static_cast<double>(head_dim) * kv_elem +
+                       static_cast<double>(num_tokens) * static_cast<double>(rope_dim) * freqs_elem +
+                       static_cast<double>(num_tokens) * static_cast<double>(value_bytes + scale_slot_bytes);
+  ::sglkernel::report_kernel_perf("fused_k_norm_rope_flashmla", queue, timer, bytes, flops);
+#endif
 }
 
 SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
@@ -1810,6 +1868,11 @@ SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
 
   auto queue = dpcppGetCurrentQueue();
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   dispatchFusedQKNormRopeScalarType<false>(q_view.scalar_type(), "fused_inplace_qknorm_rope", [&](auto scalar_tag) {
     using scalar_t = typename decltype(scalar_tag)::type;
     dispatchFusedQKNormRopePositionsType(positions.scalar_type(), "fused_inplace_qknorm_rope", [&](auto id_tag) {
@@ -1856,6 +1919,19 @@ SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
       });
     });
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double qk_heads = static_cast<double>(num_qo_heads) + static_cast<double>(num_kv_heads);
+  const double flops = static_cast<double>(num_tokens) * qk_heads *
+                       (4.0 * static_cast<double>(head_dim) + 4.0 * static_cast<double>(rope_dim));
+  const double q_elem = static_cast<double>(q_view.element_size());
+  const double w_elem = static_cast<double>(q_weight.element_size());
+  const double cs_elem = static_cast<double>(cos_sin_cache.element_size());
+  const double bytes = 2.0 * static_cast<double>(num_tokens) * qk_heads * static_cast<double>(head_dim) * q_elem +
+                       2.0 * static_cast<double>(head_dim) * w_elem +
+                       static_cast<double>(num_tokens) * static_cast<double>(rope_dim) * cs_elem;
+  ::sglkernel::report_kernel_perf("fused_inplace_qknorm_rope", queue, timer, bytes, flops);
+#endif
 }
 
 }  // namespace at::native::xpu

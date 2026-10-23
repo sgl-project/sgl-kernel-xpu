@@ -2,6 +2,7 @@
 
 #include <ATen/xpu/XPUContext.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <type_traits>
 
@@ -155,6 +156,17 @@ static inline int64_t dpcppGpuEuCount(DeviceId dev_id = dpcppGetDeviceIdOfCurren
   return dev_prop->gpu_eu_count;
 }
 
+static inline int64_t dpcppGpuEuCountPerSubslice(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
+  auto* dev_prop = at::xpu::getDeviceProperties(dev_id);
+  return dev_prop->gpu_eu_count_per_subslice;
+}
+
+static inline int64_t dpcppGpuSubsliceCount(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
+  int64_t eu_count_per_subslice = dpcppGpuEuCountPerSubslice(dev_id);
+  if (eu_count_per_subslice <= 0) return 1;
+  return std::max<int64_t>(1, dpcppGpuEuCount(dev_id) / eu_count_per_subslice);
+}
+
 static inline int64_t dpcppGpuEuSimdWidth(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
   auto* dev_prop = at::xpu::getDeviceProperties(dev_id);
   return dev_prop->gpu_eu_simd_width;
@@ -185,7 +197,7 @@ static inline int64_t dpcppMaxWorkItemsPerEU(DeviceId dev_id = dpcppGetDeviceIdO
   return simd_width * hw_threads;
 }
 
-static inline int64_t dpcppMaxDSSNum(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
+static inline int64_t dpcppMaxDSSNum([[maybe_unused]] DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
   // TODO: We need to got this info from DPC++ Runtime
   // Hardcode to 32 for ATS
   int64_t dss_num = 32;

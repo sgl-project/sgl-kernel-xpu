@@ -4,8 +4,8 @@
  **************************************************************************************************/
 
 // FP8 E4M3 weight, BF16 activation grouped-GEMM mainloop for Xe2 (BMG).
-// Weight scales are either one scalar per expert/projection or one value per
-// 128x128 weight block.
+// Weight scales are per-expert scalar (FP32), 128x128 block scales (FP32),
+// or OCP MXFP8 1x32 block scales (UE8M0 uint8).
 
 #pragma once
 
@@ -20,6 +20,7 @@
 #include "cutlass/kernel_hardware_info.h"
 #include "cutlass/platform/platform.h"
 #include "cutlass/tensor_ref.h"
+#include "scale_mode.h"
 #include "sycl/SYCLHelpers.h"
 
 #pragma clang diagnostic ignored "-Wpass-failed"
@@ -28,6 +29,16 @@
 namespace moe_w8a16 {
 
 using namespace cute;
+
+// Converts an OCP UE8M0 byte (representing 2^(byte - 127)) to IEEE 754 float32:
+// - byte == 0: 2^-127 is subnormal in IEEE 754:
+//   (-1)^0 * 2^-126 * (2^22 / 2^23) = 2^-127, encoded with exponent=0 and mantissa=(1u << 22).
+// - byte == 0xff: OCP UE8M0 reserves 0xff for NaN (encoded with quiet-NaN pattern 0x7fc00000u).
+// - byte in [1, 254]: 2^(byte - 127), normal IEEE 754 float32 (bits: byte << 23).
+CUTE_DEVICE float ue8m0_to_float32(uint8_t byte) {
+  uint32_t bits = (byte == 0) ? (1u << 22) : (byte == 0xff) ? 0x7fc00000u : (static_cast<uint32_t>(byte) << 23);
+  return sycl::bit_cast<float>(bits);
+}
 
 static constexpr int FP8_GROUP_SIZE_K = 128;
 
@@ -48,7 +59,7 @@ template <
     class TiledMMA_,
     bool WeightScalePerExpert = false,
     bool WeightScaleBlocked = false>
-struct Fp8W8A16Mainloop {
+struct W8A16Mainloop {
   static_assert(cutlass::detail::dependent_false<DispatchPolicy_>, "Could not find a mainloop specialization.");
 };
 
@@ -63,7 +74,7 @@ template <
     class TiledMMA_,
     bool WeightScalePerExpert,
     bool WeightScaleBlocked>
-struct Fp8W8A16Mainloop<
+struct W8A16Mainloop<
     W8A16MainloopPolicy<Stages>,
     TiledCopyA_,
     TiledCopyBPacked_,
@@ -82,7 +93,7 @@ struct Fp8W8A16Mainloop<
   using BPackedTensor = BPackedTensor_;
   using DTensor = DTensor_;
 
-  Fp8W8A16Mainloop() {}
+  W8A16Mainloop() {}
 
   template <typename Coord>
   CUTLASS_DEVICE void run_w8a16_block(
@@ -200,11 +211,130 @@ struct Fp8W8A16Mainloop<
   }
 
   template <typename Coord>
+  CUTLASS_DEVICE void run_w8a16_block_mxfp8(
+      ATensor& A,
+      BPackedTensor& Bp,
+      const uint8_t* w_scale_gmem,
+      int w_scale_row_stride,
+      DTensor& D,
+      Coord blk_coord,
+      TiledMMA mma,
+      int thr_id,
+      const float* Bias,
+      int gemm_n) {
+    auto wg_m = get<0>(blk_coord);
+    auto wg_n = get<1>(blk_coord);
+    auto wg_tile = mma.tile_mnk();
+    auto wg_coord = make_coord(wg_m, wg_n, 0);
+    constexpr int BLK_M = get<0>(decltype(wg_tile){});
+    constexpr int BLK_N = get<1>(decltype(wg_tile){});
+    constexpr int BLK_K = get<2>(decltype(wg_tile){});
+    constexpr int ATOM_M_V = get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());
+    constexpr int ATOM_N_V = get<2>(typename TiledMMA::ThrLayoutVMNK{}.shape());
+    constexpr int SG_M = BLK_M / ATOM_M_V;
+    constexpr int SG_N = BLK_N / ATOM_N_V;
+    constexpr int N_ATOMS = SG_N / SUBGROUP_SIZE;
+    constexpr int RELOAD_CADENCE = 32 / BLK_K;
+    static_assert(
+        RELOAD_CADENCE == 1 || RELOAD_CADENCE == 2, "MXFP8 block path supports K tiles of 32 or 16 per scale group");
+    static_assert(BLK_N <= 128, "MXFP8 block path requires BLK_N <= 128");
+
+    Tensor cA = make_identity_tensor(A.shape());
+    Tensor cBp = make_identity_tensor(Bp.shape());
+    Tensor cD = make_identity_tensor(D.shape());
+    Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));
+    Tensor gBp = local_tile(cBp, select<1, 2>(wg_tile), make_coord(wg_n, _));
+    Tensor gD = local_tile(cD, wg_tile, wg_coord, Step<_1, _1, X>{});
+
+    TiledCopyA tiled_copy_a{A};
+    TiledCopyBPacked tiled_copy_b{Bp};
+    TiledCopyD tiled_copy_d{D};
+    auto thr_copy_a = tiled_copy_a.get_slice(thr_id);
+    auto thr_copy_b = tiled_copy_b.get_slice(thr_id);
+    auto thr_copy_d = tiled_copy_d.get_slice(thr_id);
+    auto thr_mma = mma.get_slice(thr_id);
+    auto tAgA = thr_copy_a.partition_S(gA);
+    auto tBgBp = thr_copy_b.partition_S(gBp);
+    using CopyAFragment = decltype(thr_copy_a.partition_sg_fragment_D(gA(_, _, 0)));
+    using CopyBFragment = decltype(thr_copy_b.partition_sg_fragment_D(gBp(_, _, 0)));
+    using MmaAFragment = decltype(thr_mma.partition_sg_fragment_A(gA(_, _, 0)));
+    using MmaBFragment = decltype(thr_mma.partition_sg_fragment_B(gBp(_, _, 0)));
+    CopyAFragment tArA_packed = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+    CopyBFragment tBrB_packed = thr_copy_b.partition_sg_fragment_D(gBp(_, _, 0));
+    MmaAFragment tSrA = thr_mma.partition_sg_fragment_A(gA(_, _, 0));
+    MmaBFragment tSrB = thr_mma.partition_sg_fragment_B(gBp(_, _, 0));
+    SubgroupTensor tCrC = thr_mma.partition_sg_fragment_C(gD);
+    cute::clear(tCrC);
+    SubgroupTensor tCrC_group = thr_mma.partition_sg_fragment_C(gD);
+
+    auto prefetch_a = make_block_2d_prefetch(tiled_copy_a);
+    auto prefetch_b = make_block_2d_prefetch(tiled_copy_b);
+    auto pAgA = prefetch_a.get_slice(thr_id).partition_S(gA);
+    auto pBgBp = prefetch_b.get_slice(thr_id).partition_S(gBp);
+    constexpr SPIRVScope barrier_scope = ScopeWorkgroup;
+    const int k_tile_count = ceil_div(shape<1>(A), BLK_K);
+    const int full_group_count = k_tile_count / RELOAD_CADENCE;
+    CUTE_UNROLL
+    for (int prefetch_k = 0; prefetch_k < Stages; ++prefetch_k) {
+      if (prefetch_k < k_tile_count) {
+        prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
+        prefetch(prefetch_b, pBgBp(_, _, _, prefetch_k));
+      }
+    }
+
+    auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N_V;
+    int sg_local_id = cutlass::get_sub_group_local_id();
+    constexpr int sg_local_range = 16;
+    int n_tile_start = wg_n * BLK_N;
+    int n_sg_start = sg_local_n_coord * SG_N;
+
+    for (int group = 0; group < full_group_count; ++group) {
+      cute::clear(tCrC_group);
+      CUTE_UNROLL
+      for (int group_offset = 0; group_offset < RELOAD_CADENCE; ++group_offset) {
+        int k_tile = group * RELOAD_CADENCE + group_offset;
+        barrier_arrive(barrier_scope);
+        copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA_packed);
+        copy(tiled_copy_b, tBgBp(_, _, _, k_tile), tBrB_packed);
+        const int prefetch_idx = k_tile + Stages;
+        if (prefetch_idx < k_tile_count) {
+          prefetch(prefetch_a, pAgA(_, _, _, prefetch_idx));
+          prefetch(prefetch_b, pBgBp(_, _, _, prefetch_idx));
+        }
+        reorder(tArA_packed, tSrA);
+        reorder(tBrB_packed, tSrB);
+        cute::gemm(mma, tSrA, tSrB, tCrC_group);
+        barrier_wait(barrier_scope);
+      }
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int sn = 0; sn < SG_N / sg_local_range; ++sn) {
+        int global_n = n_tile_start + n_sg_start + sn * sg_local_range + sg_local_id;
+        int clamped_n = cute::min(global_n, gemm_n - 1);
+        uint8_t byte = w_scale_gmem[clamped_n * w_scale_row_stride + group];
+        float w_scale = ue8m0_to_float32(byte);
+        CUTLASS_PRAGMA_UNROLL
+        for (int sm = 0; sm < SG_M; ++sm) {
+          tCrC(sn * SG_M + sm) += tCrC_group(sn * SG_M + sm) * w_scale;
+        }
+      }
+    }
+
+    if (Bias != nullptr) {
+      add_bias<SG_M, SG_N, BLK_N>(Bias, tCrC, wg_n, thr_id, gemm_n);
+    }
+    SubgroupTensor tCrD = thr_copy_d.partition_sg_fragment_S(gD);
+    Tensor tCgD = thr_copy_d.partition_D(gD);
+    reorder(tCrC, tCrD);
+    copy(tiled_copy_d, tCrD, tCgD);
+  }
+
+  template <typename Coord>
   CUTLASS_DEVICE void run_w8a16_scalar(
       ATensor& A,
       BPackedTensor& Bp,
       const float* w_scale_gmem,
-      int weight_scale_count,
+      int scale_mode,
       DTensor& D,
       Coord blk_coord,
       TiledMMA mma,
@@ -289,7 +419,8 @@ struct Fp8W8A16Mainloop<
     CUTLASS_PRAGMA_UNROLL
     for (int sn = 0; sn < SG_N / sg_local_range; ++sn) {
       int global_n = n_tile_start + n_sg_start + sn * sg_local_range + sg_local_id;
-      float weight_scale = w_scale_gmem[weight_scale_count == 2 && global_n >= gemm_n / 2 ? 1 : 0];
+      float weight_scale =
+          w_scale_gmem[scale_mode == static_cast<int>(ScaleMode::ScalarGateUp) && global_n >= gemm_n / 2 ? 1 : 0];
       CUTLASS_PRAGMA_UNROLL
       for (int sm = 0; sm < SG_M; ++sm) {
         tCrC(sn * SG_M + sm) *= weight_scale;
@@ -310,18 +441,44 @@ struct Fp8W8A16Mainloop<
   CUTLASS_DEVICE void operator()(
       ATensor& A,
       BPackedTensor& Bp,
-      const float* w_scale_gmem,
+      const void* w_scale_gmem,
       int w_scale_row_stride,
       DTensor& D,
       Coord blk_coord,
       TiledMMA mma,
       int thr_id,
       const float* Bias,
-      int gemm_n) {
+      int gemm_n,
+      int scale_mode = static_cast<int>(ScaleMode::BlockFP32)) {
     if constexpr (WeightScalePerExpert) {
-      run_w8a16_scalar(A, Bp, w_scale_gmem, w_scale_row_stride, D, blk_coord, mma, thr_id, Bias, gemm_n);
+      run_w8a16_scalar(
+          A, Bp, static_cast<const float*>(w_scale_gmem), scale_mode, D, blk_coord, mma, thr_id, Bias, gemm_n);
     } else {
-      run_w8a16_block(A, Bp, w_scale_gmem, w_scale_row_stride, D, blk_coord, mma, thr_id, Bias, gemm_n);
+      if (scale_mode == static_cast<int>(ScaleMode::BlockMXFP8)) {
+        run_w8a16_block_mxfp8(
+            A,
+            Bp,
+            static_cast<const uint8_t*>(w_scale_gmem),
+            w_scale_row_stride,
+            D,
+            blk_coord,
+            mma,
+            thr_id,
+            Bias,
+            gemm_n);
+      } else {
+        run_w8a16_block(
+            A,
+            Bp,
+            static_cast<const float*>(w_scale_gmem),
+            w_scale_row_stride,
+            D,
+            blk_coord,
+            mma,
+            thr_id,
+            Bias,
+            gemm_n);
+      }
     }
   }
 

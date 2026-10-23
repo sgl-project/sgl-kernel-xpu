@@ -10,7 +10,7 @@
 #   3. for the 16-bit paths, query dtype bf16 vs fp16 -> separate TUs.
 # The paged and non-paged KV paths support INDEPENDENT sets of head dimensions.
 # Non-paged prefill supports 16-bit KV only (no fp8 KV cache).
-set(FMHA_PREFILL_PAGED_HEAD_DIMS 64 96 128 192 256 512)
+set(FMHA_PREFILL_PAGED_HEAD_DIMS 64 80 96 128 192 256 512)
 set(FMHA_PREFILL_NP_HEAD_DIMS 64 72 80 96 128 192 256 512)
 
 # Paged prefill (FmhaPrefillRunner) and non-paged prefill (FmhaPrefillNpRunner).

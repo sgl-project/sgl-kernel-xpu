@@ -7,6 +7,7 @@
 #   USE_FMHA -> flash attention (fwd / mha_fwd)
 #   USE_GDN  -> Gated DeltaNet attention kernels
 #   USE_MLA  -> MLA decode/prefill/sparse-decode kernels
+#   USE_QSA  -> Xe2 BF16 QSA sparse attention
 #   USE_MLA_SPARSE_FUSED -> fused (single-pass) sparse-MLA-decode kernel (optimization track)
 #
 # Defaults are set in the option() declarations below. Each toggle can be set either as a CMake option
@@ -18,6 +19,7 @@ option(USE_MOE "Build MoE kernels" ON)
 option(USE_FMHA "Build flash attention kernels" ON)
 option(USE_GDN "Build Gated DeltaNet attention kernels" ON)
 option(USE_MLA "Build MLA kernels" ON)
+option(USE_QSA "Build Xe2 BF16 QSA sparse attention" ON)
 # The fused (single-pass) sparse-MLA-decode kernel is the optimization track; the
 # 2-stage kernel is the shipping runtime default. Building the fused variant is
 # opt-in so default/CI builds don't pay for its extra instantiations. Turning it
@@ -30,7 +32,7 @@ option(USE_MLA_SPARSE_FUSED "Build the fused (single-pass) sparse MLA decode ker
 # (or 1 / On) as a CMake option or environment variable.
 option(USE_SYCL_JIT "Enable runtime-JIT kernels (opt-in; drops their AOT .so instances)" OFF)
 
-foreach(_toggle USE_MOE USE_FMHA USE_GDN USE_MLA USE_MLA_SPARSE_FUSED USE_SYCL_JIT)
+foreach(_toggle USE_MOE USE_FMHA USE_GDN USE_MLA USE_QSA USE_MLA_SPARSE_FUSED USE_SYCL_JIT)
     if(DEFINED ENV{${_toggle}} AND NOT "$ENV{${_toggle}}" STREQUAL "")
         # Normalize the env value so 1 / On / ON / on / true / yes all enable and
         # 0 / Off / OFF / false / no disable, independent of CMake's if(<string>)
@@ -52,6 +54,7 @@ message(STATUS "USE_MOE=${USE_MOE}")
 message(STATUS "USE_FMHA=${USE_FMHA}")
 message(STATUS "USE_GDN=${USE_GDN}")
 message(STATUS "USE_MLA=${USE_MLA}")
+message(STATUS "USE_QSA=${USE_QSA}")
 message(STATUS "USE_MLA_SPARSE_FUSED=${USE_MLA_SPARSE_FUSED}")
 message(STATUS "USE_SYCL_JIT=${USE_SYCL_JIT}")
 
@@ -87,6 +90,9 @@ endif()
 if(USE_MLA)
     add_compile_definitions(USE_MLA)
 endif()
+if(USE_QSA AND DPCPP_SYCL_TARGET MATCHES "bmg")
+    add_compile_definitions(USE_QSA)
+endif()
 if(USE_MLA_SPARSE_FUSED)
     add_compile_definitions(USE_MLA_SPARSE_FUSED)
 else()
@@ -112,10 +118,15 @@ if(NOT USE_GDN)
     list(FILTER device_cpp EXCLUDE REGEX "/gdn_attn_workspace\\.cpp$")
 endif()
 if(NOT USE_MLA)
-    list(FILTER device_cpp EXCLUDE REGEX "/mla_(decode|prefill|sparse_decode)\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/mla_(decode|prefill|sparse_decode|sparse_prefill)\\.cpp$")
+endif()
+if(NOT USE_QSA OR NOT DPCPP_SYCL_TARGET MATCHES "bmg")
+    list(FILTER device_cpp EXCLUDE REGEX "/QSASparseAttentionXe20\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/QSAMqaXe20\\.cpp$")
 endif()
 if(NOT USE_MOE)
     list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20|W8A16Xe20)|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/xe35/(GroupGemm|GroupGemmMxfp4W4A16|blockwise_moe_mxfp4|blockwise_moe_mxfp8)\\.cpp$")
 endif()
 
 # BMG only
@@ -143,6 +154,9 @@ endforeach()
 include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraAFwdXe20.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraBFwdXe20.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/QKVLoraBFwdXe20.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/GateUpLoraBFwdXe20.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/ChunkedSgmvLoraShrinkFwdXe20.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/ChunkedSgmvLoraExpandFwdXe20.cmake)
 if(USE_FMHA)
     if(NOT USE_SYCL_JIT)
         include(FMHADecodeXe20.cmake)
@@ -155,6 +169,10 @@ if(USE_MLA)
         include(MlaPrefillXe20.cmake)
         include(MlaSparseDecodeXe20.cmake)
         include(MlaSparsePrefillXe20.cmake)
+        include(MlaDecodeXe35.cmake)
+        include(MlaPrefillXe35.cmake)
+        include(MlaSparseDecodeXe35.cmake)
+        include(MlaSparsePrefillXe35.cmake)
     endif()
 endif()
 if(USE_MOE)
@@ -163,6 +181,10 @@ if(USE_MOE)
         include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW4A16Xe20.cmake)
         include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmW8A16Xe20.cmake)
     endif()
+    # Xe3 (CRI) does not participate in the runtime-JIT path (Xe3 AOT
+    # instances are always built when USE_MOE is on).
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmXe35.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/GroupGemmMxfp4W4A16Xe35.cmake)
 endif()
 
 

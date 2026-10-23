@@ -365,3 +365,292 @@ def qkv_lora_b_fwd(
     )
 
     return output
+
+
+def gate_up_lora_b_fwd(
+    input_x: torch.Tensor,
+    gate_up_lora_b: torch.Tensor,
+    output_dim: int,
+    seg_indptr: torch.Tensor,
+    weight_indices: torch.Tensor,
+    lora_ranks: torch.Tensor,
+    scalings: torch.Tensor,
+    seg_lens: Optional[torch.Tensor] = None,
+    base_output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Fused gate/up LoRA B-matrix SGEMM forward pass.
+
+    This kernel performs the LoRA ``B`` projection for the packed ``gate`` and
+    ``up`` MLP outputs in a single fused grouped (segmented) matrix multiplication.
+    It packs two SGEMMs (gate / up) into one kernel: for each input segment it emits
+    two groups, one per projection, accumulating each product into its column band
+    of the output. When a segment's adapter rank is 0 the group is a genuine
+    all-zero LoRA term (empty reduction), following the PyTorch convention that the
+    product of matrices of shape ``(m, 0)`` and ``(0, n)`` is the zero matrix of
+    shape ``(m, n)``.
+
+    Unlike the QKV variant, gate and up share the same output width ``N`` and the
+    same rank ``K``, so the projection column bands are the uniform partition
+    ``[0, N, 2N]`` (no ``output_offset`` argument is required).
+
+    The input ``input_x`` is the result of the LoRA ``A`` projection packed for
+    gate/up, shape ``(s, 2 * K)`` where ``s`` is the total number of tokens and
+    ``K`` is the maximum LoRA rank. Its second dimension is partitioned into two
+    contiguous ``K``-wide bands for gate and up. The weight tensor
+    ``gate_up_lora_b`` has shape ``(num_loras, 2 * N, K)``.
+
+    For each segment ``s`` (adapter ``l = weight_indices[s]``) and projection
+    ``p in {gate, up}``:
+
+    .. math::
+
+        output[i, \, band_p] = scalings[l] \; \cdot \; \left( input\_x[i, \, band_p]
+                    \; @ \; gate\_up\_lora\_b[l, \, band_p]^{T} \right) \; + \; base\_output[i, \, band_p]
+
+    where the ``base_output`` term is only added when it is supplied.
+
+    Parameters
+    ----------
+    input_x : torch.Tensor
+        Input activation tensor (the LoRA-A projection), shape ``(num_tokens, 2 * max_rank)``.
+        The second dimension is partitioned into two ``max_rank``-wide gate/up bands.
+    gate_up_lora_b : torch.Tensor
+        Packed LoRA B-matrix weight tensor, shape ``(num_loras, 2 * N, max_rank)``.
+    output_dim : int
+        Per-projection output width ``N``. ``gate_up_lora_b.size(1)`` must equal ``2 * N``.
+    seg_indptr : torch.Tensor
+        Segment index pointer tensor, shape ``(num_segments + 1,)``. Must start at 0,
+        end at ``num_tokens``, and be non-decreasing.
+    weight_indices : torch.Tensor
+        Per-segment adapter indices into ``gate_up_lora_b``, shape ``(num_segments,)``.
+        Values must be in ``[0, num_loras)``.
+    lora_ranks : torch.Tensor
+        LoRA ranks tensor, shape ``(num_loras,)``. Values must be in ``[0, max_rank]``.
+        Range-validated only; it does not shrink the per-segment GEMM, so the caller
+        is expected to have zero-padded the rank columns beyond each adapter's
+        ``R_l`` in ``gate_up_lora_b``.
+    scalings : torch.Tensor
+        Per-adapter scaling factors (e.g. ``lora_alpha / rank``), shape ``(num_loras,)``.
+    seg_lens : Optional[torch.Tensor], optional
+        Optional segment lengths tensor, shape ``(num_segments,)``. Currently unused,
+        reserved for future per-segment optimizations.
+    base_output : Optional[torch.Tensor], optional
+        Optional base-model output added as a residual, shape ``(num_tokens, 2 * N)``.
+        When provided, the kernel computes the scaled LoRA projection plus this
+        residual in a single fused pass; otherwise only the scaled LoRA projection
+        is returned.
+
+    Returns
+    -------
+    output : torch.Tensor
+        Output tensor, shape ``(num_tokens, 2 * N)``.
+
+    Notes
+    -----
+    - The output tensor is created with ``torch.empty`` and populated by the C++ kernel.
+    - ``output`` and ``input_x`` must share the same dtype as ``gate_up_lora_b``.
+    - Supported weight dtypes are FP16 and BF16.
+    """
+    # Create empty output tensor
+    output = torch.empty(
+        (input_x.size(0), gate_up_lora_b.size(1)),
+        dtype=gate_up_lora_b.dtype,
+        device=gate_up_lora_b.device,
+    )
+    # Call the kernel
+    torch.ops.sgl_kernel.gate_up_lora_b_fwd(
+        output,
+        input_x,
+        gate_up_lora_b,
+        output_dim,
+        seg_indptr,
+        weight_indices,
+        lora_ranks,
+        scalings,
+        seg_lens,
+        base_output,
+    )
+
+    return output
+
+
+def chunked_sgmv_lora_shrink_fwd(
+    input_x: torch.Tensor,
+    weights: torch.Tensor,
+    stack_num: int,
+    num_segments: int,
+    seg_indptr: torch.Tensor,
+    weight_indices: torch.Tensor,
+    lora_ranks: torch.Tensor,
+    permutation: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Chunked-SGMV LoRA "shrink" (A-matrix) forward pass.
+
+    Computes the LoRA ``A`` projection ``output = input_x @ weights[l]^T`` as a
+    segmented grouped GEMM, where each segment ``s`` uses the adapter
+    ``l = weight_indices[s]``.
+
+    This is the three-kernel decomposition, fused into a single C++ op:
+
+    1. **gather** ``x_sorted[i] = input_x[permutation[i]]`` — physical -> logical,
+    2. a dedicated small-N grouped GEMM on ``x_sorted`` -> ``out_sorted`` (logical order),
+    3. **scatter** ``output[permutation[i]] = out_sorted[i]`` — logical -> physical.
+
+    ``seg_indptr`` / ``weight_indices`` describe the *logical* (adapter-grouped)
+    layout; ``permutation`` (``logical -> physical``, a bijection over the token
+    rows) converts that into the physical token order of ``input_x`` / ``output``.
+
+    When ``permutation`` is ``None``, the gather/scatter are skipped and the GEMM runs in place.
+
+    Parameters
+    ----------
+    input_x : torch.Tensor
+        Input activation tensor in physical token order, shape ``(num_tokens, input_dim)``.
+    weights : torch.Tensor
+        LoRA A-matrix weights, shape ``(num_loras, stack_num * max_rank, input_dim)``.
+        The caller must pre-zero weight rows beyond each adapter's rank so the
+        output columns beyond the rank come out zero-padded (see
+        :func:`sgemm_lora_a_fwd`).
+    stack_num : int
+        Number of stacked projections packed along the weight rank dimension
+        (``num_slices``: 3 for QKV, 2 for gate_up, 1 otherwise).
+    num_segments : int
+        Number of segments
+    seg_indptr : torch.Tensor
+        Segment index pointer over the *logical* row order, shape ``(num_segments + 1,)``.
+    weight_indices : torch.Tensor
+        Per-segment adapter indices into ``weights``, shape ``(num_segments,)``.
+    lora_ranks : torch.Tensor
+        LoRA ranks tensor, shape ``(num_loras,)``.
+    permutation : Optional[torch.Tensor], optional
+        1D ``logical -> physical`` token index tensor, shape ``(num_tokens,)``.
+        ``None`` selects the contiguous (prefill) fast path.
+
+    Returns
+    -------
+    output : torch.Tensor
+        LoRA A projection in physical token order, shape ``(num_tokens, stack_num * max_rank)``.
+    """
+    # Create empty output tensor
+    output = torch.empty(
+        (input_x.size(0), weights.size(1)), dtype=weights.dtype, device=weights.device
+    )
+    # Call the kernel (void op: writes into `output` in place)
+    torch.ops.sgl_kernel.chunked_sgmv_lora_shrink_fwd(
+        output,
+        input_x,
+        weights,
+        stack_num,
+        num_segments,
+        seg_indptr,
+        weight_indices,
+        lora_ranks,
+        permutation,
+    )
+
+    return output
+
+
+def chunked_sgmv_lora_expand_fwd(
+    input_x: torch.Tensor,
+    weights: torch.Tensor,
+    slice_offsets: torch.Tensor,
+    max_slice_size: int,
+    num_slices: int,
+    num_segments: int,
+    seg_indptr: torch.Tensor,
+    weight_indices: torch.Tensor,
+    lora_ranks: torch.Tensor,
+    scalings: torch.Tensor,
+    permutation: Optional[torch.Tensor] = None,
+    base_output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Chunked-SGMV LoRA "expand" (B-matrix) forward pass.
+
+    Computes the scaled LoRA ``B`` projection
+    ``output = scalings[l] * (input_x @ weights[l]^T) (+ base_output)`` as a
+    segmented, per-slice grouped GEMM, where each segment ``s`` uses the adapter
+    ``l = weight_indices[s]``. It is the "expand" counterpart of
+    :func:`chunked_sgmv_lora_shrink_fwd`, and the generic ``num_slices`` sibling
+    of :func:`qkv_lora_b_fwd` / :func:`gate_up_lora_b_fwd`.
+
+    This is the three-kernel decomposition, fused into a single C++ op:
+
+    1. **gather** ``x_sorted[i] = input_x[permutation[i]]`` — physical -> logical
+       (``base_output`` is gathered the same way when supplied),
+    2. a per-slice grouped GEMM on ``x_sorted`` -> ``out_sorted`` (logical order),
+       applying the per-adapter scaling and the (fused) residual,
+    3. **scatter** ``output[permutation[i]] = out_sorted[i]`` — logical -> physical.
+
+    ``seg_indptr`` / ``weight_indices`` describe the *logical* (adapter-grouped)
+    layout; ``permutation`` (``logical -> physical``, a bijection over the token
+    rows) converts that into the physical token order of ``input_x`` / ``output``.
+
+    When ``permutation`` is ``None``, the gather/scatter are skipped and the GEMM
+    runs in place (prefill fast path).
+
+    Parameters
+    ----------
+    input_x : torch.Tensor
+        The LoRA ``A`` (shrink) projection in physical token order, shape
+        ``(num_tokens, num_slices * max_rank)``. The second dimension is
+        partitioned into ``num_slices`` contiguous ``max_rank``-wide bands.
+    weights : torch.Tensor
+        LoRA B-matrix weights, shape ``(num_loras, N_total, max_rank)`` where
+        ``N_total`` is the sum of the per-slice output widths. The caller must
+        pre-zero weight columns beyond each adapter's rank (see
+        :func:`sgemm_lora_b_fwd`).
+    slice_offsets : torch.Tensor
+        Output-column boundaries of the per-slice bands, shape ``(num_slices + 1,)``.
+        Must start at 0, end at ``weights.size(1)`` (``N_total``), and be
+        non-decreasing. For a single slice this is ``[0, N_total]``.
+    max_slice_size : int
+        Widest per-slice output width implied by ``slice_offsets``.
+    num_slices : int
+        Number of stacked projections (3 for QKV, 2 for gate_up, 1 otherwise).
+    num_segments : int
+        Number of segments.
+    seg_indptr : torch.Tensor
+        Segment index pointer over the *logical* row order, shape ``(num_segments + 1,)``.
+    weight_indices : torch.Tensor
+        Per-segment adapter indices into ``weights``, shape ``(num_segments,)``.
+    lora_ranks : torch.Tensor
+        LoRA ranks tensor, shape ``(num_loras,)``. Range-validated only.
+    scalings : torch.Tensor
+        Per-adapter scaling factors (e.g. ``lora_alpha / rank``), shape ``(num_loras,)``.
+    permutation : Optional[torch.Tensor], optional
+        1D ``logical -> physical`` token index tensor, shape ``(num_tokens,)``.
+        ``None`` selects the contiguous (prefill) fast path.
+    base_output : Optional[torch.Tensor], optional
+        Optional base-model output added as a residual, shape ``(num_tokens, N_total)``.
+        When provided, the kernel computes the scaled LoRA projection plus this
+        residual in a single fused pass; otherwise only the scaled LoRA projection
+        is returned.
+
+    Returns
+    -------
+    output : torch.Tensor
+        LoRA B projection in physical token order, shape ``(num_tokens, N_total)``.
+    """
+    # Create empty output tensor
+    output = torch.empty(
+        (input_x.size(0), weights.size(1)), dtype=weights.dtype, device=weights.device
+    )
+    # Call the kernel (void op: writes into `output` in place)
+    torch.ops.sgl_kernel.chunked_sgmv_lora_expand_fwd(
+        output,
+        input_x,
+        weights,
+        slice_offsets,
+        max_slice_size,
+        num_slices,
+        num_segments,
+        seg_indptr,
+        weight_indices,
+        lora_ranks,
+        scalings,
+        permutation,
+        base_output,
+    )
+
+    return output

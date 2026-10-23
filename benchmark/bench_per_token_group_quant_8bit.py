@@ -1,3 +1,4 @@
+import argparse
 import itertools
 from typing import Tuple
 
@@ -5,7 +6,7 @@ import pandas as pd
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel import sgl_per_token_group_quant_fp8, sgl_per_token_group_quant_int8
+from sgl_kernel import sgl_per_token_group_quant_8bit
 
 fp8_type_ = torch.float8_e4m3fn
 
@@ -123,24 +124,24 @@ def sglang_per_token_group_quant_8bit(
     ), "the last dimension of `x` cannot be divisible by `group_size`"
     assert x.is_contiguous(), "`x` is not contiguous"
 
-    m, n = x.shape
-    num_groups = n // group_size
-
-    # Allocate output tensors
-    x_q = torch.empty_like(x, dtype=dst_dtype)
-    x_s = torch.empty((m, num_groups), device=x.device, dtype=torch.float32)
-
     if dst_dtype == torch.int8:
         iinfo = torch.iinfo(dst_dtype)
-        sgl_per_token_group_quant_int8(
-            x, x_q, x_s, group_size, eps, float(iinfo.min), float(iinfo.max)
-        )
+        min_8bit = float(iinfo.min)
+        max_8bit = float(iinfo.max)
     else:
-        f8_info = torch.finfo(dst_dtype)
-        sgl_per_token_group_quant_fp8(
-            x, x_q, x_s, group_size, eps, float(f8_info.min), float(f8_info.max)
-        )
+        finfo = torch.finfo(dst_dtype)
+        min_8bit = float(finfo.min)
+        max_8bit = float(finfo.max)
 
+    x_q = torch.empty(x.shape, device=x.device, dtype=dst_dtype)
+    x_s = torch.empty(
+        (*x.shape[:-1], x.shape[-1] // group_size),
+        device=x.device,
+        dtype=torch.float32,
+    )
+    sgl_per_token_group_quant_8bit(
+        x, x_q, x_s, group_size, eps, min_8bit, max_8bit, False, False, None, False
+    )
     return x_q, x_s
 
 
@@ -265,9 +266,8 @@ def calculate_effective_bandwidth(
         args={},
     )
 )
-def benchmark(batch_size, seq_len, group_size, dst_dtype, provider):
+def benchmark(batch_size, seq_len, group_size, dst_dtype, provider, hidden_dim=7168):
     device = torch.device("xpu")
-    hidden_dim = 7168
 
     x = torch.randn(
         batch_size * seq_len, hidden_dim, device=device, dtype=torch.bfloat16
@@ -308,10 +308,51 @@ def benchmark(batch_size, seq_len, group_size, dst_dtype, provider):
 
 
 if __name__ == "__main__":
+    dtype_map = {"int8": torch.int8, "float8_e4m3fn": fp8_type_}
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--seq-lens",
+        nargs="+",
+        type=int,
+        default=seq_len_range,
+        help="Sequence lengths to sweep",
+    )
+    parser.add_argument(
+        "--group-sizes",
+        nargs="+",
+        type=int,
+        default=group_size_range,
+        help="Quant group sizes to sweep",
+    )
+    parser.add_argument(
+        "--dst-dtypes",
+        nargs="+",
+        choices=list(dtype_map),
+        default=["int8", "float8_e4m3fn"],
+        help="Output dtypes to sweep",
+    )
+    parser.add_argument("--hidden-dim", type=int, default=7168, help="Hidden dim")
+    args = parser.parse_args()
 
     calculate_diff(batch_size=4, seq_len=128, group_size=64, dst_dtype=torch.int8)
     calculate_diff(batch_size=2, seq_len=32, group_size=128, dst_dtype=fp8_type_)
 
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(
+            args.batch_sizes,
+            args.seq_lens,
+            args.group_sizes,
+            [dtype_map[d] for d in args.dst_dtypes],
+        )
+    )
+    benchmark.benchmarks.args = {"hidden_dim": args.hidden_dim}
     benchmark.run(print_data=True)
 
     # Print bandwidth results

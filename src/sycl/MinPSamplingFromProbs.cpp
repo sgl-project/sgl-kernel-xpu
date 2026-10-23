@@ -9,6 +9,7 @@
 #include <sycl/sycl.hpp>
 
 #include "MemoryAccess.h"
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "comm/Random.h"
@@ -277,6 +278,13 @@ SGL_KERNEL_EXPORT void min_p_sampling_from_probs(
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  const double flops = 0.0;
+  const double bytes = static_cast<double>(probs.numel()) * static_cast<double>(probs.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  SGL_KERNEL_PERF_SCOPE("min_p_sampling", queue, bytes, flops);
+#endif
 
   launch_min_p_sampling<float>(
       probs,

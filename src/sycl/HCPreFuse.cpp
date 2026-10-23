@@ -4,6 +4,7 @@
 #include <limits>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -572,6 +573,23 @@ SGL_KERNEL_EXPORT void hc_pre_big_fuse(
 
   // Dynamic VEC_SIZE selection based on batch size
   int vec_size = (T <= 16) ? 8 : (T <= 48) ? 4 : 2;
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Fused HC pre-processing: RMSNorm-like reduce + Sinkhorn iters + mix compute.
+  // FLOPS ~ SINKHORN_ITERS*(HC^3 per token) + RMS reduce (~4*T*hidden_size) + mix (~T*HC^3).
+  // Uses the enclosing-scope `constexpr int HC = 4;` from the entry checks above
+  // (TORCH_CHECK already verified hc_mult == HC).
+  const double sinkhorn_flops = static_cast<double>(sinkhorn_iters) * static_cast<double>(T) * static_cast<double>(HC) *
+                                static_cast<double>(HC) * static_cast<double>(HC);
+  const double norm_flops = 4.0 * static_cast<double>(T) * static_cast<double>(hidden_size);
+  const double flops = sinkhorn_flops + norm_flops;
+  const double bytes =
+      static_cast<double>(gemm_out_mul.numel()) * static_cast<double>(gemm_out_mul.element_size()) +
+      static_cast<double>(gemm_out_sqrsum.numel()) * static_cast<double>(gemm_out_sqrsum.element_size()) +
+      static_cast<double>(residual_flat.numel()) * static_cast<double>(residual_flat.element_size()) +
+      static_cast<double>(layer_input.numel()) * static_cast<double>(layer_input.element_size());
+  SGL_KERNEL_PERF_SCOPE("hc_pre_big_fuse", q, bytes, flops);
+#endif
 
 #define LAUNCH_HC_PRE_FUSE(VEC_SIZE)     \
   case VEC_SIZE: {                       \

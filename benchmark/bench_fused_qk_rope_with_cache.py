@@ -1,3 +1,4 @@
+import argparse
 import itertools
 
 import pandas as pd
@@ -149,15 +150,39 @@ def get_benchmark(device="xpu"):
 
 
 if __name__ == "__main__":
-    bs = [1, 2, 4, 8]
-    seq_len = 1024
-    num_tokens = [seq_len * b for b in bs]
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes", nargs="+", type=int, default=[1, 2, 4, 8], help="Batch sizes"
+    )
+    parser.add_argument("--seq-len", type=int, default=1024)
     # configs from llama3.1 8B an Qwen-235B
-    num_heads = [32, 64]
-    num_kv_heads = [4, 8]
-    rope_dim = [128]
+    parser.add_argument(
+        "--num-heads", nargs="+", type=int, default=[32, 64], help="Q head counts"
+    )
+    parser.add_argument(
+        "--num-kv-heads", nargs="+", type=int, default=[4, 8], help="KV head counts"
+    )
+    parser.add_argument(
+        "--rope-dims", nargs="+", type=int, default=[128], help="Rotary dims"
+    )
+    parser.add_argument(
+        "--dtypes", nargs="+", choices=list(dtype_map), default=["bfloat16"]
+    )
+    args = parser.parse_args()
+
+    bs = args.batch_sizes
+    seq_len = args.seq_len
+    num_tokens = [seq_len * b for b in bs]
+    num_heads = args.num_heads
+    num_kv_heads = args.num_kv_heads
+    rope_dim = args.rope_dims
     is_neox = [True]
-    dtype = [torch.bfloat16]
+    dtype = [dtype_map[d] for d in args.dtypes]
 
     sweep_params = {
         "num_tokens": num_tokens,

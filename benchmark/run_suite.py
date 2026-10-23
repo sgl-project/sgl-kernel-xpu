@@ -92,6 +92,12 @@ suites = {
             estimated_time=30,
         ),
         BenchFile("bench_scatter_tokens_to_experts.py"),
+        # --- KV cache / HiCache transfer ---
+        BenchFile(
+            "bench_transfer_mamba.py",
+            tee_log="transfer_mamba.log",
+            estimated_time=15,
+        ),
         # --- norm / rope / quant ---
         BenchFile("bench_merge_states_v2.py", tee_log="merge_states.py.log"),
         BenchFile("bench_mrope.py", tee_log="mrope.py.log"),
@@ -102,6 +108,7 @@ suites = {
         BenchFile("bench_per_token_quant_fp8.py"),
         BenchFile("bench_per_token_group_quant_mxfp4_fusion.py"),
         BenchFile("bench_top_k_renorm_probs.py"),
+        BenchFile("bench_scale_residual_norm_scale_shift.py"),
         BenchFile("bench_top_k_top_p_sampling_from_probs.py"),
         BenchFile("bench_min_p_sampling_from_probs.py"),
         BenchFile("bench_biased_topk.py"),
@@ -118,6 +125,10 @@ suites = {
         BenchFile("bench_embedding_lora_a_fwd.py", estimated_time=40),
         BenchFile("bench_sgemm_lora_a_fwd.py", estimated_time=25),
         BenchFile("bench_sgemm_lora_b_fwd.py"),
+        BenchFile("bench_qkv_lora_b_fwd.py"),
+        BenchFile("bench_gate_up_lora_b_fwd.py"),
+        BenchFile("bench_chunked_sgmv_lora_shrink_fwd.py"),
+        BenchFile("bench_chunked_sgmv_lora_expand_fwd.py"),
         # disabled temporialy due to env issue
         # --- JIT kernels (need icpx from the oneAPI toolchain) ---
         # BenchFile("bench_jit_rmsnorm.py"),

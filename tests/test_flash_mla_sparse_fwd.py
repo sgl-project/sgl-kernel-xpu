@@ -68,6 +68,7 @@ def reference_mla_sparse_prefill(
     return (out.to(kv.dtype), out, max_logits, orig_lse)
 
 
+@pytest.mark.arch("xe20", "xe35")
 @pytest.mark.parametrize("has_attn_sink", [False, True])
 @pytest.mark.parametrize("has_topk_length", [False, True])
 @pytest.mark.parametrize("topk", [6, 512])

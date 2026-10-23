@@ -1,5 +1,6 @@
 """Benchmark JIT per-tensor FP8 quantization vs AOT implementation."""
 
+import argparse
 from itertools import product
 
 import pandas as pd
@@ -43,20 +44,7 @@ configs = [
 ]
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch_size", "seq_len", "is_static"],
-        x_vals=configs,
-        line_arg="provider",
-        line_vals=["aot", "jit"],
-        line_names=["AOT (sgl_kernel)", "JIT (sglang)"],
-        styles=[("blue", "-"), ("green", "-")],
-        ylabel="us",
-        plot_name="aot-vs-jit-per-tensor-quant-fp8-performance",
-        args={},
-    )
-)
-def benchmark(batch_size, seq_len, is_static, provider):
+def benchmark(batch_size, seq_len, is_static, provider, hidden_size=hidden_size):
     device = torch.device("xpu")
     dtype = torch.float16
     num_tokens = batch_size * seq_len
@@ -102,7 +90,43 @@ def benchmark(batch_size, seq_len, is_static, provider):
     return 1000 * ms, 1000 * min_ms, 1000 * max_ms
 
 
+def get_benchmark(configs=configs, hidden_size=hidden_size):
+    return triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["batch_size", "seq_len", "is_static"],
+            x_vals=configs,
+            line_arg="provider",
+            line_vals=["aot", "jit"],
+            line_names=["AOT (sgl_kernel)", "JIT (sglang)"],
+            styles=[("blue", "-"), ("green", "-")],
+            ylabel="us",
+            plot_name="aot-vs-jit-per-tensor-quant-fp8-performance",
+            args={"hidden_size": hidden_size},
+        )
+    )(benchmark)
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--seq-lens",
+        nargs="+",
+        type=int,
+        default=seq_len_range,
+        help="Sequence lengths to sweep",
+    )
+    parser.add_argument(
+        "--hidden-size", type=int, default=hidden_size, help="Hidden size"
+    )
+    args = parser.parse_args()
+
     if not HAS_AOT:
         print("ERROR: sgl_kernel (AOT) not available. Please install sgl-kernel-xpu.")
         exit(1)
@@ -112,7 +136,12 @@ if __name__ == "__main__":
     print("JIT: sgl_kernel.jit.per_tensor_quant_fp8 (runtime JIT compilation)")
     print("\n" + "=" * 80 + "\n")
 
-    benchmark.run(print_data=True)
+    configs = [
+        (bs, seq_len, is_static)
+        for is_static in [False, True]
+        for bs, seq_len in product(args.batch_sizes, args.seq_lens)
+    ]
+    get_benchmark(configs, args.hidden_size).run(print_data=True)
 
     print("Benchmark finished!")
     df = pd.DataFrame(all_results)

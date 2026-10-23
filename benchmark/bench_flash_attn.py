@@ -126,63 +126,80 @@ page_size_range = [0, 1, 128]
 # path.
 kv_dtype_range = ["bf16", "fp8_e4m3", "fp8_e5m2"]
 attention_mode_range = ["standard", "relative"]
-configs = list(
-    filter(
-        lambda cfg: (
-            # Condition 1: causal and local cannot both be True
-            not (cfg[0] and cfg[1])
-            # Condition 2: when q_seq_length=1, causal must be False
-            and (cfg[4] != 1 or not cfg[0])
-            # Condition 3: num_heads_q must be a multiple of num_heads_kv (GQA requirement)
-            and (cfg[6] % cfg[7] == 0)
-            # Condition 4: kv_seq_length >= page_size
-            and (cfg[8] >= cfg[9])
-            # Condition 5: no_page mode (page_size=0) and the page_size=1
-            # workaround both dispatch to the non-paged kernel, which does
-            # not support sink logits
-            and (cfg[9] not in (0, 1) or not cfg[2])
-            # Condition 6: sink is only supported for head_size == 64
-            and (not cfg[2] or cfg[5] == 64)
-            # Condition 7: fp8 KV cache requires the native paged kernel and is
-            # exercised without sinks / local masking (matches the supported
-            # fp8 path); page_size=1 falls back to the non-paged kernel so it
-            # is excluded like page_size=0
-            and (
-                cfg[10] == "bf16"
-                or (cfg[9] not in (0, 1) and not cfg[2] and not cfg[1])
-            )
-            and (
-                cfg[11] == "standard"
-                or (
-                    cfg[9] != 0
-                    and cfg[10] == "bf16"
-                    and cfg[5] == 128
-                    and cfg[4] > 1
-                    and not cfg[1]
-                    and not cfg[2]
+
+
+def build_configs(
+    batch_size=batch_size,
+    q_seq_length_range=q_seq_length_range,
+    head_dim_no_page=head_dim_no_page,
+    head_dim_paged=head_dim_paged,
+    num_heads_q=num_heads_q,
+    num_heads_kv=num_heads_kv,
+    kv_seq_length_range=kv_seq_length_range,
+    page_size_range=page_size_range,
+    kv_dtype_range=kv_dtype_range,
+    attention_mode_range=attention_mode_range,
+):
+    return list(
+        filter(
+            lambda cfg: (
+                # Condition 1: causal and local cannot both be True
+                not (cfg[0] and cfg[1])
+                # Condition 2: when q_seq_length=1, causal must be False
+                and (cfg[4] != 1 or not cfg[0])
+                # Condition 3: num_heads_q must be a multiple of num_heads_kv (GQA requirement)
+                and (cfg[6] % cfg[7] == 0)
+                # Condition 4: kv_seq_length >= page_size
+                and (cfg[8] >= cfg[9])
+                # Condition 5: no_page mode (page_size=0) and the page_size=1
+                # workaround both dispatch to the non-paged kernel, which does
+                # not support sink logits
+                and (cfg[9] not in (0, 1) or not cfg[2])
+                # Condition 6: sink is only supported for head_size == 64
+                and (not cfg[2] or cfg[5] == 64)
+                # Condition 7: fp8 KV cache requires the native paged kernel and is
+                # exercised without sinks / local masking (matches the supported
+                # fp8 path); page_size=1 falls back to the non-paged kernel so it
+                # is excluded like page_size=0
+                and (
+                    cfg[10] == "bf16"
+                    or (cfg[9] not in (0, 1) and not cfg[2] and not cfg[1])
                 )
-            )
-        ),
-        [
-            cfg
-            for page_size in page_size_range
-            for cfg in product(
-                causal,
-                local,
-                use_sinks,
-                batch_size,
-                q_seq_length_range,
-                head_dim_no_page if page_size == 0 else head_dim_paged,
-                num_heads_q,
-                num_heads_kv,
-                kv_seq_length_range,
-                [page_size],
-                kv_dtype_range,
-                attention_mode_range,
-            )
-        ],
+                and (
+                    cfg[11] == "standard"
+                    or (
+                        cfg[9] != 0
+                        and cfg[10] == "bf16"
+                        and cfg[5] == 128
+                        and cfg[4] > 1
+                        and not cfg[1]
+                        and not cfg[2]
+                    )
+                )
+            ),
+            [
+                cfg
+                for page_size in page_size_range
+                for cfg in product(
+                    causal,
+                    local,
+                    use_sinks,
+                    batch_size,
+                    q_seq_length_range,
+                    head_dim_no_page if page_size == 0 else head_dim_paged,
+                    num_heads_q,
+                    num_heads_kv,
+                    kv_seq_length_range,
+                    [page_size],
+                    kv_dtype_range,
+                    attention_mode_range,
+                )
+            ],
+        )
     )
-)
+
+
+configs = build_configs()
 all_results = []
 
 
@@ -400,6 +417,68 @@ def benchmark(
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=batch_size)
+    parser.add_argument(
+        "--q-seq-lengths", nargs="+", type=int, default=q_seq_length_range
+    )
+    parser.add_argument(
+        "--kv-seq-lengths", nargs="+", type=int, default=kv_seq_length_range
+    )
+    parser.add_argument(
+        "--head-dims-no-page",
+        nargs="+",
+        type=int,
+        default=head_dim_no_page,
+        help="Head dims for page_size=0",
+    )
+    parser.add_argument(
+        "--head-dims-paged",
+        nargs="+",
+        type=int,
+        default=head_dim_paged,
+        help="Head dims for page_size>0",
+    )
+    parser.add_argument("--num-heads-q", nargs="+", type=int, default=num_heads_q)
+    parser.add_argument("--num-heads-kv", nargs="+", type=int, default=num_heads_kv)
+    parser.add_argument(
+        "--page-sizes",
+        nargs="+",
+        type=int,
+        default=page_size_range,
+        help="0 = non-paged varlen path",
+    )
+    parser.add_argument(
+        "--kv-dtypes",
+        nargs="+",
+        choices=["bf16", "fp8_e4m3", "fp8_e5m2"],
+        default=kv_dtype_range,
+    )
+    parser.add_argument(
+        "--attention-modes",
+        nargs="+",
+        choices=["standard", "relative"],
+        default=attention_mode_range,
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = [
+        list(c)
+        for c in build_configs(
+            batch_size=args.batch_sizes,
+            q_seq_length_range=args.q_seq_lengths,
+            head_dim_no_page=args.head_dims_no_page,
+            head_dim_paged=args.head_dims_paged,
+            num_heads_q=args.num_heads_q,
+            num_heads_kv=args.num_heads_kv,
+            kv_seq_length_range=args.kv_seq_lengths,
+            page_size_range=args.page_sizes,
+            kv_dtype_range=args.kv_dtypes,
+            attention_mode_range=args.attention_modes,
+        )
+    ]
+
     torch.manual_seed(42)
     if hasattr(torch.xpu, "manual_seed_all"):
         torch.xpu.manual_seed_all(42)

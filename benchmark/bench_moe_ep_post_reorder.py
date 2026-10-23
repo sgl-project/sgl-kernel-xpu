@@ -21,10 +21,10 @@ configs = [(bs,) for bs in batch_sizes]
         args={},
     )
 )
-def benchmark(batch_size, provider):
+def benchmark(batch_size, provider, hidden_size=4096, topk=8):
     dtype = torch.bfloat16
     device = torch.device("cuda")
-    hidden_size, topk, start_expert_id, end_expert_id, block_size = 4096, 8, 0, 255, 512
+    start_expert_id, end_expert_id, block_size = 0, 255, 512
 
     def alloc_tensors():
         down_output = torch.randn(
@@ -89,4 +89,13 @@ def benchmark(batch_size, provider):
 
 
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=batch_sizes)
+    parser.add_argument("--hidden-size", type=int, default=4096)
+    parser.add_argument("--topk", type=int, default=8)
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = [[bs] for bs in args.batch_sizes]
+
+    benchmark.run(print_data=True, hidden_size=args.hidden_size, topk=args.topk)

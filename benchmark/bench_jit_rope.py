@@ -1,5 +1,6 @@
 """Benchmark AOT vs JIT RoPE kernel implementations."""
 
+import argparse
 import importlib.util
 import itertools
 
@@ -143,6 +144,33 @@ def benchmark(batch_size, head_dim, num_heads, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_sizes,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--head-dims",
+        nargs="+",
+        type=int,
+        default=head_dims,
+        help="Head dims to sweep",
+    )
+    parser.add_argument(
+        "--num-heads",
+        nargs="+",
+        type=int,
+        default=num_heads_configs,
+        help="Head counts to sweep",
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(args.batch_sizes, args.head_dims, args.num_heads)
+    )
+
     if not HAS_AOT:
         print("ERROR: sgl_kernel (AOT) not available. Please install sgl-kernel-xpu.")
         exit(1)

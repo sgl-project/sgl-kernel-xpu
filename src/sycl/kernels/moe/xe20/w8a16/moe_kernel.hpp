@@ -36,7 +36,7 @@ template <
     typename TiledMMA,
     bool WeightScalePerExpert = false,
     bool WeightScaleBlocked = false>
-class Fp8W8A16Kernel {
+class W8A16Kernel {
  public:
   using ElementA = cutlass::bfloat16_t;
   using ElementD = cutlass::bfloat16_t;
@@ -47,7 +47,7 @@ class Fp8W8A16Kernel {
 
   constexpr static int Stages = 3;
   using MainloopDispatchPolicy = moe_w8a16::W8A16MainloopPolicy<Stages>;
-  using CollectiveMainloop = Fp8W8A16Mainloop<
+  using CollectiveMainloop = W8A16Mainloop<
       MainloopDispatchPolicy,
       TiledCopyA,
       TiledCopyBPacked,
@@ -62,7 +62,7 @@ class Fp8W8A16Kernel {
   struct Params {
     const uint8_t* Activations;    // [M_total, K] bf16 bytes
     const uint8_t* PackedWeights;  // [num_experts, N, K] fp8 e4m3 raw bytes
-    const float* WeightScales;     // Per-expert scalar or [E, ceil(N/128), K/128] block scales
+    const void* WeightScales;      // Per-expert scalar, block scales, or uint8 MXFP8 scales
     const float* Bias;
     ElementD* Outputs;
     const int32_t* M_per_group;
@@ -72,7 +72,7 @@ class Fp8W8A16Kernel {
     int32_t* workspace;
     TiledMMA mma;
     int32_t ld_b;
-    int32_t weight_scale_count;
+    int32_t scale_mode;
     bool static_scheduler = false;
   };
 
@@ -113,8 +113,9 @@ class Fp8W8A16Kernel {
     int group_range = item.get_group_range(1);
     int32_t thr_id = int32_t(item.get_local_linear_id());
 
-    const int64_t K_scale = K / FP8_GROUP_SIZE_K;
-    int64_t scale_n = WeightScalePerExpert ? params.weight_scale_count : (N + 127) / 128;
+    const bool is_mxfp8 = (params.scale_mode == static_cast<int32_t>(ScaleMode::BlockMXFP8));
+    const int64_t K_scale = is_mxfp8 ? (K / 32) : (K / FP8_GROUP_SIZE_K);
+    int64_t scale_n = WeightScalePerExpert ? params.scale_mode : (is_mxfp8 ? N : (N + 127) / 128);
 
     int pre_rows = 0;
     int pre_tiles = 0;
@@ -136,7 +137,9 @@ class Fp8W8A16Kernel {
 
       uint8_t* ptr_A_curr_batch = const_cast<uint8_t*>(params.Activations) + pre_rows * K * sizeof(ElementA);
       uint8_t* ptr_B_curr_batch = const_cast<uint8_t*>(params.PackedWeights) + B_offset;
-      float* ptr_S_curr_batch = const_cast<float*>(params.WeightScales) + S_offset;
+      const void* ptr_S_curr_batch =
+          is_mxfp8 ? static_cast<const void*>(static_cast<const uint8_t*>(params.WeightScales) + S_offset)
+                   : static_cast<const void*>(static_cast<const float*>(params.WeightScales) + S_offset);
       const float* ptr_Bias_curr_batch =
           params.Bias == nullptr ? nullptr : params.Bias + static_cast<int64_t>(expert_id) * N;
 
@@ -150,9 +153,15 @@ class Fp8W8A16Kernel {
 
         auto tile_coord = make_coord(m_coord, n_coord, _, 0);
         if constexpr (WeightScalePerExpert) {
-          if (params.weight_scale_count == 1) {
+          if (params.scale_mode == static_cast<int32_t>(ScaleMode::ScalarSingle)) {
             moe_xe20::xe_gemm<void, void, void>(
-                A_tensor, B_tensor, ptr_S_curr_batch, ptr_Bias_curr_batch, D_tensor, tile_coord, mma);
+                A_tensor,
+                B_tensor,
+                static_cast<const float*>(ptr_S_curr_batch),
+                ptr_Bias_curr_batch,
+                D_tensor,
+                tile_coord,
+                mma);
           } else {
             CollectiveMainloop mainloop;
             mainloop(
@@ -165,12 +174,23 @@ class Fp8W8A16Kernel {
                 mma,
                 thr_id,
                 ptr_Bias_curr_batch,
-                N);
+                N,
+                params.scale_mode);
           }
         } else {
           CollectiveMainloop mainloop;
           mainloop(
-              A_tensor, B_tensor, ptr_S_curr_batch, K_scale, D_tensor, tile_coord, mma, thr_id, ptr_Bias_curr_batch, N);
+              A_tensor,
+              B_tensor,
+              ptr_S_curr_batch,
+              K_scale,
+              D_tensor,
+              tile_coord,
+              mma,
+              thr_id,
+              ptr_Bias_curr_batch,
+              N,
+              params.scale_mode);
         }
 
         if (params.static_scheduler) {
@@ -189,4 +209,5 @@ class Fp8W8A16Kernel {
     }
   };
 };
+
 }  // namespace moe_w8a16

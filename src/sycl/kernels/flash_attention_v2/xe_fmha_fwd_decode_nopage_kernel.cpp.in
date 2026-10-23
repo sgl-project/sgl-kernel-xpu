@@ -37,6 +37,7 @@
 // parameter) so its kernel instantiations land in shared libraries separate
 // from the paged decode path. Non-paged decode supports bf16/fp16 queries only
 // (no fp8 KV cache, no split-KV).
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
 #include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
@@ -73,10 +74,13 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   if (params.return_softmax_lse) {
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       using Element = @ELEM_TYPE@;
+      dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
       DecodeConfig<
           false,
           LocalMask,
           false,
+          Softcap,
           /*LSE=*/true,
           TileShapeQK_NP,
           TileShapePV_NP,
@@ -89,16 +93,20 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
           Element,
           Element,
           Element>::run_nopaged(params);
+      });
     });
     return;
   }
   // No sink support for no_page path; always use Sink=false
   AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
     using Element = @ELEM_TYPE@;
+    dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
     DecodeConfig<
         false,
         LocalMask,
         false,
+        Softcap,
         /*LSE=*/false,
         TileShapeQK_NP,
         TileShapePV_NP,
@@ -111,6 +119,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
         Element,
         Element,
         Element>::run_nopaged(params);
+    });
   });
 }
 

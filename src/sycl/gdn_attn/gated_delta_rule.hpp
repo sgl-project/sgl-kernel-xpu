@@ -527,6 +527,527 @@ struct gated_delta_rule_spec_kernel {
   const int head_v_dim;
 };
 
+// ---------------------------------------------------------------------------
+// Verify-mode (speculative-decode target_verify) recurrent kernel.
+//
+// Unlike `gated_delta_rule_spec_kernel` above (which indexes the COMMITTED
+// state pool with a 2D `[num_spec_decodes, num_speculative_tokens + 1]` index
+// and a `num_accepted_tokens` column selector -- the vLLM-style convention),
+// this kernel follows SGLang's native `target_verify` contract, i.e. the same
+// convention already used by the Triton / KDA recurrent verify kernels
+// (`fused_sigmoid_gating_delta_rule_update` in
+// `sglang/kernels/ops/attention/fla/fused_sigmoid_gating_recurrent.py`):
+//   - `cache_indices` is a plain 1D `[num_spec_decodes]` index into the
+//     COMMITTED `ssm_state` pool (same convention as decode/extend), used only
+//     to SEED this round's initial state. It is never written back to: the
+//     round's real outcome (how many draft tokens got accepted) isn't known
+//     until after sampling, so the committed pool must stay untouched here.
+//   - Every draft position's post-update state is snapshotted into a
+//     dedicated scratch buffer, `intermediate_states_buffer`
+//     (`[scratch_rows, cache_steps, num_v_heads, head_v_dim, head_k_dim]`,
+//     contiguous), at row `intermediate_state_indices[batch_id]`. The caller
+//     commits the accepted-length row into the committed pool afterwards
+//     (SGLang's `update_mamba_state_after_mtp_verify`), once acceptance is
+//     known -- mirroring how Triton/KDA verify already works, and reusing
+//     the same scratch pool/indices SGLang already builds for them.
+//   - `retrieve_parent_token` (optional) supports EAGLE tree-shaped drafts:
+//     for step `t_local != 0`, the state is reloaded from the parent
+//     position's own snapshot (within the same request's scratch row)
+//     instead of carried forward sequentially. `nullptr` selects the fast
+//     chain-only path (register-carried state, no extra scratch reload).
+template <typename T, typename StateT, typename index_t, int k_bucket_size>
+struct gated_delta_rule_verify_kernel {
+ public:
+  static constexpr int group_size = 32;
+  static constexpr int sg_per_group = group_size / sub_group_size;  // == 1
+  static constexpr int v_dim_per_sg = 4;
+  static constexpr int v_dim_per_group = v_dim_per_sg * sg_per_group;
+  static constexpr float eps = 0.000001;
+
+  gated_delta_rule_verify_kernel(
+      T* core_attn_out,
+      const T* q,
+      const T* k,
+      const T* v,
+      const T* b,
+      const T* a,
+      const float* A_log,
+      const T* dt_bias,
+      const StateT* ssm_state,
+      const int ssm_state_stride_0,
+      const int* token_indx,
+      const int* cache_indices,
+      StateT* intermediate_states_buffer,
+      const int intermediate_states_stride_0,
+      const int* intermediate_state_indices,
+      const index_t* retrieve_parent_token,
+      const int num_spec_decodes,
+      const int num_spec_tokens,
+      const int num_k_heads,
+      const int head_k_dim,
+      const int num_v_heads,
+      const int head_v_dim)
+      : core_attn_out(core_attn_out),
+        q(q),
+        k(k),
+        v(v),
+        b(b),
+        a(a),
+        A_log(A_log),
+        dt_bias(dt_bias),
+        ssm_state(ssm_state),
+        ssm_state_stride_0(ssm_state_stride_0),
+        token_indx(token_indx),
+        cache_indices(cache_indices),
+        intermediate_states_buffer(intermediate_states_buffer),
+        intermediate_states_stride_0(intermediate_states_stride_0),
+        intermediate_state_indices(intermediate_state_indices),
+        retrieve_parent_token(retrieve_parent_token),
+        num_spec_decodes(num_spec_decodes),
+        num_spec_tokens(num_spec_tokens),
+        num_k_heads(num_k_heads),
+        head_k_dim(head_k_dim),
+        num_v_heads(num_v_heads),
+        head_v_dim(head_v_dim) {}
+
+  static inline sycl::nd_range<3>
+  get_nd_range(const int num_spec_decodes, const int num_v_heads, const int head_v_dim) {
+    int num_v_bucket = (head_v_dim + v_dim_per_group - 1) / v_dim_per_group;
+    sycl::range<3> local(1, 1, group_size);
+    sycl::range<3> global(num_spec_decodes, num_v_heads, num_v_bucket);
+    return sycl::nd_range<3>(global * local, local);
+  }
+
+  static inline float act_sigmoid(float& x) {
+    return 1.0f / (1.0f + sycl::exp(-x));
+  }
+
+  static inline float act_softplus(float& x, float beta = 1.0f, float threshold = 20.0f) {
+    if (beta * x < threshold) {
+      return sycl::log(1.0f + sycl::exp(beta * x)) / beta;
+    } else
+      return x;
+  }
+
+  [[sycl::reqd_sub_group_size(sub_group_size)]] void operator()(sycl::nd_item<3> item) const {
+    int batch_id = item.get_group(0);
+    int num_v_heads_id = item.get_group(1);
+    int v_bucket_id = item.get_group(2);
+
+    auto sg = item.get_sub_group();
+    int sg_id = sg.get_group_id();
+    int sg_local_id = sg.get_local_id();
+
+    int kv_ratio = num_v_heads / num_k_heads;
+    int head_v_dim_id = v_bucket_id * v_dim_per_group + sg_id * v_dim_per_sg;
+    if (head_v_dim_id >= head_v_dim) {
+      return;
+    }
+
+    const float scale = 1.0f / sycl::sqrt(float(head_k_dim));
+    float A_log_local = A_log[num_v_heads_id];
+    float dt_bias_local = dt_bias[num_v_heads_id];
+    A_log_local = -sycl::exp(A_log_local);
+
+    float state_local[v_dim_per_sg * k_bucket_size];
+    float q_local[k_bucket_size];
+    float k_local[k_bucket_size];
+    float v_local[v_dim_per_sg];
+
+    // -- Seed from the COMMITTED pool (read-only; never written back here) ---
+    const int seed_idx = cache_indices[batch_id];
+    const StateT* seed_state_ptr = ssm_state + static_cast<int64_t>(seed_idx) * ssm_state_stride_0;
+#pragma unroll
+    for (int j = 0; j < v_dim_per_sg; ++j) {
+#pragma unroll
+      for (int i = 0; i < k_bucket_size; ++i) {
+        state_local[j * k_bucket_size + i] =
+            static_cast<float>(seed_state_ptr
+                                   [num_v_heads_id * head_k_dim * head_v_dim + (k_bucket_size * sg_local_id + i) +
+                                    (head_v_dim_id + j) * head_k_dim]);
+      }
+    }
+
+    // Per-request scratch row this batch element snapshots into.
+    const int cache_row = intermediate_state_indices[batch_id];
+    StateT* scratch_base = intermediate_states_buffer + static_cast<int64_t>(cache_row) * intermediate_states_stride_0;
+    const int step_stride = num_v_heads * head_k_dim * head_v_dim;
+
+    // -- Iterate over the num_spec_tokens tokens of this sequence -------------
+    for (int t_local = 0; t_local < num_spec_tokens; ++t_local) {
+      // Tree attention: reload the parent step's snapshot from this
+      // request's own scratch row instead of carrying state_local forward.
+      // step_idx == 0 always keeps the seeded state above.
+      if (retrieve_parent_token != nullptr && t_local != 0) {
+        int parent_step = static_cast<int>(retrieve_parent_token[batch_id * num_spec_tokens + t_local]);
+        if (parent_step >= 0) {
+          const StateT* parent_ptr = scratch_base + static_cast<int64_t>(parent_step) * step_stride;
+#pragma unroll
+          for (int j = 0; j < v_dim_per_sg; ++j) {
+#pragma unroll
+            for (int i = 0; i < k_bucket_size; ++i) {
+              state_local[j * k_bucket_size + i] =
+                  static_cast<float>(parent_ptr
+                                         [num_v_heads_id * head_k_dim * head_v_dim + (k_bucket_size * sg_local_id + i) +
+                                          (head_v_dim_id + j) * head_k_dim]);
+            }
+          }
+        }
+      }
+
+      const int t = batch_id * num_spec_tokens + t_local;
+
+      float b_local = b[t * num_v_heads + num_v_heads_id];
+      float beta = act_sigmoid(b_local);
+      float a_local = a[t * num_v_heads + num_v_heads_id] + dt_bias_local;
+      float g = sycl::exp(A_log_local * act_softplus(a_local));
+
+      float q_sum = 0.0f;
+      float k_sum = 0.0f;
+#pragma unroll
+      for (int i = 0; i < k_bucket_size; ++i) {
+        q_local[i] =
+            q[t * num_k_heads * head_k_dim + (num_v_heads_id / kv_ratio) * head_k_dim +
+              (k_bucket_size * sg_local_id + i)];
+        k_local[i] =
+            k[t * num_k_heads * head_k_dim + (num_v_heads_id / kv_ratio) * head_k_dim +
+              (k_bucket_size * sg_local_id + i)];
+        q_sum += q_local[i] * q_local[i];
+        k_sum += k_local[i] * k_local[i];
+      }
+      q_sum = sycl::reduce_over_group(sg, q_sum, sycl::plus<>());
+      k_sum = sycl::reduce_over_group(sg, k_sum, sycl::plus<>());
+      q_sum += eps;
+      k_sum += eps;
+#pragma unroll
+      for (int i = 0; i < k_bucket_size; ++i) {
+        q_local[i] /= sycl::sqrt(q_sum);
+        q_local[i] *= scale;
+        k_local[i] /= sycl::sqrt(k_sum);
+      }
+
+      float kv_mem[v_dim_per_sg];
+#pragma unroll
+      for (int i = 0; i < v_dim_per_sg; ++i) {
+        kv_mem[i] = 0.0f;
+      }
+#pragma unroll
+      for (int j = 0; j < v_dim_per_sg; ++j) {
+#pragma unroll
+        for (int i = 0; i < k_bucket_size; ++i) {
+          state_local[j * k_bucket_size + i] *= g;
+          kv_mem[j] += state_local[j * k_bucket_size + i] * k_local[i];
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < v_dim_per_sg; ++i) {
+        kv_mem[i] = sycl::reduce_over_group(sg, kv_mem[i], sycl::plus<>());
+      }
+
+#pragma unroll
+      for (int i = 0; i < v_dim_per_sg; ++i) {
+        v_local[i] = v[t * num_v_heads * head_v_dim + num_v_heads_id * head_v_dim + head_v_dim_id + i];
+      }
+      float delta[v_dim_per_sg];
+#pragma unroll
+      for (int i = 0; i < v_dim_per_sg; ++i) {
+        delta[i] = (v_local[i] - kv_mem[i]) * beta;
+      }
+
+      float res[v_dim_per_sg];
+#pragma unroll
+      for (int i = 0; i < v_dim_per_sg; ++i) {
+        res[i] = 0.0f;
+      }
+#pragma unroll
+      for (int j = 0; j < v_dim_per_sg; ++j) {
+#pragma unroll
+        for (int i = 0; i < k_bucket_size; ++i) {
+          state_local[j * k_bucket_size + i] += k_local[i] * delta[j];
+          res[j] += state_local[j * k_bucket_size + i] * q_local[i];
+        }
+      }
+#pragma unroll
+      for (int i = 0; i < v_dim_per_sg; ++i) {
+        res[i] = sycl::reduce_over_group(sg, res[i], sycl::plus<>());
+      }
+
+      // Write O(t) to GLOBAL core_attn_out via token_indx remap.
+      if (sg_local_id == 0) {
+        const int global_t = (token_indx != nullptr) ? token_indx[t] : t;
+#pragma unroll
+        for (int i = 0; i < v_dim_per_sg; ++i) {
+          core_attn_out[global_t * num_v_heads * head_v_dim + num_v_heads_id * head_v_dim + head_v_dim_id + i] = res[i];
+        }
+      }
+
+      // Snapshot this step's post-update state into the scratch buffer (NOT
+      // the committed pool -- see the struct-level comment above).
+      StateT* step_ptr = scratch_base + static_cast<int64_t>(t_local) * step_stride;
+#pragma unroll
+      for (int j = 0; j < v_dim_per_sg; ++j) {
+#pragma unroll
+        for (int i = 0; i < k_bucket_size; ++i) {
+          step_ptr
+              [num_v_heads_id * head_k_dim * head_v_dim + (k_bucket_size * sg_local_id + i) +
+               (head_v_dim_id + j) * head_k_dim] = static_cast<StateT>(state_local[j * k_bucket_size + i]);
+        }
+      }
+    }
+  }
+
+ private:
+  T* core_attn_out;
+  const T* q;
+  const T* k;
+  const T* v;
+  const T* b;
+  const T* a;
+  const float* A_log;
+  const T* dt_bias;
+  const StateT* ssm_state;
+  const int ssm_state_stride_0;
+  const int* token_indx;
+  const int* cache_indices;
+  StateT* intermediate_states_buffer;
+  const int intermediate_states_stride_0;
+  const int* intermediate_state_indices;
+  const index_t* retrieve_parent_token;
+  const int num_spec_decodes;
+  const int num_spec_tokens;
+  const int num_k_heads;
+  const int head_k_dim;
+  const int num_v_heads;
+  const int head_v_dim;
+};
+
+template <typename T, typename StateT, typename index_t, int k_bucket_size>
+void kernel_launcher_verify(
+    sycl::queue& queue,
+    T* core_attn_out,
+    const T* q,
+    const T* k,
+    const T* v,
+    const T* b,
+    const T* a,
+    const float* A_log,
+    const T* dt_bias,
+    const StateT* ssm_state,
+    const int ssm_state_stride_0,
+    const int* token_indx,
+    const int* cache_indices,
+    StateT* intermediate_states_buffer,
+    const int intermediate_states_stride_0,
+    const int* intermediate_state_indices,
+    const index_t* retrieve_parent_token,
+    const int num_spec_decodes,
+    const int num_spec_tokens,
+    const int num_k_heads,
+    const int head_k_dim,
+    const int num_v_heads,
+    const int head_v_dim) {
+  using KERNEL = gated_delta_rule_verify_kernel<T, StateT, index_t, k_bucket_size>;
+  auto range = KERNEL::get_nd_range(num_spec_decodes, num_v_heads, head_v_dim);
+  assert(head_v_dim % KERNEL::v_dim_per_group == 0);
+  queue.submit([&](sycl::handler& cgh) {
+    KERNEL task(
+        core_attn_out,
+        q,
+        k,
+        v,
+        b,
+        a,
+        A_log,
+        dt_bias,
+        ssm_state,
+        ssm_state_stride_0,
+        token_indx,
+        cache_indices,
+        intermediate_states_buffer,
+        intermediate_states_stride_0,
+        intermediate_state_indices,
+        retrieve_parent_token,
+        num_spec_decodes,
+        num_spec_tokens,
+        num_k_heads,
+        head_k_dim,
+        num_v_heads,
+        head_v_dim);
+    cgh.parallel_for(range, task);
+  });
+}
+
+// Speculative-decode target_verify entry point, using SGLang's native
+// convention -- see `gated_delta_rule_verify_kernel` above for the full
+// contract. Never mutates `ssm_state` (the committed pool); only writes
+// per-draft-token snapshots into `intermediate_states_buffer`.
+void gated_delta_rule_verify(
+    sycl::queue& queue,
+    torch::Tensor& core_attn_out,                     // [num_spec_decodes * num_spec_tokens,
+                                                      // num_v_heads, head_v_dim]
+    const torch::Tensor& q,                           // [num_spec_decodes * num_spec_tokens,
+                                                      // num_k_heads, head_k_dim]
+    const torch::Tensor& k,                           // same shape as q
+    const torch::Tensor& v,                           // [.., num_v_heads, head_v_dim]
+    const torch::Tensor& b,                           // [.., num_v_heads]
+    const torch::Tensor& a,                           // [.., num_v_heads]
+    const torch::Tensor& A_log,                       // [num_v_heads]
+    const torch::Tensor& dt_bias,                     // [num_v_heads]
+    const torch::Tensor& ssm_state,                   // committed pool, [cache_batch_size,
+                                                      // num_v_heads, head_v_dim, head_k_dim];
+                                                      // read-only, never written here
+    const torch::Tensor& cache_indices,               // [num_spec_decodes], row into ssm_state
+    torch::Tensor& intermediate_states_buffer,        // [scratch_rows, cache_steps, num_v_heads,
+                                                      // head_v_dim, head_k_dim]
+    const torch::Tensor& intermediate_state_indices,  // [num_spec_decodes], row into the buffer above
+    const int64_t cache_steps,
+    const std::optional<torch::Tensor>& token_indx,               // [num_spec_decodes * num_spec_tokens] or None
+    const std::optional<torch::Tensor>& retrieve_parent_token) {  // [num_spec_decodes, num_spec_tokens] or None
+  TORCH_CHECK(cache_indices.dim() == 1, "cache_indices must be 1D of shape [num_spec_decodes]");
+  TORCH_CHECK(
+      intermediate_state_indices.dim() == 1, "intermediate_state_indices must be 1D of shape [num_spec_decodes]");
+  TORCH_CHECK(cache_indices.dtype() == torch::kInt32, "cache_indices must be int32");
+  TORCH_CHECK(cache_indices.is_xpu() && cache_indices.is_contiguous(), "cache_indices must be a contiguous XPU tensor");
+  TORCH_CHECK(intermediate_state_indices.dtype() == torch::kInt32, "intermediate_state_indices must be int32");
+  TORCH_CHECK(
+      intermediate_state_indices.is_xpu() && intermediate_state_indices.is_contiguous(),
+      "intermediate_state_indices must be a contiguous XPU tensor");
+  TORCH_CHECK(
+      intermediate_states_buffer.is_xpu() && intermediate_states_buffer.is_contiguous(),
+      "intermediate_states_buffer must be a contiguous XPU tensor");
+  TORCH_CHECK(
+      intermediate_states_buffer.dim() == 5,
+      "intermediate_states_buffer must be 5D of shape [scratch_rows, cache_steps, "
+      "num_v_heads, head_v_dim, head_k_dim]");
+  TORCH_CHECK(
+      intermediate_states_buffer.size(1) == cache_steps, "intermediate_states_buffer.size(1) must equal cache_steps");
+
+  const int num_spec_decodes = cache_indices.size(0);
+  TORCH_CHECK(intermediate_state_indices.size(0) == num_spec_decodes);
+  TORCH_CHECK(num_spec_decodes > 0 && q.size(0) % num_spec_decodes == 0);
+  const int num_spec_tokens = q.size(0) / num_spec_decodes;
+  TORCH_CHECK(
+      num_spec_tokens <= cache_steps,
+      "num_spec_tokens (draft window length) must not exceed cache_steps "
+      "(intermediate_states_buffer capacity per row)");
+
+  const int num_k_heads = q.size(1);
+  const int head_k_dim = q.size(2);
+  const int num_v_heads = v.size(1);
+  const int head_v_dim = v.size(2);
+  const int ssm_state_stride_0 = ssm_state.stride(0);
+  const int intermediate_states_stride_0 = intermediate_states_buffer.stride(0);
+
+  if (retrieve_parent_token.has_value()) {
+    TORCH_CHECK(
+        retrieve_parent_token->dtype() == torch::kInt32 || retrieve_parent_token->dtype() == torch::kInt64,
+        "retrieve_parent_token must be int32 or int64");
+    TORCH_CHECK(
+        retrieve_parent_token->size(0) == num_spec_decodes && retrieve_parent_token->size(1) == num_spec_tokens,
+        "retrieve_parent_token must be [num_spec_decodes, num_spec_tokens]");
+    TORCH_CHECK(retrieve_parent_token->is_xpu(), "retrieve_parent_token must be an XPU tensor");
+    TORCH_CHECK(retrieve_parent_token->is_contiguous(), "retrieve_parent_token must be contiguous");
+  }
+
+  TORCH_CHECK(num_v_heads % num_k_heads == 0);
+  TORCH_CHECK(A_log.scalar_type() == at::kFloat, "A_log dtype must be float32, but got ", A_log.scalar_type());
+  TORCH_CHECK(
+      dt_bias.scalar_type() == core_attn_out.scalar_type(),
+      "dt_bias dtype must match core_attn_out dtype (float16/bfloat16), but "
+      "got dt_bias=",
+      dt_bias.scalar_type(),
+      ", core_attn_out=",
+      core_attn_out.scalar_type());
+  TORCH_CHECK(
+      intermediate_states_buffer.scalar_type() == ssm_state.scalar_type(),
+      "intermediate_states_buffer dtype must match ssm_state dtype");
+
+  TORCH_CHECK(head_k_dim % sub_group_size == 0);
+  const int k_bucket_size = head_k_dim / sub_group_size;
+
+#define VERIFY_KERNEL_LAUNCHER(scalar_t, state_scalar_t, k_bucket_size)                                \
+  kernel_launcher_verify<scalar_t, state_scalar_t, index_scalar_t, k_bucket_size>(                     \
+      queue,                                                                                           \
+      reinterpret_cast<scalar_t*>(core_attn_out.data_ptr()),                                           \
+      reinterpret_cast<scalar_t*>(q.data_ptr()),                                                       \
+      reinterpret_cast<scalar_t*>(k.data_ptr()),                                                       \
+      reinterpret_cast<scalar_t*>(v.data_ptr()),                                                       \
+      reinterpret_cast<scalar_t*>(b.data_ptr()),                                                       \
+      reinterpret_cast<scalar_t*>(a.data_ptr()),                                                       \
+      reinterpret_cast<float*>(A_log.data_ptr()),                                                      \
+      reinterpret_cast<scalar_t*>(dt_bias.data_ptr()),                                                 \
+      reinterpret_cast<state_scalar_t*>(ssm_state.data_ptr()),                                         \
+      ssm_state_stride_0,                                                                              \
+      token_indx.has_value() ? reinterpret_cast<int*>(token_indx->data_ptr()) : nullptr,               \
+      reinterpret_cast<int*>(cache_indices.data_ptr()),                                                \
+      reinterpret_cast<state_scalar_t*>(intermediate_states_buffer.data_ptr()),                        \
+      intermediate_states_stride_0,                                                                    \
+      reinterpret_cast<int*>(intermediate_state_indices.data_ptr()),                                   \
+      retrieve_parent_token.has_value() ? retrieve_parent_token->data_ptr<index_scalar_t>() : nullptr, \
+      num_spec_decodes,                                                                                \
+      num_spec_tokens,                                                                                 \
+      num_k_heads,                                                                                     \
+      head_k_dim,                                                                                      \
+      num_v_heads,                                                                                     \
+      head_v_dim);
+
+#define VERIFY_BUCKET_DISPATCH(scalar_t, state_scalar_t, k_bucket_size) \
+  switch (k_bucket_size) {                                              \
+    case 1:                                                             \
+      VERIFY_KERNEL_LAUNCHER(scalar_t, state_scalar_t, 1)               \
+      break;                                                            \
+    case 2:                                                             \
+      VERIFY_KERNEL_LAUNCHER(scalar_t, state_scalar_t, 2)               \
+      break;                                                            \
+    case 4:                                                             \
+      VERIFY_KERNEL_LAUNCHER(scalar_t, state_scalar_t, 4)               \
+      break;                                                            \
+    case 8:                                                             \
+      VERIFY_KERNEL_LAUNCHER(scalar_t, state_scalar_t, 8)               \
+      break;                                                            \
+    default:                                                            \
+      TORCH_CHECK(false);                                               \
+  }
+
+#define VERIFY_DISPATCH_STATE_DTYPE(scalar_t)                                                                    \
+  do {                                                                                                           \
+    if (ssm_state.scalar_type() == at::kFloat) {                                                                 \
+      using state_scalar_t = float;                                                                              \
+      VERIFY_BUCKET_DISPATCH(scalar_t, state_scalar_t, k_bucket_size)                                            \
+    } else if (ssm_state.scalar_type() == at::kBFloat16) {                                                       \
+      using state_scalar_t = sycl::ext::oneapi::bfloat16;                                                        \
+      VERIFY_BUCKET_DISPATCH(scalar_t, state_scalar_t, k_bucket_size)                                            \
+    } else if (ssm_state.scalar_type() == at::kHalf) {                                                           \
+      using state_scalar_t = sycl::half;                                                                         \
+      VERIFY_BUCKET_DISPATCH(scalar_t, state_scalar_t, k_bucket_size)                                            \
+    } else {                                                                                                     \
+      TORCH_CHECK(false, "ssm_state dtype must be float32/float16/bfloat16, but got ", ssm_state.scalar_type()); \
+    }                                                                                                            \
+  } while (0)
+
+  auto launch_for_index = [&](auto index_value) {
+    using index_scalar_t = decltype(index_value);
+    if (core_attn_out.scalar_type() == at::kBFloat16) {
+      using scalar_t = sycl::ext::oneapi::bfloat16;
+      VERIFY_DISPATCH_STATE_DTYPE(scalar_t);
+    } else if (core_attn_out.scalar_type() == at::kHalf) {
+      using scalar_t = sycl::half;
+      VERIFY_DISPATCH_STATE_DTYPE(scalar_t);
+    } else {
+      using scalar_t = float;
+      VERIFY_DISPATCH_STATE_DTYPE(scalar_t);
+    }
+  };
+  if (retrieve_parent_token.has_value() && retrieve_parent_token->scalar_type() == at::kLong) {
+    launch_for_index(int64_t{});
+  } else {
+    launch_for_index(int32_t{});
+  }
+#undef VERIFY_DISPATCH_STATE_DTYPE
+#undef VERIFY_BUCKET_DISPATCH
+#undef VERIFY_KERNEL_LAUNCHER
+}
+
 template <typename T, typename StateT, int k_bucket_size>
 void kernel_launcher(
     sycl::queue& queue,

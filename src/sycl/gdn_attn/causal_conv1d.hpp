@@ -72,8 +72,8 @@ struct causal_conv1d_kernel {
         act_mode(act_mode),
         pad_slot_id(pad_slot_id),
         batch_size(batch_size),
-        num_actual_tokens(num_actual_tokens),
         num_virtual_tokens(num_virtual_tokens),
+        num_actual_tokens(num_actual_tokens),
         num_k_heads(num_k_heads),
         head_k_dim(head_k_dim),
         num_v_heads(num_v_heads),
@@ -431,7 +431,8 @@ struct update_states_kernel {
     int states_id = cache_indices[batch_id];
     T* conv_states_ptr = conv_states + states_id * conv_states_stride_0;
     const T* conv_states_tmp_ptr = conv_states_tmp + batch_id * (width - 1) * conv_elems;
-    for (int i = elems_start_offset_group + local_id; i < (local_group_id + 1) * elems_per_group; i += group_size) {
+    for (int i = elems_start_offset_group + local_id; i < (local_group_id + 1) * elems_per_group && i < conv_elems;
+         i += group_size) {
       conv_states_ptr[width_id * conv_w_stride + i * conv_d_stride] = conv_states_tmp_ptr[width_id * conv_elems + i];
     }
   }
@@ -845,7 +846,7 @@ void kernel_launcher(
     const int& qkvz_elems,
     const int& conv_elems,
     const int& num_prefills,
-    const int& num_decodes,
+    [[maybe_unused]] const int& num_decodes,
     const int& num_spec_decodes,
     const int& num_spec_tokens) {
   // Spec path: state writeback happens inside the spec kernel, so we do not

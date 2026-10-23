@@ -7,6 +7,7 @@
 #include <type_traits>
 
 #include "Compress.h"
+#include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
@@ -323,6 +324,11 @@ SGL_KERNEL_EXPORT void flash_compress128_decode(
   const uint32_t num_split = static_cast<uint32_t>(head_dim / kTileDim);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   using input_t = float;
   using output_t = float;
   SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress128Decode", [&]() {
@@ -346,6 +352,17 @@ SGL_KERNEL_EXPORT void flash_compress128_decode(
       cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(kBlockSize)), kernel);
     });
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Compress-128 decode: gather 128 tokens per batch, project into head_dim with APE.
+  const double flops = 2.0 * static_cast<double>(batch_size) * 128.0 * static_cast<double>(head_dim);
+  const double bytes =
+      static_cast<double>(batch_size) * static_cast<double>(elem_size) * static_cast<double>(kv_input.element_size()) +
+      static_cast<double>(batch_size) * 128.0 * static_cast<double>(elem_size) *
+          static_cast<double>(kv_buffer.element_size()) +
+      static_cast<double>(batch_size) * static_cast<double>(head_dim) * static_cast<double>(kv_output.element_size());
+  ::sglkernel::report_kernel_perf("flash_compress128_decode", queue, timer, bytes, flops);
+#endif
 }
 
 SGL_KERNEL_EXPORT void flash_compress128_prefill(
@@ -398,6 +415,11 @@ SGL_KERNEL_EXPORT void flash_compress128_prefill(
   const uint32_t num_split = static_cast<uint32_t>(head_dim / kTileDim);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   using input_t = float;
   using output_t = float;
   SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress128Prefill", [&]() {
@@ -439,6 +461,18 @@ SGL_KERNEL_EXPORT void flash_compress128_prefill(
       });
     }
   });
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Compress-128 prefill: compress step (num_compress rows) + write step (num_write rows).
+  const double compress_flops = 2.0 * static_cast<double>(num_compress) * 128.0 * static_cast<double>(head_dim);
+  const double write_flops = 2.0 * static_cast<double>(num_write) * static_cast<double>(elem_size);
+  const double flops = compress_flops + write_flops;
+  const double bytes =
+      static_cast<double>(kv_input.numel()) * static_cast<double>(kv_input.element_size()) +
+      static_cast<double>(kv_output.numel()) * static_cast<double>(kv_output.element_size()) +
+      static_cast<double>(num_write) * static_cast<double>(elem_size) * static_cast<double>(kv_buffer.element_size());
+  ::sglkernel::report_kernel_perf("flash_compress128_prefill", queue, timer, bytes, flops);
+#endif
 }
 
 }  // namespace at::native::xpu

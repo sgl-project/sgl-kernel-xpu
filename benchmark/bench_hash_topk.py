@@ -163,15 +163,40 @@ def get_benchmark(device: str = "xpu"):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    dtype_map = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num-tokens", nargs="+", type=int, default=[1, 64, 1024, 4096]
+    )
+    parser.add_argument("--num-routed-experts", nargs="+", type=int, default=[256, 384])
+    parser.add_argument("--topk-routed", nargs="+", type=int, default=[6])
+    parser.add_argument(
+        "--num-fused-shared-experts",
+        nargs="+",
+        type=int,
+        choices=[0, 1],
+        default=[0, 1],
+    )
+    parser.add_argument(
+        "--dtypes", nargs="+", choices=list(dtype_map), default=["float32"]
+    )
+    args = parser.parse_args()
+
     if not torch.xpu.is_available():
         raise RuntimeError("XPU is required for bench_hash_topk.py")
 
     sweep_params = {
-        "num_tokens": [1, 64, 1024, 4096],
-        "num_routed_experts": [256, 384],
-        "topk_routed": [6],
-        "num_fused_shared_experts": [0, 1],
-        "dtype": [torch.float32],
+        "num_tokens": args.num_tokens,
+        "num_routed_experts": args.num_routed_experts,
+        "topk_routed": args.topk_routed,
+        "num_fused_shared_experts": args.num_fused_shared_experts,
+        "dtype": [dtype_map[d] for d in args.dtypes],
     }
     configs = list(itertools.product(*sweep_params.values()))
 

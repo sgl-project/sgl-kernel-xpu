@@ -91,6 +91,10 @@ struct Arguments {
   int64_t rel_bias_head_stride = 0;
   int rel_bias_extent = 0;
 
+  // Optional per-token block id; non-null enables the bidirectional-block mask
+  // (tokens sharing a non-negative id attend bidirectionally, causal otherwise).
+  const int* __restrict__ block_id_ptr = nullptr;
+
   // The stride between rows of O.
   int64_t o_batch_stride;
   int64_t o_row_stride;
@@ -323,6 +327,11 @@ struct PrefillRunner {
     // must be contiguous, which is enforced by CHECK_LAST_DIM_CONTIGUOUS_INPUT.
     // StrideQ/K/V/O use plain `int` elements, but Arguments stores strides as
     // int64_t, so narrow explicitly before handing them to make_stride.
+    // softcap folds through apply_relative_bias as softcap(QK+bias); the reference
+    // ordering is softcap(QK)+bias, so reject the unsupported combination.
+    TORCH_CHECK(
+        !(params.softcap > 0.f && params.rel_bias_ptr != nullptr),
+        "softcap combined with relative attention bias is not supported on XPU");
     constexpr int64_t kIntMax = 2147483647LL;
     TORCH_CHECK(
         q_row_stride <= kIntMax && k_row_stride <= kIntMax && v_row_stride <= kIntMax && q_head_stride <= kIntMax &&
@@ -453,6 +462,7 @@ struct PrefillRunner {
         },
         {
             params.softmax_scale,
+            params.softcap,
             params.page_table,
             params.page_size,
             params.max_num_pages_per_seq,
@@ -462,6 +472,7 @@ struct PrefillRunner {
             params.rel_bias_token_stride,
             params.rel_bias_head_stride,
             params.rel_bias_extent,
+            params.block_id_ptr,
         },
         {},
         hw_info};
@@ -622,6 +633,7 @@ template <
     bool Causal,
     bool LocalMask,
     bool Sink,
+    bool Softcap,
     bool LSE,
     typename TileShapeQK,
     typename TileShapePV,
@@ -635,6 +647,7 @@ template <
     typename ElementK = bfloat16_t,
     typename ElementV = bfloat16_t,
     typename ElementO = bfloat16_t,
+    bool HasBidirectionalBlock = false,
     typename MMAOperation_ = void, /* void -> default */
     typename StrideQ = Stride<int, _1, int, int>,
     typename StrideK = Stride<int, _1, int, int>,
@@ -710,7 +723,9 @@ struct FMHAConfig {
         GmemTiledCopyV_cache,
         LocalMask,
         false,  // PackGQA is decode-only; relative attention always uses prefill.
-        HasRelBias>;
+        HasRelBias,
+        Softcap,
+        HasBidirectionalBlock>;
 
     // Epilogue
     using CollectiveEpilogue = cutlass::fmha::collective::

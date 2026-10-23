@@ -33,6 +33,7 @@
 # Run:
 #   python benchmark/bench_moe_wna16_grouped_gemm.py
 
+import argparse
 import gc
 import math
 import os
@@ -130,6 +131,11 @@ W8_BENCH_SHAPES = [
     (256, 8, 256, 2048, "block"),
     (256, 1, 2048, 128, "block"),
     (256, 256, 2048, 128, "block"),
+    # MXFP8 shapes (E4M3 with 1x32 UE8M0 block scales)
+    (256, 1, 256, 2048, "mxfp8"),
+    (256, 8, 256, 2048, "mxfp8"),
+    (256, 1, 2048, 128, "mxfp8"),
+    (256, 256, 2048, 128, "mxfp8"),
 ]
 
 
@@ -151,6 +157,21 @@ def _quantize_w8_weights(weights, scale_layout):
                 experts, rows // FP8_BLOCK_SIZE, columns // FP8_BLOCK_SIZE
             ).contiguous(),
         )
+    elif scale_layout == "mxfp8":
+        experts, rows, columns = weights.shape
+        num_blocks = columns // 32
+        w_f32 = weights.float().reshape(experts, rows, num_blocks, 32)
+        amax = w_f32.abs().amax(dim=-1).clamp(min=1e-10)
+        exp = torch.ceil(torch.log2(amax / FP8_MAX)).clamp(-127.0, 127.0)
+        scale_biased = (exp + 127.0).to(torch.uint8)
+        descale = torch.exp2(exp).unsqueeze(-1)
+        quantized = (
+            (w_f32 / descale)
+            .clamp(-FP8_MAX, FP8_MAX)
+            .to(torch.float8_e4m3fn)
+            .reshape_as(weights)
+        )
+        return quantized.contiguous(), scale_biased.contiguous()
 
     parts = 2 if scale_layout == "scalar_gemm1" else 1
     chunks = weights.chunk(parts, dim=1)
@@ -182,6 +203,12 @@ def _build_w8_weights(num_experts, gemm_n, gemm_k, scale_layout):
             device="xpu",
             dtype=torch.float32,
         )
+    elif scale_layout == "mxfp8":
+        scales = torch.empty(
+            (num_experts, gemm_n, gemm_k // 32),
+            device="xpu",
+            dtype=torch.uint8,
+        )
     else:
         parts = 2 if scale_layout == "scalar_gemm1" else 1
         scales = torch.empty((num_experts, parts), device="xpu", dtype=torch.float32)
@@ -209,7 +236,7 @@ def _prepare_w8_inputs(num_experts, avg_m, gemm_n, gemm_k, scale_layout):
 
 
 def _run_w8(inputs):
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_fp8_w8a16(
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
         inputs["output"],
         inputs["activations"],
         inputs["weights"],
@@ -220,19 +247,6 @@ def _run_w8(inputs):
     )
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["num_experts", "avg_m", "gemm_n", "gemm_k", "scale_layout"],
-        x_vals=W8_BENCH_SHAPES,
-        line_arg="provider",
-        line_vals=["w8a16_fused"],
-        line_names=["w8a16_fused (sgl_kernel Xe2 grouped GEMM)"],
-        styles=[("purple", "-")],
-        ylabel="Time (ms)",
-        plot_name="moe-w8a16-gemm-op-level",
-        args={},
-    )
-)
 def benchmark_w8(num_experts, avg_m, gemm_n, gemm_k, scale_layout, provider):
     inputs = _prepare_w8_inputs(num_experts, avg_m, gemm_n, gemm_k, scale_layout)
     for _ in range(5):
@@ -261,6 +275,22 @@ def benchmark_w8(num_experts, avg_m, gemm_n, gemm_k, scale_layout, provider):
     del inputs
     torch.xpu.empty_cache()
     return ms
+
+
+def get_benchmark_w8(shapes=W8_BENCH_SHAPES):
+    return triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["num_experts", "avg_m", "gemm_n", "gemm_k", "scale_layout"],
+            x_vals=shapes,
+            line_arg="provider",
+            line_vals=["w8a16_fused"],
+            line_names=["w8a16_fused (sgl_kernel Xe2 grouped GEMM)"],
+            styles=[("purple", "-")],
+            ylabel="Time (ms)",
+            plot_name="moe-w8a16-gemm-op-level",
+            args={},
+        )
+    )(benchmark_w8)
 
 
 _MXFP4_CPU_WEIGHT_CACHE = {}
@@ -756,19 +786,6 @@ if VLLM_REF_AVAILABLE:
     _LINE_STYLES = [("green", "-"), ("red", "-"), ("blue", "-"), ("orange", "-")]
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["num_experts", "avg_m", "gemm_n", "gemm_k"],
-        x_vals=BENCH_SHAPES,
-        line_arg="provider",
-        line_vals=_LINE_VALS,
-        line_names=_LINE_NAMES,
-        styles=_LINE_STYLES,
-        ylabel="Time (ms)",
-        plot_name="moe-mxfp4-gemm-op-level",
-        args={},
-    )
-)
 def benchmark(num_experts, avg_m, gemm_n, gemm_k, provider):
     recipe = "int4" if provider in ("int4_fused", "vllm_int4") else "mxfp4"
     backend = "vllm" if provider.startswith("vllm_") else "sgl"
@@ -846,6 +863,22 @@ def benchmark(num_experts, avg_m, gemm_n, gemm_k, provider):
     return ms
 
 
+def get_benchmark(shapes=BENCH_SHAPES):
+    return triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["num_experts", "avg_m", "gemm_n", "gemm_k"],
+            x_vals=shapes,
+            line_arg="provider",
+            line_vals=_LINE_VALS,
+            line_names=_LINE_NAMES,
+            styles=_LINE_STYLES,
+            ylabel="Time (ms)",
+            plot_name="moe-mxfp4-gemm-op-level",
+            args={},
+        )
+    )(benchmark)
+
+
 def _run_gpt_oss_120b_benchmark():
     """Time all 16 real ragged GPT-OSS-120B production calls.
 
@@ -917,7 +950,7 @@ def _run_gpt_oss_120b_benchmark():
         torch.xpu.empty_cache()
 
 
-def _correctness_check(rel_tol=CORRECTNESS_REL_TOL):
+def _correctness_check(rel_tol=CORRECTNESS_REL_TOL, shapes=BENCH_SHAPES):
     """Cross-check sgl_kernel vs vLLM outputs on the same logical weights.
 
     Runs once per (shape, recipe) outside the timed loop and reports the
@@ -931,7 +964,7 @@ def _correctness_check(rel_tol=CORRECTNESS_REL_TOL):
     failures = []
     sgl_run = {"mxfp4": _run_mxfp4_fused, "int4": _run_int4_fused}
     vllm_run = {"mxfp4": _run_vllm_mxfp4, "int4": _run_vllm_int4}
-    for num_experts, avg_m, n, k in BENCH_SHAPES:
+    for num_experts, avg_m, n, k in shapes:
         for recipe in ("mxfp4", "int4"):
             sgl_in = _prepare_inputs(num_experts, avg_m, n, k, recipe, "sgl")
             sgl_run[recipe](sgl_in)
@@ -976,14 +1009,56 @@ def _correctness_check(rel_tol=CORRECTNESS_REL_TOL):
         )
 
 
+def _parse_shape(text):
+    dims = tuple(int(v) for v in text.split(","))
+    if len(dims) != 4:
+        raise argparse.ArgumentTypeError("expected E,AVG_M,N,K")
+    return dims
+
+
+def _parse_w8_shape(text):
+    *dims, scale_layout = text.split(",")
+    if len(dims) != 4 or scale_layout not in ("block", "mxfp8"):
+        raise argparse.ArgumentTypeError("expected E,AVG_M,N,K,{block,mxfp8}")
+    return (*(int(v) for v in dims), scale_layout)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--shapes",
+        nargs="+",
+        type=_parse_shape,
+        default=BENCH_SHAPES,
+        metavar="E,AVG_M,N,K",
+        help="W4 shapes (default: env-selected quick/full set)",
+    )
+    parser.add_argument(
+        "--w8-shapes",
+        nargs="+",
+        type=_parse_w8_shape,
+        default=W8_BENCH_SHAPES,
+        metavar="E,AVG_M,N,K,LAYOUT",
+        help="W8A16 shapes; LAYOUT is block or mxfp8",
+    )
+    parser.add_argument(
+        "--correctness-rel-tol",
+        type=float,
+        default=CORRECTNESS_REL_TOL,
+        help="Max sgl-vs-vLLM relative L2 error",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     if RUN_GPT_OSS_120B:
         _run_gpt_oss_120b_benchmark()
         print("\nGPT-OSS-120B benchmark finished!\n")
         raise SystemExit(0)
 
-    _correctness_check()
-    benchmark.run(print_data=False)
+    _correctness_check(args.correctness_rel_tol, args.shapes)
+    get_benchmark(args.shapes).run(print_data=False)
     print("\nBenchmark finished!\n")
     import pandas as pd
 
@@ -1024,6 +1099,6 @@ if __name__ == "__main__":
         ).round(2)
     print(pv.to_markdown())
 
-    benchmark_w8.run(print_data=False)
+    get_benchmark_w8(args.w8_shapes).run(print_data=False)
     print("\nWNA16 W8A16 benchmark finished!\n")
     print(pd.DataFrame(W8_RESULTS).to_markdown(index=False))

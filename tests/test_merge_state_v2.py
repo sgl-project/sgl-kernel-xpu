@@ -5,7 +5,10 @@ import pytest
 import torch
 import triton
 import triton.language as tl
+import utils
 from sgl_kernel import merge_state, merge_state_v2
+
+ref_device = utils.get_reference_device()
 
 
 @triton.jit
@@ -244,11 +247,15 @@ def test_merge_attn_states(
         # Avoid inplace inf -> -inf, we have to use prefix_lse
         # and suffix_lse for other kernel.
         if fn_type == "torch":
-            prefix_lse_ = prefix_lse.clone()
-            suffix_lse_ = suffix_lse.clone()
+            prefix_lse_ = prefix_lse.clone().to(ref_device)
+            suffix_lse_ = suffix_lse.clone().to(ref_device)
+            prefix_output_ = prefix_output.to(ref_device)
+            suffix_output_ = suffix_output.to(ref_device)
         else:
             prefix_lse_ = prefix_lse
             suffix_lse_ = suffix_lse
+            prefix_output_ = prefix_output
+            suffix_output_ = suffix_output
 
         if fn_type == "xpu_v1":
             # merge_state v1 kernel not support float32
@@ -262,9 +269,9 @@ def test_merge_attn_states(
         try:
             for _ in range(warmup_times):
                 output_fn, output_lse_fn = kernel_fn(
-                    prefix_output,
+                    prefix_output_,
                     prefix_lse_,
-                    suffix_output,
+                    suffix_output_,
                     suffix_lse_,
                     output_fn,
                     output_lse_fn,
@@ -274,9 +281,9 @@ def test_merge_attn_states(
             for _ in range(repeat_times):
                 start.record()
                 output_fn, output_lse_fn = kernel_fn(
-                    prefix_output,
+                    prefix_output_,
                     prefix_lse_,
-                    suffix_output,
+                    suffix_output_,
                     suffix_lse_,
                     output_fn,
                     output_lse_fn,
@@ -291,8 +298,8 @@ def test_merge_attn_states(
             return 0, output_fn, output_lse_fn
 
     # 0. Run the Torch kernel
-    output_torch = output.clone()
-    output_lse_torch = output_lse.clone()
+    output_torch = output.clone().to(ref_device)
+    output_lse_torch = output_lse.clone().to(ref_device)
     time_torch, output_torch, output_lse_torch = perf_kernel_fn(
         output_torch, output_lse_torch, merge_state_torch, fn_type="torch"
     )
@@ -315,7 +322,7 @@ def test_merge_attn_states(
     )
 
     # 3. Performance compare
-    improved = time_triton / time_v2
+    improved = time_triton / time_v2 if time_v2 > 0 else float("inf")
     print(f"Torch time: {time_torch:.6f}ms")
     print(f"Triton time: {time_triton:.6f}ms")
     print(f"XPU v2 time: {time_v2:.6f}ms, Performance: {improved:.5f}x")
@@ -328,7 +335,7 @@ def test_merge_attn_states(
     rtol = 1e-2 if output_dtype == torch.bfloat16 else 1e-3
 
     def diff(a: torch.Tensor, b: torch.Tensor):
-        max_diff = torch.max(torch.abs(a.float() - b.float()))
+        max_diff = torch.max(torch.abs(a.cpu().float() - b.cpu().float()))
         return max_diff
 
     # Use Triton output as reference because we want to replace
@@ -337,7 +344,7 @@ def test_merge_attn_states(
     output_ref = output_ref_triton
     output_lse_ref = output_lse_ref_triton
     torch.testing.assert_close(
-        output_v2.float(), output_ref.float(), atol=1e-3, rtol=rtol
+        output_v2.cpu().float(), output_ref.cpu().float(), atol=1e-3, rtol=rtol
     )
     print("Output all match, max abs diff:")
     print(f"(Triton  vs Torch) : {diff(output_torch, output_ref)}")
@@ -346,7 +353,7 @@ def test_merge_attn_states(
     print("-" * 100)
 
     torch.testing.assert_close(
-        output_lse_v2.float(), output_lse_ref.float(), atol=1e-3, rtol=rtol
+        output_lse_v2.cpu().float(), output_lse_ref.cpu().float(), atol=1e-3, rtol=rtol
     )
     print("Output LSE all match, max abs diff:")
     print(f"(Triton  vs Torch) : {diff(output_lse_torch, output_lse_ref)}")

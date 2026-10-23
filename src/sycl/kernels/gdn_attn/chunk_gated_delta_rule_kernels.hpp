@@ -69,7 +69,7 @@ CUTE_DEVICE void chunk_prepare_kernel(
     const int total_virtual_seqlen,
     const int batch_size,
     const int num_v_heads,
-    const int head_v_dim) {
+    [[maybe_unused]] const int head_v_dim) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   int group_id = item.get_group(1);
   int group_range = item.get_group_range(1);
@@ -143,13 +143,13 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
     T* A,
     T* w,
     T* u,
-    const T* q,
+    [[maybe_unused]] const T* q,
     const T* k,
     const T* v,
     const float* b,
     const float* a,
-    const float* A_log,
-    const T* dt_bias,
+    [[maybe_unused]] const float* A_log,
+    [[maybe_unused]] const T* dt_bias,
     const int* query_start_loc,
     const bool* has_initial_state,
     const int total_virtual_seqlen,
@@ -165,12 +165,12 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
   const int global_chunk_range = item.get_group_range(1);
 
   // l2norm for q, k
-  int group_id = item.get_group(1);
-  int group_range = item.get_group_range(1);
+  [[maybe_unused]] int group_id = item.get_group(1);
+  [[maybe_unused]] int group_range = item.get_group_range(1);
   auto sg = item.get_sub_group();
-  int sg_id = sg.get_group_linear_id();
-  int sg_range = sg.get_group_linear_range();
-  int sg_local_id = sg.get_local_linear_id();
+  [[maybe_unused]] int sg_id = sg.get_group_linear_id();
+  [[maybe_unused]] int sg_range = sg.get_group_linear_range();
+  [[maybe_unused]] int sg_local_id = sg.get_local_linear_id();
 
   float* slm_mem = static_cast<float*>(slm_mem_const.template get_multi_ptr<sycl::access::decorated::no>().get());
   float* A_log_slm_ptr = slm_mem;
@@ -193,12 +193,12 @@ CUTE_DEVICE void chunk_compute_wu_kernel(
 
   auto sg_local_m_coord = cutlass::get_sub_group_id() / ATOM_N;
   auto sg_local_n_coord = cutlass::get_sub_group_id() % ATOM_N;
-  int m_tile_start = 0;
-  int n_tile_start = 0;
-  int m_sg_start = sg_local_m_coord * SG_M;
-  int n_sg_start = sg_local_n_coord * SG_N;
+  [[maybe_unused]] int m_tile_start = 0;
+  [[maybe_unused]] int n_tile_start = 0;
+  [[maybe_unused]] int m_sg_start = sg_local_m_coord * SG_M;
+  [[maybe_unused]] int n_sg_start = sg_local_n_coord * SG_N;
 
-  using TileShape = decltype(mma.tile_mnk());
+  using TileShape [[maybe_unused]] = decltype(mma.tile_mnk());
 
   int pre_chunks = 0;
 
@@ -536,7 +536,7 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           // --- QS epilogue: apply exp(g) scaling ---
           CUTE_UNROLL
           for (int sn = 0; sn < SG_N / sub_group_size; ++sn) {
-            int n_idx = n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
+            [[maybe_unused]] int n_idx = n_tile_start + n_sg_start + sn * sub_group_size + sg_local_id;
             CUTE_UNROLL
             for (int sm = 0; sm < SG_M; ++sm) {
               int m_idx = m_tile_start + m_sg_start + sm;
@@ -686,7 +686,7 @@ void kernel_launcher(
   // prepare data for A, W, U compute
   sycl::range<3> local_prepare(1, 1, MaxThreadsPerSM);
   sycl::range<3> global_prepare(1, sm_count, 1);
-  int slm_size_prepare = num_v_heads * 2 + chunk_size;
+  [[maybe_unused]] int slm_size_prepare = num_v_heads * 2 + chunk_size;
 
   queue.submit([&](sycl::handler& cgh) {
     cgh.parallel_for<ChunkPrepareKernel<T, StateT>>(

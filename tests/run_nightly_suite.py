@@ -78,6 +78,7 @@ NIGHTLY_TESTS: List[Entry] = [
     Entry("test_embedding_lora_a_fwd.py"),
     Entry("test_sgemm_lora_a_fwd.py"),
     Entry("test_fused_q_norm_rope.py"),
+    Entry("test_qsa_mqa_nightly.py", estimated_time=180),
 ]
 
 
@@ -116,6 +117,10 @@ NIGHTLY_BENCHMARKS: List[Entry] = [
         tee_log="bench_scatter_tokens_to_experts.py.log",
     ),
     Entry("bench_top_k_renorm_probs.py", tee_log="bench_top_k_renorm_probs.py.log"),
+    Entry(
+        "bench_scale_residual_norm_scale_shift.py",
+        tee_log="bench_scale_residual_norm_scale_shift.py.log",
+    ),
     Entry("bench_hc_split_sinkhorn.py", tee_log="bench_hc_split_sinkhorn.py.log"),
     Entry("bench_hc_pre_fuse.py", tee_log="bench_hc_pre_fuse.py.log"),
     Entry("bench_embedding_lora_a_fwd.py", tee_log="bench_embedding_lora_a_fwd.py.log"),

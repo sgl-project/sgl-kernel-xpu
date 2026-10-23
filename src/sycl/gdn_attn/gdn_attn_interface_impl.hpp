@@ -2,6 +2,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include "../SGLKernelPerf.h"
 #include "../Utils.h"
 #include "causal_conv1d.hpp"
 #include "chunk_causal_conv1d.hpp"
@@ -209,6 +210,19 @@ SGL_KERNEL_EXPORT void gdn_attention(
   auto& queue = dpcppGetCurrentQueue();
   auto dtype = projected_states_qkvz.dtype();
   auto device = projected_states_qkvz.device();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // GDN attention combines causal conv1d, L2 norm, chunk gated delta rule, and recurrent decode.
+  // Coarse accounting: ~(2 * head_v_dim * head_k_dim) flops per (token * num_v_heads) as a
+  // reference matmul workload; memory covers projected states + workspace shuffles.
+  const double per_token_flops = 2.0 * static_cast<double>(head_v_dim) * static_cast<double>(head_k_dim);
+  const double flops = static_cast<double>(num_actual_tokens) * static_cast<double>(num_v_heads) * per_token_flops;
+  const double bytes =
+      static_cast<double>(projected_states_qkvz.numel()) * static_cast<double>(projected_states_qkvz.element_size()) +
+      static_cast<double>(projected_states_ba.numel()) * static_cast<double>(projected_states_ba.element_size()) +
+      static_cast<double>(core_attn_out.numel()) * static_cast<double>(core_attn_out.element_size());
+  SGL_KERNEL_PERF_SCOPE("gdn_attention", queue, bytes, flops);
+#endif
 
   // Details about `workspace` scratch buffer management:
   // Reuse a caller-provided persistent workspace buffer to reduce allocations.
@@ -495,4 +509,95 @@ SGL_KERNEL_EXPORT void gdn_attention(
     }
 #undef NATIVE_LAUNCHER
   }
+}
+
+// Standalone GDN recurrent op for plain (non-spec) prefill/decode, i.e. the
+// SSM-only half of what the fused `gdn_attention` op does internally for
+// its own non-spec path (see `NATIVE_LAUNCHER`'s `gdn::gated_delta_rule`
+// call above) -- minus conv1d. Exposed separately so SGLang can drive
+// prefill/decode through `causal_conv1d_fwd`/`causal_conv1d_update` +
+// this op, matching the same two-call convention CUDA/Triton/NPU/CPU
+// already use, instead of the fused monolithic op. `ssm_state` is the
+// committed recurrent-state pool, updated in place (mirrors CUDA/Triton's
+// `chunk_gated_delta_rule`/decode kernels; unlike `gated_delta_rule_verify`,
+// there is no separate scratch pool here since acceptance isn't a concern
+// outside of speculative decoding).
+SGL_KERNEL_EXPORT void gated_delta_rule(
+    torch::Tensor& core_attn_out,                           // [total_seqlen, num_v_heads, head_v_dim]
+    const torch::Tensor& q,                                 // [total_seqlen, num_k_heads, head_k_dim]
+    const torch::Tensor& k,                                 // [total_seqlen, num_k_heads, head_k_dim]
+    const torch::Tensor& v,                                 // [total_seqlen, num_v_heads, head_v_dim]
+    const torch::Tensor& b,                                 // [total_seqlen, num_v_heads]
+    const torch::Tensor& a,                                 // [total_seqlen, num_v_heads]
+    const torch::Tensor& A_log,                             // [num_v_heads]
+    const torch::Tensor& dt_bias,                           // [num_v_heads]
+    torch::Tensor& ssm_state,                               // [cache_batch_size, num_v_heads, head_v_dim, head_k_dim]
+    const torch::Tensor& query_start_loc,                   // [num_prefills + num_decodes + 1]
+    const std::optional<torch::Tensor>& token_indx,         // [total_seqlen] or None
+    const torch::Tensor& cache_indices,                     // [num_prefills + num_decodes]
+    const std::optional<torch::Tensor>& has_initial_state,  // [num_prefills + num_decodes] or None
+    const int64_t num_prefills,
+    const int64_t num_decodes) {
+  auto& queue = dpcppGetCurrentQueue();
+  std::optional<torch::Tensor> no_num_accepted_tokens{std::nullopt};
+  gdn::gated_delta_rule(
+      queue,
+      core_attn_out,
+      q,
+      k,
+      v,
+      b,
+      a,
+      A_log,
+      dt_bias,
+      ssm_state,
+      query_start_loc,
+      token_indx,
+      cache_indices,
+      has_initial_state,
+      no_num_accepted_tokens,
+      static_cast<int>(num_prefills),
+      static_cast<int>(num_decodes),
+      /*num_spec_decodes=*/0);
+}
+
+// Standalone GDN target_verify op (see `gdn::gated_delta_rule_verify` in
+// gated_delta_rule.hpp for the full contract). Exposed separately from the
+// fused `gdn_attention` op above so SGLang can drive spec-decode verify
+// through the SYCL kernel using its native scratch-pool convention without
+// requiring `causal_conv1d`'s spec branch to change in lockstep.
+SGL_KERNEL_EXPORT void gated_delta_rule_verify(
+    torch::Tensor& core_attn_out,
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& b,
+    const torch::Tensor& a,
+    const torch::Tensor& A_log,
+    const torch::Tensor& dt_bias,
+    const torch::Tensor& ssm_state,
+    const torch::Tensor& cache_indices,
+    torch::Tensor& intermediate_states_buffer,
+    const torch::Tensor& intermediate_state_indices,
+    const int64_t cache_steps,
+    const std::optional<torch::Tensor>& token_indx,
+    const std::optional<torch::Tensor>& retrieve_parent_token) {
+  auto& queue = dpcppGetCurrentQueue();
+  gdn::gated_delta_rule_verify(
+      queue,
+      core_attn_out,
+      q,
+      k,
+      v,
+      b,
+      a,
+      A_log,
+      dt_bias,
+      ssm_state,
+      cache_indices,
+      intermediate_states_buffer,
+      intermediate_state_indices,
+      cache_steps,
+      token_indx,
+      retrieve_parent_token);
 }

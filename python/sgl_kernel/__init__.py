@@ -27,6 +27,15 @@ def _export_jit_toolchain_env() -> None:
 
 _export_jit_toolchain_env()
 
+# Opt-in H2D transfer profiler. Set SGL_H2D_PROFILE=1 to print one perf line
+# per cpu->xpu `.to()` call, using the same "op perf(source): time=... ms,
+# bandwidth=... GB/s" shape as the C++ SGL_KERNEL_PERF_SCOPE output. See
+# python/sgl_kernel/_h2d_profile.py.
+if os.environ.get("SGL_H2D_PROFILE") == "1":
+    from sgl_kernel._h2d_profile import install as _install_h2d_profile
+
+    _install_h2d_profile()
+
 cuda_path = f"/usr/local/cuda/targets/{SYSTEM_ARCH}-linux/lib/libcudart.so.12"
 if os.path.exists(cuda_path):
     ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)
@@ -51,6 +60,7 @@ from sgl_kernel.compress_plan import (
     plan_compress_prefill,
     plan_compress_prefill_legacy,
 )
+from sgl_kernel.diffusion import fused_scale_residual_norm_scale_shift
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
@@ -83,7 +93,7 @@ except ImportError:
     # fp8_paged_mqa_logits_triton will simply be unavailable.
     fp8_paged_mqa_logits_triton = None
 from sgl_kernel.fused_norm_rope_v2 import compress_norm_rope_store
-from sgl_kernel.gdn_attn import gdn_attention
+from sgl_kernel.gdn_attn import gated_delta_rule, gated_delta_rule_verify, gdn_attention
 
 hadamard_transform = torch.ops.sgl_kernel.hadamard_transform
 fused_q_indexer_rope_hadamard_quant = (
@@ -94,6 +104,8 @@ from sgl_kernel.gemm import (
     awq_dequantize,
     bmm_fp8,
     cutlass_scaled_fp4_mm,
+    dsv3_fused_a_gemm,
+    dsv3_router_gemm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
     int8_scaled_mm,
@@ -141,6 +153,8 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_all_layer_mla,
     transfer_kv_all_layer_mla_lf_pf,
     transfer_kv_direct,
+    transfer_kv_mamba_lf_pf,
+    transfer_kv_mamba_pf_lf,
     transfer_kv_per_layer,
     transfer_kv_per_layer_direct_pf_lf,
     transfer_kv_per_layer_mla,
@@ -149,12 +163,19 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_ph_lf,
 )
 from sgl_kernel.lora import (
+    chunked_sgmv_lora_expand_fwd,
+    chunked_sgmv_lora_shrink_fwd,
     embedding_lora_a_fwd,
+    gate_up_lora_b_fwd,
     qkv_lora_b_fwd,
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
 )
-from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
+from sgl_kernel.mamba import (
+    causal_conv1d_fn_xpu,
+    causal_conv1d_update_verify_xpu,
+    causal_conv1d_update_xpu,
+)
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
     hc_post,
@@ -171,6 +192,8 @@ from sgl_kernel.moe import (
     apply_shuffle_mul_sum,
     biased_topk,
     cutlass_fp4_group_mm,
+    cutlass_fused_experts_fp8,
+    cutlass_fused_experts_mxfp4,
     fp8_blockwise_scaled_grouped_mm,
     fused_experts,
     hash_topk,
@@ -178,6 +201,7 @@ from sgl_kernel.moe import (
     moe_fused_gate,
     moe_sum,
     moe_sum_reduce,
+    mxfp4_blockwise_scaled_grouped_mm,
     prepare_moe_input,
     scatter_tokens_to_experts,
     swiglu_gpt_oss_sigmoid_alpha,
@@ -185,6 +209,7 @@ from sgl_kernel.moe import (
     topk_softmax,
 )
 from sgl_kernel.nsa import fp8_mqa_logits, fp8_paged_mqa_logits
+from sgl_kernel.qsa_sparse_attention import qsa_sparse_attention
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_renorm_prob,
@@ -199,7 +224,9 @@ from sgl_kernel.sparse_flash_attn import (
     sparse_attn_varlen_func,
 )
 from sgl_kernel.speculative import (
+    TreeMaskMode,
     build_tree_kernel_efficient,
+    reconstruct_indices_from_tree_mask,
     segment_packbits,
     tree_speculative_sampling_target_only,
     verify_tree_greedy,
@@ -212,7 +239,7 @@ from sgl_kernel.top_k import (
     topk_transform_paged,
     topk_transform_ragged,
 )
-from sgl_kernel.utils import get_device_capability, is_xe2_arch
+from sgl_kernel.utils import get_device_capability, is_xe2_arch, is_xe3_arch
 from sgl_kernel.version import __version__
 
 build_tree_kernel = (

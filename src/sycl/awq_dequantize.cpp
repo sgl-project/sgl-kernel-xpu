@@ -9,6 +9,7 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "sgl_kernel_export.h"
 
@@ -31,7 +32,7 @@ struct AWQDequantizeKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
         K(K),
         group_size(group_size) {}
 
-  void sycl_ker_config_convention(sycl::handler& cgh) {}
+  void sycl_ker_config_convention([[maybe_unused]] sycl::handler& cgh) {}
 
   [[sycl::reqd_sub_group_size(SgSize)]] void operator()(sycl::nd_item<2> item) const {
     int col = item.get_global_id(1);
@@ -87,7 +88,7 @@ void dequantize_awq_sycl(
   sycl::range<2> local_range{GroupN, GroupK};
 
   // Launch the kernel
-  auto nd_range = sycl::nd_range<2>(global_range, local_range);
+  [[maybe_unused]] auto nd_range = sycl::nd_range<2>(global_range, local_range);
   auto kfn = AWQDequantizeKernelFunctor<T_out, T_scale, GroupK, GroupN, SgSize>(
       d_qweight, d_scales, d_qzeros, d_output, N, K, group_size);
   sycl_kernel_submit(global_range, local_range, q, kfn);
@@ -107,6 +108,16 @@ SGL_KERNEL_EXPORT at::Tensor awq_dequantize(at::Tensor qweight, at::Tensor scale
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // AWQ dequantize: one shift/AND/multiply per output element. Memory-bound.
+  const double flops = static_cast<double>(output.numel());
+  const double bytes = static_cast<double>(qweight.numel()) * static_cast<double>(qweight.element_size()) +
+                       static_cast<double>(scales.numel()) * static_cast<double>(scales.element_size()) +
+                       static_cast<double>(qzeros.numel()) * static_cast<double>(qzeros.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  SGL_KERNEL_PERF_SCOPE("awq_dequant", queue, bytes, flops);
+#endif
 
   if (scales.scalar_type() == at::ScalarType::Half) {
     auto _scales = reinterpret_cast<sycl::half*>(scales.data_ptr<at::Half>());

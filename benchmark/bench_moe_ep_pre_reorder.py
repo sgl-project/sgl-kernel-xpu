@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 import triton
 from sgl_kernel import ep_moe_pre_reorder
@@ -8,29 +10,10 @@ batch_sizes = [64, 128, 256, 512, 640, 768, 1024, 2048, 4096]
 configs = [(bs,) for bs in batch_sizes]
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["batch_size"],
-        x_vals=[list(_) for _ in configs],
-        line_arg="provider",
-        line_vals=["cuda", "triton"],
-        line_names=["CUDA Kernel", "Triton Kernel"],
-        styles=[("green", "-"), ("orange", "-")],
-        ylabel="us",
-        plot_name="ep-moe-pre-reorder-performance",
-        args={},
-    )
-)
-def benchmark(batch_size, provider):
+def benchmark(batch_size, provider, hidden_size=4096, topk=8, num_experts=256):
     dtype = torch.bfloat16
     device = torch.device("cuda")
-    hidden_size, topk, start_expert_id, end_expert_id, block_size = (
-        4096,
-        8,
-        0,
-        255,
-        512,
-    )
+    start_expert_id, end_expert_id, block_size = 0, num_experts - 1, 512
 
     # Allocate fresh tensors for every run to match bench_moe_fused_gate style
     def alloc_tensors():
@@ -99,5 +82,43 @@ def benchmark(batch_size, provider):
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
+def get_benchmark(configs=configs, hidden_size=4096, topk=8, num_experts=256):
+    return triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=["batch_size"],
+            x_vals=[list(_) for _ in configs],
+            line_arg="provider",
+            line_vals=["cuda", "triton"],
+            line_names=["CUDA Kernel", "Triton Kernel"],
+            styles=[("green", "-"), ("orange", "-")],
+            ylabel="us",
+            plot_name="ep-moe-pre-reorder-performance",
+            args={
+                "hidden_size": hidden_size,
+                "topk": topk,
+                "num_experts": num_experts,
+            },
+        )
+    )(benchmark)
+
+
 if __name__ == "__main__":
-    benchmark.run(print_data=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_sizes,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument("--hidden-size", type=int, default=4096, help="Hidden size")
+    parser.add_argument("--topk", type=int, default=8, help="Experts per token")
+    parser.add_argument(
+        "--num-experts", type=int, default=256, help="Number of experts"
+    )
+    args = parser.parse_args()
+
+    configs = [(bs,) for bs in args.batch_sizes]
+    get_benchmark(configs, args.hidden_size, args.topk, args.num_experts).run(
+        print_data=True
+    )

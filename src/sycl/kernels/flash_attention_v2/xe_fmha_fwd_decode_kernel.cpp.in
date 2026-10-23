@@ -31,6 +31,7 @@
  **************************************************************************************************/
 // Auto-generated from xe_fmha_fwd_decode_kernel.cpp.in
 // Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@, ELEM_TAG=@ELEM_TAG@
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
 #include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
@@ -45,12 +46,24 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
   // VTiles = get<1>(TileShapeOutput) / get<1>(TileShapePV) covers the full head dimension when
   // HEAD_DIM is not a multiple of 32 (e.g. HEAD_DIM=72 -> 96, VTiles=3). The actual O surface is
   // bounded by head_size_vo, so HW clips the OOB tail writes in the epilogue.
-  using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
-  // Split the KV (page) tile across as many subgroups as fit the epilogue reduction
-  // SLM budget. For large head dims / GQA groups / page sizes the full split
-  // (PAGE_SIZE / 16) overflows shared local memory and hangs the device, so cap it.
-  static constexpr int kKvSubgroups = kv_subgroups_for_slm(
-      @PAGE_SIZE@ / 16, @QG_SZ@, ((@HEAD_DIM@ + 31) / 32) * 32);
+
+  // The QG_SZ x kOutputTile fp32 accumulator spills registers when it exceeds
+  // kDecodeAccBudget (e.g. QG 8 x 512), so cap the V tile and split V across
+  // grid.x. Each V tile re-reads K, so only split when needed:
+  //   HEAD_DIM <= 256 : unchanged
+  //   HEAD_DIM = 512  : QG 1/2/4 -> 512, QG 8 -> 256, QG 16 -> 128
+  // Mirrors kDecodeAccBudget in vllm-xpu-kernels (csrc/xpu/attn/fmha_utils.hpp).
+  static constexpr int kHeadRounded = ((@HEAD_DIM@ + 31) / 32) * 32;
+  static constexpr int kDecodeAccBudget = 2048;
+  static constexpr int kBudgetTile = kDecodeAccBudget / @QG_SZ@;
+  static constexpr int kOutputTile =
+    (kHeadRounded <= 256 || kHeadRounded <= kBudgetTile) ? kHeadRounded : kBudgetTile;
+  static_assert(kOutputTile % 32 == 0, "output tile must be a multiple of the PV tile (32)");
+  using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<kOutputTile>>;
+
+  // Cap KV subgroups so the epilogue reduction buffer (sized by the output tile)
+  // fits in SLM; overflowing it hangs the device.
+  static constexpr int kKvSubgroups = kv_subgroups_for_slm(@PAGE_SIZE@ / 16, @QG_SZ@, kOutputTile);
   using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<kKvSubgroups>, cute::_1>>;
 
   // softmax_lse output is threaded as a template constexpr, so every mask
@@ -62,10 +75,13 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
     TORCH_CHECK(!params.use_sink, "return_softmax_lse is not supported with sink masking");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       using Element = @ELEM_TYPE@;
+      dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
       DecodeConfig<
           false,
           LocalMask,
           false,
+          Softcap,
           /*LSE=*/true,
           TileShapeQK,
           TileShapePV,
@@ -79,6 +95,7 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
           Element,
           Element,
           /*PackGQAEnabled=*/false>::run_paged(params);
+      });
     });
     return;
   }
@@ -95,10 +112,13 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
         " columns");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
       using Element = @ELEM_TYPE@;
+      // softcap+rel_bias is host-rejected (runner TORCH_CHECK); Softcap=false only.
+      constexpr bool Softcap = false;
       DecodeConfig<
           false,
           LocalMask,
           false,
+          Softcap,
           /*LSE=*/false,
           TileShapeQK,
           TileShapePV,
@@ -133,10 +153,13 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
     AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
       AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
           using Element = @ELEM_TYPE@;
+          dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
           DecodeConfig<
               false,
               LocalMask,
               Sink,
+              Softcap,
               /*LSE=*/false,
               TileShapeQK,
               TileShapePV,
@@ -149,6 +172,7 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
               Element,
               Element,
               Element>::run_paged(params);
+          });
       });
     });
 #else
@@ -157,10 +181,13 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
         "sink is only supported for head_size == 64, got @HEAD_DIM@");
     AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
         using Element = @ELEM_TYPE@;
+        dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
         DecodeConfig<
             false,
             LocalMask,
             false,
+            Softcap,
             /*LSE=*/false,
             TileShapeQK,
             TileShapePV,
@@ -173,6 +200,7 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
             Element,
             Element,
               Element>::run_paged(params);
+        });
     });
 #endif
 }

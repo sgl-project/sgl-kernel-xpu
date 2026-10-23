@@ -78,6 +78,13 @@ include(FetchContent)
 
 # SYCL support in cutlass
 add_compile_definitions(CUTLASS_ENABLE_SYCL)
+# Propagate CUTLASS SYCL profiling flag so that any sgl-kernel-xpu kernel guarded
+# by `#if defined(CUTLASS_SYCL_PROFILING_ENABLED)` compiles in its GPU_Clock timer
+# and report_kernel_perf() call. This is the compile-time switch that enables the
+# time / bandwidth / TFLOPS printout in every instrumented kernel entry point.
+if(CUTLASS_SYCL_PROFILING_ENABLED)
+  add_compile_definitions(CUTLASS_SYCL_PROFILING_ENABLED)
+endif()
 set(CUTLASS_ENABLE_SYCL ON CACHE BOOL "Enable SYCL in the cutlass" FORCE)
 set(CUTLASS_ENABLE_BENCHMARKS  OFF CACHE BOOL "Remove benchmark to avoid cmake version issue in google benchmark" FORCE)
 set(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable headers only mode in cutlass" FORCE)
@@ -99,10 +106,10 @@ endif()
 # cutlass — repo and commit depend on the target architecture
 if(DPCPP_SYCL_TARGET MATCHES "bmg")
   set(CUTLASS_SYCL_REPO "https://github.com/intel/sycl-tla.git")
-  set(CUTLASS_SYCL_TAG  "87f6850680a580654b9ea2c80dbc01aeb36ad231")
+  set(CUTLASS_SYCL_TAG  "7b56b936b87f799f80dde60c2fd8d11c1128cebb")
 elseif(DPCPP_SYCL_TARGET MATCHES "cri")
   set(CUTLASS_SYCL_REPO "https://github.com/intel/sycl-tla.git")
-  set(CUTLASS_SYCL_TAG  "d54352dffe8daab532abd88fc6ab0e9c9fbc6d62")
+  set(CUTLASS_SYCL_TAG  "7b56b936b87f799f80dde60c2fd8d11c1128cebb")
 else()
   message(FATAL_ERROR
       "Unsupported DPCPP_SYCL_TARGET: ${DPCPP_SYCL_TARGET}. "
@@ -121,8 +128,27 @@ FetchContent_MakeAvailable(repo-cutlass-sycl)
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+# -isystem: CuTe/sycl-tla emit ~10M warnings that are not actionable here and
+# would otherwise drown out (and, under SGL_WERROR, break) first-party code.
+include_directories(SYSTEM
     ${repo-cutlass-sycl_SOURCE_DIR}/include
     ${repo-cutlass-sycl_SOURCE_DIR}/tools/util/include
+)
+
+# Every third-party header root, in one list. The SYCL kernel libraries are not
+# built by CMake's own compile rules but by the custom FindSYCL wrapper, which
+# flattens a target's INCLUDE_DIRECTORIES property into plain -I and so silently
+# drops the SYSTEM marking set above and in src/BuildOnLinux.cmake. FindSYCL
+# forwards this list to run_sycl.cmake, which re-applies it as -isystem on both
+# the device and the -fsycl-host-compiler passes. Keep it in sync with the
+# SYSTEM target_include_directories() calls in src/BuildOnLinux.cmake.
+set(SGL_SYSTEM_INCLUDE_DIRS
+    ${repo-cutlass-sycl_SOURCE_DIR}/include
+    ${repo-cutlass-sycl_SOURCE_DIR}/tools/util/include
+    ${SYCL_INCLUDE_DIR}
+    ${TORCH_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS}
 )
 
 add_subdirectory(${SGL_OPS_XPU_ROOT}/src)

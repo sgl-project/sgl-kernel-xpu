@@ -39,7 +39,7 @@ jobs:
             intel/sgl-kernel-xpu-dev:latest
 
       - name: Rebuild sgl-kernel from latest main + PR
-        timeout-minutes: 40
+        timeout-minutes: 60
         env:
           # refs/pull/N/merge is GitHub's pre-computed merge commit:
           # current base (main) merged with this PR. Testing that ref
@@ -70,16 +70,16 @@ jobs:
       - name: Install Dependency
         timeout-minutes: 20
         run: |
+          # huggingface_hub reads HF_TOKEN from the env; `hf auth login` hits a rate-limited whoami call.
           docker exec ci_sglkernel_xpu /miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
           docker exec ci_sglkernel_xpu /miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub
-          docker exec ci_sglkernel_xpu /bin/bash -c '/miniforge3/envs/py3.12/bin/hf auth login --token ${HF_TOKEN} '
           docker exec ci_sglkernel_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.12/bin/python3 /usr/bin/python3"
 
       - name: Run Sglang Kernel Cases
         timeout-minutes: 70
         run: |
           docker exec -w /root/sglang ci_sglkernel_xpu \
-            /bin/bash -c "cd /root/sglang/sgl-kernel-xpu/tests && /miniforge3/envs/py3.12/bin/python3 -m pip install scipy && \
+            /bin/bash -c "cd /root/sglang/sgl-kernel-xpu/tests && \
                           python3 run_suite.py --suite per-commit "
 
       - name: Run Sglang Kernel Benchmarks
@@ -241,7 +241,7 @@ jobs:
     env:
       # Keep in step with the FROM in Dockerfile.xpu_kernel so CRI and BMG
       # compile with the same oneAPI.
-      DLE_IMAGE: intel/deep-learning-essentials:2026.2.0-devel-ubuntu24.04
+      DLE_IMAGE: intel/deep-learning-essentials:2026.1.3-devel-ubuntu24.04
     steps:
       - name: Reclaim workspace from any previous run
         # Must precede actions/checkout. The build container writes to the
@@ -294,7 +294,7 @@ jobs:
         # pre-builds is a BMG `pip install .` this job would ignore anyway.
         #
         # This is the image Dockerfile.xpu_kernel itself FROMs, so oneAPI/icpx is
-        # the same Deep Learning Essentials 2026.2.0 BMG compiles with -- the
+        # the same Deep Learning Essentials 2026.1.3 BMG compiles with -- the
         # toolchain part, without the sglang clone, media drivers or BMG build.
         run: |
           docker pull "${DLE_IMAGE}"
@@ -327,7 +327,7 @@ jobs:
         run: |
           docker exec ci_sglkernel_xpu_cri /bin/bash -c '\
             set -euxo pipefail && \
-            CR=26.18.38308.1 && IGC=2.34.4+21428 && GMM=22.10.0 && \
+            CR=26.27.39122.11 && IGC=2.38.2+22051 && GMM=22.10.0 && \
             export DEBIAN_FRONTEND=noninteractive && \
             apt-get update && \
             apt-get install -y --no-install-recommends curl ca-certificates python3-venv && \
@@ -362,7 +362,7 @@ jobs:
             python3 -V && \
             python3 -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version" && \
             pip install -q --upgrade pip && \
-            pip install -q --timeout 300 --retries 10 torch==2.13.0 \
+            pip install -q --timeout 300 --retries 10 torch==2.14.0 \
               --index-url https://download.pytorch.org/whl/xpu && \
             python3 -c "import torch; print(torch.__version__)"'
 
@@ -392,7 +392,7 @@ jobs:
               # a -fsycl compile succeeds with nothing but PATH set).
               #
               # Resolved, not hardcoded: the debs install into a versioned dir
-              # (compiler/2026.2/bin) and `latest` is only a symlink their postinst
+              # (compiler/2026.1/bin) and `latest` is only a symlink their postinst
               # adds, so neither path can be assumed. Prefer `latest` -- that is
               # the toolkit own choice of default -- else the highest version. Do
               # not just sort the glob: `latest` sorts after every number, so it

@@ -39,6 +39,7 @@
     that (m, 0) @ (0, n) is the zero matrix of shape (m, n).
 */
 
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
 #include <ATen/ATen.h>
@@ -48,6 +49,7 @@
 #include <algorithm>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "kernels/lora/device/qkv_lora_b_fwd_dispatch.hpp"
@@ -94,7 +96,7 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
     const torch::Tensor& weight_indices,  // [num_segments,]
     const torch::Tensor& lora_ranks,      // [num_loras,]
     const torch::Tensor& scalings,        // [num_loras,]
-    const std::optional<torch::Tensor>&
+    [[maybe_unused]] const std::optional<torch::Tensor>&
         seg_lens,  // [num_segments,] optional; currently unused, reserved for future per-segment optimizations
     const std::optional<torch::Tensor>&
         base_output  // [num_tokens, N_Q + 2N_{KV}] optional; this can be the base model's output for a fused add
@@ -213,6 +215,18 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
   const int n_total = static_cast<int>(n_total_i64);
   const int num_segments = static_cast<int>(num_segments_i64);
   (void)max_qkv_out_dim;  // validated above; per-group N comes from output_offset
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Grouped GEMM: (num_tokens, K) @ (K, N_total) -> (num_tokens, N_total). K == max_rank per group.
+  const double M = static_cast<double>(num_tokens_i64);
+  const double N = static_cast<double>(n_total_i64);
+  const double K = static_cast<double>(max_rank_i64);
+  const double flops = 2.0 * M * N * K;
+  const double bytes = static_cast<double>(input_x.numel()) * static_cast<double>(input_x.element_size()) +
+                       static_cast<double>(qkv_lora_b.numel()) * static_cast<double>(qkv_lora_b.element_size()) +
+                       static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
+  SGL_KERNEL_PERF_SCOPE("qkv_lora_b_fwd", queue, bytes, flops);
+#endif
 
   // Dispatch on dtype. Each launch symbol is defined in a separate generated
   // translation unit (see QKVLoraBFwdXe20.cmake).

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <sycl/sycl.hpp>
 
+#include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
@@ -408,6 +409,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc
       comb_3d.size(0) == num_tokens && comb_3d.size(1) == hc_mult && comb_3d.size(2) == hc_mult,
       "comb_res_mix shape mismatch");
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  GPU_Clock timer;
+  timer.start();
+#endif
+
   if (num_tokens > kSmallBatchThreshold) {
     at::Tensor residual_cur = at::empty_like(residual);
     hc_post(x, residual, post_2d, comb_3d, residual_cur);
@@ -444,6 +451,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc
         norm_weight,
         norm_eps);
 
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+    // Bulk work: hc_post (~2*T*HC^2*D) + hc_pre gemm (~2*T*HC^3*D) + sinkhorn/norm ~T*HC^3*iters + rms.
+    const double post_flops = 2.0 * static_cast<double>(num_tokens) * static_cast<double>(hc_mult) *
+                              static_cast<double>(hc_mult) * static_cast<double>(hidden_size);
+    const double pre_flops = 2.0 * static_cast<double>(num_tokens) * static_cast<double>(hc_mult) *
+                             static_cast<double>(hc_mult) * static_cast<double>(hidden_size);
+    const double sinkhorn_flops = static_cast<double>(sinkhorn_repeat) * static_cast<double>(num_tokens) *
+                                  static_cast<double>(hc_mult) * static_cast<double>(hc_mult);
+    const double flops = post_flops + pre_flops + sinkhorn_flops;
+    const double bytes = 3.0 * static_cast<double>(x.numel()) * static_cast<double>(x.element_size()) +
+                         3.0 * static_cast<double>(residual.numel()) * static_cast<double>(residual.element_size());
+    ::sglkernel::report_kernel_perf("mhc_fused_post_pre", profiling_queue, timer, bytes, flops);
+#endif
     return {residual_cur, post_mix_cur.unsqueeze(-1), comb_mix_cur, layer_input_cur};
   }
 

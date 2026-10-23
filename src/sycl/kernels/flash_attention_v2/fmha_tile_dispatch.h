@@ -44,6 +44,9 @@ constexpr PrefillTile prefill_paged_tile(int hd) {
   switch (hd) {
     case 64:
       return {128, 64, 8, true};
+    case 80:
+      // Mirrors the tuned non-paged HD=80 tile; unvalidated for the paged path.
+      return {256, 64, 16, true};
     case 96:
       return {128, 64, 8, true};
     case 128:
@@ -77,7 +80,8 @@ constexpr PrefillTile prefill_nopage_tile(int hd) {
     case 256:
       return {128, 64, 16, true};
     case 512:
-      return {128, 128, 16, true};
+      // A 128-wide KV tile spills registers at HD512; match the paged tile.
+      return {256, 64, 32, true};
     default:
       return {0, 0, 0, false};
   }

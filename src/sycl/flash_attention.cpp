@@ -29,6 +29,9 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
+// Overrides the build-wide -DSYCL_INTEL_TARGET; cutlass.h re-derives it from
+// __SYCL_TARGET_INTEL_GPU_*__ on first include.
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 #include <ATen/ATen.h>
 #include <ATen/Parallel.h>
@@ -41,6 +44,7 @@
 #ifdef USE_FMHA_JIT
 #include "jit/fmha_jit.h"
 #endif
+#include "SGLKernelPerf.h"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -297,15 +301,15 @@ void mha_fwd(
     const at::Tensor& cu_seqlens_k,         // b+1
     int max_seqlen_q,
     int max_seqlen_k,
-    std::optional<const at::Tensor>& page_table,       // (b_k, max_num_pages_per_seq)
-    std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
-    std::optional<const at::Tensor>& leftpad_k_,       // b
-    std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& rotary_sin_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& seqlens_rotary_,  // b
-    std::optional<at::Tensor>& q_descale_,             // (b, h_k), not (b, h)
-    std::optional<at::Tensor>& k_descale_,             // (b, h_k)
-    std::optional<at::Tensor>& v_descale_,             // (b, h_k)
+    std::optional<const at::Tensor>& page_table,             // (b_k, max_num_pages_per_seq)
+    std::optional<const at::Tensor>& kv_batch_idx_,          // b. indices to index into the KV cache
+    std::optional<const at::Tensor>& leftpad_k_,             // b
+    std::optional<const at::Tensor>& rotary_cos_,            // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& rotary_sin_,            // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& seqlens_rotary_,        // b
+    [[maybe_unused]] std::optional<at::Tensor>& q_descale_,  // (b, h_k), not (b, h)
+    std::optional<at::Tensor>& k_descale_,                   // (b, h_k)
+    std::optional<at::Tensor>& v_descale_,                   // (b, h_k)
     const float softmax_scale_,
     std::optional<const at::Tensor>& sinks_,
     bool is_causal,
@@ -313,10 +317,10 @@ void mha_fwd(
     int window_size_right,
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-    std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
+    [[maybe_unused]] std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
     int num_kv_splits,
-    std::optional<bool> pack_gqa_,
-    int const sm_margin,
+    [[maybe_unused]] std::optional<bool> pack_gqa_,
+    [[maybe_unused]] int const sm_margin,
     // Caller-provided output buffers written in place: ``out`` receives the
     // attention result and ``softmax_lse`` the logsumexp when present. A
     // per-batch skip mask (length = batch, chunkprefill two-launch path) selects
@@ -387,7 +391,7 @@ void mha_fwd(
   CHECK_INPUT(cu_seqlens_k);
   TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
 
-  auto const sizes = q.sizes();
+  [[maybe_unused]] auto const sizes = q.sizes();
   const int batch_size = cu_seqlens_q.size(0) - 1;
   int seqlen_q = max_seqlen_q;
   int total_q = q.size(0);
@@ -538,7 +542,8 @@ void mha_fwd(
     params.max_logits_ptr = max_logits.data_ptr();
   }
   int const head_size_rounded = round_up_headdim(head_size);
-  int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
+  [[maybe_unused]] int const head_size_v_rounded =
+      head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
 
   // Otherwise the kernel will be launched from cuda:0 device
   // Cast to char to avoid compiler warning about narrowing
@@ -732,7 +737,8 @@ void mha_fwd(
   // Paged decode supports its own (independent) set of head dims; see
   // FMHA_DECODE_PAGED_HEAD_DIMS in FMHADecodeXe20.cmake.
   TORCH_CHECK(
-      params.d == 64 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 || params.d == 512,
+      params.d == 64 || params.d == 80 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 ||
+          params.d == 512,
       "Unsupported head size for paged decode attention: ",
       params.d);
   TORCH_CHECK(
@@ -981,15 +987,15 @@ void mha_fwd(
     const at::Tensor& cu_seqlens_k,         // b+1
     int max_seqlen_q,
     int max_seqlen_k,
-    std::optional<const at::Tensor>& page_table,       // (b_k, max_num_pages_per_seq)
-    std::optional<const at::Tensor>& kv_batch_idx_,    // b. indices to index into the KV cache
-    std::optional<const at::Tensor>& leftpad_k_,       // b
-    std::optional<const at::Tensor>& rotary_cos_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& rotary_sin_,      // seqlen_ro x (rotary_dim / 2)
-    std::optional<const at::Tensor>& seqlens_rotary_,  // b
-    std::optional<at::Tensor>& q_descale_,             // (b, h_k), not (b, h)
-    std::optional<at::Tensor>& k_descale_,             // (b, h_k)
-    std::optional<at::Tensor>& v_descale_,             // (b, h_k)
+    std::optional<const at::Tensor>& page_table,             // (b_k, max_num_pages_per_seq)
+    std::optional<const at::Tensor>& kv_batch_idx_,          // b. indices to index into the KV cache
+    std::optional<const at::Tensor>& leftpad_k_,             // b
+    std::optional<const at::Tensor>& rotary_cos_,            // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& rotary_sin_,            // seqlen_ro x (rotary_dim / 2)
+    std::optional<const at::Tensor>& seqlens_rotary_,        // b
+    [[maybe_unused]] std::optional<at::Tensor>& q_descale_,  // (b, h_k), not (b, h)
+    std::optional<at::Tensor>& k_descale_,                   // (b, h_k)
+    std::optional<at::Tensor>& v_descale_,                   // (b, h_k)
     const float softmax_scale_,
     std::optional<const at::Tensor>& sinks_,
     bool is_causal,
@@ -997,10 +1003,10 @@ void mha_fwd(
     int window_size_right,
     float const softcap,
     bool const is_rotary_interleaved,  // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-    std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
-    int num_splits,
-    std::optional<bool> pack_gqa_,
-    int const sm_margin,
+    [[maybe_unused]] std::optional<at::Tensor>& scheduler_metadata_,  // (b + 1)
+    [[maybe_unused]] int num_splits,
+    [[maybe_unused]] std::optional<bool> pack_gqa_,
+    [[maybe_unused]] int const sm_margin,
     // Caller-provided output buffers written in place: ``out`` receives the
     // attention result and ``softmax_lse`` the logsumexp when present. A
     // per-batch skip mask (length = batch, chunkprefill two-launch path) selects
@@ -1008,7 +1014,8 @@ void mha_fwd(
     at::Tensor& out,
     std::optional<at::Tensor>& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
-    std::optional<const at::Tensor> rel_bias_ = std::nullopt) {
+    std::optional<const at::Tensor> rel_bias_ = std::nullopt,
+    std::optional<const at::Tensor> block_id_ = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -1037,6 +1044,7 @@ void mha_fwd(
   // Non-paged (page_table == nullopt) prefill: contiguous ragged KV cache.
   if (!page_table.has_value()) {
     TORCH_CHECK(!rel_bias_.has_value(), "relative attention requires paged KV cache");
+    TORCH_CHECK(!block_id_.has_value(), "bidirectional_block_ids requires paged KV cache");
     mha_fwd_nopage(
         q,
         k,
@@ -1067,7 +1075,7 @@ void mha_fwd(
   CHECK_INPUT(cu_seqlens_k);
   TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype torch.int32");
 
-  auto const sizes = q.sizes();
+  [[maybe_unused]] auto const sizes = q.sizes();
   const int batch_size = cu_seqlens_q.size(0) - 1;
   int seqlen_q = max_seqlen_q;
   int total_q = q.size(0);
@@ -1140,7 +1148,8 @@ void mha_fwd(
   bool const return_softmax_lse = softmax_lse.has_value();
 
   int const head_size_rounded = round_up_headdim(head_size);
-  int const head_size_v_rounded = head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
+  [[maybe_unused]] int const head_size_v_rounded =
+      head_size_v == head_size ? head_size_rounded : round_up_headdim(head_size_v);
 
   // Otherwise the kernel will be launched from cuda:0 device
   // Cast to char to avoid compiler warning about narrowing
@@ -1183,6 +1192,31 @@ void mha_fwd(
     params.rel_bias_token_stride = sheared_rel_bias.stride(0);
     params.rel_bias_head_stride = sheared_rel_bias.stride(1);
     params.rel_bias_extent = rel_bias.size(-1);
+  }
+
+  // A per-token block id (-1 = none) enables the bidirectional-block mask in the
+  // prefill mainloop: keys sharing a query's non-negative id are attended
+  // bidirectionally, causal otherwise. The mask re-imposes causal for
+  // block-less tokens, so the caller must run non-causal; ids cover the extend
+  // tokens (total_q), i.e. the full-prefill path.
+  if (block_id_.has_value()) {
+    const at::Tensor& block_id = block_id_.value();
+    TORCH_CHECK(block_id.scalar_type() == at::kInt, "bidirectional_block_ids must be int32");
+    TORCH_CHECK(block_id.device() == q.device(), "bidirectional_block_ids must be on q's device");
+    TORCH_CHECK(block_id.is_contiguous(), "bidirectional_block_ids must be contiguous");
+    TORCH_CHECK(block_id.numel() == q.size(0), "bidirectional_block_ids must have total_q entries");
+    // Block ids cover the extend (query) tokens only; the mainloop indexes them
+    // up to the KV length, so require full prefill (per-sequence KV length ==
+    // query length, no cached prefix) to avoid out-of-range reads.
+    const int64_t bsz = cu_seqlens_q.size(0) - 1;
+    const at::Tensor q_seqlens = cu_seqlens_q.slice(0, 1, bsz + 1) - cu_seqlens_q.slice(0, 0, bsz);
+    TORCH_CHECK(
+        cu_seqlens_k.numel() == bsz && at::equal(q_seqlens, cu_seqlens_k),
+        "bidirectional_block_ids requires full prefill: each query length must equal the corresponding KV cache "
+        "length");
+    TORCH_CHECK(!is_causal, "bidirectional_block_ids (bidirectional-block mask) requires is_causal=false");
+    TORCH_CHECK(params.rel_bias_ptr == nullptr, "bidirectional_block_ids and rel_bias are mutually exclusive");
+    params.block_id_ptr = block_id.data_ptr<int>();
   }
 
   // Per-batch skip mask for the chunkprefill two-launch dispatcher.
@@ -1235,6 +1269,12 @@ void mha_fwd(
   // Local is the more general case where window_size_right >= 0 or window_size_left >= 0.
   params.is_causal = window_size_left < 0 && window_size_right == 0;
   params.is_local = (window_size_left >= 0 || window_size_right >= 0) && !params.is_causal;
+  // The prefill kernel only instantiates the bidirectional-block mask on the
+  // non-causal, non-local path, so reject a sliding window here rather than
+  // silently dropping the mask.
+  TORCH_CHECK(
+      params.block_id_ptr == nullptr || !params.is_local,
+      "bidirectional_block_ids does not support sliding-window (local) attention");
 
   // TODO: check this
   if (window_size_left < 0) {
@@ -1313,7 +1353,8 @@ void mha_fwd(
   // Paged prefill supports its own (independent) set of head dims; see
   // FMHA_PREFILL_PAGED_HEAD_DIMS in FMHAPrefillXe20.cmake.
   TORCH_CHECK(
-      params.d == 64 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 || params.d == 512,
+      params.d == 64 || params.d == 80 || params.d == 96 || params.d == 128 || params.d == 192 || params.d == 256 ||
+          params.d == 512,
       "Unsupported head size for paged prefill attention: ",
       params.d);
 
@@ -1336,6 +1377,9 @@ void mha_fwd(
   switch (params.d) {
     case 64:
       DISPATCH_PREFILL_KERNEL(64);
+      break;
+    case 80:
+      DISPATCH_PREFILL_KERNEL(80);
       break;
     case 96:
       DISPATCH_PREFILL_KERNEL(96);
@@ -1401,7 +1445,8 @@ void mha_fwd(
     std::optional<bool> pack_gqa_,
     int const sm_margin,
     at::Tensor& out,
-    std::optional<at::Tensor>& softmax_lse) {
+    std::optional<at::Tensor>& softmax_lse,
+    std::optional<const at::Tensor> block_id_ = std::nullopt) {
   // Supports both paged (page_table != None) and non-paged (contiguous ragged
   // KV, page_table == None) layouts.
   // ``seqlens_rotary_`` is intentionally not checked here: callers pass it
@@ -1468,12 +1513,12 @@ void mha_fwd(
   // decode batches. The two complementary skip masks partition every query token
   // across the launches, so the shared buffers end up fully written with no
   // stitching or extra copies needed.
-  launch(prefill::mha_fwd, is_prefill.logical_not(), std::nullopt);
+  launch(prefill::mha_fwd, is_prefill.logical_not(), std::nullopt, block_id_);
 }
 
 }  // namespace chunkprefill
 
-SGL_KERNEL_EXPORT void mha_fwd(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     const at::Tensor& q,  // (total_q, h, d) — ragged 3D
     const at::Tensor& k,  // (total_k, h_k, d) if non-paged, or (num_pages, page_size, h_k, d) if paged
     const at::Tensor& v,  // (total_k, h_k, dv) if non-paged, or (num_pages, page_size, h_k, dv) if paged
@@ -1502,15 +1547,13 @@ SGL_KERNEL_EXPORT void mha_fwd(
     int num_kv_splits,
     std::optional<bool> pack_gqa_,
     int const sm_margin,
-    // Caller-provided output buffers, written in place (no value is returned).
-    // ``softmax_lse`` doubles as the "return LSE" flag: a present optional
-    // requests the logsumexp be computed and written; std::nullopt skips the
-    // LSE computation entirely.
-    at::Tensor& out,
-    std::optional<at::Tensor>& softmax_lse,
+    std::optional<at::Tensor>& out_,
+    bool return_softmax_lse,
     std::optional<const at::Tensor>& rel_bias_,
-    bool rel_bias_is_sheared) {
+    bool rel_bias_is_sheared,
+    std::optional<const at::Tensor>& bidirectional_block_ids_) {
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
+  at::Tensor out = out_.has_value() ? *out_ : at::empty({q.size(0), q.size(1), v.size(-1)}, q.options());
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
   TORCH_CHECK(out.scalar_type() == q.scalar_type(), "out dtype must match q dtype");
@@ -1520,18 +1563,39 @@ SGL_KERNEL_EXPORT void mha_fwd(
   TORCH_CHECK(out.device() == q.device(), "out must be on the same device as q");
   TORCH_CHECK(out.stride(-1) == 1, "out must have a contiguous last dimension");
 
-  // Whether to compute the softmax logsumexp is derived from the caller-provided
-  // ``softmax_lse`` optional: a present tensor requests it. The sub-kernels
-  // derive the same flag and write into the buffer directly.
-  if (softmax_lse.has_value()) {
-    TORCH_CHECK(softmax_lse->scalar_type() == at::kFloat, "softmax_lse must be float32");
-    TORCH_CHECK(
-        softmax_lse->dim() == 2 && softmax_lse->size(0) == q.size(1) && softmax_lse->size(1) == q.size(0),
-        "softmax_lse shape must be [num_heads, total_q]");
-    TORCH_CHECK(softmax_lse->device() == q.device(), "softmax_lse must be on the same device as q");
+  std::optional<at::Tensor> softmax_lse;
+  if (return_softmax_lse) {
+    softmax_lse = at::empty({q.size(1), q.size(0)}, q.options().dtype(at::kFloat).device(q.device()));
   }
 
   int64_t batch_size = cu_seqlens_q.size(0) - 1;
+
+#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
+  // Mirrors PR#269 flash_attentionXe35_common.hpp accounting:
+  //   QK: 2 * H_q * B * S_q * S_kv * D
+  //   PV: 2 * H_q * B * S_q * S_kv * D
+  // and bytes count Q read + K read + V read + O write on the effective seq lengths.
+  const int64_t num_heads_q = q.size(1);
+  const int64_t num_heads_kv = k.size(-2);
+  const int64_t head_dim = q.size(-1);
+  const int64_t head_dim_v = v.size(-1);
+  const double batched_qk_pairs =
+      static_cast<double>(batch_size) * static_cast<double>(max_seqlen_q) * static_cast<double>(max_seqlen_k);
+  const double flops_qk = 2.0 * static_cast<double>(num_heads_q) * batched_qk_pairs * static_cast<double>(head_dim);
+  const double flops_pv = 2.0 * static_cast<double>(num_heads_q) * batched_qk_pairs * static_cast<double>(head_dim_v);
+  const double flops = flops_qk + flops_pv;
+  const double elem_sz = static_cast<double>(q.element_size());
+  const double batched_eff_seq_q = static_cast<double>(batch_size) * static_cast<double>(max_seqlen_q);
+  const double batched_seq_kv = static_cast<double>(batch_size) * static_cast<double>(max_seqlen_k);
+  const double bytes_qk =
+      static_cast<double>(num_heads_q) * batched_eff_seq_q * static_cast<double>(head_dim) * elem_sz +
+      static_cast<double>(num_heads_kv) * batched_seq_kv * static_cast<double>(head_dim) * elem_sz;
+  const double bytes_pv =
+      static_cast<double>(num_heads_kv) * batched_seq_kv * static_cast<double>(head_dim_v) * elem_sz +
+      static_cast<double>(num_heads_q) * batched_eff_seq_q * static_cast<double>(head_dim_v) * elem_sz;
+  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  SGL_KERNEL_PERF_SCOPE("mha_fwd", profiling_queue, bytes_qk + bytes_pv, flops);
+#endif
 
   // decode / prefill / chunkprefill all take the same leading argument list;
   // only the trailing parameters differ. Bind the shared arguments once here so
@@ -1585,7 +1649,7 @@ SGL_KERNEL_EXPORT void mha_fwd(
     // Relative bias currently bypasses chunkprefill. For any request with
     // max_seqlen_q > 1, use the prefill sheared-bias layout for all rows,
     // including q_len == 1 rows in a mixed batch.
-    dispatch(prefill::mha_fwd, std::nullopt, rel_bias_);
+    dispatch(prefill::mha_fwd, std::nullopt, rel_bias_, std::nullopt);
   } else if (!page_table.has_value() || is_uniform_qlen) {
     // Pure prefill path
     //
@@ -1597,10 +1661,14 @@ SGL_KERNEL_EXPORT void mha_fwd(
     //
     // This condition is sufficient but not necessary: a non-uniform
     // all-prefill batch falls through to chunkprefill, which is still correct.
-    dispatch(prefill::mha_fwd, std::nullopt, std::nullopt);
+    dispatch(prefill::mha_fwd, std::nullopt, std::nullopt, bidirectional_block_ids_);
   } else {
     // Non-uniform paged batches fall back to chunkprefill.
-    dispatch(chunkprefill::mha_fwd);
+    dispatch(chunkprefill::mha_fwd, bidirectional_block_ids_);
   }
+  if (return_softmax_lse) {
+    return {out, *softmax_lse};
+  }
+  return {out, c10::nullopt};
 }
 #undef SYCL_INTEL_TARGET

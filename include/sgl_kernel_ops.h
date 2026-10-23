@@ -122,6 +122,8 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void qwen4_gate_value(torch::Tensor& output, torch::Tensor& gate, torch::Tensor& value);
+void qwen4_gate_reduce(torch::Tensor& output, torch::Tensor& key, torch::Tensor& query, torch::Tensor& value);
 std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_norm_scale_shift(
     const torch::Tensor& residual,
     const torch::Tensor& x,

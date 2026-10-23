@@ -179,6 +179,8 @@ from sgl_kernel.mamba import (
     causal_conv1d_fn_xpu,
     causal_conv1d_update_verify_xpu,
     causal_conv1d_update_xpu,
+    qwen4_short_conv_state,
+    qwen4_verify_conv,
 )
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (

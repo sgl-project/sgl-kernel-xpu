@@ -747,6 +747,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("causal_conv1d_update_verify", torch::kXPU, &causal_conv1d_update_verify);
 
   /*
+   * Qwen3.8-Flash-Next PLE short convolution
+   */
+  m.def("qwen4_short_conv_state(Tensor! conv_input, Tensor! state, Tensor state_indices, Tensor x) -> ()");
+  m.impl("qwen4_short_conv_state", torch::kXPU, &at::native::xpu::qwen4_short_conv_state);
+
+  m.def(
+      "qwen4_verify_conv(Tensor! output, Tensor(a!)? intermediate, Tensor x, Tensor residual, Tensor weight, "
+      "Tensor state, Tensor state_indices, Tensor valid, int width, int dilation) -> ()");
+  m.impl("qwen4_verify_conv", torch::kXPU, &at::native::xpu::qwen4_verify_conv);
+
+  /*
    * Compress plan kernels
    */
   m.def(

@@ -140,6 +140,32 @@ def gemma_fused_add_rmsnorm(
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(input, residual, weight, eps)
 
 
+def fused_sigmoid_mul(
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    inplace: bool = False,
+) -> torch.Tensor:
+    r"""Attention output gating: ``input * sigmoid(gate)``.
+
+    The sigmoid is rounded to the input dtype before the multiply, matching the
+    eager ``input * torch.sigmoid(gate)``.
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        BF16/FP16 contiguous, shape ``(N, H)``.
+    gate: torch.Tensor
+        Same dtype, shape ``(N, H)`` or ``(N, heads, head_dim)`` with
+        ``heads * head_dim == H``. May be strided (e.g. a chunk of the q/gate
+        projection) but must be contiguous in the last dim.
+    inplace: bool
+        Write the result into ``input`` and return it.
+    """
+    out = input if inplace else torch.empty_like(input)
+    torch.ops.sgl_kernel.fused_sigmoid_mul(out, input, gate)
+    return out
+
+
 def fused_inplace_qknorm_rope(
     q: torch.Tensor,
     k: torch.Tensor,

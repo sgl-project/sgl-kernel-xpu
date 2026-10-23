@@ -91,6 +91,7 @@ suites = {
         TestFile("test_qsa_sparse_attention.py"),
         TestFile("test_qsa_mqa.py"),
         TestFile("test_qsa_prepare.py"),
+        TestFile("test_qwen4_ngram_hash.py"),
     ],
     # Nightly suite: exercises the wheel installed in the intel/sgl-kernel-xpu-dev
     # nightly image. Populate with longer-running or full-shape tests that are

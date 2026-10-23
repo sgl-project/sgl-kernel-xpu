@@ -75,6 +75,7 @@ from sgl_kernel.elementwise import (
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
     multimodal_rotary_embedding,
+    qwen4_ngram_hash,
     rmsnorm,
     silu_and_mul,
     silu_and_mul_clamp,

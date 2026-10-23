@@ -1115,7 +1115,7 @@ template <typename scalar_t, int vec_size, int ITERS>
 void launch_grouped_gemma_rmsnorm(
     const scalar_t* x, const scalar_t* w, scalar_t* y, int64_t rows, int64_t N, int64_t num_groups, double eps) {
   const int64_t vecs = N / vec_size;
-  const int64_t wg_size = std::min<int64_t>(kMaxWorkGroupSize, (((vecs + ITERS - 1) / ITERS) + 15) / 16 * 16);
+  const int64_t wg_size = std::min<int64_t>(kMaxWorkGroupSize, div_up(div_up(vecs, int64_t{ITERS}), int64_t{16}) * 16);
   GroupedGemmaRMSNormFunctor<scalar_t, vec_size, ITERS> fn{
       x, w, y, static_cast<uint32_t>(N), static_cast<uint32_t>(num_groups), static_cast<acc_type<scalar_t>>(eps)};
   sycl_kernel_submit(
@@ -1126,13 +1126,13 @@ template <typename scalar_t>
 void GroupedGemmaRMSNormKernelImplInternal(
     const Tensor& X, const Tensor& gemma, int64_t M, int64_t N, int64_t num_groups, double eps, Tensor& Y) {
   constexpr int kVec = 16 / sizeof(scalar_t);
-  const int64_t want = (N / kVec + 255) / 256;
+  const int64_t min_iters = div_up<int64_t>(N / kVec, 256);
   scalar_t* x = X.data_ptr<scalar_t>();
   scalar_t* w = gemma.data_ptr<scalar_t>();
   scalar_t* y = Y.data_ptr<scalar_t>();
-  if (want <= 1) {
+  if (min_iters <= 1) {
     launch_grouped_gemma_rmsnorm<scalar_t, kVec, 1>(x, w, y, M, N, num_groups, eps);
-  } else if (want <= 2) {
+  } else if (min_iters <= 2) {
     launch_grouped_gemma_rmsnorm<scalar_t, kVec, 2>(x, w, y, M, N, num_groups, eps);
   } else {
     launch_grouped_gemma_rmsnorm<scalar_t, kVec, kMaxIters>(x, w, y, M, N, num_groups, eps);

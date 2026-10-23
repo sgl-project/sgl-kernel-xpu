@@ -154,7 +154,7 @@ def get_benchmark(ratio: int, device: str = "xpu"):
             f"provider={provider:5} ms={ms:.3f}"
         )
 
-        return ms, max_ms, min_ms
+        return ms, min_ms, max_ms
 
     return benchmark
 

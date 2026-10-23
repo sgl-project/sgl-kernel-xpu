@@ -60,7 +60,7 @@ def fused_topk_torch_native(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("n_token", [2, 32, 4096])
-@pytest.mark.parametrize("n_expert", [8, 32, 256])
+@pytest.mark.parametrize("n_expert", [8, 32, 256, 512])
 @pytest.mark.parametrize("n_topk", [1, 2, 4])
 @pytest.mark.parametrize("renormalize", [False, True])
 def test_topk_softmax(dtype, n_token, n_topk, n_expert, renormalize):
@@ -103,6 +103,15 @@ def test_topk_softmax(dtype, n_token, n_topk, n_expert, renormalize):
         topk_indices,
         n_token,
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("n_token", [2, 32])
+@pytest.mark.parametrize("n_topk", [10, 16])
+@pytest.mark.parametrize("n_expert", [127, 255])
+@pytest.mark.parametrize("renormalize", [False, True])
+def test_topk_softmax_none_pow_2_experts(dtype, n_token, n_topk, n_expert, renormalize):
+    test_topk_softmax(dtype, n_token, n_topk, n_expert, renormalize)
 
 
 if __name__ == "__main__":

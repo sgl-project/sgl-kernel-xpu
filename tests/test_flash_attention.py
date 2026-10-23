@@ -2910,6 +2910,105 @@ def test_relative_attention(
     )
 
 
+@pytest.mark.skipif(device.type != "xpu", reason="ALiBi requires an XPU device")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("page_size", [64, 128])
+@pytest.mark.parametrize(
+    "causal,seqlens_q,seqlens_k,num_heads,num_heads_k,num_splits",
+    [
+        (False, [31], [33], 8, 2, 0),
+        (True, [33], [65], 8, 2, 0),
+        (True, [128], [128], 8, 8, 0),
+        (True, [257], [513], 16, 2, 0),
+        (True, [35, 17], [129, 97], 8, 2, 0),
+        (True, [1, 33], [65, 191], 8, 2, 0),
+        (True, [1, 1], [65, 300], 8, 2, 1),
+        (True, [1, 1], [65, 300], 8, 8, 1),
+        (True, [1, 1], [4097, 2050], 8, 2, 4),
+        (True, [1], [4097], 8, 8, 4),
+    ],
+)
+def test_alibi_attention(
+    dtype, page_size, causal, seqlens_q, seqlens_k, num_heads, num_heads_k, num_splits
+):
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.manual_seed(31)
+    head_dim = 128
+    slopes = 2.0 ** (-8.0 * torch.arange(1, num_heads + 1) / num_heads)
+    q = torch.randn(sum(seqlens_q), num_heads, head_dim, dtype=torch.float32).to(dtype)
+    k = [
+        torch.randn(seqlen_k, num_heads_k, head_dim, dtype=torch.float32).to(dtype)
+        for seqlen_k in seqlens_k
+    ]
+    v = [torch.randn_like(k_seq) for k_seq in k]
+    pages_per_seq = [math.ceil(seqlen_k / page_size) for seqlen_k in seqlens_k]
+    page_table = torch.empty(
+        (len(k), max(pages_per_seq)), dtype=torch.int32, device=device
+    )
+    k_cache = torch.zeros(
+        (sum(pages_per_seq), page_size, num_heads_k, head_dim),
+        dtype=dtype,
+        device=device,
+    )
+    v_cache = torch.zeros_like(k_cache)
+    page = 0
+    for batch, (k_seq, v_seq, page_count) in enumerate(zip(k, v, pages_per_seq)):
+        page_table[batch, :page_count] = torch.arange(
+            page, page + page_count, dtype=torch.int32, device=device
+        )
+        k_cache[page : page + page_count].flatten(0, 1)[: k_seq.size(0)].copy_(
+            k_seq.to(device)
+        )
+        v_cache[page : page + page_count].flatten(0, 1)[: v_seq.size(0)].copy_(
+            v_seq.to(device)
+        )
+        page += page_count
+
+    reference = torch.empty_like(q, device="cpu")
+    q_start = 0
+    for q_len, k_len, k_seq, v_seq in zip(seqlens_q, seqlens_k, k, v):
+        q_seq = q[q_start : q_start + q_len].float()
+        k_seq = repeat(k_seq.float(), "s h d -> s (h g) d", g=num_heads // num_heads_k)
+        v_seq = repeat(v_seq.float(), "s h d -> s (h g) d", g=num_heads // num_heads_k)
+        scores = torch.einsum("qhd,khd->hqk", q_seq, k_seq) * head_dim**-0.5
+        q_rows = torch.arange(q_len).unsqueeze(1) + k_len - q_len
+        distance = (q_rows - torch.arange(k_len).unsqueeze(0)).float()
+        scores -= slopes.view(-1, 1, 1) * distance.abs()
+        if causal:
+            scores.masked_fill_(distance < 0, float("-inf"))
+        reference[q_start : q_start + q_len] = torch.einsum(
+            "hqk,khd->qhd", torch.softmax(scores, dim=-1), v_seq
+        ).to(dtype)
+        q_start += q_len
+
+    cu_seqlens_q = torch.tensor(
+        [0, *torch.tensor(seqlens_q).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=device,
+    )
+    out = flash_attn_with_kvcache(
+        q.to(device),
+        k_cache,
+        v_cache,
+        cache_seqlens=torch.tensor(seqlens_k, dtype=torch.int32, device=device),
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max(seqlens_q),
+        max_seqlen_k=max(seqlens_k),
+        causal=causal,
+        num_splits=num_splits,
+        alibi_slopes=slopes.to(device),
+    )
+    torch.xpu.synchronize()
+    torch.testing.assert_close(
+        out.cpu().float(),
+        reference.float(),
+        rtol=1.6e-2 if dtype == torch.bfloat16 else 1e-3,
+        atol=1e-2 if dtype == torch.bfloat16 else 1e-3,
+    )
+
+
 @pytest.mark.skipif(
     device.type != "xpu", reason="relative attention requires an XPU device"
 )

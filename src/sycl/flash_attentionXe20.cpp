@@ -329,7 +329,8 @@ void mha_fwd(
     std::optional<at::Tensor>& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
     std::optional<const at::Tensor> rel_bias_ = std::nullopt,
-    bool rel_bias_is_sheared = false) {
+    bool rel_bias_is_sheared = false,
+    std::optional<const at::Tensor> alibi_slopes_ = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -598,6 +599,7 @@ void mha_fwd(
     params.rel_bias_head_stride = sheared_rel_bias.stride(1);
     params.rel_bias_extent = rel_bias_is_sheared ? rel_bias.size(-1) - page_size : rel_bias.size(-1);
   }
+  params.alibi_slopes_ptr = alibi_slopes_.has_value() ? alibi_slopes_->data_ptr<float>() : nullptr;
 
   // Per-batch skip mask for the chunkprefill two-launch path
   // (vllm-xpu-kernels#218). When provided, decode skips batches where
@@ -1015,7 +1017,8 @@ void mha_fwd(
     std::optional<at::Tensor>& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
     std::optional<const at::Tensor> rel_bias_ = std::nullopt,
-    std::optional<const at::Tensor> block_id_ = std::nullopt) {
+    std::optional<const at::Tensor> block_id_ = std::nullopt,
+    std::optional<const at::Tensor> alibi_slopes_ = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -1193,6 +1196,7 @@ void mha_fwd(
     params.rel_bias_head_stride = sheared_rel_bias.stride(1);
     params.rel_bias_extent = rel_bias.size(-1);
   }
+  params.alibi_slopes_ptr = alibi_slopes_.has_value() ? alibi_slopes_->data_ptr<float>() : nullptr;
 
   // A per-token block id (-1 = none) enables the bidirectional-block mask in the
   // prefill mainloop: keys sharing a query's non-negative id are attended
@@ -1508,12 +1512,12 @@ void mha_fwd(
 
   // Launch 1: decode writes the decode rows of ``out`` (and, when requested, of
   // ``softmax_lse``) and skips prefill batches, leaving their rows untouched.
-  launch(decode::mha_fwd, is_prefill, std::nullopt, false);
+  launch(decode::mha_fwd, is_prefill, std::nullopt, false, std::nullopt);
   // Launch 2: prefill writes the prefill rows into the same buffers and skips
   // decode batches. The two complementary skip masks partition every query token
   // across the launches, so the shared buffers end up fully written with no
   // stitching or extra copies needed.
-  launch(prefill::mha_fwd, is_prefill.logical_not(), std::nullopt, block_id_);
+  launch(prefill::mha_fwd, is_prefill.logical_not(), std::nullopt, block_id_, std::nullopt);
 }
 
 }  // namespace chunkprefill
@@ -1551,8 +1555,23 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     bool return_softmax_lse,
     std::optional<const at::Tensor>& rel_bias_,
     bool rel_bias_is_sheared,
-    std::optional<const at::Tensor>& bidirectional_block_ids_) {
+    std::optional<const at::Tensor>& bidirectional_block_ids_,
+    std::optional<const at::Tensor>& alibi_slopes_) {
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
+  if (alibi_slopes_.has_value()) {
+    const at::Tensor& slopes = alibi_slopes_.value();
+    TORCH_CHECK(
+        slopes.scalar_type() == at::kFloat && slopes.device() == q.device() && slopes.is_contiguous() &&
+            slopes.dim() == 1 && slopes.size(0) == q.size(1),
+        "alibi_slopes must be a contiguous fp32 [num_heads] tensor on q's device");
+    TORCH_CHECK(page_table.has_value(), "alibi_slopes requires a paged KV cache");
+    TORCH_CHECK(q.size(-1) == 128 && v.size(-1) == 128, "alibi_slopes requires head_dim=head_dim_v=128");
+    TORCH_CHECK(k.scalar_type() == q.scalar_type(), "alibi_slopes does not support fp8 KV cache");
+    TORCH_CHECK(
+        softcap == 0.f && !return_softmax_lse && !sinks_.has_value() && !rel_bias_.has_value() &&
+            !bidirectional_block_ids_.has_value(),
+        "alibi_slopes does not support softcap, softmax LSE, sinks, rel_bias or bidirectional_block_ids");
+  }
   at::Tensor out = out_.has_value() ? *out_ : at::empty({q.size(0), q.size(1), v.size(-1)}, q.options());
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
@@ -1643,13 +1662,13 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
   if (max_seqlen_q == 1) {
     // Pure decode path. Decode also supports the pre-sheared relative-bias fast
     // path, so forward both relative-bias tail arguments.
-    dispatch(decode::mha_fwd, std::nullopt, rel_bias_, rel_bias_is_sheared);
-  } else if (rel_bias_.has_value()) {
+    dispatch(decode::mha_fwd, std::nullopt, rel_bias_, rel_bias_is_sheared, alibi_slopes_);
+  } else if (rel_bias_.has_value() || alibi_slopes_.has_value()) {
     TORCH_CHECK(!rel_bias_is_sheared, "pre-sheared relative bias is supported only for decode");
     // Relative bias currently bypasses chunkprefill. For any request with
     // max_seqlen_q > 1, use the prefill sheared-bias layout for all rows,
     // including q_len == 1 rows in a mixed batch.
-    dispatch(prefill::mha_fwd, std::nullopt, rel_bias_, std::nullopt);
+    dispatch(prefill::mha_fwd, std::nullopt, rel_bias_, std::nullopt, alibi_slopes_);
   } else if (!page_table.has_value() || is_uniform_qlen) {
     // Pure prefill path
     //
@@ -1661,7 +1680,7 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     //
     // This condition is sufficient but not necessary: a non-uniform
     // all-prefill batch falls through to chunkprefill, which is still correct.
-    dispatch(prefill::mha_fwd, std::nullopt, std::nullopt, bidirectional_block_ids_);
+    dispatch(prefill::mha_fwd, std::nullopt, std::nullopt, bidirectional_block_ids_, std::nullopt);
   } else {
     // Non-uniform paged batches fall back to chunkprefill.
     dispatch(chunkprefill::mha_fwd, bidirectional_block_ids_);

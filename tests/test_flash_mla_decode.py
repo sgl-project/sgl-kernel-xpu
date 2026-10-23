@@ -176,5 +176,252 @@ def test_flash_mla_decode(
     del workspace, seq_lens_xpu
 
 
+# Multi-token decode: 4D q (bs, s_q, num_heads, dim), causal among the s_q tokens.
+
+
+def ref_mla_multi_token(
+    query: Tensor,  # (bs, s_q, num_heads, head_dim)
+    kv_cache: Tensor,  # (num_blocks, block_size, head_dim)
+    scale: float,
+    block_tables: Tensor,  # (bs, max_num_blocks)
+    seq_lens: Tensor,  # (bs,), includes the s_q new tokens
+    dv: int,
+):
+    """Causal reference: token t sees KV [0, seq_lens - s_q + t]; lse is log2-domain."""
+    bs, s_q, num_heads, head_dim = query.shape
+    out = torch.empty(bs, s_q, num_heads, dv, dtype=torch.float32)
+    lse = torch.empty(bs, s_q, num_heads, dtype=torch.float32)
+    for i in range(bs):
+        seq_len = int(seq_lens[i])
+        kv = kv_cache[block_tables[i]].view(-1, head_dim)[:seq_len].float()
+        v = kv[:, :dv]
+
+        # (s_q, num_heads, head_dim) x (seq_len, head_dim) -> (s_q, num_heads, seq_len)
+        scores = torch.einsum("shd,kd->shk", query[i].float(), kv) * scale
+        q_pos = torch.arange(s_q).view(s_q, 1, 1)
+        k_pos = torch.arange(seq_len).view(1, 1, seq_len)
+        scores = scores.masked_fill(k_pos > (seq_len - s_q) + q_pos, float("-inf"))
+
+        out[i] = scores.softmax(dim=-1) @ v
+        lse[i] = torch.logsumexp(scores, dim=-1) / math.log(2)
+    return out, lse
+
+
+def _make_decode_inputs(bs, s_q, h_q, d, mean_seq_len, varlen, block_size, dtype):
+    if varlen:
+        seq_lens = torch.empty(bs, dtype=torch.float32).normal_(
+            mean_seq_len, mean_seq_len / 2
+        )
+        # Every sequence must hold at least its s_q new tokens.
+        seq_lens = seq_lens.clip(min=max(2, s_q)).to(torch.int32)
+    else:
+        seq_lens = torch.full((bs,), max(mean_seq_len, s_q), dtype=torch.int32)
+    max_seq_len = seq_lens.max().item()
+    block_num = (max_seq_len + block_size - 1) // block_size
+    pack_factor = 128 // block_size
+    block_num = ((block_num + pack_factor - 1) // pack_factor) * pack_factor
+
+    q = torch.randn(bs, s_q, h_q, d, dtype=dtype) * 100
+    block_table = torch.randint(0, bs * block_num, (bs, block_num), dtype=torch.int32)
+    kv_cache = torch.randn(block_table.numel(), block_size, d, dtype=dtype)
+    return q, kv_cache, block_table, seq_lens, block_num
+
+
+def _check_multi_token_decode(
+    dtype,
+    s_q,
+    mean_seq_len,
+    bs,
+    varlen,
+    block_size,
+    num_heads,
+    num_kv_splits,
+    make_workspace=None,
+):
+    """Run one multi-token decode case against ref_mla_multi_token.
+
+    make_workspace(num_bytes) -> uint8 xpu tensor replaces the plain allocation
+    of the exact size the API reports (used to plant guard bytes around it).
+    """
+    torch.random.manual_seed(42)
+
+    dv, q_pe_dim = 512, 64
+    d = dv + q_pe_dim
+    scale = d ** (-0.5)
+
+    q, kv_cache, block_table, seq_lens, block_num = _make_decode_inputs(
+        bs, s_q, num_heads, d, mean_seq_len, varlen, block_size, dtype
+    )
+    out_ref, lse_ref = ref_mla_multi_token(
+        q, kv_cache, scale, block_table, seq_lens, dv
+    )
+
+    workspace_size = flash_mla_decode_get_workspace_size(
+        block_num * block_size,
+        bs,
+        num_heads,
+        block_size,
+        num_kv_splits=num_kv_splits,
+        seq_len_q=s_q,
+    )
+    if make_workspace is None:
+        workspace = torch.empty(workspace_size, device=device, dtype=torch.uint8)
+    else:
+        workspace = make_workspace(workspace_size)
+        assert workspace.numel() == workspace_size
+
+    q_xpu = q.to(device)
+    out, lse = flash_mla_decode(
+        q_xpu[..., :dv].contiguous(),
+        q_xpu[..., dv:].contiguous(),
+        kv_cache.to(device),
+        seq_lens.to(device),
+        block_table.to(device),
+        workspace,
+        scale,
+        num_kv_splits,
+        return_lse=True,
+    )
+    torch.xpu.synchronize()
+
+    assert out.shape == (bs, s_q, num_heads, dv)
+    assert lse.shape == (bs, s_q, num_heads)
+    assert lse.dtype == torch.float32
+    atol, rtol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
+    torch.testing.assert_close(out_ref, out.cpu().float(), atol=atol, rtol=rtol)
+    lse_atol, lse_rtol = (2e-2, 2e-2) if dtype == torch.bfloat16 else (5e-3, 5e-3)
+    torch.testing.assert_close(lse_ref, lse.cpu(), atol=lse_atol, rtol=lse_rtol)
+
+    del out, lse, out_ref, lse_ref, q, q_xpu, kv_cache, block_table, workspace
+
+
+@pytest.mark.arch("xe20", "xe35")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+# 1: 4D q on the single-token kernel; 2, 4: padded to the 8-row kernel; 16: two Q tiles.
+@pytest.mark.parametrize("s_q", [1, 2, 4, 8, 16])
+# 20 leaves empty splits at num_kv_splits=4.
+@pytest.mark.parametrize("mean_seq_len", [20, 1024])
+@pytest.mark.parametrize("bs", [1, 3])
+@pytest.mark.parametrize("varlen", [True, False])
+# 16: one subgroup along KV; 64/128: sub-page (32-wide) KV tiles for s_q > 1.
+@pytest.mark.parametrize("block_size", [16, 64, 128])
+@pytest.mark.parametrize("num_heads", [16, 128])
+@pytest.mark.parametrize("num_kv_splits", [-1, 1, 4])
+def test_flash_mla_decode_multi_token(
+    dtype: torch.dtype,
+    s_q: int,
+    mean_seq_len: int,
+    bs: int,
+    varlen: bool,
+    block_size: int,
+    num_heads: int,
+    num_kv_splits: int,
+):
+    _check_multi_token_decode(
+        dtype, s_q, mean_seq_len, bs, varlen, block_size, num_heads, num_kv_splits
+    )
+
+
+@pytest.mark.arch("xe20", "xe35")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+# Token counts that are not a kernel Q tile; 130 exceeds the 128-thread work-group.
+@pytest.mark.parametrize("s_q", [3, 5, 7, 9, 13, 15, 17, 28, 53, 130])
+# 0: all KV is new tokens; 1000: long causal-free prefix.
+@pytest.mark.parametrize("kv_prefix", [0, 1000])
+# 16: one subgroup along KV, KV tile == page; 128: sub-page KV tiles.
+@pytest.mark.parametrize("block_size", [16, 128])
+# 1 is the fused kernel; 4 is the split-KV kernel plus reduction.
+@pytest.mark.parametrize("num_kv_splits", [1, 4])
+def test_flash_mla_decode_off_bucket_seq_len_q(
+    dtype: torch.dtype,
+    s_q: int,
+    kv_prefix: int,
+    block_size: int,
+    num_kv_splits: int,
+):
+    _check_multi_token_decode(
+        dtype,
+        s_q,
+        mean_seq_len=s_q + kv_prefix,
+        bs=3,
+        varlen=True,
+        block_size=block_size,
+        num_heads=16,
+        num_kv_splits=num_kv_splits,
+    )
+
+
+@pytest.mark.arch("xe20", "xe35")
+def test_flash_mla_decode_workspace_scales_with_s_q():
+    """The split-KV workspace must grow with seq_len_q (GPU OOB writes are silent)."""
+    args = (4096, 4, 128, 64)
+    ws_1 = flash_mla_decode_get_workspace_size(*args, num_kv_splits=8)
+    ws_8 = flash_mla_decode_get_workspace_size(*args, num_kv_splits=8, seq_len_q=8)
+    assert ws_1 > 0
+    assert ws_8 > ws_1
+
+
+@pytest.mark.arch("xe20", "xe35")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+# 2, 3, 7: one partial 8-row Q tile; 9, 16: two Q tiles.
+@pytest.mark.parametrize("s_q", [2, 3, 7, 9, 16])
+@pytest.mark.parametrize("block_size", [16, 128])
+def test_flash_mla_decode_split_kv_stays_within_workspace(
+    dtype: torch.dtype, s_q: int, block_size: int
+):
+    """Split-KV must confine its writes to the workspace sized for seq_len_q.
+
+    The split kernel and the reduction address O_accum / exp_sums / max_logits
+    through the same host-computed offsets, so offsets that disagree with the
+    allocation (e.g. derived from the kernel's 8-row Q tile instead of
+    seq_len_q) still produce the right output. Below the tile height the
+    statistics land silently past the buffer; above it they fold back onto
+    O_accum and corrupt the result. Hand the kernel an exact-size prefix of a
+    sentinel-filled buffer big enough to absorb the misplaced writes, then
+    check the guard bytes as well as the output.
+    """
+    bs, num_heads, num_kv_splits = 3, 16, 4
+    sentinel = 0xA5
+    planted = {}
+
+    def make_workspace(num_bytes):
+        # Twice the larger of s_q and the 8-row Q tile: a layout built from the
+        # tile height, even for two tiles, then lands in the guard rather than in
+        # some other allocation. max_seq_len only drives auto split selection,
+        # so any value sizes the explicit-split layout.
+        guard_rows = 2 * max(s_q, 8)
+        guarded = flash_mla_decode_get_workspace_size(
+            1024,
+            bs,
+            num_heads,
+            block_size,
+            num_kv_splits=num_kv_splits,
+            seq_len_q=guard_rows,
+        )
+        assert guarded > num_bytes
+        buf = torch.full((guarded,), sentinel, device=device, dtype=torch.uint8)
+        planted["buf"], planted["used"] = buf, num_bytes
+        return buf[:num_bytes]  # contiguous prefix: the kernel sees only num_bytes
+
+    _check_multi_token_decode(
+        dtype,
+        s_q,
+        mean_seq_len=1024,
+        bs=bs,
+        varlen=True,
+        block_size=block_size,
+        num_heads=num_heads,
+        num_kv_splits=num_kv_splits,
+        make_workspace=make_workspace,
+    )
+
+    guard = planted["buf"][planted["used"] :]
+    touched = (guard != sentinel).nonzero()
+    assert touched.numel() == 0, (
+        f"split-KV wrote {touched.numel()} byte(s) past the "
+        f"{planted['used']}-byte workspace (first at +{int(touched[0])})"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

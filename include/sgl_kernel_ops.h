@@ -1047,6 +1047,58 @@ void top_p_sampling_from_probs(
 at::Tensor
 fast_topk(const at::Tensor& score, const at::Tensor& lengths, int64_t topk, std::optional<at::Tensor> row_starts_opt);
 
+at::Tensor qsa_sparse_attention(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    const at::Tensor& token_slots,
+    std::optional<double> softmax_scale);
+
+at::Tensor qsa_mqa_prefill(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& row_starts,
+    const at::Tensor& row_ends,
+    std::optional<double> score_scale);
+
+at::Tensor qsa_mqa_decode(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& page_table,
+    const at::Tensor& context_lens,
+    int64_t max_model_len,
+    std::optional<double> score_scale);
+
+at::Tensor qsa_index_q_norm_rope_store(
+    const at::Tensor& qk,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& axis_map,
+    const at::Tensor& weight,
+    const at::Tensor& cache_loc,
+    at::Tensor key_state_buffer,
+    at::Tensor rope_position_buffer,
+    int64_t num_q_heads,
+    int64_t rotary_dim,
+    double eps,
+    bool is_neox_style,
+    std::optional<int64_t> q_heads_padded,
+    std::optional<at::ScalarType> out_dtype);
+
+void qsa_index_k_compress_store(
+    const at::Tensor& key_state_buffer,
+    const at::Tensor& group_locs,
+    const at::Tensor& rope_position_buffer,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& axis_map,
+    const at::Tensor& weight,
+    const at::Tensor& write_locs,
+    at::Tensor compressed_k_buffer,
+    int64_t compress_ratio,
+    int64_t rotary_dim,
+    double eps,
+    bool is_neox_style);
+
 at::Tensor fast_topk_transform_fused(
     const at::Tensor& score,
     const at::Tensor& lengths,

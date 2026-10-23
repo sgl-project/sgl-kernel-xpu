@@ -34,6 +34,22 @@ inline void from_float(sycl::ext::oneapi::bfloat16& d, float s) {
   d = static_cast<sycl::ext::oneapi::bfloat16>(s);
 }
 
+// sycl::vec/half/bfloat16 have non-public members, so memcpy over them is UB.
+// This aggregate carries the same 128-bit pack and is copied by assignment.
+// Callers guarantee 16B alignment: head_size % (16 / sizeof(scalar_t)) == 0.
+template <typename scalar_t, typename pack_128b_t>
+struct alignas(sizeof(pack_128b_t)) scalar_pack_t {
+  static constexpr uint32_t num_elems = sizeof(pack_128b_t) / sizeof(scalar_t);
+  scalar_t elems[num_elems];
+
+  scalar_t& operator[](uint32_t i) {
+    return elems[i];
+  }
+  const scalar_t& operator[](uint32_t i) const {
+    return elems[i];
+  }
+};
+
 template <typename scalar_t, typename pack_128b_t>
 struct MergePrefixSuffix {
   const uint64_t total_threads;
@@ -104,14 +120,11 @@ struct MergePrefixSuffix {
     const float out_se = sycl::fmax(p_se + s_se, std::numeric_limits<float>::min());
     const float p_scale = p_se / out_se;
     const float s_scale = s_se / out_se;
-    using vec_t = sycl::vec<scalar_t, sizeof(pack_128b_t) / sizeof(scalar_t)>;
+    using vec_t = scalar_pack_t<scalar_t, pack_128b_t>;
 
     if (pack_offset < head_size) {
-      vec_t p_vec;
-      vec_t s_vec;
-
-      memcpy(&p_vec, prefix_head_ptr + pack_offset, sizeof(vec_t));
-      memcpy(&s_vec, suffix_head_ptr + pack_offset, sizeof(vec_t));
+      const vec_t p_vec = *reinterpret_cast<const vec_t*>(prefix_head_ptr + pack_offset);
+      const vec_t s_vec = *reinterpret_cast<const vec_t*>(suffix_head_ptr + pack_offset);
 
       vec_t o_vec;
 
@@ -123,7 +136,7 @@ struct MergePrefixSuffix {
         from_float(o_vec[i], of);
       }
 
-      memcpy(output_head_ptr + pack_offset, &o_vec, sizeof(vec_t));
+      *reinterpret_cast<vec_t*>(output_head_ptr + pack_offset) = o_vec;
     }
 
     if (output_lse != nullptr && pack_idx == 0) {
@@ -239,14 +252,11 @@ struct MergeState {
     const float a_scale = a_se / d;
     const float b_scale = b_se / d;
 
-    using vec_t = sycl::vec<scalar_t, sizeof(pack_128b_t) / sizeof(scalar_t)>;
+    using vec_t = scalar_pack_t<scalar_t, pack_128b_t>;
 
     if (pack_offset < head_size) {
-      vec_t a_vec;
-      vec_t b_vec;
-
-      memcpy(&a_vec, v_a + head_offset + pack_offset, sizeof(vec_t));
-      memcpy(&b_vec, v_b + head_offset + pack_offset, sizeof(vec_t));
+      const vec_t a_vec = *reinterpret_cast<const vec_t*>(v_a + head_offset + pack_offset);
+      const vec_t b_vec = *reinterpret_cast<const vec_t*>(v_b + head_offset + pack_offset);
 
       vec_t o_vec;
 
@@ -256,7 +266,7 @@ struct MergeState {
         from_float(o_vec[i], of);
       }
 
-      memcpy(v_merged + head_offset + pack_offset, &o_vec, sizeof(vec_t));
+      *reinterpret_cast<vec_t*>(v_merged + head_offset + pack_offset) = o_vec;
     }
 
     if (s_merged != nullptr && pack_idx == 0) {

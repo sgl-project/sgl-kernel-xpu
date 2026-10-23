@@ -251,7 +251,9 @@ class MLASparse {
   }
 
   cutlass::Status initialize(
-      Arguments const& args, void* workspace = nullptr, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
+      Arguments const& args,
+      void* workspace = nullptr,
+      [[maybe_unused]] sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     // Initialize the workspace
     CUTLASS_CHECK(Kernel::initialize_workspace(dense_args(args), workspace));
 
@@ -285,7 +287,8 @@ class MLASparse {
     return initialize(args, workspace);
   }
 
-  static cutlass::Status run(Params& params, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
+  static cutlass::Status
+  run(Params& params, [[maybe_unused]] sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     if constexpr (!has_gather) {
       launch<Kernel, GrfSize>(params.fmla_params);
     } else {

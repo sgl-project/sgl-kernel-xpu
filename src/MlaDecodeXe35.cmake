@@ -3,7 +3,7 @@
 # the xe35 device stack and pins SYCL_INTEL_TARGET=35. These land in
 # device_cpp_xe35 and are compiled only when DPCPP_SYCL_TARGET matches "cri".
 #
-# Both arch buckets instantiate the same (ELEM_TAG, PAGE_SIZE) grid; the device
+# Both arch buckets instantiate the same (ELEM_TAG, PAGE_SIZE, Q_TILE) grid; the device
 # code under sycl/kernels/mla/xe35 starts out identical to its xe20 twin and
 # diverges only where Xe3P needs different tiles/atoms. The arch split exists so
 # that divergence has somewhere to live -- and so CRI stops compiling the Xe2
@@ -12,6 +12,8 @@
 set(MLA_DECODE_ELEM_TAGS half bf16)
 set(MLA_DECODE_ELEM_SYCL_TYPES "sycl::half" "sycl::ext::oneapi::bfloat16")
 set(MLA_DECODE_PAGE_SIZES 16 32 64 128)
+# Must match mla_decode_q_tile() in mla_decode_types.hpp.
+set(MLA_DECODE_Q_TILES 1 8)
 
 set(MLA_DECODE_TEMPLATE
     "${CMAKE_CURRENT_SOURCE_DIR}/sycl/mla_decode_kernel.cpp.in")
@@ -24,11 +26,13 @@ foreach(_idx RANGE ${_num_elems})
     list(GET MLA_DECODE_ELEM_SYCL_TYPES ${_idx} ELEM_SYCL_TYPE)
 
     foreach(PAGE_SIZE ${MLA_DECODE_PAGE_SIZES})
-        set(ARCH_TAG xe35)
-        set(SYCL_TARGET 35)
-        set(GENERATED_FILE
-            "${CMAKE_CURRENT_BINARY_DIR}/sycl/mla_decode_kernel_${ELEM_TAG}_${PAGE_SIZE}_${ARCH_TAG}.cpp")
-        configure_file(${MLA_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
-        list(APPEND device_cpp_xe35 ${GENERATED_FILE})
+        foreach(Q_TILE ${MLA_DECODE_Q_TILES})
+            set(ARCH_TAG xe35)
+            set(SYCL_TARGET 35)
+            set(GENERATED_FILE
+                "${CMAKE_CURRENT_BINARY_DIR}/sycl/mla_decode_kernel_${ELEM_TAG}_${PAGE_SIZE}_q${Q_TILE}_${ARCH_TAG}.cpp")
+            configure_file(${MLA_DECODE_TEMPLATE} ${GENERATED_FILE} @ONLY)
+            list(APPEND device_cpp_xe35 ${GENERATED_FILE})
+        endforeach()
     endforeach()
 endforeach()

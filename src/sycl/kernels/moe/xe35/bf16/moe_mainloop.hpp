@@ -165,7 +165,7 @@ struct MoEMainloop<
     /* Slice TiledCopy/TiledMMA operations down to to work-item level */
     auto thr_copy_a = tiled_copy_a.get_slice(thr_id);
     auto thr_copy_b = tiled_copy_b.get_slice(thr_id);
-    auto thr_copy_d = tiled_copy_d.get_slice(thr_id);
+    [[maybe_unused]] auto thr_copy_d = tiled_copy_d.get_slice(thr_id);
     auto thr_mma = mma.get_slice(thr_id);
 
     /* Partition coordinate tensors for copy */
@@ -270,11 +270,11 @@ struct MoEMainloop<
     auto wg_n1 = get<2>(blk_coord);
 
     /* Create proxy coordinate tensors for A/B/C */
-    Tensor cA = make_identity_tensor(A.shape());    // (M,K)
-    Tensor cB0 = make_identity_tensor(B0.shape());  // (N/2,K)
-    Tensor cB1 = make_identity_tensor(B1.shape());  // (N/2,K)
-    Tensor cC0 = make_identity_tensor(D.shape());   // (M,N/2)
-    Tensor cC1 = make_identity_tensor(D.shape());   // (M,N/2)
+    Tensor cA = make_identity_tensor(A.shape());                     // (M,K)
+    Tensor cB0 = make_identity_tensor(B0.shape());                   // (N/2,K)
+    [[maybe_unused]] Tensor cB1 = make_identity_tensor(B1.shape());  // (N/2,K)
+    Tensor cC0 = make_identity_tensor(D.shape());                    // (M,N/2)
+    Tensor cC1 = make_identity_tensor(D.shape());                    // (M,N/2)
 
     /* init mma */
     auto wg_tile = mma.tile_mnk();
@@ -282,7 +282,7 @@ struct MoEMainloop<
 
     constexpr int BLK_M = get<0>(wg_tile);
     constexpr int BLK_N = get<1>(wg_tile);
-    constexpr int BLK_K = get<2>(wg_tile);
+    [[maybe_unused]] constexpr int BLK_K = get<2>(wg_tile);
     Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));   // (BLK_M,BLK_K,k)
     Tensor gB = local_tile(cB0, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)
     Tensor gC0 = local_tile(cC0, wg_tile, wg_coord, Step<_1, _1, X>{});       // (BLK_M,BLK_N)
@@ -298,7 +298,7 @@ struct MoEMainloop<
     auto thr_copy_a = tiled_copy_a.get_slice(thr_id);
     auto thr_copy_b0 = tiled_copy_b0.get_slice(thr_id);
     auto thr_copy_b1 = tiled_copy_b1.get_slice(thr_id);
-    auto thr_copy_d = tiled_copy_d.get_slice(thr_id);
+    [[maybe_unused]] auto thr_copy_d = tiled_copy_d.get_slice(thr_id);
     auto thr_mma = mma.get_slice(thr_id);
 
     /* Partition coordinate tensors for copy */
@@ -326,7 +326,7 @@ struct MoEMainloop<
     SubgroupTensor tCrD_final_sg_tensor0 = make_subgroup_tensor(tCrD_final_tensor0, tCrC0.tv_layout());
     TD tCrD_final_frag1[tCrC1.size()];
     Tensor tCrD_final_tensor1 = make_tensor(make_rmem_ptr(tCrD_final_frag1), tCrC1.layout());
-    SubgroupTensor tCrD_final_sg_tensor1 = make_subgroup_tensor(tCrD_final_tensor1, tCrC1.tv_layout());
+    [[maybe_unused]] SubgroupTensor tCrD_final_sg_tensor1 = make_subgroup_tensor(tCrD_final_tensor1, tCrC1.tv_layout());
 
     Tensor tCgD = thr_mma.partition_C(gC0);
 
@@ -399,7 +399,7 @@ struct MoEMainloop<
       typename tCrC_t,  // Using SubgroupTensor requires template args
       int tile_m,
       int tile_n>
-  void add_bias(const BiasTensor& Bias, tCrC_t& tCrC, const TiledMMA& mma, int wg_n, int thr_id) {
+  void add_bias(const BiasTensor& Bias, tCrC_t& tCrC, [[maybe_unused]] const TiledMMA& mma, int wg_n, int thr_id) {
     // Reference:
     // https://github.com/vllm-project/vllm-xpu-kernels/blob/c771759e75529b47d959809c96badfb7d5ba8c88/csrc/xpu/grouped_gemm/xe_2/gemm_xe2.hpp#L178C1-L208C4
     static constexpr auto ATOM_M = get<1>(typename TiledMMA::ThrLayoutVMNK{}.shape());  // SG replication along M

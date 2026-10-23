@@ -58,6 +58,10 @@
     assumed to be in *physical* layout.
 */
 
+// These kernels use the Xe2 copy atoms, so the target is pinned to 20 even on
+// an Xe3.5 build. Undef first: the build already defines SYCL_INTEL_TARGET=35
+// on the command line and redefining it is a hard warning.
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
 #include <ATen/ATen.h>

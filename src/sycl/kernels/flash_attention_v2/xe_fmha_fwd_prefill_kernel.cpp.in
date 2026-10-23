@@ -30,6 +30,7 @@
  **************************************************************************************************/
 // Auto-generated from xe_fmha_fwd_prefill_kernel.cpp.in
 // Template parameters: HEAD_DIM=@HEAD_DIM@, TILED_Q=@TILED_Q@, TILED_KV=@TILED_KV@, NUM_SG=@NUM_SG@, ELEM_TAG=@ELEM_TAG@
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
 #if @ENABLE_SCORE_BLOCK2D@

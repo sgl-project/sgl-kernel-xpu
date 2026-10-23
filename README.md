@@ -28,6 +28,7 @@ variables (default is `ON` for all):
 | `USE_FMHA` | `ON` | Flash attention kernels (`fwd`) |
 | `USE_GDN` | `ON` | Gated DeltaNet attention kernels |
 | `USE_MLA` | `ON` | MLA decode/prefill/sparse-decode kernels |
+| `USE_QSA` | `ON` | QSA sparse attention and indexer preparation and MQA scoring |
 | `USE_MLA_SPARSE_FUSED` | `OFF` | Fused (single-pass) sparse MLA decode kernel (optimization track) |
 
 There is also an opt-in switch (default `OFF`):

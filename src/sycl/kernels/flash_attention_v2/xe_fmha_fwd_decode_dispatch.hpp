@@ -91,8 +91,9 @@ namespace decode {
   EXTERN_FMHA_DECODE_NP_RUNNER(16, HD)
 
 // Paged decode + split-decode runners: paged head dims only
-// (FMHA_DECODE_PAGED_HEAD_DIMS = {64, 96, 128, 192, 256, 512}). bf16 query only.
+// (FMHA_DECODE_PAGED_HEAD_DIMS = {64, 80, 96, 128, 192, 256, 512}). bf16 query only.
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(64)
+EXTERN_FMHA_DECODE_RUNNER_ALL_QG(80)
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(96)
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(128)
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(192)
@@ -100,6 +101,7 @@ EXTERN_FMHA_DECODE_RUNNER_ALL_QG(256)
 EXTERN_FMHA_DECODE_RUNNER_ALL_QG(512)
 
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(64)
+EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(80)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(96)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(128)
 EXTERN_FMHA_SPLIT_DECODE_RUNNER_ALL_QG(192)
@@ -177,6 +179,9 @@ EXTERN_FMHA_DECODE_NP_RUNNER_ALL_QG(512)
     switch (params.d) {                                                                     \
       case 64:                                                                              \
         DISPATCH_DECODE_PAGE_SIZE(QG, 64);                                                  \
+        break;                                                                              \
+      case 80:                                                                              \
+        DISPATCH_DECODE_PAGE_SIZE(QG, 80);                                                  \
         break;                                                                              \
       case 96:                                                                              \
         DISPATCH_DECODE_PAGE_SIZE(QG, 96);                                                  \

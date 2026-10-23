@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cute/tensor.hpp>
+#include <limits>
 #include <optional>
 #include <sycl/sycl.hpp>
 
@@ -31,21 +32,21 @@ struct QSASplitKernel {
   bf16* output;
   float* partial;
   float* stats;
-  int rows;
-  int heads;
-  int kv_heads;
+  int64_t rows;
+  int64_t heads;
+  int64_t kv_heads;
   int64_t cache_tokens;
-  int topk;
-  int splits;
+  int64_t topk;
+  int64_t splits;
   float scale;
 
   [[sycl::reqd_sub_group_size(16)]]
   void operator()(sycl::nd_item<1> item) const {
-    const int group = item.get_group(0);
-    const int split = group % splits;
-    const int head = (group / splits) % heads;
-    const int row = group / (splits * heads);
-    const int kv_head = head / (heads / kv_heads);
+    const int64_t group = item.get_group(0);
+    const int64_t split = group % splits;
+    const int64_t head = (group / splits) % heads;
+    const int64_t row = group / (splits * heads);
+    const int64_t kv_head = head / (heads / kv_heads);
     const int dim = item.get_local_id(0);
     const int dim_tile = dim / kTileSize;
     const int lane = dim % kTileSize;
@@ -62,10 +63,11 @@ struct QSASplitKernel {
       state[1] = 0.0f;
     }
 
-    const int end = sycl::min(topk, (split + 1) * SplitSize);
-    for (int start = split * SplitSize; start < end; start += kTileSize) {
-      const int column = start + dim_tile;
-      const int32_t slot = column < topk ? slots[row * topk + column] : -1;
+    const int64_t end = split * SplitSize + sycl::min(static_cast<int64_t>(SplitSize), topk - split * SplitSize);
+    for (int64_t start = split * SplitSize; start < end;) {
+      const bool valid_column = dim_tile < topk - start;
+      const int64_t column = valid_column ? start + dim_tile : 0;
+      const int32_t slot = valid_column ? slots[row * topk + column] : -1;
       // Mask invalid cache slots before scoring or gathering K and V.
       if (lane == 0) selected[dim_tile] = slot >= 0 && static_cast<int64_t>(slot) < cache_tokens ? slot : -1;
       // Publish selected slots before other subgroups gather K and V.
@@ -147,13 +149,15 @@ struct QSASplitKernel {
       cute::gemm(cute::MMA_Atom<Bf16Dpas>{}, prob, values, value);
       numerator += weighted_value[0];
       // Finish reading shared slots and weights before the next tile overwrites them.
-      if (start + kTileSize < end) item.barrier(sycl::access::fence_space::local_space);
+      if (end - start <= kTileSize) break;
+      item.barrier(sycl::access::fence_space::local_space);
+      start += kTileSize;
     }
 
     if (splits == 1) {
       output[(row * heads + head) * kHeadDim + dim] = static_cast<bf16>(state[1] > 0.0f ? numerator / state[1] : 0.0f);
     } else {
-      const int64_t index = static_cast<int64_t>(split) * rows * heads + row * heads + head;
+      const int64_t index = split * rows * heads + row * heads + head;
       partial[index * kHeadDim + dim] = numerator;
       if (dim == 0) {
         stats[index * 2] = state[0];
@@ -167,23 +171,23 @@ struct QSAMergeKernel {
   const float* partial;
   const float* stats;
   bf16* output;
-  int heads;
-  int rows;
-  int splits;
+  int64_t heads;
+  int64_t rows;
+  int64_t splits;
 
   void operator()(sycl::nd_item<1> item) const {
-    const int group = item.get_group(0);
+    const int64_t group = item.get_group(0);
     const int dim = item.get_local_id(0);
     float maximum = -INFINITY;
-    for (int split = 0; split < splits; ++split) {
-      const int64_t index = static_cast<int64_t>(split) * rows * heads + group;
+    for (int64_t split = 0; split < splits; ++split) {
+      const int64_t index = split * rows * heads + group;
       maximum = sycl::fmax(maximum, stats[index * 2]);
     }
     float sum = 0.0f;
     float numerator = 0.0f;
     if (maximum != -INFINITY) {
-      for (int split = 0; split < splits; ++split) {
-        const int64_t index = static_cast<int64_t>(split) * rows * heads + group;
+      for (int64_t split = 0; split < splits; ++split) {
+        const int64_t index = split * rows * heads + group;
         if (stats[index * 2 + 1] > 0.0f) {
           const float weight = sycl::exp(stats[index * 2] - maximum);
           sum += weight * stats[index * 2 + 1];
@@ -230,14 +234,18 @@ SGL_KERNEL_EXPORT at::Tensor qsa_sparse_attention(
 
   c10::DeviceGuard guard(q.device());
   auto out = at::empty_like(q);
-  const int rows = static_cast<int>(q.size(0));
-  const int heads = static_cast<int>(q.size(1));
-  const int kv_heads = static_cast<int>(k_cache.size(1));
-  const int topk = static_cast<int>(token_slots.size(1));
+  const int64_t rows = q.size(0);
+  const int64_t heads = q.size(1);
+  const int64_t kv_heads = k_cache.size(1);
+  const int64_t topk = token_slots.size(1);
   if (rows == 0) return out;
   if (topk == 0) return at::zeros_like(q);
   const int split_size = topk <= 512 ? kShortSplitSize : kLongSplitSize;
-  const int splits = (topk + split_size - 1) / split_size;
+  const int64_t splits = (topk - 1) / split_size + 1;
+  TORCH_CHECK(
+      rows <= std::numeric_limits<int64_t>::max() / topk &&
+          rows <= std::numeric_limits<int64_t>::max() / kHeadDim / heads / splits,
+      "QSA slot or partial-buffer offsets exceed int64");
   at::Tensor partial, stats;
   if (splits > 1) {
     partial = at::empty({splits, rows, heads, kHeadDim}, q.options().dtype(at::kFloat));

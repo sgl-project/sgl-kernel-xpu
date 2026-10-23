@@ -131,6 +131,17 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "qsa_mqa_decode(Tensor q, Tensor k_cache, Tensor page_table, Tensor context_lens, "
       "int max_model_len, float? score_scale=None) -> Tensor");
   m.impl("qsa_mqa_decode", torch::kXPU, &qsa_mqa_decode);
+  m.def(
+      "qsa_index_q_norm_rope_store(Tensor qk, Tensor positions, Tensor cos_sin_cache, Tensor axis_map, "
+      "Tensor weight, Tensor cache_loc, Tensor(a!) key_state_buffer, Tensor(b!) rope_position_buffer, "
+      "int num_q_heads, int rotary_dim, float eps, bool is_neox_style, "
+      "int? q_heads_padded=None, ScalarType? out_dtype=None) -> Tensor");
+  m.impl("qsa_index_q_norm_rope_store", torch::kXPU, &qsa_index_q_norm_rope_store);
+  m.def(
+      "qsa_index_k_compress_store(Tensor key_state_buffer, Tensor group_locs, Tensor rope_position_buffer, "
+      "Tensor cos_sin_cache, Tensor axis_map, Tensor weight, Tensor write_locs, Tensor(a!) compressed_k_buffer, "
+      "int compress_ratio, int rotary_dim, float eps, bool is_neox_style) -> ()");
+  m.impl("qsa_index_k_compress_store", torch::kXPU, &qsa_index_k_compress_store);
 #endif
 
   m.def(
@@ -468,11 +479,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      num_kv_splits,"
       "    bool?    pack_gqa,"
       "    int      sm_margin,"
-      "    Tensor(a!)  out,"
-      "    Tensor(b!)?  softmax_lse,"
+      "    Tensor(a!)? out,"
+      "    bool     return_softmax_lse,"
       "    Tensor?  rel_bias=None,"
       "    bool     rel_bias_is_sheared=False,"
-      "    Tensor?  bidirectional_block_ids=None) -> ()");
+      "    Tensor?  bidirectional_block_ids=None) -> (Tensor(a!), Tensor?)");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 #endif  // USE_FMHA
 

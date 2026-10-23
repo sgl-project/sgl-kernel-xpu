@@ -1,5 +1,13 @@
+import pytest
 import sgl_kernel  # noqa: F401
 import torch
+
+pytestmark = pytest.mark.skipif(
+    not torch.xpu.is_available()
+    or not hasattr(torch.ops.sgl_kernel, "qsa_mqa_prefill")
+    or not hasattr(torch.ops.sgl_kernel, "qsa_mqa_decode"),
+    reason="Requires an XPU build with QSA MQA operators enabled",
+)
 
 
 def test_mqa_int32_q_index_overflow():

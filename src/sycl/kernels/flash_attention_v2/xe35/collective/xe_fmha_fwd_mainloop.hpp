@@ -79,6 +79,24 @@ void cvt_f32x2_to_bf16x2_pack(cute::intel::uint2 const& tmp, cute::intel::ushort
       : "rw"(tmp));
 }
 
+#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
+CUTE_DEVICE
+uint32_t subgroup_any_less(float const& lhs, float const& rhs) {
+  uint32_t result;
+  asm("{\n"
+      ".decl OUT_UD v_type=G type=UD num_elts=16 alias=<%0,0>\n"
+      ".decl LHS_F v_type=G type=F num_elts=16 alias=<%1,0>\n"
+      ".decl RHS_F v_type=G type=F num_elts=16 alias=<%2,0>\n"
+      ".decl ANY_LESS v_type=P num_elts=16\n"
+      "cmp.lt (M1_NM, 16) ANY_LESS LHS_F(0,0)<1;1,0> RHS_F(0,0)<1;1,0>\n"
+      "(ANY_LESS.any) sel (M1_NM, 16) OUT_UD(0,0)<1> 0x1:ud 0x0:ud\n"
+      "}\n"
+      : "=rw"(result)
+      : "rw"(lhs), "rw"(rhs));
+  return result;
+}
+#endif
+
 template <class ElementP>
 struct PackedFP8PReorder;
 
@@ -408,6 +426,111 @@ struct FMHAFwdMainloop<
     return params.ptr_page_table[batch_offset + page_idx] * tiles_per_page + tile_in_page;
   }
 
+  template <bool NoAcc, int KAtom, class ATensor, class BTensor, class CTensor>
+  CUTE_DEVICE static constexpr void gemm_qk_wide_b(ATensor const& A, BTensor const& B, CTensor& C) {
+    using MMAOp = typename TiledMMAQK::MMA_Op;
+    using DVector = typename remove_extent<typename MMAOp::DRegisters>::type;
+    using AVector = typename remove_extent<typename MMAOp::ARegisters>::type;
+    using BVector = typename remove_extent<typename MMAOp::BRegisters>::type;
+    using BWideVector = typename MMAOp::BWideVector;
+    using CVector = typename remove_extent<typename MMAOp::CRegisters>::type;
+
+    constexpr int MAtoms = decltype(size<1>(typename CTensor::layout_type{}))::value;
+    constexpr int NAtoms = decltype(size<2>(typename CTensor::layout_type{}))::value;
+    constexpr int Owner = NAtoms * (KAtom / 2);
+    constexpr int BByteOffset = (KAtom % 2) * sizeof(BVector);
+
+    static_assert(sizeof(BWideVector) == 2 * sizeof(BVector));
+
+    auto rB = recast<BWideVector>(B);
+    for_each(make_seq<NAtoms>{}, [&](auto n) {
+      for_each(make_seq<MAtoms>{}, [&](auto m) {
+        auto rD = recast<DVector>(C(_, m, n));
+        auto rA = recast<AVector>(A(_, m));
+        auto rC = recast<CVector>(C(_, m, n));
+        MMAOp::template fma<NoAcc, BByteOffset>(rD[0], rA[0], rB[Owner + decltype(n)::value], rC[0]);
+      });
+    });
+  }
+
+  /* Block-scaled counterpart of gemm_qk_wide_b for MXFP8:
+     BDPAS selects each K atom out of the wide fragment by byte offset,
+     eliminating reorder and software packing for hardware block scaled GEMM. */
+  template <
+      bool NoAcc,
+      int KAtom,
+      class ATensor,
+      class BTensor,
+      class CTensor,
+      class SFAVec,
+      class SFBVec,
+      class SFAMOff,
+      class SFBNOff,
+      class SFAKOff,
+      class SFBKOff>
+  CUTE_DEVICE static constexpr void gemm_qk_wide_b_scaled(
+      ATensor const& A,
+      BTensor const& B,
+      CTensor& C,
+      SFAVec const& sfa,
+      SFBVec const& sfb,
+      SFAMOff const& sfa_m_off,
+      SFBNOff const& sfb_n_off,
+      SFAKOff const& sfa_k_off,
+      SFBKOff const& sfb_k_off) {
+    using MMAOp = typename TiledMMAQK::MMA_Op;
+    using DVector = typename remove_extent<typename MMAOp::DRegisters>::type;
+    using AVector = typename remove_extent<typename MMAOp::ARegisters>::type;
+    using BVector = typename remove_extent<typename MMAOp::BRegisters>::type;
+    using BWideVector = typename MMAOp::BWideVector;
+    using CVector = typename remove_extent<typename MMAOp::CRegisters>::type;
+
+    constexpr int MAtoms = decltype(size<1>(typename CTensor::layout_type{}))::value;
+    constexpr int NAtoms = decltype(size<2>(typename CTensor::layout_type{}))::value;
+    constexpr int Owner = NAtoms * (KAtom / 2);
+    constexpr int BByteOffset = (KAtom % 2) * sizeof(BVector);
+
+    static_assert(sizeof(BWideVector) == 2 * sizeof(BVector));
+
+    auto rB = recast<BWideVector>(B);
+    for_each(make_seq<NAtoms>{}, [&](auto n) {
+      for_each(make_seq<MAtoms>{}, [&](auto m) {
+        auto rD = recast<DVector>(C(_, m, n));
+        auto rA = recast<AVector>(A(_, m));
+        auto rC = recast<CVector>(C(_, m, n));
+        if constexpr (NoAcc) {
+          MMAOp::template fma<BByteOffset>(
+              rD[0],
+              rA[0],
+              rB[Owner + decltype(n)::value],
+              sfa,
+              sfb,
+              static_cast<uint16_t>(sfa_m_off(0, decltype(m)::value, 0) + sfa_k_off(0, 0, KAtom)),
+              static_cast<uint16_t>(sfb_n_off(0, decltype(n)::value, 0) + sfb_k_off(0, 0, KAtom)));
+        } else {
+          MMAOp::template fma<BByteOffset>(
+              rD[0],
+              rA[0],
+              rB[Owner + decltype(n)::value],
+              rC[0],
+              sfa,
+              sfb,
+              static_cast<uint16_t>(sfa_m_off(0, decltype(m)::value, 0) + sfa_k_off(0, 0, KAtom)),
+              static_cast<uint16_t>(sfb_n_off(0, decltype(n)::value, 0) + sfb_k_off(0, 0, KAtom)));
+        }
+      });
+    });
+  }
+
+  static constexpr int kAtomsPerD =
+      decltype(get<2>(TileShapeQK{}))::value / decltype(get<2>(typename TiledMMAQK::AtomShape_MNK{}))::value;
+  static constexpr bool use_wide_b = !BlockScale_ && !F8kvF16mma_ && is_void_v<TiledCopyK_> &&
+                                     sizeof_bits_v<typename TiledMMAQK::ValTypeB> == 8 &&
+                                     (kAtomsPerD == 2 || kAtomsPerD == 4);
+  static constexpr bool use_wide_b_scaled = BlockScale_ && !F8kvF16mma_ && is_void_v<TiledCopyK_> &&
+                                            sizeof_bits_v<typename TiledMMAQK::ValTypeB> == 8 &&
+                                            (kAtomsPerD == 2 || kAtomsPerD == 4);
+
   template <bool GqaFusion = false, typename QVCoord>
   CUTLASS_DEVICE void operator()(
       TensorQ2D const& Q_2D,    // (q,d)
@@ -624,7 +747,7 @@ struct FMHAFwdMainloop<
       CUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < Stages; s++) {
         int logical_k = blk_k0 + s;
-        if (logical_k < kblocks_cache) {
+        if (logical_k < blk_k1 && logical_k < kblocks_cache) {
           physical_k_tiles_cache[s] = get_physical_k_tile(logical_k, batch_offset, tiles_per_page);
         }
       }
@@ -662,7 +785,7 @@ struct FMHAFwdMainloop<
         CUTLASS_PRAGMA_UNROLL
         for (int K = 0; K < Stages; K++) {
           int logical_k = blk_k0 + K;
-          if (logical_k < kblocks_cache) {
+          if (logical_k < blk_k1 && logical_k < kblocks_cache) {
             if constexpr (PagedKV) {
               int physical_K_tile = physical_k_tiles_cache[K];
               prefetch(prefetch_k_cache, pKgK_cache(_, _, _, physical_K_tile, D));
@@ -730,7 +853,8 @@ struct FMHAFwdMainloop<
                              auto& pVgV_cur) {
 #if not defined(CUTLASS_TEST_FOR_CRI)
       /* Split barrier to keep threads together */
-      barrier_arrive(ScopeWorkgroup);
+      constexpr auto barrier_scope = CausalMask ? ScopeSubgroup : ScopeWorkgroup;
+      barrier_arrive(barrier_scope);
 #endif
       constexpr bool is_cache = decltype(cached_k)::value;
 
@@ -761,7 +885,9 @@ struct FMHAFwdMainloop<
           copy(copy_k_cur, tKgK_cur(_, _, _, k_idx, D), tKrK);
         }
 
-        reorder(tKrK, tSrK);
+        if constexpr (!use_wide_b && !use_wide_b_scaled) {
+          reorder(tKrK, tSrK);
+        }
 
         if constexpr (BlockScale) {
           if constexpr (sizeof_bits_v<ElementQ> <= 8) {
@@ -782,38 +908,88 @@ struct FMHAFwdMainloop<
           using scaleQSize = decltype(size(fragment_scaleQ_d));
           using scaleKSize = decltype(size(fragment_scaleK));
 
-          Tensor scaleQ_view = make_tensor(
-              recast<intel::vector_t<ElementScaleQ, scaleQSize::value>>(fragment_scaleQ_d).data(),
-              make_layout(Shape<_1, decltype(size<1>(tSrQ.shape())), _1>{}, Stride<_1, _0, _0>{}));
-          Tensor scaleK_view = make_tensor(
-              recast<intel::vector_t<ElementScaleK, scaleKSize::value>>(fragment_scaleK).data(),
-              make_layout(Shape<_1, decltype(size<1>(tSrK.shape())), _1>{}, Stride<_1, _0, _0>{}));
-
-          auto zipped_q = make_zip_tensor(tSrQ_arr[D], scaleQ_view, gemm_qm_offsets, gemm_qk_offsets);
-          auto zipped_k = make_zip_tensor(tSrK, scaleK_view, gemm_kn_offsets, gemm_kk_offsets);
-
           copy_iter_scaleK.data().coord_ = {k_coord, 0, l_coord};
-
           copy(tiled_copy_scaleK, copy_iter_scaleK(_, _, _, D), fragment_scaleK);
 
-          if (D == 0) {
-            cute::gemm<true>(mma_qk, zipped_q, zipped_k, tSrS);
-          } else {
-            cute::gemm(mma_qk, zipped_q, zipped_k, tSrS);
-          }
-        } else {
-          if constexpr (F8kvF16mma) {
-            dequantize(tSrK, scale_k);
-          }
-          auto const& tSrQ_d = tSrQ_arr[D];
-          if (D == 0) {
-            cute::gemm<true>(mma_qk, tSrQ_d(_, _, 0), tSrK(_, _, 0), tSrS);
-            CUTLASS_PRAGMA_UNROLL
-            for (int k = 1; k < kAtomsPerD; k++) {
-              cute::gemm(mma_qk, tSrQ_d(_, _, k), tSrK(_, _, k), tSrS);
+          if constexpr (use_wide_b_scaled) {
+            auto sfa_vec = recast<intel::vector_t<ElementScaleQ, scaleQSize::value>>(fragment_scaleQ_d);
+            auto sfb_vec = recast<intel::vector_t<ElementScaleK, scaleKSize::value>>(fragment_scaleK);
+            auto const& qk_offsets = get<4>(scale_context_qk);
+            auto const& tSrQ_d = tSrQ_arr[D];
+            if (D == 0) {
+              for_each(make_seq<kAtomsPerD>{}, [&](auto k) {
+                constexpr int KAtom = decltype(k)::value;
+                gemm_qk_wide_b_scaled<KAtom == 0, KAtom>(
+                    tSrQ_d(_, _, k),
+                    tKrK,
+                    tSrS,
+                    sfa_vec[0],
+                    sfb_vec[0],
+                    get<0>(qk_offsets),
+                    get<1>(qk_offsets),
+                    get<2>(qk_offsets),
+                    get<3>(qk_offsets));
+              });
+            } else {
+              for_each(make_seq<kAtomsPerD>{}, [&](auto k) {
+                constexpr int KAtom = decltype(k)::value;
+                gemm_qk_wide_b_scaled<false, KAtom>(
+                    tSrQ_d(_, _, k),
+                    tKrK,
+                    tSrS,
+                    sfa_vec[0],
+                    sfb_vec[0],
+                    get<0>(qk_offsets),
+                    get<1>(qk_offsets),
+                    get<2>(qk_offsets),
+                    get<3>(qk_offsets));
+              });
             }
           } else {
-            cute::gemm(mma_qk, tSrQ_d, tSrK, tSrS);
+            Tensor scaleQ_view = make_tensor(
+                recast<intel::vector_t<ElementScaleQ, scaleQSize::value>>(fragment_scaleQ_d).data(),
+                make_layout(Shape<_1, decltype(size<1>(tSrQ.shape())), _1>{}, Stride<_1, _0, _0>{}));
+            Tensor scaleK_view = make_tensor(
+                recast<intel::vector_t<ElementScaleK, scaleKSize::value>>(fragment_scaleK).data(),
+                make_layout(Shape<_1, decltype(size<1>(tSrK.shape())), _1>{}, Stride<_1, _0, _0>{}));
+
+            auto zipped_q = make_zip_tensor(tSrQ_arr[D], scaleQ_view, gemm_qm_offsets, gemm_qk_offsets);
+            auto zipped_k = make_zip_tensor(tSrK, scaleK_view, gemm_kn_offsets, gemm_kk_offsets);
+
+            if (D == 0) {
+              cute::gemm<true>(mma_qk, zipped_q, zipped_k, tSrS);
+            } else {
+              cute::gemm(mma_qk, zipped_q, zipped_k, tSrS);
+            }
+          }
+        } else {
+          if constexpr (use_wide_b) {
+            auto const& tSrQ_d = tSrQ_arr[D];
+            if (D == 0) {
+              for_each(make_seq<kAtomsPerD>{}, [&](auto k) {
+                constexpr int KAtom = decltype(k)::value;
+                gemm_qk_wide_b<KAtom == 0, KAtom>(tSrQ_d(_, _, k), tKrK, tSrS);
+              });
+            } else {
+              for_each(make_seq<kAtomsPerD>{}, [&](auto k) {
+                constexpr int KAtom = decltype(k)::value;
+                gemm_qk_wide_b<false, KAtom>(tSrQ_d(_, _, k), tKrK, tSrS);
+              });
+            }
+          } else {
+            if constexpr (F8kvF16mma) {
+              dequantize(tSrK, scale_k);
+            }
+            auto const& tSrQ_d = tSrQ_arr[D];
+            if (D == 0) {
+              cute::gemm<true>(mma_qk, tSrQ_d(_, _, 0), tSrK(_, _, 0), tSrS);
+              CUTLASS_PRAGMA_UNROLL
+              for (int k = 1; k < kAtomsPerD; k++) {
+                cute::gemm(mma_qk, tSrQ_d(_, _, k), tSrK(_, _, k), tSrS);
+              }
+            } else {
+              cute::gemm(mma_qk, tSrQ_d, tSrK, tSrS);
+            }
           }
         }
       }
@@ -939,7 +1115,18 @@ struct FMHAFwdMainloop<
       if constexpr (PerTensorScale) {
         qk_scale = params.scale * ElementS(scale_q) * ElementS(scale_k);
       }
-      auto [rescale, tS_partial_sum] = softmax(tSrS, tA_max, tA_sum, qk_scale);
+
+      constexpr bool preload_v = cute::is_any_of_v<ElementQ, cutlass::float_e4m3_t, cutlass::float_e5m2_t>;
+      if constexpr (preload_v) {
+        if constexpr (is_cache) {
+          copy(copy_v_cur, tVgV_cur(_, _, _, 0, k_idx), tVrV);
+        } else {
+          copy(copy_v_cur, tVgV_cur(_, _, _, 0, k_idx), tVrV);
+        }
+        reorder(tVrV, tArV);
+      }
+
+      auto [rescale, tS_partial_sum, subgroup_needs_rescale] = softmax(tSrS, tA_max, tA_sum, qk_scale);
       asm volatile("fence_sw");
       auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
       constexpr int kSumSize = decltype(tA_sum.size())::value;
@@ -993,23 +1180,31 @@ struct FMHAFwdMainloop<
         tArA rescaling is fused to per-VTile */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
-        if constexpr (is_cache) {
-          copy(copy_v_cur, tVgV_cur(_, _, _, VV, k_idx), tVrV);
-        } else {
-          // Indexed read (mirrors the cache path); payload-advance is broken here.
-          copy(copy_v_cur, tVgV_cur(_, _, _, VV, k_idx), tVrV);
+        if constexpr (!preload_v) {
+          if constexpr (is_cache) {
+            copy(copy_v_cur, tVgV_cur(_, _, _, VV, k_idx), tVrV);
+          } else {
+            // Indexed read (mirrors the cache path); payload-advance is broken here.
+            copy(copy_v_cur, tVgV_cur(_, _, _, VV, k_idx), tVrV);
+          }
+          reorder(tVrV, tArV);
         }
-        reorder(tVrV, tArV);
 
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = tArA.size() / VTiles - 1; i >= 0; i--)
-          tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+        if (subgroup_needs_rescale) {
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = tArA.size() / VTiles - 1; i >= 0; i--)
+            tArA(_, _, _, VV)(i) *= broadcast<0>(rescale, tArA, i);
+        }
 
         if constexpr (kSumDivVT) {
           CUTLASS_PRAGMA_UNROLL
           for (int j = 0; j < kSumPerVT; j++) {
             int const i = VV * kSumPerVT + j;
-            tA_sum(i) = tA_sum(i) * group_broadcast(sg, rescale(0), i) + tS_partial_sum(i);
+            if (subgroup_needs_rescale) {
+              tA_sum(i) = tA_sum(i) * group_broadcast(sg, rescale(0), i) + tS_partial_sum(i);
+            } else {
+              tA_sum(i) = tA_sum(i) + tS_partial_sum(i);
+            }
           }
         }
         if constexpr (BlockScale && !FP4Input) {
@@ -1047,12 +1242,24 @@ struct FMHAFwdMainloop<
           }
           cute::gemm(mma_pv, tArP, tArV, tArA(_, _, _, VV));
         }
+
+        if constexpr (preload_v) {
+          if (VV + 1 < VTiles) {
+            int next_vv = VV + 1;
+            if constexpr (is_cache) {
+              copy(copy_v_cur, tVgV_cur(_, _, _, next_vv, k_idx), tVrV);
+            } else {
+              copy(copy_v_cur, tVgV_cur(_, _, _, next_vv, k_idx), tVrV);
+            }
+            reorder(tVrV, tArV);
+          }
+        }
       }
 
       /* K prefetch */
       int K_next = K + Stages;
       if constexpr (is_cache) {
-        if (K_next < kblocks_cache) {
+        if (K_next < blk_k1 && K_next < kblocks_cache) {
           int physical_K_next = K_next;
           if constexpr (PagedKV) {
             int slot_next = (K_next - blk_k0) % Stages;
@@ -1075,7 +1282,7 @@ struct FMHAFwdMainloop<
         }
       }
 #if not defined(CUTLASS_TEST_FOR_CRI)
-      barrier_wait(ScopeWorkgroup);
+      barrier_wait(barrier_scope);
 #endif
     };
 
@@ -1111,9 +1318,15 @@ struct FMHAFwdMainloop<
     auto tS_bmax = reduce<1, ReduceMode::Full, /*EnableFast64Rows=*/!CausalMask>(tS, sycl::maximum<void>{});
 
     FragARow rescale;
+    uint32_t subgroup_needs_rescale = 0;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tA_max.size(); i++) {
       ElementS new_max = sycl::max(tA_max(i), qk_scale * tS_bmax(i));
+#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
+      subgroup_needs_rescale |= subgroup_any_less(tA_max(i), new_max);
+#else
+      subgroup_needs_rescale = 1;
+#endif
       rescale(i) = sycl::native::exp2(tA_max(i) - new_max);
       tA_max(i) = new_max;
     }
@@ -1144,7 +1357,7 @@ struct FMHAFwdMainloop<
       }
     }
 
-    return cute::make_tuple(rescale, tS_partial_sum);
+    return cute::make_tuple(rescale, tS_partial_sum, subgroup_needs_rescale);
   }
 };
 

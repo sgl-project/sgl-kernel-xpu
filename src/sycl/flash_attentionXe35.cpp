@@ -69,7 +69,6 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
   float v_descale = 1.0f;
   if (is_fp8) {
     auto read_descale = [&](const at::Tensor& descale, const char* name) {
-      TORCH_CHECK(descale.device().is_cpu(), "flash_attentionXe35: ", name, " must be a CPU scalar");
       TORCH_CHECK(descale.scalar_type() == at::ScalarType::Float, "flash_attentionXe35: ", name, " must be float32");
       TORCH_CHECK(descale.numel() == 1, "flash_attentionXe35: ", name, " must contain one per-tensor scale");
       return descale.item<float>();
@@ -173,8 +172,9 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
   }
 
   TORCH_CHECK(
-      head_dim == 64 || head_dim == 128 || (is_paged && head_dim == 256),
-      "flash_attentionXe35: non-paged attention supports head_dim 64 and 128; paged attention also supports 256");
+      head_dim == 64 || head_dim == 128 || (is_paged ? head_dim == 256 : head_dim == 72 || head_dim == 96),
+      "flash_attentionXe35: non-paged attention supports head_dim 64, 72, 96, and 128; paged attention supports 64, "
+      "128, and 256");
 
   c10::DeviceGuard device_guard(q.device());
   at::Tensor out = out_.has_value() ? *out_ : at::empty({total_q, num_heads_q, head_dim}, q.options());
@@ -198,9 +198,15 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
   } else {
     TORCH_CHECK(!is_fp8, "flash_attentionXe35: non-paged FP8 is not supported");
     if (max_seqlen_q == 1) {
-      dispatch = head_dim == 64 ? &dispatch_xe35_decode_nopage_64 : &dispatch_xe35_decode_nopage_128;
+      dispatch = head_dim == 64   ? &dispatch_xe35_decode_nopage_64
+                 : head_dim == 72 ? &dispatch_xe35_decode_nopage_72
+                 : head_dim == 96 ? &dispatch_xe35_decode_nopage_96
+                                  : &dispatch_xe35_decode_nopage_128;
     } else {
-      dispatch = head_dim == 64 ? &dispatch_xe35_prefill_nopage_64 : &dispatch_xe35_prefill_nopage_128;
+      dispatch = head_dim == 64   ? &dispatch_xe35_prefill_nopage_64
+                 : head_dim == 72 ? &dispatch_xe35_prefill_nopage_72
+                 : head_dim == 96 ? &dispatch_xe35_prefill_nopage_96
+                                  : &dispatch_xe35_prefill_nopage_128;
     }
   }
 

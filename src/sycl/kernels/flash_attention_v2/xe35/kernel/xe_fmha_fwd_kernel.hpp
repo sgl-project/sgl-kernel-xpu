@@ -502,6 +502,14 @@ class XeFMHAFwdKernel {
         blk_k1 = (wsr < 0) ? k_blocks : cute::min(k_blocks, cute::ceil_div(q_tile_max_row_kv + wsr + 1, tile_k));
         if (blk_k0 >= blk_k1) continue;
       }
+      if constexpr (CollectiveMainloop::CausalMask) {
+        const int tile_q = get<0>(TileShapeQK{});
+        const int tile_k = get<1>(TileShapeQK{});
+        const int q_tile_max_row_kv = blk_q * tile_q + full_tile_offset + tile_q - 1 - discard_seq_coord;
+        const int hi_kv_plus_one = cute::max(0, q_tile_max_row_kv + 1);
+        blk_k1 = cute::min(blk_k1, cute::ceil_div(hi_kv_plus_one, tile_k));
+        if (blk_k0 >= blk_k1) continue;
+      }
 
       int offset_q = 0, offset_k = 0, offset_v = 0, offset_o = 0;
       int offset_k_cache = 0, offset_v_cache = 0;

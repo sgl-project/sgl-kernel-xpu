@@ -13,6 +13,8 @@ Xe35DispatchFn dispatch_xe35_decode_256_fp8_e4m3;
 Xe35DispatchFn dispatch_xe35_decode_256_fp8_e5m2;
 
 Xe35DispatchFn dispatch_xe35_decode_nopage_64;
+Xe35DispatchFn dispatch_xe35_decode_nopage_72;
+Xe35DispatchFn dispatch_xe35_decode_nopage_96;
 Xe35DispatchFn dispatch_xe35_decode_nopage_128;
 
 inline Xe35DispatchFn* get_xe35_decode_dispatch(int head_dim, at::ScalarType dtype) {

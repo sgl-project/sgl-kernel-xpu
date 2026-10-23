@@ -29,7 +29,7 @@ def skip_unsupported_attention_case(
     head_dim, paged, dtype=torch.bfloat16, full_fp8=False
 ):
     if is_cri_device():
-        supported_dims = (64, 128, 256) if paged else (64, 128)
+        supported_dims = (64, 128, 256) if paged else (64, 72, 96, 128)
         if head_dim not in supported_dims or dtype == torch.float16:
             pytest.skip("Xe35 attention does not compile this head dimension or dtype")
         if dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not full_fp8:
@@ -972,7 +972,11 @@ def test_flash_attn_kvcache(
                 key_padding_mask,
                 arange >= cache_leftpad.unsqueeze(-1).expand(-1, seqlen_k),
             )
-        rotary_seqlens = cache_seqlens if not has_rotary_seqlens else cache_seqlens // 2
+        rotary_seqlens = (
+            None
+            if is_cri_device() and rotary_dim == 0
+            else (cache_seqlens if not has_rotary_seqlens else cache_seqlens // 2)
+        )
         if rotary_dim > 0:
             angle = (
                 torch.rand(
@@ -1562,7 +1566,11 @@ def test_flash_attn_decode_kvcache(
                 key_padding_mask,
                 arange >= cache_leftpad.unsqueeze(-1).expand(-1, seqlen_k),
             )
-        rotary_seqlens = cache_seqlens if not has_rotary_seqlens else cache_seqlens // 2
+        rotary_seqlens = (
+            None
+            if is_cri_device() and rotary_dim == 0
+            else (cache_seqlens if not has_rotary_seqlens else cache_seqlens // 2)
+        )
         if rotary_dim > 0:
             angle = (
                 torch.rand(
@@ -2109,7 +2117,7 @@ def _generate_block_kvcache(
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
 @pytest.mark.parametrize("add_unused_qkv", [False])
-@pytest.mark.parametrize("d", [72, 80, 128, 192, 256, 512])
+@pytest.mark.parametrize("d", [72, 80, 96, 128, 192, 256, 512])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [

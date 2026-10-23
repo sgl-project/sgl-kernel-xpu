@@ -46,7 +46,7 @@ def benchmark(gate_layout, tokens, provider):
         sgl_kernel.fused_sigmoid_mul(x, gate, inplace=True)
 
     def torch_fn():
-        x * torch.sigmoid(gate.reshape(tokens, hidden))
+        x * torch.sigmoid(gate).reshape(tokens, hidden)
 
     fn = {"sgl_kernel": sgl_fn, "torch": torch_fn}[provider]
 

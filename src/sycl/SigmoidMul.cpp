@@ -139,6 +139,9 @@ SGL_KERNEL_EXPORT void fused_sigmoid_mul(torch::Tensor& output, torch::Tensor& i
     gate_stride_head = gate.stride(1);
   }
   at::assert_no_partial_overlap(output, input);
+  TORCH_CHECK(
+      !output.is_alias_of(gate) || at::get_overlap_status(output, gate) != at::MemOverlapStatus::TooHard,
+      "output and gate must not share storage when overlap cannot be determined");
   at::assert_no_overlap(output, gate);
   if (rows == 0 || hidden == 0) {
     return;

@@ -1107,11 +1107,15 @@ struct GroupedGemmaRMSNormFunctor {
   accscalar_t eps;
 };
 
+// Past 4 register-cached passes a wider work-group is faster than more passes per thread.
+constexpr int kMaxIters = 4;
+constexpr int64_t kMaxWorkGroupSize = 512;
+
 template <typename scalar_t, int vec_size, int ITERS>
 void launch_grouped_gemma_rmsnorm(
     const scalar_t* x, const scalar_t* w, scalar_t* y, int64_t rows, int64_t N, int64_t num_groups, double eps) {
   const int64_t vecs = N / vec_size;
-  const int64_t wg_size = std::min<int64_t>(256, (((vecs + ITERS - 1) / ITERS) + 15) / 16 * 16);
+  const int64_t wg_size = std::min<int64_t>(kMaxWorkGroupSize, (((vecs + ITERS - 1) / ITERS) + 15) / 16 * 16);
   GroupedGemmaRMSNormFunctor<scalar_t, vec_size, ITERS> fn{
       x, w, y, static_cast<uint32_t>(N), static_cast<uint32_t>(num_groups), static_cast<acc_type<scalar_t>>(eps)};
   sycl_kernel_submit(
@@ -1130,10 +1134,8 @@ void GroupedGemmaRMSNormKernelImplInternal(
     launch_grouped_gemma_rmsnorm<scalar_t, kVec, 1>(x, w, y, M, N, num_groups, eps);
   } else if (want <= 2) {
     launch_grouped_gemma_rmsnorm<scalar_t, kVec, 2>(x, w, y, M, N, num_groups, eps);
-  } else if (want <= 4) {
-    launch_grouped_gemma_rmsnorm<scalar_t, kVec, 4>(x, w, y, M, N, num_groups, eps);
   } else {
-    launch_grouped_gemma_rmsnorm<scalar_t, kVec, 8>(x, w, y, M, N, num_groups, eps);
+    launch_grouped_gemma_rmsnorm<scalar_t, kVec, kMaxIters>(x, w, y, M, N, num_groups, eps);
   }
 }
 
@@ -1153,7 +1155,7 @@ SGL_KERNEL_EXPORT void grouped_gemma_rmsnorm(
   TORCH_CHECK(weight.scalar_type() == input.scalar_type(), "weight dtype must match input");
   constexpr int64_t kVecElems = 8;
   TORCH_CHECK(group_size > 0 && group_size % kVecElems == 0, "group_size must be a positive multiple of ", kVecElems);
-  constexpr int64_t kMaxGroupSize = 8 * 256 * kVecElems;  // 8 register-cached passes of a 256-thread work-group
+  constexpr int64_t kMaxGroupSize = kMaxIters * kMaxWorkGroupSize * kVecElems;
   TORCH_CHECK(
       group_size <= kMaxGroupSize,
       "grouped_gemma_rmsnorm: group_size ",

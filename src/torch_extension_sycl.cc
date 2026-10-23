@@ -532,6 +532,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_q_indexer_rope_hadamard_fp4_quant(Tensor q_input, Tensor(a!) q_fp4, Tensor(b!) q_scale, "
       "Tensor weight, Tensor(c!) weights_out, float weight_scale, Tensor rope_cache, Tensor positions) -> ()");
   m.impl("fused_q_indexer_rope_hadamard_fp4_quant", torch::kXPU, &fused_q_indexer_rope_hadamard_fp4_quant);
+  m.def(
+      "index_q_rope_pack_weights(Tensor input, Tensor freqs_cis, Tensor positions, Tensor head_weights, "
+      "Tensor(a!) payload, Tensor(b!) scale, Tensor(c!) weights_out, float weight_scale) -> ()");
+  m.impl("index_q_rope_pack_weights", torch::kXPU, &index_q_rope_pack_weights);
+  m.def(
+      "index_k_norm_rope_pack_store(Tensor input, Tensor norm_weight, float eps, Tensor freqs_cis, "
+      "Tensor positions, Tensor loc, Tensor(a!) cache, int ratio) -> ()");
+  m.impl("index_k_norm_rope_pack_store", torch::kXPU, &index_k_norm_rope_pack_store);
 
   /*
    * From fused qk norm rope

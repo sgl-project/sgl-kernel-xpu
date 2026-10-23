@@ -10,10 +10,12 @@ pytestmark = pytest.mark.skipif(
 HEAD_DIM = 128
 PACKED_DIM = 64
 GROUPS = 4
-PAGE_SIZE = 4
+PAGE_SIZE = 64
 
 
 def _decode_fp4(code: torch.Tensor) -> torch.Tensor:
+    code = code.to(torch.int16)
+    code = torch.stack((code & 0xF, (code >> 4) & 0xF), dim=-1).flatten(-2)
     magnitudes = torch.tensor(
         [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
         device=code.device,
@@ -27,71 +29,87 @@ def _decode_scale(scale: torch.Tensor) -> torch.Tensor:
     return torch.pow(2.0, scale.to(torch.float32) - 127.0)
 
 
-def _reference(
-    q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len, weight_scale
-):
+def _reference(q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len):
     batch, heads = q.shape[:2]
-    output = torch.zeros((batch, max_seq_len), device=q.device, dtype=torch.float32)
-    page_bytes = cache[0].numel()
-    for b in range(batch):
-        for token in range(int(seq_lens[b].item())):
-            page = int(block_tables[b, token // PAGE_SIZE].item())
-            offset = token % PAGE_SIZE
-            flat = cache[page].reshape(page_bytes)
-            k_payload = flat[offset * PACKED_DIM : (offset + 1) * PACKED_DIM]
-            scale_base = PAGE_SIZE * PACKED_DIM + offset * GROUPS
-            k_scales = _decode_scale(flat[scale_base : scale_base + GROUPS])
-            score = 0.0
-            for head in range(heads):
-                q_code = torch.stack(
-                    ((q[b, head] & 0x0F), (q[b, head] >> 4) & 0x0F), dim=-1
-                ).reshape(-1)
-                k_code = torch.stack(
-                    ((k_payload & 0x0F), (k_payload >> 4) & 0x0F), dim=-1
-                ).reshape(-1)
-                dot = (
-                    _decode_fp4(q_code)
-                    * _decode_scale(q_scale[b, head]).repeat_interleave(32)
-                    * _decode_fp4(k_code)
-                    * k_scales.repeat_interleave(32)
-                ).sum()
-                score += torch.relu(dot) * weights[b, head]
-            output[b, token] = score * weight_scale
-    return output
+    device = q.device
+    cache_flat = cache.reshape(cache.shape[0], -1)
+    positions = torch.arange(max_seq_len, device=device, dtype=torch.int64)
+    page_ids = block_tables[:, positions // PAGE_SIZE].long()
+    offsets = positions % PAGE_SIZE
+
+    payload_indices = offsets.view(1, -1, 1) * PACKED_DIM + torch.arange(
+        PACKED_DIM, device=device
+    ).view(1, 1, -1)
+    k_packed = cache_flat[
+        page_ids.unsqueeze(-1),
+        payload_indices.expand(batch, -1, -1),
+    ]
+    scale_indices = (
+        PAGE_SIZE * PACKED_DIM
+        + offsets.view(1, -1, 1) * GROUPS
+        + torch.arange(GROUPS, device=device).view(1, 1, -1)
+    )
+    k_scales = cache_flat[
+        page_ids.unsqueeze(-1),
+        scale_indices.expand(batch, -1, -1),
+    ]
+
+    q_values = _decode_fp4(q).float()
+    k_values = _decode_fp4(k_packed).float()
+    q_scale_values = _decode_scale(q_scale).repeat_interleave(32, dim=-1)
+    k_scale_values = _decode_scale(k_scales).repeat_interleave(32, dim=-1)
+    dots = (
+        q_values.unsqueeze(2)
+        * q_scale_values.unsqueeze(2)
+        * k_values.unsqueeze(1)
+        * k_scale_values.unsqueeze(1)
+    ).sum(dim=-1)
+    logits = (torch.relu(dots) * weights.unsqueeze(-1)).sum(dim=1)
+    valid = positions.unsqueeze(0) < seq_lens.unsqueeze(1)
+    return torch.where(valid, logits, torch.zeros_like(logits))
 
 
-@pytest.mark.parametrize("batch,heads", [(1, 2), (2, 4)])
-def test_fp4_paged_mqa_logits(batch, heads):
+@pytest.mark.parametrize("batch", [1, 6, 13])
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("max_seq_len", [1, 63, 64, 65, 129])
+def test_fp4_paged_mqa_logits(batch, heads, max_seq_len):
     device = torch.device("xpu")
-    torch.manual_seed(batch + heads)
+    torch.manual_seed(batch * 1000 + heads * 10 + max_seq_len)
+    pages_per_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
+    num_pages = batch * pages_per_batch
     q = torch.randint(
         0, 256, (batch, heads, PACKED_DIM), device=device, dtype=torch.uint8
     )
-    q_scale = (
-        torch.tensor([127, 128, 126, 127], device=device, dtype=torch.uint8)
-        .expand(batch, heads, GROUPS)
-        .contiguous()
+    q_scale = torch.randint(
+        126, 129, (batch, heads, GROUPS), device=device, dtype=torch.uint8
     )
     cache = torch.randint(
-        0, 128, (4, PAGE_SIZE, 1, PACKED_DIM + GROUPS), device=device, dtype=torch.uint8
+        0,
+        256,
+        (num_pages, PAGE_SIZE, 1, PACKED_DIM + GROUPS),
+        device=device,
+        dtype=torch.uint8,
     )
-    # Real layout: [payload for every token of the page][UE8M0 scales for every token].
-    cache.view(4, -1)[:, PAGE_SIZE * PACKED_DIM :] = torch.tensor(
-        [127, 128, 126, 127], device=device, dtype=torch.uint8
-    ).repeat(PAGE_SIZE)
-    weight_scale = 0.75
-    weights = (
-        torch.randn(batch, heads, device=device, dtype=torch.float32) * weight_scale
+    # The cache stores all packed payloads before per-token group scales.
+    cache.view(num_pages, -1)[:, PAGE_SIZE * PACKED_DIM :] = torch.randint(
+        126,
+        129,
+        (num_pages, PAGE_SIZE * GROUPS),
+        device=device,
+        dtype=torch.uint8,
     )
-    seq_lens = torch.tensor([5, 3][:batch], device=device, dtype=torch.int32)
-    block_tables = torch.tensor(
-        [[0, 1], [2, 3]][:batch], device=device, dtype=torch.int32
+    weights = torch.randint(-8, 9, (batch, heads), device=device).to(torch.float32) / 8
+    lengths = [0, 1, 63, 64, 65, max_seq_len - 1, max_seq_len]
+    seq_lens = torch.tensor(
+        [min(max_seq_len, lengths[i % len(lengths)]) for i in range(batch)],
+        device=device,
+        dtype=torch.int32,
     )
-    max_seq_len = 5
+    seq_lens[-1] = max_seq_len
+    page_order = torch.randperm(num_pages, device=device, dtype=torch.int32)
+    block_tables = page_order.view(batch, pages_per_batch)
     got = fp4_paged_mqa_logits(
         (q, q_scale), cache, weights, seq_lens, block_tables, None, max_seq_len
     )
-    ref = _reference(
-        q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len, 1.0
-    )
-    torch.testing.assert_close(got.cpu(), ref.cpu(), rtol=1e-4, atol=1e-4)
+    ref = _reference(q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len)
+    torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)

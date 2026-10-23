@@ -129,6 +129,10 @@ from sgl_kernel.hisparse import (
     load_cache_to_device_buffer_mla,
     transfer_cache_dsv4_mla,
 )
+from sgl_kernel.indexer_rope_pack import (
+    index_k_norm_rope_pack_store,
+    index_q_rope_pack_weights,
+)
 from sgl_kernel.inkling_attn_prologue import (
     compile_inkling_attn_prologue,
     inkling_attn_prologue_decode,

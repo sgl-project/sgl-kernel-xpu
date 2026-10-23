@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/OpMathType.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <sycl/sycl.hpp>
 #include <vector>
 
@@ -1046,6 +1048,149 @@ gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Te
         "CUTLASS_SYCL_PROFILING_ENABLED build flag.\n");
   }
 #endif
+}
+
+// One work-group per (row, group) pair of group_size elements; weights are loaded together with the input so their
+// latency overlaps the reduction.
+template <typename scalar_t, int vec_size, int ITERS>
+struct GroupedGemmaRMSNormFunctor {
+  using accscalar_t = acc_type<scalar_t>;
+  using vec_t = aligned_vector_loop<scalar_t, vec_size>;
+
+  [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item) const {
+    const uint32_t wg = item.get_group(0);
+    const uint32_t lid = item.get_local_id(0);
+    const uint32_t wg_size = item.get_local_range(0);
+    const uint32_t num_vecs = group_size / vec_size;
+    const vec_t* x = reinterpret_cast<const vec_t*>(input + static_cast<int64_t>(wg) * group_size);
+    vec_t* y = reinterpret_cast<vec_t*>(output + static_cast<int64_t>(wg) * group_size);
+    const vec_t* w = reinterpret_cast<const vec_t*>(weight + (wg % num_groups) * group_size);
+
+    vec_t reg[ITERS];
+    vec_t wreg[ITERS];
+    accscalar_t sum_sq = 0;
+#pragma unroll
+    for (int it = 0; it < ITERS; ++it) {
+      const uint32_t idx = it * wg_size + lid;
+      if (idx < num_vecs) {
+        reg[it] = x[idx];
+        wreg[it] = w[idx];
+#pragma unroll
+        for (int i = 0; i < vec_size; ++i) {
+          const accscalar_t f = static_cast<accscalar_t>(reg[it][i]);
+          sum_sq += f * f;
+        }
+      }
+    }
+    sum_sq = sycl::reduce_over_group(item.get_group(), sum_sq, sycl::plus<accscalar_t>());
+    const accscalar_t rstd = sycl::rsqrt(sum_sq / static_cast<accscalar_t>(group_size) + eps);
+#pragma unroll
+    for (int it = 0; it < ITERS; ++it) {
+      const uint32_t idx = it * wg_size + lid;
+      if (idx < num_vecs) {
+        vec_t out;
+#pragma unroll
+        for (int i = 0; i < vec_size; ++i) {
+          out[i] = GemmaRMSNormNoRstdForward<scalar_t, scalar_t>::apply_weight(
+              static_cast<accscalar_t>(reg[it][i]), rstd, static_cast<accscalar_t>(wreg[it][i]));
+        }
+        y[idx] = out;
+      }
+    }
+  }
+
+  const scalar_t* input;
+  const scalar_t* weight;
+  scalar_t* output;
+  uint32_t group_size;
+  uint32_t num_groups;
+  accscalar_t eps;
+};
+
+// Past 4 register-cached passes a wider work-group is faster than more passes per thread.
+constexpr int kMaxIters = 4;
+constexpr int64_t kMaxWorkGroupSize = 512;
+
+template <typename scalar_t, int vec_size, int ITERS>
+void launch_grouped_gemma_rmsnorm(
+    const scalar_t* x, const scalar_t* w, scalar_t* y, int64_t rows, int64_t N, int64_t num_groups, double eps) {
+  const int64_t vecs = N / vec_size;
+  const int64_t wg_size = std::min<int64_t>(kMaxWorkGroupSize, div_up(div_up(vecs, int64_t{ITERS}), int64_t{16}) * 16);
+  GroupedGemmaRMSNormFunctor<scalar_t, vec_size, ITERS> fn{
+      x, w, y, static_cast<uint32_t>(N), static_cast<uint32_t>(num_groups), static_cast<acc_type<scalar_t>>(eps)};
+  sycl_kernel_submit(
+      sycl::range<1>(rows * wg_size), sycl::range<1>(wg_size), at::xpu::getCurrentXPUStream().queue(), fn);
+}
+
+template <typename scalar_t>
+void GroupedGemmaRMSNormKernelImplInternal(
+    const Tensor& X, const Tensor& gemma, int64_t M, int64_t N, int64_t num_groups, double eps, Tensor& Y) {
+  constexpr int kVec = 16 / sizeof(scalar_t);
+  const int64_t min_iters = div_up<int64_t>(N / kVec, 256);
+  scalar_t* x = X.data_ptr<scalar_t>();
+  scalar_t* w = gemma.data_ptr<scalar_t>();
+  scalar_t* y = Y.data_ptr<scalar_t>();
+  if (min_iters <= 1) {
+    launch_grouped_gemma_rmsnorm<scalar_t, kVec, 1>(x, w, y, M, N, num_groups, eps);
+  } else if (min_iters <= 2) {
+    launch_grouped_gemma_rmsnorm<scalar_t, kVec, 2>(x, w, y, M, N, num_groups, eps);
+  } else {
+    launch_grouped_gemma_rmsnorm<scalar_t, kVec, kMaxIters>(x, w, y, M, N, num_groups, eps);
+  }
+}
+
+// Gemma RMSNorm with the variance computed per group_size slice of the last dim. weight has the full hidden size.
+SGL_KERNEL_EXPORT void grouped_gemma_rmsnorm(
+    torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps, int64_t group_size) {
+  CHECK_INPUT(input);
+  CHECK_INPUT(weight);
+  CHECK_INPUT(output);
+  TORCH_CHECK(input.dim() >= 1, "input must have at least 1 dim");
+  TORCH_CHECK(input.sizes() == output.sizes(), "output must have the same shape as input");
+  TORCH_CHECK(
+      input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
+      "grouped_gemma_rmsnorm supports bfloat16 and float16, got ",
+      input.scalar_type());
+  TORCH_CHECK(output.scalar_type() == input.scalar_type(), "output dtype must match input");
+  TORCH_CHECK(weight.scalar_type() == input.scalar_type(), "weight dtype must match input");
+  constexpr int64_t kVecElems = 8;
+  TORCH_CHECK(group_size > 0 && group_size % kVecElems == 0, "group_size must be a positive multiple of ", kVecElems);
+  constexpr int64_t kMaxGroupSize = kMaxIters * kMaxWorkGroupSize * kVecElems;
+  TORCH_CHECK(
+      group_size <= kMaxGroupSize,
+      "grouped_gemma_rmsnorm: group_size ",
+      group_size,
+      " is too large (max ",
+      kMaxGroupSize,
+      ")");
+
+  const int64_t hidden = input.size(-1);
+  TORCH_CHECK(hidden % group_size == 0, "hidden size ", hidden, " must be divisible by group_size ", group_size);
+  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == hidden, "weight must be 1-D with hidden_size elements");
+  TORCH_CHECK(
+      weight.device() == input.device() && output.device() == input.device(),
+      "input, weight and output must be on the same device");
+  for (const auto* t : {&input, &weight, &output}) {
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0, "tensors must be 16-byte aligned");
+  }
+
+  if (input.numel() == 0) {
+    return;
+  }
+  at::assert_no_partial_overlap(output, input);
+  at::assert_no_overlap(output, weight);
+  TORCH_CHECK(
+      input.numel() <= std::numeric_limits<int32_t>::max(),
+      "grouped_gemma_rmsnorm: input is too large (",
+      input.numel(),
+      " elements)");
+
+  const int64_t M = input.numel() / group_size;
+  c10::DeviceGuard guard(input.device());
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "grouped_gemma_rmsnorm", [&]() {
+        GroupedGemmaRMSNormKernelImplInternal<scalar_t>(input, weight, M, group_size, hidden / group_size, eps, output);
+      });
 }
 
 }  // namespace at::native::xpu

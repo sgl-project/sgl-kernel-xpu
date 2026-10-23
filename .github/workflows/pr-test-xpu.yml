@@ -225,3 +225,119 @@ jobs:
         if: always()
         run: |
           docker rm -f ci_sglkernel_xpu || true
+
+  build-cri:
+    # Build-only gate for CRI (Xe3P). CRI is pre-silicon: nothing runs, nothing is packaged.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    permissions:
+      contents: read
+    runs-on: sglang-cri
+    env:
+      # Keep in step with Dockerfile.xpu_kernel.
+      DLE_IMAGE: intel/deep-learning-essentials:2026.1.3-devel-ubuntu24.04
+      CR_VERSION: 26.27.39122.11
+      IGC_VERSION: 2.38.2+22051
+      GMM_VERSION: 22.10.0
+      TORCH_VERSION: 2.14.0
+      CONTAINER: ci_sglkernel_xpu_cri
+    steps:
+      - name: Reclaim workspace
+        # The container builds as root; a cancelled run can leave root-owned files behind.
+        run: docker run --rm -v "${GITHUB_WORKSPACE}:/ws" --entrypoint chown "${DLE_IMAGE}" -R "$(id -u):$(id -g)" /ws || true
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start container
+        run: docker run -dt --name "${CONTAINER}" -v "${GITHUB_WORKSPACE}:/src" -w /src -e CR_VERSION -e IGC_VERSION -e GMM_VERSION -e TORCH_VERSION "${DLE_IMAGE}"
+
+      - name: Install toolchain
+        # DLE ships icpx but not ocloc, which the Xe3P AOT link needs.
+        timeout-minutes: 30
+        run: |
+          docker exec -i "${CONTAINER}" bash -s <<'EOF'
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates python3-dev python3-venv
+          cd /tmp
+          igc_url="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION%%+*}"
+          cr_url="https://github.com/intel/compute-runtime/releases/download/${CR_VERSION}"
+          debs="${igc_url}/intel-igc-core-2_${IGC_VERSION}_amd64.deb
+                ${igc_url}/intel-igc-opencl-2_${IGC_VERSION}_amd64.deb
+                ${cr_url}/libigdgmm12_${GMM_VERSION}_amd64.deb
+                ${cr_url}/intel-ocloc_${CR_VERSION}-0_amd64.deb"
+          for url in ${debs}; do curl -fsSLO "${url}"; done
+          apt-get install -y --allow-downgrades ./*.deb
+          rm -f ./*.deb
+          ocloc ids cri || echo "warning: ocloc does not list cri"
+
+          python3 -m venv /opt/venv
+          . /opt/venv/bin/activate
+          pip install -q --upgrade pip cmake ninja
+          pip install -q --timeout 300 --retries 10 "torch==${TORCH_VERSION}" --index-url https://download.pytorch.org/whl/xpu
+          EOF
+
+      - name: Build for CRI
+        timeout-minutes: 180
+        run: |
+          docker exec -i "${CONTAINER}" bash -s <<'EOF'
+          set -euxo pipefail
+          . /opt/venv/bin/activate
+          # PATH only: setvars.sh would shadow torch's bundled libsycl.
+          icpx=$(ls /opt/intel/oneapi/compiler/latest/bin/icpx 2>/dev/null \
+                 || ls /opt/intel/oneapi/compiler/[0-9]*/bin/icpx | sort -V | tail -n1)
+          export PATH="$(dirname "${icpx}"):${PATH}"
+
+          # Size parallelism by memory (4 GiB per job): the compiler launcher kills the build on OOM.
+          jobs=$(awk '/MemTotal/ {print int($2 * 0.8 / 4194304)}' /proc/meminfo)
+          jobs=$(( jobs < $(nproc) ? jobs : $(nproc) ))
+          jobs=$(( jobs > 0 ? jobs : 1 ))
+          export MAX_JOBS="${jobs}" CMAKE_BUILD_PARALLEL_LEVEL="${jobs}"
+          echo "parallel jobs: ${jobs}"
+
+          # Stand in for what scikit-build-core would pass. Do not set CC/CXX:
+          # BuildFlags.cmake only adds the SYCL flags for a GNU host compiler.
+          sabi=$(python3 -c 'import tomllib; print("3." + tomllib.load(open("pyproject.toml", "rb"))["tool"]["scikit-build"]["wheel"]["py-api"][3:])')
+          icc=$(echo __INTEL_LLVM_COMPILER | icpx -E -x c++ - | tail -n1 | tr -dc 0-9)
+
+          # DPCPP_SYCL_TARGET must be explicit, or auto-detect builds Xe2 on a BMG host.
+          cmake -GNinja -S . -B build-cri \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDPCPP_SYCL_TARGET=cri \
+            -DSKBUILD_SABI_COMPONENT=Development.SABIModule \
+            -DSKBUILD_SABI_VERSION="${sabi}" \
+            -D__INTEL_LLVM_COMPILER="${icc}" \
+            -DPython3_EXECUTABLE="$(which python3)" \
+            -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch.utils; print(torch.utils.cmake_prefix_path)')" \
+            2>&1 | tee cri_build.log
+          cmake --build build-cri --parallel "${CMAKE_BUILD_PARALLEL_LEVEL}" 2>&1 | tee -a cri_build.log
+          EOF
+
+      - name: Verify Xe3P build
+        # Fail on a build that silently fell back to BMG or stopped after configure.
+        run: |
+          set -uo pipefail
+          fail=0
+          check() { if eval "$2"; then echo "ok: $1"; else echo "::error::$1"; fail=1; fi; }
+          check "log reports target cri"      'grep -qF "DPCPP_SYCL_TARGET set to: cri" cri_build.log'
+          check "log reports AOT for cri"     'grep -qF "Compile Intel GPU AOT Targets for cri" cri_build.log'
+          check "CMakeCache target is cri"    '[ "$(sed -n "s/^DPCPP_SYCL_TARGET:[A-Z]*=//p" build-cri/CMakeCache.txt)" = cri ]'
+          check "kernel libraries were built" '[ -n "$(find build-cri -name "*.so" -print -quit)" ]'
+          check "no wheel was produced"       '[ -z "$(find . -name "*.whl" -print -quit)" ]'
+          exit "${fail}"
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cri-build-log-${{ github.event.pull_request.number || github.sha }}
+          path: cri_build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup container
+        if: always()
+        run: |
+          docker exec "${CONTAINER}" chown -R "$(id -u):$(id -g)" /src || true
+          docker rm -f "${CONTAINER}" || true

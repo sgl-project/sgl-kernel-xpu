@@ -50,6 +50,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
+  m.def("fused_sigmoid_mul(Tensor! output, Tensor input, Tensor gate) -> ()");
+  m.impl("fused_sigmoid_mul", torch::kXPU, &at::native::xpu::fused_sigmoid_mul);
+
   m.def(
       "fused_scale_residual_norm_scale_shift(Tensor residual, Tensor x, Tensor? gate, Tensor? weight, "
       "Tensor? bias, Tensor scale, Tensor shift, float eps) -> (Tensor, Tensor)");

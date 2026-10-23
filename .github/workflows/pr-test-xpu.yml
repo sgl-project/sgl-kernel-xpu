@@ -259,7 +259,7 @@ jobs:
           set -euxo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y --no-install-recommends curl ca-certificates python3-venv
+          apt-get install -y --no-install-recommends curl ca-certificates python3-dev python3-venv
           cd /tmp
           igc_url="https://github.com/intel/intel-graphics-compiler/releases/download/v${IGC_VERSION%%+*}"
           cr_url="https://github.com/intel/compute-runtime/releases/download/${CR_VERSION}"
@@ -292,7 +292,9 @@ jobs:
           # Size parallelism by memory (4 GiB per job): the compiler launcher kills the build on OOM.
           jobs=$(awk '/MemTotal/ {print int($2 * 0.8 / 4194304)}' /proc/meminfo)
           jobs=$(( jobs < $(nproc) ? jobs : $(nproc) ))
-          export MAX_JOBS=$(( jobs > 0 ? jobs : 1 ))
+          jobs=$(( jobs > 0 ? jobs : 1 ))
+          export MAX_JOBS="${jobs}" CMAKE_BUILD_PARALLEL_LEVEL="${jobs}"
+          echo "parallel jobs: ${jobs}"
 
           # Stand in for what scikit-build-core would pass. Do not set CC/CXX:
           # BuildFlags.cmake only adds the SYCL flags for a GNU host compiler.
@@ -309,7 +311,7 @@ jobs:
             -DPython3_EXECUTABLE="$(which python3)" \
             -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch.utils; print(torch.utils.cmake_prefix_path)')" \
             2>&1 | tee cri_build.log
-          cmake --build build-cri --parallel "${MAX_JOBS}" 2>&1 | tee -a cri_build.log
+          cmake --build build-cri --parallel "${CMAKE_BUILD_PARALLEL_LEVEL}" 2>&1 | tee -a cri_build.log
           EOF
 
       - name: Verify Xe3P build

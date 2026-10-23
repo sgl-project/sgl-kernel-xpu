@@ -86,7 +86,9 @@ std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     // Optional per-token block id (-1 = none) enabling the bidirectional-block
     // mask in the prefill path: keys sharing a query's non-negative id are
     // attended bidirectionally, causal otherwise.
-    std::optional<const at::Tensor>& bidirectional_block_ids_);
+    std::optional<const at::Tensor>& bidirectional_block_ids_,
+    // Optional fp32 ALiBi slopes [num_heads]; bias = -slope * |i + s_k - s_q - j|.
+    std::optional<const at::Tensor>& alibi_slopes_);
 
 void flash_mla_decode(
     torch::Tensor& out,

@@ -232,6 +232,7 @@ struct Arguments {
   int64_t rel_bias_token_stride = 0;
   int64_t rel_bias_head_stride = 0;
   int rel_bias_extent = 0;
+  const float* __restrict__ alibi_slopes_ptr = nullptr;  // [h] fp32 ALiBi slopes
 
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;
@@ -443,7 +444,8 @@ struct DecodeRunner {
          static_cast<const ElementQ*>(params.rel_bias_ptr),
          params.rel_bias_token_stride,
          params.rel_bias_head_stride,
-         params.rel_bias_extent},
+         params.rel_bias_extent,
+         params.alibi_slopes_ptr},
         {},
         hw_info};
 
@@ -621,7 +623,8 @@ struct SplitDecodeKernelRunner {
          params.window_size_right,
          static_cast<const ElementQ*>(params.rel_bias_ptr),
          params.rel_bias_head_stride,
-         params.rel_bias_extent},
+         params.rel_bias_extent,
+         params.alibi_slopes_ptr},
         {},
         hw_info,
         params.num_kv_splits};

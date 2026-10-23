@@ -101,12 +101,13 @@ __attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@
   }
 
 #if @HEAD_DIM@ == 128 || @HEAD_DIM@ == 512
-  if (params.rel_bias_ptr != nullptr) {
+  if (params.rel_bias_ptr != nullptr || params.alibi_slopes_ptr != nullptr) {
     TORCH_CHECK(params.dv == @HEAD_DIM@, "relative attention requires head_dim_v == @HEAD_DIM@");
     TORCH_CHECK(!params.is_e4m3 && !params.is_e5m2, "relative attention does not support fp8 KV cache");
     TORCH_CHECK(
-        params.rel_bias_head_stride ==
-            flash_attention_v2::relative_attention::decode_padded_cols(params.rel_bias_extent, @PAGE_SIZE@),
+        params.alibi_slopes_ptr != nullptr ||
+            params.rel_bias_head_stride ==
+                flash_attention_v2::relative_attention::decode_padded_cols(params.rel_bias_extent, @PAGE_SIZE@),
         "relative attention expects a decode-sheared bias with ",
         flash_attention_v2::relative_attention::decode_padded_cols(params.rel_bias_extent, @PAGE_SIZE@),
         " columns");

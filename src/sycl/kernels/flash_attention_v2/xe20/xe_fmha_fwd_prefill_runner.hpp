@@ -44,10 +44,10 @@
 #include "cutlass/util/packed_stride.hpp"
 #include "sycl/Utils.h"
 #include "sycl/comm/common.h"
-#include "sycl/kernels/flash_attention_v2/collective/fmha_fusion.hpp"
-#include "sycl/kernels/flash_attention_v2/kernel/xe_fmha_fwd_kernel.hpp"
-#include "sycl/kernels/flash_attention_v2/kernel/xe_tile_scheduler.hpp"
-#include "sycl/kernels/flash_attention_v2/relative_attention.hpp"
+#include "sycl/kernels/flash_attention_v2/xe20/collective/fmha_fusion.hpp"
+#include "sycl/kernels/flash_attention_v2/xe20/kernel/xe_fmha_fwd_kernel.hpp"
+#include "sycl/kernels/flash_attention_v2/xe20/kernel/xe_tile_scheduler.hpp"
+#include "sycl/kernels/flash_attention_v2/xe20/relative_attention.hpp"
 
 using namespace cute;
 namespace prefill {

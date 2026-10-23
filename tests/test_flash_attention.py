@@ -17,6 +17,27 @@ device = utils.get_device()
 apply_rotary_emb = None
 
 
+def is_cri_device() -> bool:
+    if device.type != "xpu" or not torch.xpu.is_available():
+        return False
+    from sgl_kernel.utils import is_xe3_arch
+
+    return is_xe3_arch()
+
+
+def skip_unsupported_attention_case(
+    head_dim, paged, dtype=torch.bfloat16, full_fp8=False
+):
+    if is_cri_device():
+        supported_dims = (64, 128, 256) if paged else (64, 72, 96, 128)
+        if head_dim not in supported_dims or dtype == torch.float16:
+            pytest.skip("Xe35 attention does not compile this head dimension or dtype")
+        if dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not full_fp8:
+            pytest.skip("Xe35 requires full-QKV FP8 on the paged path")
+    elif full_fp8:
+        pytest.skip("full-QKV FP8 attention requires Xe35")
+
+
 def is_hopper():
     #  Only Hopper supports different V headdim
     if torch.cuda.is_available():
@@ -40,7 +61,7 @@ def is_fa3_supported(device=None) -> bool:
             or torch.cuda.get_device_capability(device)[0] == 8
         ) and (torch.version.cuda >= "12.3")
     elif torch.xpu.is_available():
-        return torch.xpu.get_device_properties().has_fp64
+        return is_cri_device() or torch.xpu.get_device_properties().has_fp64
     else:
         return False
 
@@ -734,6 +755,9 @@ def test_flash_attn_kvcache(
 ):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
+    skip_unsupported_attention_case(d, page_size is not None, dtype)
+    if is_cri_device() and softcap > 0:
+        pytest.skip("Xe35 does not support softcap")
     if page_size is not None and seqlen_k % page_size != 0:
         pytest.skip("page_size must divide seqlen_k")
     if seqlen_q > seqlen_k and new_kv:
@@ -948,7 +972,11 @@ def test_flash_attn_kvcache(
                 key_padding_mask,
                 arange >= cache_leftpad.unsqueeze(-1).expand(-1, seqlen_k),
             )
-        rotary_seqlens = cache_seqlens if not has_rotary_seqlens else cache_seqlens // 2
+        rotary_seqlens = (
+            None
+            if is_cri_device() and rotary_dim == 0
+            else (cache_seqlens if not has_rotary_seqlens else cache_seqlens // 2)
+        )
         if rotary_dim > 0:
             angle = (
                 torch.rand(
@@ -1080,7 +1108,7 @@ def test_flash_attn_kvcache(
                 # softmax_lse is supported alongside causal / local masking; it
                 # is only unavailable with sink logits (no LSE kernel
                 # instantiation exists for the sink path).
-                return_lse = not use_sinks
+                return_lse = not use_sinks and not is_cri_device()
                 result = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
@@ -1328,6 +1356,9 @@ def test_flash_attn_decode_kvcache(
 ):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
+    skip_unsupported_attention_case(d, page_size is not None, dtype)
+    if is_cri_device() and softcap > 0:
+        pytest.skip("Xe35 does not support softcap")
     if (nheads_q, nheads_kv) == (8, 1) and (
         batch_size != 1 or d != 512 or page_size != 64
     ):
@@ -1535,7 +1566,11 @@ def test_flash_attn_decode_kvcache(
                 key_padding_mask,
                 arange >= cache_leftpad.unsqueeze(-1).expand(-1, seqlen_k),
             )
-        rotary_seqlens = cache_seqlens if not has_rotary_seqlens else cache_seqlens // 2
+        rotary_seqlens = (
+            None
+            if is_cri_device() and rotary_dim == 0
+            else (cache_seqlens if not has_rotary_seqlens else cache_seqlens // 2)
+        )
         if rotary_dim > 0:
             angle = (
                 torch.rand(
@@ -1675,7 +1710,7 @@ def test_flash_attn_decode_kvcache(
                 # softmax_lse is supported alongside causal / local masking; it
                 # is only unavailable with sink logits (no LSE kernel
                 # instantiation exists for the sink path).
-                return_lse = not use_sinks
+                return_lse = not use_sinks and not is_cri_device()
                 result = flash_attn_with_kvcache(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
@@ -1802,6 +1837,7 @@ def test_flash_attn_decode_kvcache(
     reason="soft-cap head-dim gating is an XPU (sgl-kernel-xpu) feature",
 )
 @pytest.mark.skipif(DISABLE_SOFTCAP, reason="soft-cap disabled")
+@pytest.mark.skipif(is_cri_device(), reason="Xe35 does not support softcap")
 def test_softcap_unsupported_head_dim_rejected():
     """Soft-cap is only compiled for head_dim 128/256; other head dims must reject
     softcap>0 with a clear error instead of silently dropping the cap."""
@@ -1861,6 +1897,8 @@ def test_flash_attn_fp8_kvcache(
     """
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
+    if is_cri_device():
+        pytest.skip("Xe35 requires full-QKV FP8 rather than BF16-Q/FP8-KV")
     if seqlen_k % page_size != 0:
         pytest.skip("page_size must divide seqlen_k")
     assert nheads_q % nheads_kv == 0
@@ -2079,7 +2117,7 @@ def _generate_block_kvcache(
 @pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
 @pytest.mark.parametrize("causal,local", [(False, True), (False, False), (True, False)])
 @pytest.mark.parametrize("add_unused_qkv", [False])
-@pytest.mark.parametrize("d", [72, 80, 128, 192, 256, 512])
+@pytest.mark.parametrize("d", [72, 80, 96, 128, 192, 256, 512])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -2121,6 +2159,11 @@ def test_flash_attn_varlen_output(
 ):
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
+    skip_unsupported_attention_case(d, False, dtype)
+    if is_cri_device() and causal:
+        pytest.skip("Xe35 non-paged batched causal varlen is not supported")
+    if is_cri_device() and (softcap > 0 or has_qv or add_unused_qkv):
+        pytest.skip("Xe35 does not support softcap, QV, or unused QKV rows")
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
     batch_size = 9 if seqlen_q <= 1024 else 2
@@ -2137,6 +2180,8 @@ def test_flash_attn_varlen_output(
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
     for dv in dv_vals:
+        if is_cri_device() and dv != d:
+            continue
         softmax_scale = 1.0 / math.sqrt(d if not has_qv else d + dv)
         q_ref = torch.randn(
             batch_size, seqlen_q, nheads_q, d, device=device, dtype=dtype_ref
@@ -2288,7 +2333,7 @@ def test_flash_attn_varlen_output(
         # softmax_lse is supported alongside causal / local masking on the
         # non-paged prefill path; it is only unavailable with sink logits (none
         # here) or an fp8 KV cache.
-        return_lse = dtype != torch.float8_e4m3fn
+        return_lse = dtype != torch.float8_e4m3fn and not is_cri_device()
         # Reference LSE in the unpadded (nheads, total_q) layout the kernel
         # writes. unpad_input selects the used (+ unused) query rows in flattened
         # (b s) order, so mirror that indexing here.
@@ -2432,7 +2477,7 @@ if EXTENDED_KVCACHE_TESTS:
         )
 
     @pytest.mark.skipif(
-        device.type != "xpu" or not is_fa3_supported(),
+        device.type != "xpu" or not is_fa3_supported() or is_cri_device(),
         reason="large ScoreBlock2D workspace coverage is only supported on BMG XPU",
     )
     @pytest.mark.parametrize(
@@ -2511,7 +2556,7 @@ if EXTENDED_KVCACHE_TESTS:
         assert workspace_bytes <= 1024 * 1024 * 1024
 
     @pytest.mark.skipif(
-        device.type != "xpu" or not is_fa3_supported(),
+        device.type != "xpu" or not is_fa3_supported() or is_cri_device(),
         reason="ScoreBlock2D LSE coverage is only supported on BMG XPU",
     )
     def test_flash_attn_varlen_hd512_score_workspace_lse_head_slicing(
@@ -2598,6 +2643,8 @@ if EXTENDED_KVCACHE_TESTS:
         batch_size, nheads_q, nheads_kv
     ):
         """Paged ScoreBlock2D cases that previously required a 4 GiB workspace."""
+        if is_cri_device():
+            pytest.skip("Xe35 does not support head_dim 512")
         from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
         seqlen_q = 4096
@@ -2657,6 +2704,8 @@ if EXTENDED_KVCACHE_TESTS:
 @pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
 def test_flash_attn_with_kvcache_out_buffer():
     """Test that a preallocated out buffer is reused and the result is correct."""
+    if is_cri_device():
+        pytest.skip("Xe35 does not support LSE")
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
     torch.random.manual_seed(42)
@@ -2752,6 +2801,7 @@ def test_flash_attn_with_kvcache_out_buffer():
         (False, [257, 513], [1025, 2049], 512, 8, 2),
     ],
 )
+@pytest.mark.skipif(is_cri_device(), reason="Xe35 does not support relative bias")
 def test_relative_attention(
     dtype, page_size, causal, seqlens_q, seqlens_k, extent, num_heads, num_heads_k
 ):
@@ -2863,6 +2913,7 @@ def test_relative_attention(
 @pytest.mark.skipif(
     device.type != "xpu", reason="relative attention requires an XPU device"
 )
+@pytest.mark.skipif(is_cri_device(), reason="Xe35 does not support relative bias")
 def test_relative_attention_zero_bias_matches_prefill():
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
@@ -2909,6 +2960,7 @@ def test_relative_attention_zero_bias_matches_prefill():
 @pytest.mark.skipif(
     device.type != "xpu", reason="relative attention requires an XPU device"
 )
+@pytest.mark.skipif(is_cri_device(), reason="Xe35 does not support relative bias")
 def test_relative_attention_decode_pre_sheared_matches_raw():
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
@@ -2979,6 +3031,7 @@ def test_relative_attention_decode_pre_sheared_matches_raw():
     "seqlen_k,extent",
     [(1, 1), (63, 64), (64, 64), (65, 64), (4097, 128), (4097, 4097), (5120, 192)],
 )
+@pytest.mark.skipif(is_cri_device(), reason="Xe35 does not support relative bias")
 def test_relative_attention_decode_d512_bias_only_matches_reference_and_pre_sheared(
     seqlen_k, extent
 ):
@@ -3060,6 +3113,8 @@ def test_relative_attention_decode_d512_bias_only_matches_reference_and_pre_shea
 def test_flash_attn_with_kvcache_page_size_1():
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
+    if is_cri_device():
+        pytest.skip("Xe35 does not support LSE in the page_size=1 fallback")
     torch.random.manual_seed(42)
     batch_size, nheads_q, nheads_kv, d = 2, 4, 2, 64
     dtype = torch.bfloat16
@@ -3114,6 +3169,8 @@ def test_flash_attn_varlen_output_noncontiguous(d, causal, dtype):
     having to pay for that copy."""
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
+    if is_cri_device():
+        pytest.skip("Xe35 requires contiguous Q head and row strides")
     torch.random.manual_seed(d + int(causal))
     batch_size, seqlen_q, seqlen_k, nheads = 4, 96, 128, 8
 
@@ -3181,6 +3238,162 @@ def test_flash_attn_varlen_output_noncontiguous(d, causal, dtype):
     assert (out - out_ref).abs().max().item() <= 2 * (
         out_pt - out_ref
     ).abs().max().item() + fwd_atol, "non-contiguous q/k/v must match golden result"
+
+
+@pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
+@pytest.mark.parametrize("causal,local", [(False, False), (False, True), (True, False)])
+@pytest.mark.parametrize("use_sinks", [False, True])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("seqlen_q", [1, 128])
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_flash_attention_paged_smoke(
+    causal, local, use_sinks, head_dim, seqlen_q, page_size
+):
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    skip_unsupported_attention_case(head_dim, True)
+    if use_sinks and head_dim != 64:
+        pytest.skip("sinks require head_dim 64")
+    if local and seqlen_q == 1:
+        pytest.skip("local-window coverage uses seqlen_q > 1")
+
+    batch, seqlen_k, nheads_q, nheads_kv = 2, 128, 4, 2
+    num_pages_per_seq = seqlen_k // page_size
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch, seqlen_q, nheads_q, head_dim, device=device, dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        batch * num_pages_per_seq,
+        page_size,
+        nheads_kv,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.arange(
+        batch * num_pages_per_seq, dtype=torch.int32, device=device
+    ).view(batch, num_pages_per_seq)
+    cache_seqlens = torch.full((batch,), seqlen_k, dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=device) * seqlen_q
+    sinks = torch.randn(nheads_q, device=device, dtype=q.dtype) if use_sinks else None
+    window_size = (1, 0) if local else (-1, -1)
+    out = flash_attn_with_kvcache(
+        q.view(batch * seqlen_q, nheads_q, head_dim),
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        softmax_scale=head_dim**-0.5,
+        causal=causal,
+        window_size=window_size,
+        sinks=sinks,
+        rotary_interleaved=False,
+    )
+    torch.xpu.synchronize()
+    k_ref = k_cache.cpu()[page_table.cpu().long()].flatten(1, 2)
+    v_ref = v_cache.cpu()[page_table.cpu().long()].flatten(1, 2)
+    reference, _ = attention_ref(
+        q.cpu(),
+        k_ref,
+        v_ref,
+        head_dim**-0.5,
+        sink=sinks.cpu() if sinks is not None else None,
+        causal=causal,
+        window_size=window_size,
+        upcast=True,
+    )
+    baseline, _ = attention_ref(
+        q.cpu(),
+        k_ref,
+        v_ref,
+        head_dim**-0.5,
+        sink=sinks.cpu() if sinks is not None else None,
+        causal=causal,
+        window_size=window_size,
+        upcast=False,
+    )
+    kernel_diff = (
+        (out.view_as(reference).cpu().float() - reference.float()).abs().max().item()
+    )
+    baseline_diff = (baseline.float() - reference.float()).abs().max().item()
+    assert kernel_diff <= 2 * baseline_diff + 1e-5
+
+
+@pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("seqlen_q", [1, 16])
+def test_flash_attention_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q):
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    skip_unsupported_attention_case(head_dim, True, fp8_dtype, full_fp8=True)
+    batch, seqlen_k, page_size, nheads_q, nheads_kv = 1, 96, 64, 2, 1
+    torch.manual_seed(1)
+
+    def quantize(tensor):
+        info = torch.finfo(fp8_dtype)
+        scale = (tensor.abs().amax().float() / info.max).clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
+        return (tensor.float() / scale).clamp(info.min, info.max).to(
+            fp8_dtype
+        ), scale.cpu()
+
+    q_bf16 = torch.randn(
+        batch, seqlen_q, nheads_q, head_dim, device=device, dtype=torch.bfloat16
+    )
+    k_bf16 = torch.randn(
+        2, page_size, nheads_kv, head_dim, device=device, dtype=torch.bfloat16
+    )
+    v_bf16 = torch.randn_like(k_bf16)
+    q_fp8, q_descale = quantize(q_bf16)
+    k_cache, k_descale = quantize(k_bf16)
+    v_cache, v_descale = quantize(v_bf16)
+    page_table = torch.tensor([[1, 0]], dtype=torch.int32, device=device)
+    cache_seqlens = torch.tensor([seqlen_k], dtype=torch.int32, device=device)
+    cu_seqlens_q = torch.tensor([0, seqlen_q], dtype=torch.int32, device=device)
+
+    out = flash_attn_with_kvcache(
+        q_fp8.view(batch * seqlen_q, nheads_q, head_dim),
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=seqlen_k,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        softmax_scale=head_dim**-0.5,
+        rotary_interleaved=False,
+    )
+    torch.xpu.synchronize()
+
+    q_ref = (q_fp8.float().cpu() * q_descale).to(torch.bfloat16)
+    k_ref = (
+        (k_cache.float().cpu() * k_descale.cpu())[page_table.cpu().long()]
+        .flatten(1, 2)[:, :seqlen_k]
+        .to(torch.bfloat16)
+    )
+    v_ref = (
+        (v_cache.float().cpu() * v_descale.cpu())[page_table.cpu().long()]
+        .flatten(1, 2)[:, :seqlen_k]
+        .to(torch.bfloat16)
+    )
+    expected, _ = attention_ref(q_ref, k_ref, v_ref, head_dim**-0.5, upcast=True)
+    assert out.dtype == fp8_dtype
+    torch.testing.assert_close(
+        out.view_as(expected).float().cpu(),
+        expected.float(),
+        atol=0.25 if fp8_dtype == torch.float8_e5m2 else 0.06,
+        rtol=0.08,
+    )
 
 
 if __name__ == "__main__":

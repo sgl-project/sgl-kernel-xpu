@@ -79,6 +79,7 @@ NIGHTLY_TESTS: List[Entry] = [
     Entry("test_sgemm_lora_a_fwd.py"),
     Entry("test_fused_q_norm_rope.py"),
     Entry("test_qsa_mqa_nightly.py", estimated_time=180),
+    Entry("test_qsa_sparse_attention_nightly.py", estimated_time=180),
 ]
 
 

@@ -90,6 +90,7 @@ suites = {
         TestFile("test_chunked_sgmv_lora_expand_fwd.py"),
         TestFile("test_qsa_sparse_attention.py"),
         TestFile("test_qsa_mqa.py"),
+        TestFile("test_qsa_prepare.py"),
         TestFile("test_qwen4_short_conv.py"),
     ],
     # Nightly suite: exercises the wheel installed in the intel/sgl-kernel-xpu-dev

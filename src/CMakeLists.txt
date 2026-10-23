@@ -7,7 +7,7 @@
 #   USE_FMHA -> flash attention (fwd / mha_fwd)
 #   USE_GDN  -> Gated DeltaNet attention kernels
 #   USE_MLA  -> MLA decode/prefill/sparse-decode kernels
-#   USE_QSA  -> Xe2 BF16 QSA sparse attention
+#   USE_QSA  -> Xe2 BF16 QSA attention, MQA and indexer preparation
 #   USE_MLA_SPARSE_FUSED -> fused (single-pass) sparse-MLA-decode kernel (optimization track)
 #
 # Defaults are set in the option() declarations below. Each toggle can be set either as a CMake option
@@ -123,6 +123,7 @@ endif()
 if(NOT USE_QSA OR NOT DPCPP_SYCL_TARGET MATCHES "bmg")
     list(FILTER device_cpp EXCLUDE REGEX "/QSASparseAttentionXe20\\.cpp$")
     list(FILTER device_cpp EXCLUDE REGEX "/QSAMqaXe20\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/QSAPrepareXe20\\.cpp$")
 endif()
 if(NOT USE_MOE)
     list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20|W8A16Xe20)|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")

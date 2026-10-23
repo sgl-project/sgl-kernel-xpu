@@ -142,6 +142,8 @@ suites = {
         # BenchFile("bench_jit_moe_align_block_size.py"),
         # BenchFile("bench_jit_per_token_group_quant_8bit_v2.py"),
         # BenchFile("bench_jit_activation.py"),
+        # --- Qwen4 ops ---
+        BenchFile("bench_qwen4_short_conv.py"),
     ],
 }
 

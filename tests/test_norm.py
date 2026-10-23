@@ -42,6 +42,14 @@ def gemma_fused_add_rms_norm(x, residual, w, eps=1e-6):
     return x, residual
 
 
+def grouped_gemma_rms_norm(x, w, group_size, eps=1e-6):
+    orig_dtype = x.dtype
+    xf = x.float().reshape(*x.shape[:-1], x.shape[-1] // group_size, group_size)
+    xf = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    xf = xf.reshape(x.shape) * (1.0 + w.float())
+    return xf.to(orig_dtype)
+
+
 def norm_tolerances(dtype):
     if dtype == torch.float32:
         return dict(rtol=1e-4, atol=1e-4)
@@ -870,14 +878,6 @@ def test_gemma_fused_add_rmsnorm_mixed_dtype(
     tol = 1e-2 if input_dtype == torch.bfloat16 else 1e-3
     torch.testing.assert_close(x_fused, x_native, rtol=tol, atol=tol)
     torch.testing.assert_close(residual_fused, residual_native, rtol=tol, atol=tol)
-
-
-def grouped_gemma_rms_norm(x, w, group_size, eps=1e-6):
-    orig_dtype = x.dtype
-    xf = x.float().reshape(*x.shape[:-1], x.shape[-1] // group_size, group_size)
-    xf = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
-    xf = xf.reshape(x.shape) * (1.0 + w.float())
-    return xf.to(orig_dtype)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

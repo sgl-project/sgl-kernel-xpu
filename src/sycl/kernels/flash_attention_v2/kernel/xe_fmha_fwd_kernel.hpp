@@ -1484,7 +1484,7 @@ class XeFMHAFwdSplitKVKernel {
       int bias_row_base = 0;
       if constexpr (CollectiveMainloop::HasRelBias) {
         int const q_token = is_var_len ? s.seq_len_qo.cumulative_length[idx_b] : idx_b * seq_len_qo;
-        bias_row_base = q_token * s.num_heads_q + head_q_start;
+        bias_row_base = params.mainloop.ptr_alibi_slopes ? head * head_group_q : q_token * s.num_heads_q + head_q_start;
       }
 
       mainloop(

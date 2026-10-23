@@ -241,7 +241,7 @@ jobs:
     env:
       # Keep in step with the FROM in Dockerfile.xpu_kernel so CRI and BMG
       # compile with the same oneAPI.
-      DLE_IMAGE: intel/deep-learning-essentials:2026.0.0-devel-ubuntu24.04
+      DLE_IMAGE: intel/deep-learning-essentials:2026.2.0-devel-ubuntu24.04
     steps:
       - name: Reclaim workspace from any previous run
         # Must precede actions/checkout. The build container writes to the
@@ -294,7 +294,7 @@ jobs:
         # pre-builds is a BMG `pip install .` this job would ignore anyway.
         #
         # This is the image Dockerfile.xpu_kernel itself FROMs, so oneAPI/icpx is
-        # the same Deep Learning Essentials 2026.0.0 BMG compiles with -- the
+        # the same Deep Learning Essentials 2026.2.0 BMG compiles with -- the
         # toolchain part, without the sglang clone, media drivers or BMG build.
         run: |
           docker pull "${DLE_IMAGE}"
@@ -392,7 +392,7 @@ jobs:
               # a -fsycl compile succeeds with nothing but PATH set).
               #
               # Resolved, not hardcoded: the debs install into a versioned dir
-              # (compiler/2026.0/bin) and `latest` is only a symlink their postinst
+              # (compiler/2026.2/bin) and `latest` is only a symlink their postinst
               # adds, so neither path can be assumed. Prefer `latest` -- that is
               # the toolkit own choice of default -- else the highest version. Do
               # not just sort the glob: `latest` sorts after every number, so it

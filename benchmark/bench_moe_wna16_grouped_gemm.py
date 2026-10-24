@@ -140,41 +140,49 @@ W8_BENCH_SHAPES = [
 
 
 def _quantize_w8_weights(weights, scale_layout):
+    experts, gemm_k, gemm_n = weights.shape
     if scale_layout == "block":
-        experts, rows, columns = weights.shape
-        blocked = weights.float().reshape(
-            experts,
-            rows // FP8_BLOCK_SIZE,
-            FP8_BLOCK_SIZE,
-            columns // FP8_BLOCK_SIZE,
-            FP8_BLOCK_SIZE,
+        blocked = (
+            weights.float()
+            .reshape(
+                experts,
+                gemm_k // FP8_BLOCK_SIZE,
+                FP8_BLOCK_SIZE,
+                gemm_n // FP8_BLOCK_SIZE,
+                FP8_BLOCK_SIZE,
+            )
+            .permute(0, 3, 1, 4, 2)
         )
-        scales = blocked.abs().amax((2, 4), keepdim=True).clamp_min(1e-12) / FP8_MAX
+        scales = blocked.abs().amax((3, 4), keepdim=True).clamp_min(1e-12) / FP8_MAX
         quantized = (blocked / scales).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+        quantized = quantized.permute(0, 2, 4, 1, 3).reshape_as(weights)
         return (
-            quantized.reshape_as(weights).contiguous(),
+            quantized.contiguous(),
             scales.reshape(
-                experts, rows // FP8_BLOCK_SIZE, columns // FP8_BLOCK_SIZE
+                experts,
+                (gemm_n + FP8_BLOCK_SIZE - 1) // FP8_BLOCK_SIZE,
+                (gemm_k + FP8_BLOCK_SIZE - 1) // FP8_BLOCK_SIZE,
             ).contiguous(),
         )
     elif scale_layout == "mxfp8":
-        experts, rows, columns = weights.shape
-        num_blocks = columns // 32
-        w_f32 = weights.float().reshape(experts, rows, num_blocks, 32)
-        amax = w_f32.abs().amax(dim=-1).clamp(min=1e-10)
+        weights_n_k = (
+            weights.float().permute(0, 2, 1).reshape(experts, gemm_n, gemm_k // 32, 32)
+        )
+        amax = weights_n_k.abs().amax(dim=-1).clamp(min=1e-10)
         exp = torch.ceil(torch.log2(amax / FP8_MAX)).clamp(-127.0, 127.0)
         scale_biased = (exp + 127.0).to(torch.uint8)
         descale = torch.exp2(exp).unsqueeze(-1)
         quantized = (
-            (w_f32 / descale)
+            (weights_n_k / descale)
             .clamp(-FP8_MAX, FP8_MAX)
             .to(torch.float8_e4m3fn)
-            .reshape_as(weights)
+            .reshape(experts, gemm_n, gemm_k)
+            .permute(0, 2, 1)
         )
         return quantized.contiguous(), scale_biased.contiguous()
 
     parts = 2 if scale_layout == "scalar_gemm1" else 1
-    chunks = weights.chunk(parts, dim=1)
+    chunks = weights.chunk(parts, dim=2)
     scales = [
         chunk.float().abs().amax((1, 2), keepdim=True).clamp_min(1e-12) / FP8_MAX
         for chunk in chunks
@@ -184,14 +192,14 @@ def _quantize_w8_weights(weights, scale_layout):
         for chunk, scale in zip(chunks, scales)
     ]
     return (
-        torch.cat(quantized, dim=1).contiguous(),
+        torch.cat(quantized, dim=2).contiguous(),
         torch.cat(scales, dim=2).view(weights.shape[0], parts).contiguous(),
     )
 
 
 def _build_w8_weights(num_experts, gemm_n, gemm_k, scale_layout):
     weights = torch.empty(
-        (num_experts, gemm_n, gemm_k), device="xpu", dtype=torch.float8_e4m3fn
+        (num_experts, gemm_k, gemm_n), device="xpu", dtype=torch.float8_e4m3fn
     )
     if scale_layout == "block":
         scales = torch.empty(
@@ -213,7 +221,7 @@ def _build_w8_weights(num_experts, gemm_n, gemm_k, scale_layout):
         parts = 2 if scale_layout == "scalar_gemm1" else 1
         scales = torch.empty((num_experts, parts), device="xpu", dtype=torch.float32)
     for expert in range(num_experts):
-        source = torch.randn((1, gemm_n, gemm_k), device="xpu", dtype=torch.bfloat16)
+        source = torch.randn((1, gemm_k, gemm_n), device="xpu", dtype=torch.bfloat16)
         quantized, expert_scales = _quantize_w8_weights(source, scale_layout)
         weights[expert].copy_(quantized[0])
         scales[expert].copy_(expert_scales[0])

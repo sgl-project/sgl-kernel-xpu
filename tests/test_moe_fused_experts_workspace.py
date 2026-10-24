@@ -19,7 +19,7 @@ import sys
 
 import pytest
 import torch
-from sgl_kernel import fused_experts
+from sgl_kernel import convert_weights_to_col_major, fused_experts, is_xe2_arch
 from sgl_kernel.moe import (
     _MOE_WS_HEADROOM,
     _get_moe_ws,
@@ -144,15 +144,39 @@ def _make_moe_case(num_tokens, seed=0):
     return a, w1, w2, topk_weight, topk_ids
 
 
+def _kernel_weights(w1, w2):
+    if is_xe2_arch():
+        return convert_weights_to_col_major(w1, w2)
+    return w1, w2
+
+
 def test_fused_experts_internal_workspace_matches_reference():
     a, w1, w2, topk_weight, topk_ids = _make_moe_case(num_tokens=37, seed=1)
 
     ref = torch_naive_moe(a, w1, w2, topk_ids, topk_weight, _TOPK, None, None)
-    out = fused_experts(a, w1, w2, topk_weight, topk_ids)
+    kernel_w1, kernel_w2 = _kernel_weights(w1, w2)
+    out = fused_experts(a, kernel_w1, kernel_w2, topk_weight, topk_ids)
 
     torch.testing.assert_close(out, ref, rtol=1e-4, atol=1e-3)
     assert len(_moe_ws_cache) > 0
     assert all(key[0] != "out_hidden_states" for key in _moe_ws_cache)
+
+
+def test_fused_experts_upgrades_legacy_weights_in_place_once():
+    a, w1, w2, topk_weight, topk_ids = _make_moe_case(num_tokens=17, seed=2)
+    assert not getattr(w1, "_xpu_weights_transposed", False)
+    fused_experts(a, w1, w2, topk_weight, topk_ids)
+
+    assert getattr(w1, "_xpu_weights_transposed", False)
+    assert getattr(w2, "_xpu_weights_transposed", False)
+    assert tuple(w1.shape) == (_E, _HIDDEN, 2 * _INTER)
+    assert tuple(w2.shape) == (_E, _INTER, _HIDDEN)
+    w1_ptr, w2_ptr = w1.data_ptr(), w2.data_ptr()
+    assert not hasattr(w1, "_xpu_cached_col_w")
+    assert not hasattr(w2, "_xpu_cached_col_w")
+
+    fused_experts(a, w1, w2, topk_weight, topk_ids)
+    assert (w1.data_ptr(), w2.data_ptr()) == (w1_ptr, w2_ptr)
 
 
 def test_fused_experts_workspace_reused_across_varying_token_counts():
@@ -169,7 +193,8 @@ def test_fused_experts_workspace_reused_across_varying_token_counts():
             num_tokens=num_tokens, seed=100 + step
         )
         ref = torch_naive_moe(a, w1, w2, topk_ids, topk_weight, _TOPK, None, None)
-        out = fused_experts(a, w1, w2, topk_weight, topk_ids)
+        kernel_w1, kernel_w2 = _kernel_weights(w1, w2)
+        out = fused_experts(a, kernel_w1, kernel_w2, topk_weight, topk_ids)
         # Clone immediately, exactly as a real caller (e.g. the next model
         # layer) would keep using the returned tensor independently of any
         # later call that might reuse/regrow the shared workspace buffers.
@@ -192,11 +217,13 @@ def test_fused_experts_workspace_output_not_aliased_across_calls():
     output must use independent storage so the first result survives the second
     call untouched even without an explicit `.clone()`."""
     a1, w1_, w2_, tw1, ti1 = _make_moe_case(num_tokens=37, seed=7)
-    out1 = fused_experts(a1, w1_, w2_, tw1, ti1)
+    kernel_w1, kernel_w2 = _kernel_weights(w1_, w2_)
+    out1 = fused_experts(a1, kernel_w1, kernel_w2, tw1, ti1)
     out1_snapshot = out1.clone()
 
     a2, w1_, w2_, tw2, ti2 = _make_moe_case(num_tokens=91, seed=8)
-    out2 = fused_experts(a2, w1_, w2_, tw2, ti2)
+    kernel_w1, kernel_w2 = _kernel_weights(w1_, w2_)
+    out2 = fused_experts(a2, kernel_w1, kernel_w2, tw2, ti2)
 
     # out1 must be untouched by the second call (would fail if
     # `out_hidden_states` were ever routed through the workspace cache).

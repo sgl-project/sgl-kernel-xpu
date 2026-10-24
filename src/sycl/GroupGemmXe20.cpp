@@ -168,20 +168,65 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
     const int64_t activation_type,  // 0=silu, 1=gelu, 2=swiglu_gpt_oss, 3=relu2
     bool fuse_act,
     double gemm1_alpha,
-    double gemm1_limit) {
+    double gemm1_limit,
+    const bool gate_up_interleaved) {
   int total_m = activations.sizes()[0];
   int gemm_k = activations.sizes()[1];
   auto weights_shape = weights.sizes().vec();
-  int gemm_n = weights.sizes()[1];
-  int avg_m = total_m / n_experts;
-
-  TORCH_CHECK(weights_shape.size() == 3, "weights must be 3D");
+  TORCH_CHECK(weights_shape.size() == 3, "weights must be 3D [E, K, N]");
+  TORCH_CHECK(n_experts > 0, "n_experts must be positive");
   TORCH_CHECK(weights_shape[0] == n_experts, "weights must have n_experts as the first dimension");
-  TORCH_CHECK(weights_shape[1] == gemm_n, "weights must be gemm_n * gemm_k");
+
+  bool is_fused_gated = (fuse_act && activation_type != static_cast<int64_t>(ActivationType::RELU2));
+  int expected_n = is_fused_gated ? output.sizes()[1] * 2 : output.sizes()[1];
+
+  TORCH_CHECK(
+      weights.size(1) == gemm_k,
+      "weights must be column-major [E, K, N] with K=",
+      gemm_k,
+      ", got shape: ",
+      weights.sizes());
+
+  int gemm_n = weights.sizes()[2];
+  TORCH_CHECK(gemm_n == expected_n, "weights N dimension mismatch: got ", gemm_n, ", expected ", expected_n);
+
+  TORCH_CHECK(activations.is_contiguous() && weights.is_contiguous(), "activations and weights must be contiguous");
+  TORCH_CHECK(
+      weights.stride(2) == 1 && weights.stride(1) == gemm_n && weights.stride(0) == gemm_k * gemm_n,
+      "weights must have contiguous column-major strides (stride(2)==1, stride(1)==gemm_n, stride(0)==gemm_k*gemm_n)");
+
+  int avg_m = total_m / n_experts;
+  int ld_b = static_cast<int>(weights.stride(1));
   TORCH_CHECK(
       weights_shape[0] == total_rows_for_experts.size(0),
       "rows_for_experts must have the same size as the first dimension of weights");
   TORCH_CHECK(output.sizes()[0] == total_m, "output must have the same number of rows as activations");
+
+  if (fuse_act && gate_up_interleaved && activation_type == static_cast<int64_t>(ActivationType::SWIGLU_GPT_OSS)) {
+    // Preserve backward compatibility for direct callers requesting fused SWIGLU_GPT_OSS:
+    // Compute GEMM1 unfused across all gemm_n columns, then apply swiglu_gpt_oss_sigmoid_alpha into output.
+    at::Tensor intermediate = at::empty({total_m, gemm_n}, activations.options());
+    moe_grouped_mm_nt_xe20(
+        intermediate,
+        activations,
+        weights,
+        bias,
+        total_rows_for_experts,
+        n_experts,
+        activation_type,
+        /*fuse_act=*/false,
+        gemm1_alpha,
+        gemm1_limit,
+        /*gate_up_interleaved=*/true);
+
+    static auto op = c10::Dispatcher::singleton()
+                         .findSchemaOrThrow("sgl_kernel::swiglu_gpt_oss_sigmoid_alpha", "")
+                         .typed<at::Tensor(at::Tensor, double, double)>();
+    at::Tensor act_out = op.call(intermediate, gemm1_alpha, gemm1_limit);
+    output.copy_(act_out);
+    return;
+  }
+
   // For fused activation:
   // - Gated activations (SILU, GELU, SWIGLU): output has N/2 columns (gate * up fusion)
   // - Non-gated RELU2: output has N columns (single GEMM with fused activation)
@@ -191,12 +236,12 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   } else {
     TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
   }
-  TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
   if (bias.has_value()) {
     TORCH_CHECK(
         bias->scalar_type() == at::kFloat,
         "moe_grouped_mm_nt_xe20: bias must be float32 (at::kFloat) to match kernel expectations");
-
+    TORCH_CHECK(bias->dim() == 2, "bias must be 2D [n_experts, N]");
+    TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape mismatch with weight");
     // TODO this is only for binary size consideration, if needed, can remove it
     TORCH_CHECK(
         activation_type != static_cast<int>(ActivationType::RELU2), "RELU2 activation only supports no bias as of now");
@@ -206,10 +251,6 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   TORCH_CHECK(
       activations.scalar_type() == at::ScalarType::BFloat16,
       "Only bfloat16 are supported in moe_grouped_mm_nt currently");
-  if (bias.has_value()) {
-    TORCH_CHECK(bias->dim() == 2, "bias must be 2D [n_experts, N]");
-    TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape mismatch with weight");
-  }
   TORCH_CHECK(
       activation_type >= static_cast<int>(ActivationType::MIN) &&
           activation_type <= static_cast<int>(ActivationType::MAX),
@@ -222,7 +263,6 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
-  int ld_b = static_cast<int>(weights.stride(1));
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // Grouped GEMM: sum over experts of (m_e, K) @ (K, N). Total M rows summed as total_m.

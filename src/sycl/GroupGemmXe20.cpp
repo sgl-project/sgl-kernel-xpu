@@ -190,7 +190,9 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   } else {
     TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
   }
-  TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
+  // Relaxed: the kernel iterates experts scalar-wise and reads per-expert row counts
+  // at runtime, so counts not divisible by 8 are safe (e.g. Qwen1.5-MoE 60, granite-4.0-tiny 62).
+  // TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
   if (bias.has_value()) {
     TORCH_CHECK(
         bias->scalar_type() == at::kFloat,

@@ -164,7 +164,7 @@ def torch_naive_moe(
         itertools.product(
             [1, 4, 33, 64, 222],  # num_tokens
             [1, 2, 6],  # topk
-            [8, 64],  #  num_experts
+            [8, 64, 60, 62],  #  num_experts
             [1024, 4096],  # hidden_size
             [512, 1024, 4096],  # intermediate_size
             [False, "bfloat16", "float32"],  # bias_dtype

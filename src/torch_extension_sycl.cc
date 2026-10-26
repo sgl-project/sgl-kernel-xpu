@@ -59,6 +59,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("qwen4_gate_reduce(Tensor! output, Tensor key, Tensor query, Tensor value) -> ()");
   m.impl("qwen4_gate_reduce", torch::kXPU, &at::native::xpu::qwen4_gate_reduce);
 
+  m.def("fused_sigmoid_mul(Tensor! output, Tensor input, Tensor gate) -> ()");
+  m.impl("fused_sigmoid_mul", torch::kXPU, &at::native::xpu::fused_sigmoid_mul);
+
   m.def(
       "fused_scale_residual_norm_scale_shift(Tensor residual, Tensor x, Tensor? gate, Tensor? weight, "
       "Tensor? bias, Tensor scale, Tensor shift, float eps) -> (Tensor, Tensor)");

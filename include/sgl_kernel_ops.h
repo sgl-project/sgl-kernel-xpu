@@ -126,6 +126,7 @@ void grouped_gemma_rmsnorm(
     torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps, int64_t group_size);
 void qwen4_gate_value(torch::Tensor& output, torch::Tensor& gate, torch::Tensor& value);
 void qwen4_gate_reduce(torch::Tensor& output, torch::Tensor& key, torch::Tensor& query, torch::Tensor& value);
+void fused_sigmoid_mul(torch::Tensor& output, torch::Tensor& input, torch::Tensor& gate);
 std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_norm_scale_shift(
     const torch::Tensor& residual,
     const torch::Tensor& x,

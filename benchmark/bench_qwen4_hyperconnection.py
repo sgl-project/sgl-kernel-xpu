@@ -70,7 +70,7 @@ def main():
     compiled_mix = torch.compile(mix_compute)
 
     print(
-        "median time, us. comb_*/mix_*: Linear layers included; "
+        "mean time, us. comb_*/mix_*: Linear layers included; "
         "tail_*/comb+norm/fused: precomputed injection, no Linear\n"
     )
     print(

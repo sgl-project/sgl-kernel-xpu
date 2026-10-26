@@ -17,7 +17,9 @@ def make(*shape, offset=0):
     buf = torch.randn(
         int(torch.Size(shape).numel()) + offset, device=device, dtype=torch.bfloat16
     )
-    return buf[offset:].view(*shape)
+    out = buf[offset:].view(*shape)
+    assert offset == 0 or out.data_ptr() % 16 != 0
+    return out
 
 
 def silu_ref(x, hc):
@@ -158,7 +160,7 @@ def test_hc_combine_norm(tokens, hc, hidden, offset, with_injection, shared_weig
     residual = make(tokens, hc * hidden, offset=offset)
     block = make(tokens, hidden, offset=offset)
     injection = make(tokens, hc, offset=offset) if with_injection else None
-    weight = make(hidden if shared_weight else hc * hidden, offset=offset) * 0.1
+    weight = make(hidden if shared_weight else hc * hidden, offset=offset).mul_(0.1)
     combined, normalized = sgl_kernel.hc_combine_norm(
         residual, block, injection, weight, eps, hc
     )

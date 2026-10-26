@@ -10,11 +10,12 @@
 
 namespace {
 
-constexpr int64_t kHeadDim = 128;
 constexpr int64_t kPackedDim = 64;
-constexpr int64_t kGroupSize = 32;
 constexpr int64_t kNumGroups = 4;
 constexpr int64_t kCacheBytesPerToken = 68;
+constexpr int kSubgroupSize = 16;
+constexpr int kWorkgroupSize = 128;
+constexpr int kTokensPerWorkgroup = kWorkgroupSize / kSubgroupSize;
 
 inline float scale_ue8m0(uint8_t ue8m0) {
   if (ue8m0 == 0) return 0x1p-127f;
@@ -68,10 +69,17 @@ struct Fp4PagedMqaLogitsKernel {
   int max_blocks;
   int max_seq_len;
 
+  [[sycl::reqd_sub_group_size(kSubgroupSize)]]
   void operator()(sycl::nd_item<2> item) const {
-    const int b = static_cast<int>(item.get_global_id(0));
-    const int token = static_cast<int>(item.get_global_id(1));
-    if (b >= batch || token >= max_seq_len || token >= seq_lens[b]) return;
+    const int b = static_cast<int>(item.get_group(0));
+    const int lane = static_cast<int>(item.get_local_id(1)) % kSubgroupSize;
+    const int token = static_cast<int>(item.get_group(1)) * kTokensPerWorkgroup + item.get_local_id(1) / kSubgroupSize;
+    if (b >= batch || token >= max_seq_len) return;
+    if (token >= seq_lens[b]) {
+      if (lane == 0) output[b * max_seq_len + token] = 0.0f;
+      return;
+    }
+    const auto subgroup = item.get_sub_group();
 
     const int page_block = token / page_size;
     const int token_in_page = token % page_size;
@@ -85,22 +93,33 @@ struct Fp4PagedMqaLogitsKernel {
     const uint8_t* q_row = q_fp4 + static_cast<int64_t>(b) * heads * kPackedDim;
     const uint8_t* q_scale_row = q_scale + static_cast<int64_t>(b) * heads * kNumGroups;
 
+    // Each lane owns one packed byte per quantization group; reuse K across heads.
+    float key_values[kNumGroups * 2];
+#pragma unroll
+    for (int g = 0; g < kNumGroups; ++g) {
+      const uint8_t packed = k_payload[g * kSubgroupSize + lane];
+      const float scale = scale_ue8m0(k_scales[g]);
+      key_values[g * 2] = decode_fp4(packed & 0xF) * scale;
+      key_values[g * 2 + 1] = decode_fp4(packed >> 4) * scale;
+    }
+
     float score = 0.0f;
     for (int h = 0; h < heads; ++h) {
       const uint8_t* q_head = q_row + static_cast<int64_t>(h) * kPackedDim;
       const uint8_t* q_head_scale = q_scale_row + static_cast<int64_t>(h) * kNumGroups;
       float dot = 0.0f;
-      for (int d = 0; d < kHeadDim; ++d) {
-        const uint8_t q_code = (q_head[d / 2] >> ((d & 1) * 4)) & 0xF;
-        const uint8_t k_code = (k_payload[d / 2] >> ((d & 1) * 4)) & 0xF;
-        const float q_value = decode_fp4(q_code) * scale_ue8m0(q_head_scale[d / kGroupSize]);
-        const float k_value = decode_fp4(k_code) * scale_ue8m0(k_scales[d / kGroupSize]);
-        dot += q_value * k_value;
+#pragma unroll
+      for (int g = 0; g < kNumGroups; ++g) {
+        const uint8_t packed = q_head[g * kSubgroupSize + lane];
+        const float scale = scale_ue8m0(q_head_scale[g]);
+        dot += (decode_fp4(packed & 0xF) * scale) * key_values[g * 2];
+        dot += (decode_fp4(packed >> 4) * scale) * key_values[g * 2 + 1];
       }
+      dot = sycl::reduce_over_group(subgroup, dot, sycl::plus<float>());
       dot = sycl::fmax(dot, 0.0f);
       score += dot * weights[b * heads + h];
     }
-    output[b * max_seq_len + token] = score;
+    if (lane == 0) output[b * max_seq_len + token] = score;
   }
 };
 
@@ -146,8 +165,8 @@ SGL_KERNEL_EXPORT torch::Tensor fp4_paged_mqa_logits(
       max_seq_len > 0 && block_tables.size(1) * kv_cache.size(1) >= max_seq_len,
       "block table does not cover max_seq_len");
 
-  auto output = torch::zeros({q_fp4.size(0), max_seq_len}, q_fp4.options().dtype(torch::kFloat32));
-  if (q_fp4.numel() == 0) return output;
+  auto output = torch::empty({q_fp4.size(0), max_seq_len}, q_fp4.options().dtype(torch::kFloat32));
+  if (q_fp4.numel() == 0) return output.zero_();
   auto seq_flat = seq_lens.contiguous().view({-1});
   TORCH_CHECK(seq_flat.size(0) == q_fp4.size(0), "seq_lens must have B elements");
   auto queue = c10::xpu::getCurrentXPUStream().queue();
@@ -165,7 +184,11 @@ SGL_KERNEL_EXPORT torch::Tensor fp4_paged_mqa_logits(
       static_cast<int>(block_tables.size(1)),
       static_cast<int>(max_seq_len)};
   queue.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(q_fp4.size(0), max_seq_len), sycl::range<2>(1, 1)), kernel);
+    const int64_t token_groups = (max_seq_len + kTokensPerWorkgroup - 1) / kTokensPerWorkgroup;
+    cgh.parallel_for(
+        sycl::nd_range<2>(
+            sycl::range<2>(q_fp4.size(0), token_groups * kWorkgroupSize), sycl::range<2>(1, kWorkgroupSize)),
+        kernel);
   });
   return output;
 }

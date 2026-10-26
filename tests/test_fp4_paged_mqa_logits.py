@@ -70,8 +70,8 @@ def _reference(q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len):
 
 
 @pytest.mark.parametrize("batch", [1, 6, 13])
-@pytest.mark.parametrize("heads", [32, 64])
-@pytest.mark.parametrize("max_seq_len", [1, 63, 64, 65, 129])
+@pytest.mark.parametrize("heads", [2, 8, 32, 64])
+@pytest.mark.parametrize("max_seq_len", [1, 63, 64, 65, 129, 512])
 def test_fp4_paged_mqa_logits(batch, heads, max_seq_len):
     device = torch.device("xpu")
     torch.manual_seed(batch * 1000 + heads * 10 + max_seq_len)

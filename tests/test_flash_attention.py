@@ -3328,7 +3328,8 @@ def test_flash_attention_paged_smoke(
 @pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("seqlen_q", [1, 16])
-def test_flash_attention_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q):
+@pytest.mark.parametrize("capture_graph", [False, True])
+def test_flash_attention_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q, capture_graph):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
     skip_unsupported_attention_case(head_dim, True, fp8_dtype, full_fp8=True)
@@ -3340,9 +3341,9 @@ def test_flash_attention_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q):
         scale = (tensor.abs().amax().float() / info.max).clamp_min(
             torch.finfo(torch.float32).tiny
         )
-        return (tensor.float() / scale).clamp(info.min, info.max).to(
-            fp8_dtype
-        ), scale.cpu()
+        return (tensor.float() / scale).clamp(info.min, info.max).to(fp8_dtype), (
+            scale if capture_graph else scale.cpu()
+        )
 
     q_bf16 = torch.randn(
         batch, seqlen_q, nheads_q, head_dim, device=device, dtype=torch.bfloat16
@@ -3375,7 +3376,29 @@ def test_flash_attention_fp8_full_qkv(fp8_dtype, head_dim, seqlen_q):
     )
     torch.xpu.synchronize()
 
-    q_ref = (q_fp8.float().cpu() * q_descale).to(torch.bfloat16)
+    if capture_graph:
+        graph = torch.xpu.XPUGraph()
+        with torch.xpu.graph(graph):
+            captured_out = flash_attn_with_kvcache(
+                q_fp8.view(batch * seqlen_q, nheads_q, head_dim),
+                k_cache,
+                v_cache,
+                cache_seqlens=cache_seqlens,
+                page_table=page_table,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=seqlen_q,
+                max_seqlen_k=seqlen_k,
+                q_descale=q_descale,
+                k_descale=k_descale,
+                v_descale=v_descale,
+                softmax_scale=head_dim**-0.5,
+                rotary_interleaved=False,
+            )
+        graph.replay()
+        torch.xpu.synchronize()
+        torch.testing.assert_close(captured_out.float(), out.float())
+
+    q_ref = (q_fp8.float().cpu() * q_descale.cpu()).to(torch.bfloat16)
     k_ref = (
         (k_cache.float().cpu() * k_descale.cpu())[page_table.cpu().long()]
         .flatten(1, 2)[:, :seqlen_k]

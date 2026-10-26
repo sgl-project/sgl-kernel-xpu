@@ -103,9 +103,9 @@ struct Xe3FmhaConfig {
       int max_seqlen_kv_cache,
       int head_dim,
       int page_size,
-      float q_descale,
-      float k_descale,
-      float v_descale,
+      const float* q_descale,
+      const float* k_descale,
+      const float* v_descale,
       float softmax_scale,
       int window_size_left,
       int window_size_right,
@@ -231,15 +231,15 @@ struct Xe3FmhaConfig {
             stride_v,
             static_cast<ElementOutput*>(out_dense.data_ptr()),
             stride_o,
-            nullptr,
-            {},
-            nullptr,
-            {},
-            nullptr,
-            {},
             q_descale,
+            {},
             k_descale,
+            {},
             v_descale,
+            {},
+            1.0f,
+            1.0f,
+            1.0f,
             32,
             static_cast<const ElementInput*>(k_pool.data_ptr()),
             stride_k,
@@ -290,15 +290,15 @@ struct Xe3FmhaConfig {
              stride_v,                                              // dV
              static_cast<ElementOutput*>(temp_out.data_ptr()),      // O
              stride_o,                                              // dO
-             nullptr,                                               // scaleQ
+             q_descale,                                             // scaleQ
              {},                                                    // dScaleQ
-             nullptr,                                               // scaleK
+             k_descale,                                             // scaleK
              {},                                                    // dScaleK
-             nullptr,                                               // scaleV
+             v_descale,                                             // scaleV
              {},                                                    // dScaleV
-             q_descale,                                             // scale_q
-             k_descale,                                             // scale_k
-             v_descale,                                             // scale_v
+             1.0f,                                                  // scale_q
+             1.0f,                                                  // scale_k
+             1.0f,                                                  // scale_v
              32,                                                    // group_size
              static_cast<const ElementInput*>(k_pool.data_ptr()),   // K_cache
              stride_k,                                              // dK_cache
@@ -326,6 +326,7 @@ struct Xe3FmhaConfig {
              max_logits.data_ptr<float>(),
              stride_o,
              window_size_left,
+             1.0f,
              v_descale},
             hw_info,
             num_kv_splits};
@@ -404,9 +405,9 @@ void dispatch_xe3_kernel(
     int max_seqlen_q,
     int max_seqlen_kv_cache,
     int page_size,
-    float q_descale,
-    float k_descale,
-    float v_descale,
+    const float* q_descale,
+    const float* k_descale,
+    const float* v_descale,
     float softmax_scale,
     bool is_causal,
     bool is_local,
@@ -658,9 +659,9 @@ using Xe35DispatchFn = void(
     int,
     int,
     int,
-    float,
-    float,
-    float,
+    const float*,
+    const float*,
+    const float*,
     float,
     bool,
     bool,

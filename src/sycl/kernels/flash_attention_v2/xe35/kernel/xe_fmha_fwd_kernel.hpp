@@ -264,6 +264,9 @@ class XeFMHAFwdKernel {
     using namespace sycl::ext::oneapi::this_work_item;
     auto& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
     auto& p = params.kernel;
+    const float scale_q = p.scaleQ ? p.scaleQ[0] : p.scale_q;
+    const float scale_k = p.scaleK ? p.scaleK[0] : p.scale_k;
+    const float scale_v = p.scaleV ? p.scaleV[0] : p.scale_v;
     const int head_group_q = p.shape.num_heads_q / p.shape.num_heads_kv;
     const int num_kv_splits = params.scheduler.num_kv_splits;
     const int thr_id = int(ThreadIdxX());
@@ -378,9 +381,9 @@ class XeFMHAFwdKernel {
           gqa_fusion_q_per_head,
           K_cache(_, _, head, l_coord),
           V_cache(_, _, head, l_coord),
-          p.scale_q,
-          p.scale_k,
-          p.scale_v);
+          scale_q,
+          scale_k,
+          scale_v);
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
       }
@@ -413,6 +416,9 @@ class XeFMHAFwdKernel {
 
     auto& p = params.kernel;
     ProblemShape const& s = p.shape;
+    const float per_tensor_scale_q = p.scaleQ ? p.scaleQ[0] : p.scale_q;
+    const float per_tensor_scale_k = p.scaleK ? p.scaleK[0] : p.scale_k;
+    const float per_tensor_scale_v = p.scaleV ? p.scaleV[0] : p.scale_v;
     int head_group_q = s.num_heads_q / s.num_heads_kv;
 
     int thr_id = int(ThreadIdxX());
@@ -675,9 +681,9 @@ class XeFMHAFwdKernel {
               gqa_fusion_q_per_head,
               slice_2d_wide(K_cache, head, l_coord),
               slice_2d_wide(V_cache, head, l_coord),
-              p.scale_q,
-              p.scale_k,
-              p.scale_v);
+              per_tensor_scale_q,
+              per_tensor_scale_k,
+              per_tensor_scale_v);
 
           if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
             sycl::group_barrier(get_work_group<3>());
@@ -690,7 +696,7 @@ class XeFMHAFwdKernel {
               tA_sum,
               blk_qv,
               thr_id,
-              p.scale_v,
+              per_tensor_scale_v,
               p.sm_sink == nullptr ? ElementQ{} : p.sm_sink[head_q]);
         }
         return;
@@ -755,9 +761,9 @@ class XeFMHAFwdKernel {
             0,
             slice_2d_wide(K_cache, head, l_coord),
             slice_2d_wide(V_cache, head, l_coord),
-            p.scale_q,
-            p.scale_k,
-            p.scale_v,
+            per_tensor_scale_q,
+            per_tensor_scale_k,
+            per_tensor_scale_v,
             ScaleQ_head,
             ScaleK_head,
             ScaleV_head);
@@ -784,9 +790,9 @@ class XeFMHAFwdKernel {
             0,
             slice_2d_wide(K_cache, head, l_coord),
             slice_2d_wide(V_cache, head, l_coord),
-            p.scale_q,
-            p.scale_k,
-            p.scale_v);
+            per_tensor_scale_q,
+            per_tensor_scale_k,
+            per_tensor_scale_v);
       }
       if constexpr (!is_empty_v<MainloopSharedStorage> && !is_empty_v<EpilogueSharedStorage>) {
         sycl::group_barrier(get_work_group<3>());
@@ -800,7 +806,7 @@ class XeFMHAFwdKernel {
           tA_sum,
           blk_qv,
           thr_id,
-          p.scale_v,
+          per_tensor_scale_v,
           p.sm_sink == nullptr ? ElementQ{} : p.sm_sink[head_q]);
     }
   }

@@ -126,11 +126,9 @@ kv_seq_length_range = [4096]
 # page_size==1 variant, so this exercises the gather-and-varlen workaround;
 # page_size=128 -> native paged kernel path.
 page_size_range = [0, 1, 128]
-# KV cache element type: "bf16" (default) or fp8. FP8 has two formats,
-# e5m2 and e4m3; both are exercised ("fp8_e4m3" / "fp8_e5m2"), dequantized
-# in-kernel via per-tensor k_descale / v_descale. fp8 only runs on the paged
-# path.
-kv_dtype_range = ["bf16", "fp8_e4m3", "fp8_e5m2", "full_fp8_e4m3", "full_fp8_e5m2"]
+# "fp8_*" uses BF16 Q with FP8 KV; "qkv_fp8_*" uses FP8 Q, K, and V.
+# Both FP8 modes run only on the paged path.
+kv_dtype_range = ["bf16", "fp8_e4m3", "fp8_e5m2", "qkv_fp8_e4m3", "qkv_fp8_e5m2"]
 attention_mode_range = ["standard", "relative"]
 
 
@@ -190,11 +188,11 @@ def build_configs(
                     or cfg[5] in ((64, 128) if cfg[9] in (0, 1) else (64, 128, 256))
                 )
                 and (not xe3 or cfg[9] not in (0, 1) or not cfg[0])
-                and (xe3 or not cfg[10].startswith("full_fp8"))
-                and (not xe3 or cfg[10] == "bf16" or cfg[10].startswith("full_fp8"))
+                and (xe3 or not cfg[10].startswith("qkv_fp8"))
+                and (not xe3 or cfg[10] == "bf16" or cfg[10].startswith("qkv_fp8"))
                 and (not xe3 or cfg[11] == "standard")
                 and (
-                    not cfg[10].startswith("full_fp8")
+                    not cfg[10].startswith("qkv_fp8")
                     or (cfg[9] in (64, 128) and cfg[11] == "standard")
                 )
             ),
@@ -270,7 +268,7 @@ def benchmark(
     # fp8 KV cache: store K/V as e4m3 or e5m2 and dequantize in-kernel via
     # per-tensor k_descale / v_descale. Q/O stay bf16. Only valid on the paged
     # path.
-    is_full_fp8 = kv_dtype.startswith("full_fp8")
+    is_qkv_fp8 = kv_dtype.startswith("qkv_fp8")
     is_fp8 = kv_dtype != "bf16"
     fp8_dtype = torch.float8_e5m2 if kv_dtype.endswith("e5m2") else torch.float8_e4m3fn
     fp8_max = torch.finfo(fp8_dtype).max
@@ -281,7 +279,7 @@ def benchmark(
     q = torch.randn(
         (batch_size * q_seq_length, num_heads_q, head_dim), device=device, dtype=dtype
     )
-    if is_full_fp8:
+    if is_qkv_fp8:
         q_descale = (q.abs().amax().float() / fp8_max).clamp_min(
             torch.finfo(torch.float32).tiny
         )
@@ -304,7 +302,7 @@ def benchmark(
             )
             k_cache = (k_cache / k_descale_val).to(fp8_dtype)
             v_cache = (v_cache / v_descale_val).to(fp8_dtype)
-            if is_full_fp8:
+            if is_qkv_fp8:
                 k_descale = torch.tensor(k_descale_val, dtype=torch.float32)
                 v_descale = torch.tensor(v_descale_val, dtype=torch.float32)
             else:
@@ -491,7 +489,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--kv-dtypes",
         nargs="+",
-        choices=["bf16", "fp8_e4m3", "fp8_e5m2", "full_fp8_e4m3", "full_fp8_e5m2"],
+        choices=["bf16", "fp8_e4m3", "fp8_e5m2", "qkv_fp8_e4m3", "qkv_fp8_e5m2"],
         default=kv_dtype_range,
     )
     parser.add_argument(

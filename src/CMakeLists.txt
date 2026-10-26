@@ -109,10 +109,11 @@ file(GLOB host_cpp "./*.cpp" "./*.cc")
 # mla_*.cpp) are non-Xe20 and would otherwise land in device_cpp_common, which
 # is never filtered; removing them from device_cpp up front is the only way to
 # keep them out of the build.
-if(NOT USE_FMHA OR DPCPP_SYCL_TARGET MATCHES "cri")
+if(NOT USE_FMHA)
+    list(FILTER device_cpp EXCLUDE REGEX "/flash_attentionXe[0-9]+\\.cpp$")
+elseif(DPCPP_SYCL_TARGET MATCHES "cri")
     list(FILTER device_cpp EXCLUDE REGEX "/flash_attentionXe20\\.cpp$")
-endif()
-if(NOT USE_FMHA OR NOT DPCPP_SYCL_TARGET MATCHES "cri")
+else()
     list(FILTER device_cpp EXCLUDE REGEX "/flash_attentionXe35\\.cpp$")
 endif()
 if(NOT USE_GDN)
@@ -167,6 +168,7 @@ if(USE_FMHA)
         include(FMHAPrefillXe20.cmake)
     endif()
     if(DPCPP_SYCL_TARGET MATCHES "cri")
+        # TODO: Add Xe35 attention JIT dispatch before disabling these AOT instances with USE_SYCL_JIT.
         include(FMHADecodeXe35.cmake)
         include(FMHAPrefillXe35.cmake)
     endif()

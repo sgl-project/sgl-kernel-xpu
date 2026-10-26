@@ -64,18 +64,23 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
       is_fp8 ? has_all_descales : !has_any_descale,
       "flash_attentionXe35: FP8 requires q/k/v descale; bf16 does not accept descale");
 
-  float q_descale = 1.0f;
-  float k_descale = 1.0f;
-  float v_descale = 1.0f;
+  at::Tensor q_descale;
+  at::Tensor k_descale;
+  at::Tensor v_descale;
   if (is_fp8) {
-    auto read_descale = [&](const at::Tensor& descale, const char* name) {
+    auto prepare_descale = [&](const at::Tensor& descale, const char* name) {
       TORCH_CHECK(descale.scalar_type() == at::ScalarType::Float, "flash_attentionXe35: ", name, " must be float32");
       TORCH_CHECK(descale.numel() == 1, "flash_attentionXe35: ", name, " must contain one per-tensor scale");
-      return descale.item<float>();
+      TORCH_CHECK(
+          descale.device().is_cpu() || descale.device() == q.device(),
+          "flash_attentionXe35: ",
+          name,
+          " must be on CPU or q's xpu device");
+      return descale.device().is_cpu() ? descale.to(q.device()) : descale;
     };
-    q_descale = read_descale(q_descale_.value(), "q_descale");
-    k_descale = read_descale(k_descale_.value(), "k_descale");
-    v_descale = read_descale(v_descale_.value(), "v_descale");
+    q_descale = prepare_descale(q_descale_.value(), "q_descale");
+    k_descale = prepare_descale(k_descale_.value(), "k_descale");
+    v_descale = prepare_descale(v_descale_.value(), "v_descale");
   }
   TORCH_CHECK(q.is_xpu() && k.is_xpu() && v.is_xpu(), "flash_attentionXe35: q/k/v must be xpu tensors");
   TORCH_CHECK(cu_seqlens_q.is_xpu() && cu_seqlens_k.is_xpu(), "flash_attentionXe35: cu_seqlens must be xpu tensors");
@@ -319,9 +324,9 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
       max_seqlen_q,
       max_seqlen_k,
       page_size,
-      q_descale,
-      k_descale,
-      v_descale,
+      is_fp8 ? q_descale.data_ptr<float>() : nullptr,
+      is_fp8 ? k_descale.data_ptr<float>() : nullptr,
+      is_fp8 ? v_descale.data_ptr<float>() : nullptr,
       softmax_scale_,
       effective_causal,
       is_local,

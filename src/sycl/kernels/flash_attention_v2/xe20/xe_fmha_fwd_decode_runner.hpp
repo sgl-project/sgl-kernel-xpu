@@ -232,7 +232,6 @@ struct Arguments {
   int64_t rel_bias_token_stride = 0;
   int64_t rel_bias_head_stride = 0;
   int rel_bias_extent = 0;
-  const float* __restrict__ alibi_slopes_ptr = nullptr;  // [h] fp32 ALiBi slopes
 
   // Pointer to the RNG seed (idx 0) and offset (idx 1).
   uint64_t* rng_state;
@@ -251,6 +250,7 @@ struct Arguments {
   void* skip_batch_mask_ptr = nullptr;
 
   torch::TensorOptions tensor_opts;
+  const float* __restrict__ alibi_slopes_ptr = nullptr;  // [h] fp32 ALiBi slopes
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

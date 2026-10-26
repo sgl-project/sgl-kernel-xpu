@@ -90,7 +90,6 @@ struct Arguments {
   int64_t rel_bias_token_stride = 0;
   int64_t rel_bias_head_stride = 0;
   int rel_bias_extent = 0;
-  const float* __restrict__ alibi_slopes_ptr = nullptr;  // [h] fp32 ALiBi slopes
 
   // Optional per-token block id; non-null enables the bidirectional-block mask
   // (tokens sharing a non-negative id attend bidirectionally, causal otherwise).
@@ -209,6 +208,7 @@ struct Arguments {
   void* skip_batch_mask_ptr = nullptr;
 
   torch::TensorOptions tensor_opts;
+  const float* __restrict__ alibi_slopes_ptr = nullptr;  // [h] fp32 ALiBi slopes
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////

@@ -23,9 +23,8 @@ SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index
 // (__INTEL_LLVM_COMPILER) rather than the build date (__SYCL_COMPILER_VERSION): 2026.1.x
 // patch releases (e.g. 2026.1.3, 20260724) are built later but still lack this enum.
 // The host compiler (g++) uses the release number extracted by CMake from icpx.
-#if (defined(__INTEL_LLVM_COMPILER) && __INTEL_LLVM_COMPILER >= 20260200) ||        \
-    (!defined(__INTEL_LLVM_COMPILER) && defined(SGL_INTEL_LLVM_COMPILER_VERSION) && \
-     SGL_INTEL_LLVM_COMPILER_VERSION >= 20260200)
+#if __INTEL_LLVM_COMPILER >= 20260200 || \
+    (!defined(__INTEL_LLVM_COMPILER) && SGL_INTEL_LLVM_COMPILER_VERSION >= 20260200)
     case syclex::architecture::intel_gpu_cri:
       return std::make_tuple(3, 5);
 #endif

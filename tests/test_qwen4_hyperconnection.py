@@ -52,7 +52,7 @@ def combine_ref(residual, block, injection, hc):
 @pytest.mark.parametrize("offset", [0, 1])
 def test_hc_silu(hc, numel, offset):
     torch.manual_seed(numel)
-    x = make(numel, offset=offset) * 4
+    x = make(numel, offset=offset).mul_(4)
     torch.testing.assert_close(
         sgl_kernel.hc_silu(x, hc).float(), silu_ref(x, hc).float(), **ONE_ULP
     )
@@ -250,7 +250,7 @@ def test_single_tensor_misaligned(which, hidden):
         "weight": (hidden,),
     }
     args = {k: make(*v, offset=int(k == which)) for k, v in t.items()}
-    args["weight"] = args["weight"] * 0.1
+    args["weight"].mul_(0.1)
     combined, normalized = sgl_kernel.hc_combine_norm(
         args["residual"], args["block"], args["injection"], args["weight"], 1e-6, hc
     )

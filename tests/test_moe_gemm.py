@@ -201,7 +201,7 @@ def test_moe_gemm(
     # For relu2 activation, only test bias_dtype=False
     if act_type == "relu2" and bias_dtype != False:
         pytest.skip("relu2 only supports bias_dtype=False")
-    
+
     # Only the Xe2 kernel (moe_grouped_mm_nt_xe20) supports expert counts that
     # are not a multiple of 8; the Xe3 kernel still requires it.
     if num_experts % 8 != 0 and not utils.is_xe2_device():

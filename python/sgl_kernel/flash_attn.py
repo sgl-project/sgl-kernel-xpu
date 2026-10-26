@@ -572,6 +572,8 @@ def flash_attn_varlen_func(
         sm_margin,
         out,
         return_softmax_lse,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
     )
 
     return (out, softmax_lse) if return_softmax_lse else out

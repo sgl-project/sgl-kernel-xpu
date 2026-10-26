@@ -62,6 +62,16 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("fused_sigmoid_mul(Tensor! output, Tensor input, Tensor gate) -> ()");
   m.impl("fused_sigmoid_mul", torch::kXPU, &at::native::xpu::fused_sigmoid_mul);
 
+  m.def("qwen4_hc_silu(Tensor! output, Tensor input, int hc_count) -> ()");
+  m.impl("qwen4_hc_silu", torch::kXPU, &at::native::xpu::qwen4_hc_silu);
+
+  m.def("qwen4_hc_gate_mix(Tensor! output, Tensor input, Tensor gate, int hc_count) -> ()");
+  m.impl("qwen4_hc_gate_mix", torch::kXPU, &at::native::xpu::qwen4_hc_gate_mix);
+
+  m.def(
+      "qwen4_hc_combine(Tensor! output, Tensor residual, Tensor block_output, Tensor? injection, int hc_count) -> ()");
+  m.impl("qwen4_hc_combine", torch::kXPU, &at::native::xpu::qwen4_hc_combine);
+
   m.def(
       "qwen4_ngram_hash(Tensor! output, Tensor contexts, Tensor multipliers, Tensor vocab_sizes, Tensor offsets, "
       "int eos_token_id) -> ()");

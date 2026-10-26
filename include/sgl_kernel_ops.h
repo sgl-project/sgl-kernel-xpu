@@ -127,6 +127,14 @@ void grouped_gemma_rmsnorm(
 void qwen4_gate_value(torch::Tensor& output, torch::Tensor& gate, torch::Tensor& value);
 void qwen4_gate_reduce(torch::Tensor& output, torch::Tensor& key, torch::Tensor& query, torch::Tensor& value);
 void fused_sigmoid_mul(torch::Tensor& output, torch::Tensor& input, torch::Tensor& gate);
+void qwen4_hc_silu(torch::Tensor& output, const torch::Tensor& input, int64_t hc_count);
+void qwen4_hc_gate_mix(torch::Tensor& output, const torch::Tensor& input, const torch::Tensor& gate, int64_t hc_count);
+void qwen4_hc_combine(
+    torch::Tensor& output,
+    const torch::Tensor& residual,
+    const torch::Tensor& block_output,
+    const std::optional<torch::Tensor>& injection,
+    int64_t hc_count);
 void qwen4_ngram_hash(
     torch::Tensor& output,
     torch::Tensor& contexts,

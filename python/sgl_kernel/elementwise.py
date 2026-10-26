@@ -302,6 +302,47 @@ def fused_sigmoid_mul(
     return out
 
 
+def hc_silu(input: torch.Tensor, hc_count: int) -> torch.Tensor:
+    r"""HyperConnection mix activation: ``silu(input / hc_count)``.
+
+    ``input`` is a contiguous BF16 tensor of any shape.
+    """
+    out = torch.empty_like(input)
+    torch.ops.sgl_kernel.qwen4_hc_silu(out, input, hc_count)
+    return out
+
+
+def hc_gate_mix(input: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
+    r"""HyperConnection input mix: ``mean_s(sigmoid(gate_s) * input_s)``.
+
+    ``input`` and ``gate`` are contiguous BF16 ``(tokens, hc_count * hidden)``;
+    the result is ``(tokens, hidden)``.
+    """
+    out = input.new_empty(input.shape[0], input.shape[1] // hc_count)
+    torch.ops.sgl_kernel.qwen4_hc_gate_mix(out, input, gate, hc_count)
+    return out
+
+
+def hc_combine(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: Optional[torch.Tensor],
+    hc_count: int,
+) -> torch.Tensor:
+    r"""HyperConnection combine: ``residual_s + block_output * 2 * sigmoid(injection_s / hc_count)``.
+
+    ``residual`` is contiguous BF16 ``(tokens, hc_count * hidden)``,
+    ``block_output`` is ``(tokens, hidden)`` and ``injection`` is the
+    ``(tokens, hc_count)`` output of the inject projection. With
+    ``injection=None`` the weight is 1.
+    """
+    out = torch.empty_like(residual)
+    torch.ops.sgl_kernel.qwen4_hc_combine(
+        out, residual, block_output, injection, hc_count
+    )
+    return out
+
+
 def fused_inplace_qknorm_rope(
     q: torch.Tensor,
     k: torch.Tensor,

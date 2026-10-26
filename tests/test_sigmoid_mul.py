@@ -27,8 +27,11 @@ def strided_gate(tokens, heads, head_dim, dtype):
         (17, 24, 256),
         (1031, 24, 256),
         (3, 16, 128),
-        (5, 2, 4),  # head_dim not a multiple of the vector width
+        (5, 2, 4),  # head_dim a multiple of 4 but not 8: 4-element vector path
         (4, 3, 12),
+        (3, 5, 36),
+        (5, 2, 6),  # head_dim not a multiple of 4: scalar path
+        (4, 3, 7),
     ],
 )
 @pytest.mark.parametrize("gate_layout", ["flat", "strided_3d", "contiguous_3d"])
@@ -49,6 +52,21 @@ def test_fused_sigmoid_mul(tokens, heads, head_dim, gate_layout, inplace, dtype)
     else:
         torch.testing.assert_close(x_in, x, rtol=0, atol=0)
     torch.testing.assert_close(out, ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("offset", [0, 1, 2, 4])
+def test_fused_sigmoid_mul_misaligned_views(offset, dtype):
+    # Offsets of 4 elements break 16-byte alignment (4-element path); odd offsets fall back to scalar.
+    tokens, heads, head_dim = 5, 2, 16
+    hidden = heads * head_dim
+    x_buf = torch.randn(tokens * hidden + 8, device=device, dtype=dtype)
+    gate_buf = torch.randn(tokens * hidden + 8, device=device, dtype=dtype) * 4
+    x = x_buf[offset : offset + tokens * hidden].view(tokens, hidden)
+    gate = gate_buf[offset : offset + tokens * hidden].view(tokens, hidden)
+    ref = sigmoid_mul_ref(x, gate)
+    sgl_kernel.fused_sigmoid_mul(x, gate, inplace=True)
+    torch.testing.assert_close(x, ref, rtol=0, atol=0)
 
 
 def test_fused_sigmoid_mul_special_values():

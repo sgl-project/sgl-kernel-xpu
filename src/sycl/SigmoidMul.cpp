@@ -93,11 +93,18 @@ void dispatch_vec(
     int64_t head_dim,
     int64_t gate_stride_row,
     int64_t gate_stride_head) {
+  // Widest vector first: 16-byte, then 8-byte, then scalar for odd head dims or misaligned views.
   constexpr int V = VEC_BYTES / sizeof(T);
-  auto aligned = [](const torch::Tensor& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % VEC_BYTES == 0; };
-  if (head_dim % V == 0 && gate_stride_row % V == 0 && gate_stride_head % V == 0 && aligned(output) && aligned(input) &&
-      aligned(gate)) {
+  auto usable = [&](int vec) {
+    const size_t bytes = vec * sizeof(T);
+    auto aligned = [&](const torch::Tensor& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % bytes == 0; };
+    return head_dim % vec == 0 && gate_stride_row % vec == 0 && gate_stride_head % vec == 0 && aligned(output) &&
+           aligned(input) && aligned(gate);
+  };
+  if (usable(V)) {
     launch<T, V>(output, input, gate, rows, hidden, head_dim, gate_stride_row, gate_stride_head);
+  } else if (usable(V / 2)) {
+    launch<T, V / 2>(output, input, gate, rows, hidden, head_dim, gate_stride_row, gate_stride_head);
   } else {
     launch<T, 1>(output, input, gate, rows, hidden, head_dim, gate_stride_row, gate_stride_head);
   }

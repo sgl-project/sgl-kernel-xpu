@@ -273,6 +273,7 @@ def fused_inplace_qknorm_rope(
     eps: float = 1e-6,
     head_dim: int = 0,
     rope_dim: int = 0,
+    round_norm_before_rope: bool = False,
 ) -> None:
     r"""Apply fused RMSNorm + RoPE to Q/K using a precomputed cos/sin cache.
 
@@ -305,6 +306,11 @@ def fused_inplace_qknorm_rope(
         Optional explicit head dimension. Defaults to ``q.size(-1)`` when set to 0.
     rope_dim: int
         Optional explicit rotary dimension. Defaults to ``cos_sin_cache.size(-1)`` when set to 0.
+    round_norm_before_rope: bool
+        Match PyTorch eager ``nn.RMSNorm`` followed by RoPE bit for bit: round the norm output
+        to the activation dtype before RoPE and round each RoPE product and sum. Supported for
+        ``head_dim`` 64 and 128 in bfloat16. With ``is_neox``, ``rope_dim // 2`` must be a
+        multiple of ``head_dim // 16`` (e.g. 96 of 128, or 32 of 64).
 
     Note
     ----
@@ -321,6 +327,7 @@ def fused_inplace_qknorm_rope(
         eps,
         head_dim,
         rope_dim,
+        round_norm_before_rope,
     )
 
 

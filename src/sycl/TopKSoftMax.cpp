@@ -18,7 +18,6 @@ template <typename T>
 struct FusedTopkSoftmax {
   static constexpr int sub_group_size = 32;
   static constexpr int max_group_size = 1024;
-  static constexpr int malloc_per_item = 8;
   static constexpr float kNegInfinity = -std::numeric_limits<float>::infinity();
 
   FusedTopkSoftmax(
@@ -61,7 +60,6 @@ struct FusedTopkSoftmax {
     int group_id = item.get_group_linear_id();
     int local_range = item.get_local_range(2);
     int sub_groups_per_group = local_range / sub_group_size;
-    int calc_per_item = (experts + sub_group_size - 1) / sub_group_size;
 
     sycl::sub_group sg = item.get_sub_group();
     int sg_id = sg.get_group_id();
@@ -73,114 +71,63 @@ struct FusedTopkSoftmax {
       return;  // Out of bounds
     }
 
-    T local_elems[malloc_per_item];
-    int local_idx[malloc_per_item];
-
-    int start_offset = sg_local_id * calc_per_item;
-    int local_num = calc_per_item;
-
-    if (start_offset + local_num >= experts) {
-      local_num = experts - start_offset;
-      if (local_num < 0) {
-        local_num = 0;  // No elements to process
-      }
+    const int row_offset = tid * experts;
+    const int output_offset = tid * top_k;
+    float thread_max = kNegInfinity;
+    for (int expert = sg_local_id; expert < experts; expert += sub_group_size) {
+      thread_max = sycl::max(thread_max, static_cast<float>(gating_output[row_offset + expert]));
+    }
+    for (int offset = sub_group_size / 2; offset > 0; offset /= 2) {
+      thread_max = sycl::max(thread_max, sycl::permute_group_by_xor(sg, thread_max, offset));
     }
 
-    for (int e = 0; e < calc_per_item; ++e) {
-      local_elems[e] = kNegInfinity;
-      local_idx[e] = -1;
+    float thread_sum = 0.0f;
+    for (int expert = sg_local_id; expert < experts; expert += sub_group_size) {
+      thread_sum += sycl::native::exp(static_cast<float>(gating_output[row_offset + expert]) - thread_max);
+    }
+    for (int offset = sub_group_size / 2; offset > 0; offset /= 2) {
+      thread_sum += sycl::permute_group_by_xor(sg, thread_sum, offset);
     }
 
-    for (int e = 0; e < local_num; ++e) {
-      local_elems[e] = gating_output[tid * experts + start_offset + e];
-      local_idx[e] = start_offset + e;
-    }
-
-    // Perform top-k selection
-    T topk_weights_local[malloc_per_item];
-    int topk_ids_local[malloc_per_item];
-
+    float topk_sum = 0.0f;
     for (int k = 0; k < top_k; ++k) {
-      T k_max = kNegInfinity;
-      int k_max_idx = -1;
-      int remove_ix = -1;
-      for (int e = 0; e < calc_per_item; ++e) {
-        T my_val = local_elems[e];
-        int my_idx = local_idx[e];
-        for (int offset = sub_group_size / 2; offset > 0; offset /= 2) {
-          T other_val = sycl::permute_group_by_xor(sg, my_val, offset);
-          int other_idx = sycl::permute_group_by_xor(sg, my_idx, offset);
-          if (other_val > my_val || (other_val == my_val && other_idx < my_idx)) {
-            my_val = other_val;
-            my_idx = other_idx;
+      float max_score = kNegInfinity;
+      int max_expert = experts;
+      for (int expert = sg_local_id; expert < experts; expert += sub_group_size) {
+        bool selected = false;
+        for (int prior_k = 0; prior_k < k; ++prior_k) {
+          selected |= topk_ids[output_offset + prior_k] == expert;
+        }
+        if (!selected) {
+          float score = static_cast<float>(gating_output[row_offset + expert]);
+          if (score > max_score || (score == max_score && expert < max_expert)) {
+            max_score = score;
+            max_expert = expert;
           }
         }
-        if (my_val > k_max || (my_val == k_max && my_idx < k_max_idx)) {
-          k_max = my_val;
-          k_max_idx = my_idx;
-
-          if (k_max_idx == local_idx[e]) {
-            remove_ix = e;  // Mark this index for removal
-          } else
-            remove_ix = -1;
-        }
       }
-      topk_weights_local[k] = k_max;
-      topk_ids_local[k] = k_max_idx;
-      if (remove_ix != -1) {
-        // Reset the score to avoid re-selection
-        local_elems[remove_ix] = kNegInfinity;
-        local_idx[remove_ix] = -1;
-        remove_ix = -1;
-      }
-    }
 
-    float max_score = topk_weights_local[0];
-    float sum_exp = 0;
-
-    for (int i = 0; i < top_k; ++i) {
-      float score = topk_weights_local[i];
-      sum_exp += sycl::native::exp(score - max_score);
-    }
-
-    for (int e = 0; e < calc_per_item; ++e) {
-      float score = local_elems[e];
-      float my_val = sycl::native::exp(score - max_score);
       for (int offset = sub_group_size / 2; offset > 0; offset /= 2) {
-        float other_val = sycl::permute_group_by_xor(sg, my_val, offset);
-        my_val += other_val;
-      }
-      sum_exp += my_val;
-    }
-
-    for (int i = 0; i < top_k; ++i) {
-      float score = topk_weights_local[i];
-      topk_weights_local[i] = sycl::native::exp(score - max_score) / sum_exp;
-    }
-
-    if (renormalize) {
-      // Renormalize the top-k weights
-      float sum = 0;
-      for (int i = 0; i < top_k; ++i) {
-        sum += topk_weights_local[i];
-      }
-      if (sum > 0) {
-        for (int i = 0; i < top_k; ++i) {
-          topk_weights_local[i] /= sum;
+        float other_score = sycl::permute_group_by_xor(sg, max_score, offset);
+        int other_expert = sycl::permute_group_by_xor(sg, max_expert, offset);
+        if (other_score > max_score || (other_score == max_score && other_expert < max_expert)) {
+          max_score = other_score;
+          max_expert = other_expert;
         }
       }
+
+      if (sg_local_id == 0) {
+        float weight = sycl::native::exp(max_score - thread_max) / thread_sum;
+        topk_weights[output_offset + k] = weight;
+        topk_ids[output_offset + k] = max_expert;
+        topk_sum += weight;
+      }
+      sycl::group_barrier(sg);
     }
 
-    if (sg_local_id == 0) {
-      int offset = tid * top_k;
-      for (int i = 0; i < top_k; ++i) {
-        topk_weights[offset + i] = topk_weights_local[i];
-        if (topk_ids_local[i] < 0 || topk_ids_local[i] >= experts) {
-          // Ensure valid index
-          topk_ids[offset + i] = 0;
-          continue;
-        }
-        topk_ids[offset + i] = topk_ids_local[i];
+    if (renormalize && sg_local_id == 0 && topk_sum > 0.0f) {
+      for (int k = 0; k < top_k; ++k) {
+        topk_weights[output_offset + k] /= topk_sum;
       }
     }
   }
@@ -565,6 +512,9 @@ void fused_topk_softmax(
     case 256:
       LAUNCH_GATING_SOFTMAX(T, 256, WARPS_PER_TB);
       break;
+    case 512:
+      LAUNCH_GATING_SOFTMAX(T, 512, WARPS_PER_TB);
+      break;
     default:
       launch_fused_topk_softmax(
           queue, gating_output, topk_weights, topk_indices, renormalize, topk, num_tokens, num_experts);
@@ -590,7 +540,7 @@ topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gat
   int64_t n_tokens = shape[0];
   int64_t n_experts = shape[1];
 
-  TORCH_CHECK(n_experts <= 256, "n_experts only support up to 256, but got ", n_experts);
+  TORCH_CHECK(n_experts <= 512, "n_experts only support up to 512, but got ", n_experts);
 
   TORCH_CHECK(topk_weights.scalar_type() == at::kFloat, "topk_weights should be Float");
   TORCH_CHECK(topk_indices.scalar_type() == at::kInt, "topk_indices should be Int");
@@ -619,15 +569,9 @@ topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gat
       " vs ",
       n_topk);
 
-  constexpr int64_t alignment = 8;
-  [[maybe_unused]] int64_t n_experts_aligned = div_up(n_experts, alignment) * alignment;  // align to 8
-  constexpr int64_t kernel_max_topk = TopKSoftmaxImpl::FusedTopkSoftmax<float>::malloc_per_item;
-  auto max_topk = n_experts < kernel_max_topk ? n_experts : kernel_max_topk;
   TORCH_CHECK(
-      0 < n_topk && n_topk <= max_topk,
-      "n_topk must satisfy 0 < n_topk <= min(n_experts, ",
-      kernel_max_topk,
-      "), but got n_topk=",
+      0 < n_topk && n_topk <= n_experts,
+      "n_topk must satisfy 0 < n_topk <= n_experts, but got n_topk=",
       n_topk,
       " and n_experts=",
       n_experts);

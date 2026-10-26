@@ -122,6 +122,10 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void grouped_gemma_rmsnorm(
+    torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps, int64_t group_size);
+void qwen4_gate_value(torch::Tensor& output, torch::Tensor& gate, torch::Tensor& value);
+void qwen4_gate_reduce(torch::Tensor& output, torch::Tensor& key, torch::Tensor& query, torch::Tensor& value);
 std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_norm_scale_shift(
     const torch::Tensor& residual,
     const torch::Tensor& x,
@@ -1105,6 +1109,36 @@ at::Tensor qsa_mqa_decode(
     const at::Tensor& context_lens,
     int64_t max_model_len,
     std::optional<double> score_scale);
+
+at::Tensor qsa_index_q_norm_rope_store(
+    const at::Tensor& qk,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& axis_map,
+    const at::Tensor& weight,
+    const at::Tensor& cache_loc,
+    at::Tensor key_state_buffer,
+    at::Tensor rope_position_buffer,
+    int64_t num_q_heads,
+    int64_t rotary_dim,
+    double eps,
+    bool is_neox_style,
+    std::optional<int64_t> q_heads_padded,
+    std::optional<at::ScalarType> out_dtype);
+
+void qsa_index_k_compress_store(
+    const at::Tensor& key_state_buffer,
+    const at::Tensor& group_locs,
+    const at::Tensor& rope_position_buffer,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& axis_map,
+    const at::Tensor& weight,
+    const at::Tensor& write_locs,
+    at::Tensor compressed_k_buffer,
+    int64_t compress_ratio,
+    int64_t rotary_dim,
+    double eps,
+    bool is_neox_style);
 
 at::Tensor fast_topk_transform_fused(
     const at::Tensor& score,

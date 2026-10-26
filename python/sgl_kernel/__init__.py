@@ -74,7 +74,10 @@ from sgl_kernel.elementwise import (
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
+    grouped_gemma_rmsnorm,
     multimodal_rotary_embedding,
+    qwen4_gate_reduce,
+    qwen4_gate_value,
     rmsnorm,
     silu_and_mul,
     silu_and_mul_clamp,
@@ -216,6 +219,10 @@ from sgl_kernel.moe import (
     topk_softmax,
 )
 from sgl_kernel.nsa import fp4_paged_mqa_logits, fp8_mqa_logits, fp8_paged_mqa_logits
+from sgl_kernel.qsa_prepare import (
+    qsa_index_k_compress_store,
+    qsa_index_q_norm_rope_store,
+)
 from sgl_kernel.qsa_sparse_attention import qsa_sparse_attention
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,

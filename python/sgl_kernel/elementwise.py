@@ -108,6 +108,42 @@ def gemma_rmsnorm(
     return out
 
 
+def grouped_gemma_rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Grouped Gemma-style RMSNorm.
+
+    The last dim is split into slices of ``group_size`` elements; each slice is
+    normalized independently: ``out = x * rsqrt(mean(x^2) + eps) * (1 + weight)``,
+    with ``weight`` indexed over the full hidden size.
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        BF16/FP16 contiguous tensor, shape ``(..., hidden_size)``. Unlike the
+        SGLang CUDA wrapper, non-contiguous inputs are rejected; callers must
+        call ``.contiguous()`` first.
+    weight: torch.Tensor
+        Same dtype as ``input``, shape ``(hidden_size,)``.
+    group_size: int
+        Elements per group. Must divide ``hidden_size`` and be a multiple of 8.
+    eps: float
+        Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        Pre-allocated contiguous output, same shape and dtype as ``input``.
+        May alias ``input`` exactly (same data pointer) for an in-place update;
+        partial overlap with ``input`` or any overlap with ``weight`` is rejected.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    torch.ops.sgl_kernel.grouped_gemma_rmsnorm(out, input, weight, eps, group_size)
+    return out
+
+
 def gemma_fused_add_rmsnorm(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -138,6 +174,66 @@ def gemma_fused_add_rmsnorm(
         Not Used on XPU.
     """
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(input, residual, weight, eps)
+
+
+def qwen4_gate_value(
+    gate: torch.Tensor,
+    value: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Qwen3.8 PLE gate activation followed by the value broadcast.
+
+    ``out[t, s, :] = sigmoid(sign(g) * sqrt(max(|g|, 1e-6))) * value[t, :]`` with
+    ``g = gate[t, s, 0]``, rounding to bf16 after each step like the eager ops.
+
+    Parameters
+    ----------
+    gate: torch.Tensor
+        BF16 contiguous, shape ``(N, HC, 1)``.
+    value: torch.Tensor
+        BF16 contiguous, shape ``(N, H)``; ``H`` must be a multiple of 8.
+    out: Optional[torch.Tensor]
+        Pre-allocated BF16 contiguous output of shape ``(N, HC, H)``; must not
+        overlap ``gate`` or ``value``.
+    """
+    if out is None:
+        out = torch.empty(
+            (gate.shape[0], gate.shape[1], value.shape[-1]),
+            dtype=value.dtype,
+            device=value.device,
+        )
+    torch.ops.sgl_kernel.qwen4_gate_value(out, gate, value)
+    return out
+
+
+def qwen4_gate_reduce(
+    key: torch.Tensor,
+    query: torch.Tensor,
+    value: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Qwen3.8 PLE key/query dot-product gate followed by the value broadcast.
+
+    ``g = bf16(sum_h bf16(key[t, s, h] * query[t, s, h]))``, then
+    ``out[t, s, :] = gate_activation(g / sqrt(H)) * value[t, :]`` where
+    ``gate_activation`` is the one used by :func:`qwen4_gate_value`.
+
+    Parameters
+    ----------
+    key, query: torch.Tensor
+        BF16 contiguous, shape ``(N, HC, H)``; ``H`` must be a multiple of 8.
+    value: torch.Tensor
+        BF16 contiguous, shape ``(N, H)``.
+    out: Optional[torch.Tensor]
+        Pre-allocated BF16 contiguous output with the shape of ``key``; must
+        not overlap ``value``. It may be the exact same tensor region as
+        ``key`` or ``query`` (in-place), but partial overlap with either is
+        rejected.
+    """
+    if out is None:
+        out = torch.empty_like(key)
+    torch.ops.sgl_kernel.qwen4_gate_reduce(out, key, query, value)
+    return out
 
 
 def fused_inplace_qknorm_rope(

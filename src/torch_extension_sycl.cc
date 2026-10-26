@@ -50,6 +50,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("gemma_fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
   m.impl("gemma_fused_add_rmsnorm", torch::kXPU, &at::native::xpu::gemma_fused_add_rmsnorm);
 
+  m.def("grouped_gemma_rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps, int group_size) -> ()");
+  m.impl("grouped_gemma_rmsnorm", torch::kXPU, &at::native::xpu::grouped_gemma_rmsnorm);
+
   m.def("qwen4_gate_value(Tensor! output, Tensor gate, Tensor value) -> ()");
   m.impl("qwen4_gate_value", torch::kXPU, &at::native::xpu::qwen4_gate_value);
 

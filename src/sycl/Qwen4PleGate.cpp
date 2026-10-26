@@ -142,7 +142,8 @@ namespace at::native::xpu {
 // output[N, HC, H] = gate_activation(gate[N, HC, 1]) * value[N, H]
 SGL_KERNEL_EXPORT void qwen4_gate_value(torch::Tensor& output, torch::Tensor& gate, torch::Tensor& value) {
   check_bf16_xpu(output, "output");
-  check_bf16_xpu(gate, "gate");
+  CHECK_INPUT(gate);
+  TORCH_CHECK(gate.scalar_type() == at::kBFloat16, "gate must be bfloat16, got ", gate.scalar_type());
   check_bf16_xpu(value, "value");
   TORCH_CHECK(gate.dim() == 3 && gate.size(2) == 1, "gate must have shape [N, HC, 1]");
   TORCH_CHECK(value.dim() == 2 && value.size(0) == gate.size(0), "value must have shape [N, H]");

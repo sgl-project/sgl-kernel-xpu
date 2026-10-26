@@ -36,6 +36,24 @@ def bench(fn):
     return triton.testing.do_bench(fn) * 1000
 
 
+def check_correctness(weights, dev, dt):
+    t = 64
+    residual = torch.randn(t, HC * HIDDEN, device=dev, dtype=dt)
+    normed = torch.randn(t, HC * HIDDEN, device=dev, dtype=dt)
+    block = torch.randn(t, HIDDEN, device=dev, dtype=dt)
+    c_args = (block, residual, normed, weights["inject"], HC, HIDDEN)
+    m_args = (normed, weights["down"], weights["up"], HC, HIDDEN)
+    torch.testing.assert_close(
+        combine_sgl(*c_args).float(),
+        combine_compute(*c_args).float(),
+        atol=0.07,
+        rtol=2**-6,
+    )
+    torch.testing.assert_close(
+        mix_sgl(*m_args).float(), mix_compute(*m_args).float(), atol=0.05, rtol=2**-6
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tokens", nargs="+", type=int, default=TOKENS)
@@ -47,10 +65,14 @@ def main():
         down=torch.randn(LOWRANK, width, device=dev, dtype=dt) * 0.02,
         up=torch.randn(width, LOWRANK, device=dev, dtype=dt) * 0.02,
     )
+    check_correctness(weights, dev, dt)
     compiled_combine = torch.compile(combine_compute)
     compiled_mix = torch.compile(mix_compute)
 
-    print("median time, us (Linear layers included)\n")
+    print(
+        "median time, us. comb_*/mix_*: Linear layers included; "
+        "tail_*/comb+norm/fused: precomputed injection, no Linear\n"
+    )
     print(
         f"{'tokens':>8}{'comb_eager':>12}{'comb_compile':>14}{'comb_sgl':>10}{'mix_eager':>12}"
         f"{'mix_compile':>13}{'mix_sgl':>9}{'tail_eager':>12}{'tail_sgl':>10}{'comb+norm':>11}{'fused':>8}"

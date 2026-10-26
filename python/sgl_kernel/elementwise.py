@@ -318,6 +318,8 @@ def hc_gate_mix(input: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch
     ``input`` and ``gate`` are contiguous BF16 ``(tokens, hc_count * hidden)``;
     the result is ``(tokens, hidden)``.
     """
+    if input.dim() != 2 or hc_count <= 0:
+        raise ValueError("input must be 2D and hc_count positive")
     out = input.new_empty(input.shape[0], input.shape[1] // hc_count)
     torch.ops.sgl_kernel.qwen4_hc_gate_mix(out, input, gate, hc_count)
     return out

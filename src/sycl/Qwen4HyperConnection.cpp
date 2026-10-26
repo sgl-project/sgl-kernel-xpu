@@ -460,6 +460,7 @@ SGL_KERNEL_EXPORT void qwen4_hc_silu(torch::Tensor& output, const torch::Tensor&
   check_bf16_xpu(input, "input");
   check_bf16_xpu(output, "output");
   TORCH_CHECK(output.sizes() == input.sizes(), "output must have the same shape as input");
+  TORCH_CHECK(output.device() == input.device(), "output and input must be on the same device");
   TORCH_CHECK(hc_count > 0, "hc_count must be positive");
   at::assert_no_partial_overlap(output, input);
   const int64_t n = input.numel();

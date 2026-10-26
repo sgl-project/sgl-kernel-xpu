@@ -4,6 +4,64 @@ sglang-kernel-xpu is the official kernel library of the [SGLang](https://github.
 
 [![PyPI](https://img.shields.io/pypi/v/sgl-kernel)](https://pypi.org/project/sgl-kernel)
 
+## Two-stage ConvRot INT8 (BMG / Xe2)
+
+The standalone ConvRot kernels do not depend on comfy-kitchen and do not change
+SGLang model dispatch:
+
+```python
+from sgl_kernel import convrot_rotate_quantize, convrot_int8_linear_prequant
+
+# x: contiguous BF16 [M, K]; weight: pre-rotated INT8 [N, K].
+q, row_scale = convrot_rotate_quantize(x, group_size=256)
+y = convrot_int8_linear_prequant(q, weight, row_scale, weight_scale, bias=None)
+```
+
+These inference-only kernels currently support BMG devices, K divisible by 256
+in `[256, 8192]`, and positive N divisible by 32. Empty M is supported.
+Weights must already use the regular-Hadamard ConvRot basis; ordinary
+Walsh-Hadamard weights are not interchangeable. No online weight quantization
+or weight transpose/packing is performed.
+
+The first kernel applies normalized regular H256 independently to each group,
+rounds the rotation to BF16, then quantizes **the entire row with one scale**.
+It returns contiguous INT8 `[M, K]` and FP32 `[M]`. Scale is
+`max(absmax * float32(1/127), 1e-30)`; the division scale and quotient are
+rounded to BF16 before round-to-even and saturation to `[-128, 127]`.
+Inputs must be finite and remain finite through the rotation.
+
+**Precision limitation:** FP32 butterfly summation reorders the additions
+relative to a dense Torch matmul. At BF16 rounding boundaries this can change
+the quantized values; the first stage is not guaranteed bit-exact with the
+eager rotation. Model-quality acceptance is still required before model
+integration.
+
+The second kernel uses SYCL-TLA signed INT8 DPAS with INT32 accumulation and
+a fused epilogue: `BF16(float32(acc) * (row_scale * weight_scale))`, followed by
+optional BF16 bias addition. It writes BF16 `[M, N]` directly, without a full
+INT32 output or Torch scaling/casting/concatenation. Scales are contiguous
+FP32 `[M]` and `[N]` (or `[N, 1]` for weight scales); optional bias is contiguous
+BF16 `[N]`. All tensors must be on the same device. Unsupported metadata raises
+an error rather than silently selecting an eager backend.
+
+Run correctness tests and the synthetic H3-shape benchmark after building:
+
+```bash
+ZE_AFFINITY_MASK=4,5,6,7 python -m pytest tests/test_convrot_int8.py -q
+ZE_AFFINITY_MASK=4,5,6,7 python benchmark/bench_convrot_int8.py \
+  --devices 0 1 2 3 --rows 63744 66048 53376 --iterations 5 \
+  --output /tmp/convrot-benchmark.json --trace /tmp/convrot.trace.json.gz
+```
+
+The benchmark checks the prequantized GEMM independently with exact tensor
+equality, and reports end-to-end differences against eager dense rotation.
+For its seeded synthetic inputs, it requires equal row scales, quantized
+mismatch fraction at most `1e-6`, INT8 difference at most 2, and final-output
+relative L2 error at most `1e-4`. These are benchmark checks, not a guarantee
+for arbitrary input distributions or a replacement for model-quality tests.
+It reports synchronized host latency and incremental peak allocated memory.
+Devices are exercised sequentially: this is not a TP4 model benchmark.
+
 ## Installation
 
 Currently we only support building from source. To use on Intel GPUs, you need to install the Intel GPUs driver first. For installation guide, visit [Intel GPUs Driver Installation](https://www.intel.com/content/www/us/en/developer/articles/tool/pytorch-prerequisites-for-intel-gpu/2-8.html#driver-installation).

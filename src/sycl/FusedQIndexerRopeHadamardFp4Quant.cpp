@@ -22,11 +22,11 @@ inline uint8_t quant_fp4_e2m1(float value) {
   const float absolute_value = sycl::fmin(sycl::fabs(value), 6.0f);
   uint8_t code = 0;
   code += absolute_value > 0.25f;
-  code += absolute_value > 0.75f;
+  code += absolute_value >= 0.75f;
   code += absolute_value > 1.25f;
-  code += absolute_value > 1.75f;
+  code += absolute_value >= 1.75f;
   code += absolute_value > 2.5f;
-  code += absolute_value > 3.5f;
+  code += absolute_value >= 3.5f;
   code += absolute_value > 5.0f;
   if (value < 0.0f && code != 0) code |= 0x8;
   return code;
@@ -45,6 +45,7 @@ inline void reduce_max_64(float* reduction, sycl::nd_item<1> item, sycl::sub_gro
   const uint32_t lane_id = local_id & (kSubGroupSize - 1u);
   const uint32_t subgroup_id = local_id / kSubGroupSize;
   const float subgroup_max = subgroup_reduce_max(subgroup, reduction[local_id]);
+  item.barrier(sycl::access::fence_space::local_space);
   if (lane_id == 0) reduction[subgroup_id] = subgroup_max;
   item.barrier(sycl::access::fence_space::local_space);
   if (subgroup_id == 0) {

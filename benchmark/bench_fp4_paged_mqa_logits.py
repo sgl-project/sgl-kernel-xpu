@@ -28,12 +28,9 @@ def _make_fp4_cache(
         device=device,
         dtype=torch.uint8,
     )
-    cache[..., PACKED_DIM:] = torch.randint(
-        120,
-        135,
-        cache[..., PACKED_DIM:].shape,
-        device=device,
-        dtype=torch.uint8,
+    scale_plane = cache.view(num_pages, -1)[:, PAGE_SIZE * PACKED_DIM :]
+    scale_plane.copy_(
+        torch.randint(120, 135, scale_plane.shape, device=device, dtype=torch.uint8)
     )
     page_table = torch.arange(num_pages, device=device, dtype=torch.int32).view(
         batch, pages_per_batch

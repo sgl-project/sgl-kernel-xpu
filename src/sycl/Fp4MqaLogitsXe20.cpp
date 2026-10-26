@@ -17,6 +17,8 @@ constexpr int64_t kNumGroups = 4;
 constexpr int64_t kCacheBytesPerToken = 68;
 
 inline float scale_ue8m0(uint8_t ue8m0) {
+  if (ue8m0 == 0) return 0x1p-127f;
+  if (ue8m0 == 255) return sycl::nan(0u);
   const uint32_t bits = static_cast<uint32_t>(ue8m0) << 23;
   return sycl::bit_cast<float>(bits);
 }

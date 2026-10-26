@@ -39,15 +39,59 @@ def _fp4_e2m1_code_ref(x: torch.Tensor) -> torch.Tensor:
     absolute = torch.minimum(x.abs(), torch.tensor(E2M1_MAX, device=x.device))
     code = torch.zeros_like(absolute, dtype=torch.uint8)
     for threshold in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
-        code += (absolute > threshold).to(torch.uint8)
+        comparison = (
+            absolute >= threshold
+            if threshold in (0.75, 1.75, 3.5)
+            else absolute > threshold
+        )
+        code += comparison.to(torch.uint8)
     sign = ((x < 0) & (code != 0)).to(torch.uint8) * 8
     return code | sign
+
+
+def test_fp4_e2m1_midpoint_reference():
+    midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device="xpu")
+    expected = torch.tensor([0, 2, 2, 4, 4, 6, 6], device="xpu", dtype=torch.uint8)
+    torch.testing.assert_close(_fp4_e2m1_code_ref(midpoints), expected, rtol=0, atol=0)
+    negative_expected = torch.tensor(
+        [0, 10, 10, 12, 12, 14, 14], device="xpu", dtype=torch.uint8
+    )
+    torch.testing.assert_close(
+        _fp4_e2m1_code_ref(-midpoints), negative_expected, rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("midpoint,expected_code", [(1.75, 4), (3.5, 6)])
+def test_fp4_fused_q_midpoint_rounding(midpoint, expected_code):
+    device = torch.device("xpu")
+    q = torch.zeros(1, 1, HEAD_DIM, device=device, dtype=torch.bfloat16)
+    q[..., 64] = 1
+    q[..., 66] = 1
+    rope_cache = torch.zeros(1, 64, device=device)
+    # Two impulses produce +/-4 and +/-midpoint after normalized Hadamard.
+    scale = torch.tensor(HEAD_DIM**-0.5, device=device)
+    rope_cache[0, 0] = (4 + midpoint) / (2 * scale)
+    rope_cache[0, 2] = (4 - midpoint) / (2 * scale)
+    positions = torch.zeros(1, device=device, dtype=torch.int32)
+    weight = torch.ones(1, 1, device=device, dtype=torch.bfloat16)
+    payload = torch.empty(1, 1, FP4_DIM, device=device, dtype=torch.uint8)
+    scales = torch.empty(1, 1, SCALE_GROUPS, device=device, dtype=torch.uint8)
+    weights_out = torch.empty(1, 1, 1, device=device)
+    fused_q_indexer_rope_hadamard_fp4_quant(
+        q, payload, scales, weight, weights_out, 1.0, rope_cache, positions
+    )
+    indices = torch.arange(HEAD_DIM, device=device)
+    codes = torch.where((indices & 2) == 0, 6, expected_code)
+    codes = (codes | torch.where((indices & 64) != 0, 8, 0)).to(torch.uint8)
+    expected = (codes[0::2] | (codes[1::2] << 4)).view(1, 1, FP4_DIM)
+    torch.testing.assert_close(payload, expected, rtol=0, atol=0)
+    torch.testing.assert_close(scales, torch.full_like(scales, 127), rtol=0, atol=0)
 
 
 def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     values = x.contiguous().view(-1, HEAD_DIM).float()
     groups = values.view(-1, SCALE_GROUPS, GROUP_SIZE)
-    scale_raw = (groups.abs().amax(dim=-1) / E2M1_MAX).clamp_min(1.0e-4)
+    scale_raw = groups.abs().amax(dim=-1).clamp_min(1.0e-4) / E2M1_MAX
     scale_exp = _ceil_ue8m0_exp_ref(scale_raw)
     scale = (scale_exp << 23).contiguous().view(torch.float32)
     codes = _fp4_e2m1_code_ref((groups / scale.unsqueeze(-1)).view(-1, HEAD_DIM))
@@ -68,7 +112,8 @@ def _make_freqs_cis(max_pos: int, device: torch.device) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("batch_size", [1, 5, 17])
-def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int):
+@pytest.mark.parametrize("input_scale", [0.0, 1.0e-6, 1.0e-4, 1.0])
+def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int, input_scale: float):
     device = torch.device("xpu")
     torch.manual_seed(batch_size + 200)
     num_heads = 8
@@ -76,6 +121,7 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int):
     q_input = torch.randn(
         batch_size, num_heads, HEAD_DIM, device=device, dtype=torch.bfloat16
     )
+    q_input.mul_(input_scale)
     weight = torch.randn(batch_size, num_heads, device=device, dtype=torch.bfloat16)
     positions = (torch.arange(batch_size, device=device, dtype=torch.int32) * 7) % 63
     rope_cache = torch.view_as_real(_make_freqs_cis(64, device)).flatten(-2)

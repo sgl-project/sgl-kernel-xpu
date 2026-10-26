@@ -9,7 +9,6 @@
 #   USE_MLA  -> MLA decode/prefill/sparse-decode kernels
 #   USE_QSA  -> Xe2 BF16 QSA attention, MQA and indexer preparation
 #   USE_MLA_SPARSE_FUSED -> fused (single-pass) sparse-MLA-decode kernel (optimization track)
-#   USE_DEBUG_CHECKS -> value-level input checks that sync device -> host (opt-in, default OFF)
 #
 # Defaults are set in the option() declarations below. Each toggle can be set either as a CMake option
 # (-DUSE_MOE=OFF) or, for convenience with `pip install`, via an environment
@@ -32,15 +31,8 @@ option(USE_MLA_SPARSE_FUSED "Build the fused (single-pass) sparse MLA decode ker
 # src/jit instead of being instantiated ahead of time. Enable with USE_SYCL_JIT=ON
 # (or 1 / On) as a CMake option or environment variable.
 option(USE_SYCL_JIT "Enable runtime-JIT kernels (opt-in; drops their AOT .so instances)" OFF)
-# Debug-only input validation (opt-in, default OFF). Kernel entrypoints may check
-# tensor *values* (index ranges, monotonic seg_indptr, permutation bijectivity,
-# offset tables). Each such check is a device -> host sync, which dominates small
-# decode ops, so they are compiled only with USE_DEBUG_CHECKS=ON (defines
-# SGL_KERNEL_DEBUG_CHECKS=1 in the generated sgl_kernel_debug_config.h). Shape /
-# dtype checks are always on.
-option(USE_DEBUG_CHECKS "Compile value-level input checks that force device->host syncs (debug only)" OFF)
 
-foreach(_toggle USE_MOE USE_FMHA USE_GDN USE_MLA USE_QSA USE_MLA_SPARSE_FUSED USE_SYCL_JIT USE_DEBUG_CHECKS)
+foreach(_toggle USE_MOE USE_FMHA USE_GDN USE_MLA USE_QSA USE_MLA_SPARSE_FUSED USE_SYCL_JIT)
     if(DEFINED ENV{${_toggle}} AND NOT "$ENV{${_toggle}}" STREQUAL "")
         # Normalize the env value so 1 / On / ON / on / true / yes all enable and
         # 0 / Off / OFF / false / no disable, independent of CMake's if(<string>)
@@ -65,19 +57,19 @@ message(STATUS "USE_MLA=${USE_MLA}")
 message(STATUS "USE_QSA=${USE_QSA}")
 message(STATUS "USE_MLA_SPARSE_FUSED=${USE_MLA_SPARSE_FUSED}")
 message(STATUS "USE_SYCL_JIT=${USE_SYCL_JIT}")
-message(STATUS "USE_DEBUG_CHECKS=${USE_DEBUG_CHECKS}")
 
 if(USE_MOE)
     add_compile_definitions(USE_MOE)
 endif()
-# Delivered as a generated header, not a global -D: only sources that include it
-# (via lora_debug_checks.hpp) recompile when USE_DEBUG_CHECKS is toggled.
-set(SGL_KERNEL_DEBUG_CHECKS ${USE_DEBUG_CHECKS})
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/sgl_kernel_debug_config.h.in
-    ${CMAKE_BINARY_DIR}/generated_include/sgl_kernel_debug_config.h
-    @ONLY)
-include_directories(${CMAKE_BINARY_DIR}/generated_include)
+# Value-level input checks (index ranges, monotonic seg_indptr, permutation
+# bijectivity, offset tables) each force a device -> host sync, which dominates
+# small decode ops, so they are compiled only into RelWithDebInfo builds:
+# SKBUILD_CMAKE_BUILD_TYPE=RelWithDebInfo pip install -e . --no-build-isolation -v
+# Shape / dtype checks are always on.
+if(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    add_compile_definitions(SGL_KERNEL_DEBUG_CHECKS)
+    message(STATUS "Value-level input checks: ON (${CMAKE_BUILD_TYPE})")
+endif()
 if(USE_FMHA)
     add_compile_definitions(USE_FMHA)
 endif()

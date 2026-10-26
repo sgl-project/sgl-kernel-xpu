@@ -29,17 +29,17 @@
  *
 /*!
   \file
-  \brief Value-level LoRA input validation, compiled only in debug-check builds.
+  \brief Value-level LoRA input validation, compiled only in non-Release builds.
 
   These checks read tensor *values* (not just shapes), so each one costs a
   device -> host sync (`.item()`, `.cpu()`): the host stalls until the GPU has
   drained its queue. For small decode batches that costs more than the kernel
-  itself, so they are compiled only when the build sets USE_DEBUG_CHECKS=ON
-  (which sets SGL_KERNEL_DEBUG_CHECKS=1 in the generated sgl_kernel_debug_config.h):
+  itself, so they are compiled only into RelWithDebInfo builds (where
+  src/CMakeLists.txt defines SGL_KERNEL_DEBUG_CHECKS):
 
-      USE_DEBUG_CHECKS=ON pip install -e . --no-build-isolation -v
+      SKBUILD_CMAKE_BUILD_TYPE=RelWithDebInfo pip install -e . --no-build-isolation -v
 
-  In a default build every function below is an empty inline function, so call
+  In a Release build (the default) every function below is an empty inline function, so call
   sites need no #ifdef and the fast path issues no syncs. Shape / dtype /
   contiguity checks are host-only metadata and stay on in every build.
 */
@@ -52,11 +52,13 @@
 #include <algorithm>
 #include <cstdint>
 
-#include "sgl_kernel_debug_config.h"  // generated: SGL_KERNEL_DEBUG_CHECKS = 0 / 1
-
 namespace lora_debug_checks {
 
-inline constexpr bool kEnabled = SGL_KERNEL_DEBUG_CHECKS != 0;
+#if defined(SGL_KERNEL_DEBUG_CHECKS)
+inline constexpr bool kEnabled = true;
+#else
+inline constexpr bool kEnabled = false;
+#endif
 
 // weight_indices[s] in [0, num_loras) for every segment.
 inline void check_weight_indices(const torch::Tensor& weight_indices, int64_t num_loras, const char* weights_name) {

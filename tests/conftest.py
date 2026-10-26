@@ -22,14 +22,15 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "debug_checks: exercises value-level input checks that exist only in "
-        "USE_DEBUG_CHECKS=ON builds. Skipped unless SGL_KERNEL_DEBUG_CHECKS=1 "
+        "RelWithDebInfo builds. Skipped unless SGL_KERNEL_DEBUG_CHECKS=1 "
         "(set it when testing such a build).",
     )
 
 
 # Value-level input checks (index ranges, seg_indptr, offset tables) cost a
-# device -> host sync, so kernels compile them only with USE_DEBUG_CHECKS=ON. A
-# default build does not validate those values; feeding it bad ones is undefined.
+# device -> host sync, so kernels compile them only into RelWithDebInfo builds.
+# A Release build (the default) does not validate those values; feeding it bad
+# ones is undefined.
 _DEBUG_CHECKS_BUILD = os.environ.get("SGL_KERNEL_DEBUG_CHECKS", "0").lower() in (
     "1",
     "on",
@@ -41,7 +42,7 @@ _DEBUG_CHECKS_BUILD = os.environ.get("SGL_KERNEL_DEBUG_CHECKS", "0").lower() in 
 def pytest_runtest_setup(item):
     if item.get_closest_marker("debug_checks") is not None and not _DEBUG_CHECKS_BUILD:
         pytest.skip(
-            "needs a USE_DEBUG_CHECKS=ON build; set SGL_KERNEL_DEBUG_CHECKS=1 to run"
+            "needs a RelWithDebInfo build; set SGL_KERNEL_DEBUG_CHECKS=1 to run"
         )
 
     marker = item.get_closest_marker("arch")

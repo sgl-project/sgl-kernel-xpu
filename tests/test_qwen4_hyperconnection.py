@@ -128,6 +128,56 @@ def test_hc_combine_matches_sglang_eager():
     )
 
 
+def grouped_norm_ref(x, weight, hc, eps):
+    g = x.float().unflatten(-1, (hc, -1))
+    out = g * torch.rsqrt(g.square().mean(-1, keepdim=True) + eps)
+    w = weight.float()
+    w = w.view(hc, -1) if w.numel() == x.shape[-1] else w
+    return (out * (1.0 + w)).flatten(-2).to(x.dtype)
+
+
+@pytest.mark.parametrize("shared_weight", [False, True])
+@pytest.mark.parametrize("with_injection", [True, False])
+@pytest.mark.parametrize(
+    "tokens, hc, hidden, offset",
+    [
+        (1, 4, 2560, 0),  # decode
+        (63, 4, 2560, 0),  # 252 rows: last decode configuration
+        (64, 4, 2560, 0),  # 256 rows: first prefill configuration
+        (1031, 4, 2560, 0),
+        (3, 4, 256, 0),  # smaller row: lanes are partly idle
+        (5, 4, 12, 0),  # scalar: hidden not a multiple of 8
+        (5, 3, 64, 0),  # hc other than 4
+        (5, 4, 2560, 1),  # scalar: misaligned
+        (3, 4, 5120, 0),  # row too long for the register tile: scalar
+    ],
+)
+def test_hc_combine_norm(tokens, hc, hidden, offset, with_injection, shared_weight):
+    torch.manual_seed(tokens)
+    eps = 1e-6
+    residual = make(tokens, hc * hidden, offset=offset)
+    block = make(tokens, hidden, offset=offset)
+    injection = make(tokens, hc, offset=offset) if with_injection else None
+    weight = make(hidden if shared_weight else hc * hidden, offset=offset) * 0.1
+    combined, normalized = sgl_kernel.hc_combine_norm(
+        residual, block, injection, weight, eps, hc
+    )
+    expected = combine_ref(residual, block, injection, hc).to(torch.bfloat16)
+    if with_injection:
+        torch.testing.assert_close(combined.float(), expected.float(), **ONE_ULP)
+    else:
+        assert torch.equal(combined, expected)
+    # The norm reads the bf16-rounded combined, whatever it rounded to.
+    torch.testing.assert_close(
+        normalized.float(),
+        grouped_norm_ref(combined, weight, hc, eps).float(),
+        atol=2e-2,
+        rtol=2**-6,
+    )
+    # And it matches the separate combine kernel.
+    assert torch.equal(combined, sgl_kernel.hc_combine(residual, block, injection, hc))
+
+
 def test_empty():
     hc, hidden = 4, 2560
     assert sgl_kernel.hc_silu(make(0, 320), hc).shape == (0, 320)

@@ -73,6 +73,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("qwen4_hc_combine", torch::kXPU, &at::native::xpu::qwen4_hc_combine);
 
   m.def(
+      "qwen4_hc_combine_norm(Tensor! combined, Tensor! normalized, Tensor residual, Tensor block_output, "
+      "Tensor? injection, Tensor weight, float eps, int hc_count) -> ()");
+  m.impl("qwen4_hc_combine_norm", torch::kXPU, &at::native::xpu::qwen4_hc_combine_norm);
+
+  m.def(
       "qwen4_ngram_hash(Tensor! output, Tensor contexts, Tensor multipliers, Tensor vocab_sizes, Tensor offsets, "
       "int eos_token_id) -> ()");
   m.impl("qwen4_ngram_hash", torch::kXPU, &at::native::xpu::qwen4_ngram_hash);

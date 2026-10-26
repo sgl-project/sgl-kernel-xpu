@@ -135,6 +135,15 @@ void qwen4_hc_combine(
     const torch::Tensor& block_output,
     const std::optional<torch::Tensor>& injection,
     int64_t hc_count);
+void qwen4_hc_combine_norm(
+    torch::Tensor& combined,
+    torch::Tensor& normalized,
+    const torch::Tensor& residual,
+    const torch::Tensor& block_output,
+    const std::optional<torch::Tensor>& injection,
+    const torch::Tensor& weight,
+    double eps,
+    int64_t hc_count);
 void qwen4_ngram_hash(
     torch::Tensor& output,
     torch::Tensor& contexts,

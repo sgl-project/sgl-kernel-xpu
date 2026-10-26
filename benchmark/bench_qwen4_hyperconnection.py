@@ -53,7 +53,7 @@ def main():
     print("median time, us (Linear layers included)\n")
     print(
         f"{'tokens':>8}{'comb_eager':>12}{'comb_compile':>14}{'comb_sgl':>10}{'mix_eager':>12}"
-        f"{'mix_compile':>13}{'mix_sgl':>9}{'tail_eager':>12}{'tail_sgl':>10}"
+        f"{'mix_compile':>13}{'mix_sgl':>9}{'tail_eager':>12}{'tail_sgl':>10}{'comb+norm':>11}{'fused':>8}"
     )
     for t in args.tokens:
         torch.manual_seed(0)
@@ -63,7 +63,7 @@ def main():
         inj = F.linear(normed, weights["inject"])
         c_args = (block, residual, normed, weights["inject"], HC, HIDDEN)
         m_args = (normed, weights["down"], weights["up"], HC, HIDDEN)
-        gate = torch.randn(t, width, device=dev, dtype=dt)
+        norm_w = torch.randn(width, device=dev, dtype=dt) * 0.1
 
         def tail_eager():
             w = 2 * torch.sigmoid(inj / HC)
@@ -81,13 +81,22 @@ def main():
             bench(lambda: mix_sgl(*m_args)),
             bench(tail_eager),
             bench(lambda: sgl_kernel.hc_combine(residual, block, inj, HC)),
+            bench(
+                lambda: sgl_kernel.grouped_gemma_rmsnorm(
+                    sgl_kernel.hc_combine(residual, block, inj, HC), norm_w, HIDDEN
+                )
+            ),
+            bench(
+                lambda: sgl_kernel.hc_combine_norm(
+                    residual, block, inj, norm_w, 1e-6, HC
+                )
+            ),
         ]
         print(
             f"{t:>8}{row[0]:>12.1f}{row[1]:>14.1f}{row[2]:>10.1f}{row[3]:>12.1f}{row[4]:>13.1f}{row[5]:>9.1f}"
-            f"{row[6]:>12.1f}{row[7]:>10.1f}",
+            f"{row[6]:>12.1f}{row[7]:>10.1f}{row[8]:>11.1f}{row[9]:>8.1f}",
             flush=True,
         )
-        del gate
 
 
 if __name__ == "__main__":

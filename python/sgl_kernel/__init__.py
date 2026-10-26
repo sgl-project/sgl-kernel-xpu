@@ -77,6 +77,7 @@ from sgl_kernel.elementwise import (
     gemma_rmsnorm,
     grouped_gemma_rmsnorm,
     hc_combine,
+    hc_combine_norm,
     hc_gate_mix,
     hc_silu,
     multimodal_rotary_embedding,

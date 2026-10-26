@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from sgl_kernel.utils import get_xpu_stream
@@ -341,6 +341,29 @@ def hc_combine(
         out, residual, block_output, injection, hc_count
     )
     return out
+
+
+def hc_combine_norm(
+    residual: torch.Tensor,
+    block_output: torch.Tensor,
+    injection: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    eps: float,
+    hc_count: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    r"""``hc_combine`` fused with the next grouped Gemma RMSNorm.
+
+    Returns ``(combined, normalized)``, where ``normalized`` is the per-stream
+    ``combined * rsqrt(mean(combined^2) + eps) * (1 + weight)`` of the
+    BF16-rounded ``combined``. ``weight`` is BF16 with ``hidden`` or
+    ``hc_count * hidden`` elements.
+    """
+    combined = torch.empty_like(residual)
+    normalized = torch.empty_like(residual)
+    torch.ops.sgl_kernel.qwen4_hc_combine_norm(
+        combined, normalized, residual, block_output, injection, weight, eps, hc_count
+    )
+    return combined, normalized
 
 
 def fused_inplace_qknorm_rope(

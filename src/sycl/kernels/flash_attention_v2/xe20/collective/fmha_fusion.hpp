@@ -43,6 +43,8 @@ struct VariableLength {
   int max_length;
   int total_length = 0;
   int* cumulative_length = nullptr;
+  // Real length of each sequence when set; cumulative_length still gives its offset.
+  int* seqused = nullptr;
   CUTE_HOST_DEVICE operator int() const {
     return max_length;
   }
@@ -59,7 +61,7 @@ template <class Shape, class Idx>
 CUTE_HOST_DEVICE constexpr auto apply_variable_length(Shape const& shape, Idx const& idx) {
   return transform_leaf(shape, [&](auto const& s) {
     if constexpr (is_variable_length_v<remove_cvref_t<decltype(s)>>) {
-      return s.cumulative_length[idx + 1] - s.cumulative_length[idx];
+      return s.seqused ? s.seqused[idx] : s.cumulative_length[idx + 1] - s.cumulative_length[idx];
     } else {
       return s;
     }

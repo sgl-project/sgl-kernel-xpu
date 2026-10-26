@@ -98,6 +98,9 @@ def test_rotation_butterfly_order(k):
         (17, 96, 256),
         (257, 288, 512),
         (128, 5376, 1792),
+        (2305, 288, 256),
+        (4097, 608, 512),
+        (8193, 96, 256),
     ],
 )
 @pytest.mark.parametrize("with_bias", [False, True])
@@ -113,6 +116,25 @@ def test_prequant_linear(m, n, k, with_bias):
         expected = reference_linear(q, weight, scale, weight_scale, bias)
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
     assert out.shape == (m, n) and out.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("device", range(4))
+@pytest.mark.parametrize("m", [16385, 16641, 16897])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_grouped_gemm_partial_band(device, m, with_bias):
+    if torch.xpu.device_count() <= device:
+        pytest.skip("requires additional visible XPU")
+    with torch.xpu.device(device):
+        torch.manual_seed(227 + m)
+        n, k = 7168, 5376
+        q = torch.randint(-128, 128, (m, k), device=f"xpu:{device}", dtype=torch.int8)
+        weight = torch.randint(-128, 128, (n, k), device=q.device, dtype=torch.int8)
+        scale = torch.rand(m, device=q.device) / 128
+        weight_scale = torch.rand(n, device=q.device) / 128
+        bias = torch.randn(n, device=q.device, dtype=torch.bfloat16) if with_bias else None
+        out = convrot_int8_linear_prequant(q, weight, scale, weight_scale, bias)
+        expected = reference_linear(q, weight, scale, weight_scale, bias)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -163,12 +185,13 @@ def test_invalid_gemm_inputs():
             convrot_int8_linear_prequant(*args)
 
 
-def test_non_default_stream():
+@pytest.mark.parametrize("k", [256, 1792, 3584, 5376])
+def test_non_default_stream(k):
     stream = torch.xpu.Stream()
     stream.wait_stream(torch.xpu.current_stream())
     with torch.xpu.stream(stream):
-        x = torch.ones(17, 256, device="xpu", dtype=torch.bfloat16)
-        weight = torch.ones(32, 256, device="xpu", dtype=torch.int8)
+        x = torch.ones(17, k, device="xpu", dtype=torch.bfloat16)
+        weight = torch.ones(32, k, device="xpu", dtype=torch.int8)
         weight_scale = torch.ones(32, device="xpu")
         q, scale = convrot_rotate_quantize(x)
         out = convrot_int8_linear_prequant(q, weight, scale, weight_scale)
@@ -190,12 +213,13 @@ def test_zero_scale_preserves_sign_without_bias():
 
 
 @pytest.mark.parametrize("device", [1, 2, 3])
-def test_other_devices(device):
+@pytest.mark.parametrize("k", [256, 1792, 3584, 5376])
+def test_other_devices(device, k):
     if torch.xpu.device_count() <= device:
         pytest.skip("requires additional visible XPU")
     with torch.xpu.device(device):
-        x = torch.ones(17, 256, device=f"xpu:{device}", dtype=torch.bfloat16)
-        weight = torch.ones(32, 256, device=x.device, dtype=torch.int8)
+        x = torch.ones(17, k, device=f"xpu:{device}", dtype=torch.bfloat16)
+        weight = torch.ones(32, k, device=x.device, dtype=torch.int8)
         weight_scale = torch.ones(32, device=x.device)
         q, scale = convrot_rotate_quantize(x)
         out = convrot_int8_linear_prequant(q, weight, scale, weight_scale)

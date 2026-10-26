@@ -30,6 +30,12 @@ It returns contiguous INT8 `[M, K]` and FP32 `[M]`. Scale is
 rounded to BF16 before round-to-even and saturation to `[-128, 127]`.
 Inputs must be finite and remain finite through the rotation.
 
+For K=1792/3584/5376, specialized kernels retain the final rounded BF16 values
+in the producing threads across the row-maximum reduction, avoiding a final
+SLM write/read and its explicit work-group barrier. These paths use 256 threads
+for K=1792/3584 and 512 threads for K=5376. Other supported K values retain the
+generic 256-thread SLM path. The row scale and quantization rounding are unchanged.
+
 **Precision limitation:** FP32 butterfly summation reorders the additions
 relative to a dense Torch matmul. At BF16 rounding boundaries this can change
 the quantized values; the first stage is not guaranteed bit-exact with the
@@ -37,12 +43,20 @@ eager rotation. Model-quality acceptance is still required before model
 integration.
 
 The second kernel uses SYCL-TLA signed INT8 DPAS with INT32 accumulation and
+a `256 x 256 x 64` tile with L1 prefetch depth 3. The wider K tile amortizes
+mainloop loads and scheduling over more DPAS work; all supported K values
+remain aligned to the tile. It uses
 a fused epilogue: `BF16(float32(acc) * (row_scale * weight_scale))`, followed by
 optional BF16 bias addition. It writes BF16 `[M, N]` directly, without a full
 INT32 output or Torch scaling/casting/concatenation. Scales are contiguous
 FP32 `[M]` and `[N]` (or `[N, 1]` for weight scales); optional bias is contiguous
 BF16 `[N]`. All tensors must be on the same device. Unsupported metadata raises
 an error rather than silently selecting an eager backend.
+
+For the measured bandwidth-heavy shape N=7168, K=5376 and M>=16384, the GEMM
+uses bands of four M tiles while traversing N. The mainloop and epilogue share
+the same coordinate mapping, including short final bands. Other shapes retain
+the original GEMM kernel and traversal; no weight repacking is required.
 
 Run correctness tests and the synthetic H3-shape benchmark after building:
 

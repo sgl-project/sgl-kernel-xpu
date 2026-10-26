@@ -26,7 +26,7 @@ void check_tensor(const at::Tensor& tensor, const at::Device& device, at::Scalar
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
-template <int StaticK>
+template <int StaticK, int Threads>
 struct ConvRotQuantKernel {
   const at::BFloat16* input;
   int8_t* output;
@@ -39,7 +39,7 @@ struct ConvRotQuantKernel {
     const int tid = item.get_local_id(0);
     const int64_t row = item.get_group(0);
     // Fuse input loading with the first H4 stage, avoiding an SLM round trip.
-    for (int b = tid; b < k / 4; b += 256) {
+    for (int b = tid; b < k / 4; b += Threads) {
       const int base = b * 4;
       const float a = static_cast<float>(input[row * k + base]);
       const float b1 = static_cast<float>(input[row * k + base + 1]);
@@ -53,7 +53,7 @@ struct ConvRotQuantKernel {
     sycl::group_barrier(item.get_group());
     // H256 is four regular-H4 stages, not a Sylvester-order FWHT.
     for (int stride = 4; stride < 64; stride *= 4) {
-      for (int b = tid; b < k / 4; b += 256) {
+      for (int b = tid; b < k / 4; b += Threads) {
         const int base = (b / stride) * 4 * stride + b % stride;
         const float a = values[base];
         const float b1 = values[base + stride];
@@ -67,8 +67,11 @@ struct ConvRotQuantKernel {
       sycl::group_barrier(item.get_group());
     }
     float maximum = 0;
+    // Specialized rows retain BF16 results in the producing threads across the reduction.
+    constexpr int Chunks = StaticK ? (StaticK + 4 * Threads - 1) / (4 * Threads) : 1;
+    at::BFloat16 rounded_values[Chunks][4];
     // Fuse the final H4 stage with BF16 rounding and the local row maximum.
-    for (int b = tid; b < k / 4; b += 256) {
+    for (int b = tid; b < k / 4; b += Threads) {
       const int base = (b / 64) * 256 + b % 64;
       const float a = values[base];
       const float b1 = values[base + 64];
@@ -80,20 +83,43 @@ struct ConvRotQuantKernel {
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const float rotated = static_cast<float>(static_cast<at::BFloat16>(final_values[i] * 0.0625f));
-        values[base + i * 64] = rotated;
+        if constexpr (StaticK) {
+          rounded_values[(b - tid) / Threads][i] = static_cast<at::BFloat16>(rotated);
+        } else {
+          values[base + i * 64] = rotated;
+        }
         maximum = sycl::fmax(maximum, sycl::fabs(rotated));
       }
     }
-    sycl::group_barrier(item.get_group());
+    if constexpr (!StaticK) {
+      sycl::group_barrier(item.get_group());
+    }
     maximum = sycl::reduce_over_group(item.get_group(), maximum, sycl::maximum<float>());
     const float scale = sycl::fmax(maximum * (1.0f / 127.0f), 1e-30f);
     if (item.get_local_id(0) == 0) {
       scales[row] = scale;
     }
     const float math_scale = static_cast<float>(static_cast<at::BFloat16>(scale));
-    for (int j = tid; j < k; j += 256) {
-      const float quotient = static_cast<float>(static_cast<at::BFloat16>(values[j] / math_scale));
-      output[row * k + j] = static_cast<int8_t>(sycl::clamp(sycl::rint(quotient), -128.0f, 127.0f));
+    if constexpr (StaticK) {
+#pragma unroll
+      for (int chunk = 0; chunk < Chunks; ++chunk) {
+        const int b = tid + chunk * Threads;
+        if (b < k / 4) {
+          const int base = (b / 64) * 256 + b % 64;
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const float quotient = static_cast<float>(
+                static_cast<at::BFloat16>(static_cast<float>(rounded_values[chunk][i]) / math_scale));
+            output[row * k + base + i * 64] =
+                static_cast<int8_t>(sycl::clamp(sycl::rint(quotient), -128.0f, 127.0f));
+          }
+        }
+      }
+    } else {
+      for (int j = tid; j < k; j += Threads) {
+        const float quotient = static_cast<float>(static_cast<at::BFloat16>(values[j] / math_scale));
+        output[row * k + j] = static_cast<int8_t>(sycl::clamp(sycl::rint(quotient), -128.0f, 127.0f));
+      }
     }
   }
 };
@@ -102,7 +128,7 @@ struct ConvRotQuantKernel {
 using namespace cute;
 namespace fusion = cutlass::epilogue::fusion;
 using Output = cutlass::bfloat16_t;
-using ConvRotTile = Shape<_256, _256, _32>;
+using ConvRotTile = Shape<_256, _256, _64>;
 using Stride = cute::Stride<int64_t, _1, int64_t>;
 
 struct ConvRotScaleArguments {
@@ -151,7 +177,7 @@ using TiledMma = typename TiledMMAHelper<
     MMA_Atom<XE_DPAS_TT<8, int32_t, int8_t>>,
     Layout<ConvRotTile>,
     Layout<Shape<_8, _4, _1>, cute::Stride<_4, _1, _0>>>::TiledMMA;
-using Mainloop = cutlass::gemm::collective::CollectiveMma<
+using BaseMainloop = cutlass::gemm::collective::CollectiveMma<
     cutlass::gemm::MainloopXeL1Staged<3>,
     ConvRotTile,
     int8_t,
@@ -172,7 +198,7 @@ using Callbacks = fusion::FusionCallbacks<
     fusion::ConvRotOperation,
     ConvRotTile,
     decltype(tile_shape(TiledMma()))>;
-using Epilogue = cutlass::epilogue::collective::CollectiveEpilogue<
+using BaseEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
     cutlass::epilogue::IntelXeGeneric,
     ConvRotTile,
     void,
@@ -183,8 +209,55 @@ using Epilogue = cutlass::epilogue::collective::CollectiveEpilogue<
     Callbacks,
     void,
     void>;
-using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Mainloop, Epilogue>;
+template <class Coord>
+CUTLASS_DEVICE auto convrot_tile_coord(Coord coord, int m, int n) {
+  const int tiles_m = m / 256 + (m % 256 != 0);
+  const int tiles_n = n / 256 + (n % 256 != 0);
+  constexpr int GroupM = 4;
+  // Keep a small band of M tiles together while traversing N, including a short final band.
+  const int64_t linear = int64_t(get<0>(coord)) * tiles_n + get<1>(coord);
+  const int64_t band_size = int64_t(GroupM) * tiles_n;
+  const int first_m = int(linear / band_size) * GroupM;
+  const int height = cute::min(GroupM, tiles_m - first_m);
+  const int64_t offset = linear % band_size;
+  return make_coord(first_m + int(offset % height), int(offset / height), _, get<3>(coord));
+}
+
+struct Mainloop : BaseMainloop {
+  template <class D, class A, class B, class C, class Iterator, class Coord>
+  CUTLASS_DEVICE void operator()(
+      D& accum, A, B, C const& source, Iterator iterator, int count,
+      Coord coord, int const& start, int thread, Params const& params) {
+    const int m = size<0>(params.mA_mkl);
+    const int n = size<0>(params.mB_nkl);
+    const int k = size<1>(params.mA_mkl);
+    const int l = size<2>(params.mA_mkl);
+    const auto mapped = convrot_tile_coord(coord, m, n);
+    const auto a = local_tile(
+        make_identity_tensor(make_shape(m, k, l)), select<0, 2>(ConvRotTile{}),
+        make_coord(get<0>(mapped), _, get<3>(mapped)));
+    const auto b = local_tile(
+        make_identity_tensor(make_shape(n, k, l)), select<1, 2>(ConvRotTile{}),
+        make_coord(get<1>(mapped), _, get<3>(mapped)));
+    BaseMainloop::operator()(accum, a, b, source, iterator, count, mapped, start, thread, params);
+  }
+};
+
+struct Epilogue : BaseEpilogue {
+  using BaseEpilogue::BaseEpilogue;
+
+  template <class Problem, class Tile, class Coord, class Accumulator, class Mma>
+  CUTLASS_DEVICE void operator()(
+      Problem problem, Tile tile, Coord coord, Accumulator accum, Mma mma, int thread) {
+    const auto mapped = convrot_tile_coord(coord, get<0>(problem), get<1>(problem));
+    BaseEpilogue::operator()(problem, tile, mapped, accum, mma, thread);
+  }
+};
+
+using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, BaseMainloop, BaseEpilogue>;
+using GroupedGemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int, int, int, int>, Mainloop, Epilogue>;
 using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+using GroupedGemm = cutlass::gemm::device::GemmUniversalAdapter<GroupedGemmKernel>;
 #endif
 }  // namespace
 
@@ -201,12 +274,12 @@ convrot_rotate_quantize(const at::Tensor& input, int64_t group_size) {
   auto scales = at::empty({input.size(0)}, input.options().dtype(at::kFloat));
   if (input.size(0) > 0) {
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
-    const auto launch = [&]<int StaticK>() {
+    const auto launch = [&]<int StaticK, int Threads = 256>() {
       queue.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> values(sycl::range<1>(k), cgh);
         cgh.parallel_for(
-          sycl::nd_range<1>(sycl::range<1>(input.size(0) * 256), sycl::range<1>(256)),
-          ConvRotQuantKernel<StaticK>{
+          sycl::nd_range<1>(sycl::range<1>(input.size(0) * Threads), sycl::range<1>(Threads)),
+          ConvRotQuantKernel<StaticK, Threads>{
               input.data_ptr<at::BFloat16>(),
               output.data_ptr<int8_t>(),
               scales.data_ptr<float>(),
@@ -214,11 +287,11 @@ convrot_rotate_quantize(const at::Tensor& input, int64_t group_size) {
       });
     };
     if (k == 1792) {
-      launch.template operator()<1792>();
+      launch.template operator()<1792, 256>();
     } else if (k == 3584) {
-      launch.template operator()<3584>();
+      launch.template operator()<3584, 256>();
     } else if (k == 5376) {
-      launch.template operator()<5376>();
+      launch.template operator()<5376, 512>();
     } else {
       launch.template operator()<0>();
     }
@@ -263,21 +336,29 @@ SGL_KERNEL_EXPORT at::Tensor convrot_int8_linear_prequant(
       {weight_scale.data_ptr<float>(), 0.0f, {_0{}, _1{}, 0}},
       {bias ? reinterpret_cast<const Output*>(bias->data_ptr()) : nullptr, Output(0.0f), {_0{}, _1{}, 0}},
       {bias.has_value()}};
-  typename Gemm::Arguments args{
-      cutlass::gemm::GemmUniversalMode::kGemm,
-      {static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), 1},
-      {input.data_ptr<int8_t>(), {k, _1{}, 0}, weight.data_ptr<int8_t>(), {k, _1{}, 0}},
-      {thread, nullptr, {n, _1{}, 0}, reinterpret_cast<Output*>(output.data_ptr()), {n, _1{}, 0}}};
-  Gemm gemm;
-  auto status = gemm.can_implement(args);
-  TORCH_CHECK(
-      status == cutlass::Status::kSuccess,
-      "ConvRot INT8 GEMM cannot implement shape: ",
-      cutlassGetStatusString(status));
-  auto workspace = at::empty({static_cast<int64_t>(Gemm::get_workspace_size(args))}, input.options().dtype(at::kByte));
-  auto& queue = c10::xpu::getCurrentXPUStream().queue();
-  status = gemm.run(args, workspace.data_ptr(), &queue);
-  TORCH_CHECK(status == cutlass::Status::kSuccess, "ConvRot INT8 GEMM launch failed: ", cutlassGetStatusString(status));
+  const auto launch = [&]<class DeviceGemm>() {
+    typename DeviceGemm::Arguments args{
+        cutlass::gemm::GemmUniversalMode::kGemm,
+        {static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), 1},
+        {input.data_ptr<int8_t>(), {k, _1{}, 0}, weight.data_ptr<int8_t>(), {k, _1{}, 0}},
+        {thread, nullptr, {n, _1{}, 0}, reinterpret_cast<Output*>(output.data_ptr()), {n, _1{}, 0}}};
+    DeviceGemm gemm;
+    auto status = gemm.can_implement(args);
+    TORCH_CHECK(
+        status == cutlass::Status::kSuccess,
+        "ConvRot INT8 GEMM cannot implement shape: ",
+        cutlassGetStatusString(status));
+    auto workspace = at::empty(
+        {static_cast<int64_t>(DeviceGemm::get_workspace_size(args))}, input.options().dtype(at::kByte));
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+    status = gemm.run(args, workspace.data_ptr(), &queue);
+    TORCH_CHECK(status == cutlass::Status::kSuccess, "ConvRot INT8 GEMM launch failed: ", cutlassGetStatusString(status));
+  };
+  if (n == 7168 && k == 5376 && m >= 16384) {
+    launch.template operator()<GroupedGemm>();
+  } else {
+    launch.template operator()<Gemm>();
+  }
   return output;
 #else
   TORCH_CHECK(false, "ConvRot INT8 GEMM currently requires a BMG (Xe2) build");

@@ -108,6 +108,42 @@ def gemma_rmsnorm(
     return out
 
 
+def grouped_gemma_rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    group_size: int,
+    eps: float = 1e-6,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Grouped Gemma-style RMSNorm.
+
+    The last dim is split into slices of ``group_size`` elements; each slice is
+    normalized independently: ``out = x * rsqrt(mean(x^2) + eps) * (1 + weight)``,
+    with ``weight`` indexed over the full hidden size.
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        BF16/FP16 contiguous tensor, shape ``(..., hidden_size)``. Unlike the
+        SGLang CUDA wrapper, non-contiguous inputs are rejected; callers must
+        call ``.contiguous()`` first.
+    weight: torch.Tensor
+        Same dtype as ``input``, shape ``(hidden_size,)``.
+    group_size: int
+        Elements per group. Must divide ``hidden_size`` and be a multiple of 8.
+    eps: float
+        Epsilon for numerical stability.
+    out: Optional[torch.Tensor]
+        Pre-allocated contiguous output, same shape and dtype as ``input``.
+        May alias ``input`` exactly (same data pointer) for an in-place update;
+        partial overlap with ``input`` or any overlap with ``weight`` is rejected.
+    """
+    if out is None:
+        out = torch.empty_like(input)
+    torch.ops.sgl_kernel.grouped_gemma_rmsnorm(out, input, weight, eps, group_size)
+    return out
+
+
 def gemma_fused_add_rmsnorm(
     input: torch.Tensor,
     residual: torch.Tensor,
@@ -138,6 +174,132 @@ def gemma_fused_add_rmsnorm(
         Not Used on XPU.
     """
     torch.ops.sgl_kernel.gemma_fused_add_rmsnorm(input, residual, weight, eps)
+
+
+def qwen4_gate_value(
+    gate: torch.Tensor,
+    value: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Qwen3.8 PLE gate activation followed by the value broadcast.
+
+    ``out[t, s, :] = sigmoid(sign(g) * sqrt(max(|g|, 1e-6))) * value[t, :]`` with
+    ``g = gate[t, s, 0]``, rounding to bf16 after each step like the eager ops.
+
+    Parameters
+    ----------
+    gate: torch.Tensor
+        BF16 contiguous, shape ``(N, HC, 1)``.
+    value: torch.Tensor
+        BF16 contiguous, shape ``(N, H)``; ``H`` must be a multiple of 8.
+    out: Optional[torch.Tensor]
+        Pre-allocated BF16 contiguous output of shape ``(N, HC, H)``; must not
+        overlap ``gate`` or ``value``.
+    """
+    if out is None:
+        out = torch.empty(
+            (gate.shape[0], gate.shape[1], value.shape[-1]),
+            dtype=value.dtype,
+            device=value.device,
+        )
+    torch.ops.sgl_kernel.qwen4_gate_value(out, gate, value)
+    return out
+
+
+def qwen4_gate_reduce(
+    key: torch.Tensor,
+    query: torch.Tensor,
+    value: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Qwen3.8 PLE key/query dot-product gate followed by the value broadcast.
+
+    ``g = bf16(sum_h bf16(key[t, s, h] * query[t, s, h]))``, then
+    ``out[t, s, :] = gate_activation(g / sqrt(H)) * value[t, :]`` where
+    ``gate_activation`` is the one used by :func:`qwen4_gate_value`.
+
+    Parameters
+    ----------
+    key, query: torch.Tensor
+        BF16 contiguous, shape ``(N, HC, H)``; ``H`` must be a multiple of 8.
+    value: torch.Tensor
+        BF16 contiguous, shape ``(N, H)``.
+    out: Optional[torch.Tensor]
+        Pre-allocated BF16 contiguous output with the shape of ``key``; must
+        not overlap ``value``. It may be the exact same tensor region as
+        ``key`` or ``query`` (in-place), but partial overlap with either is
+        rejected.
+    """
+    if out is None:
+        out = torch.empty_like(key)
+    torch.ops.sgl_kernel.qwen4_gate_reduce(out, key, query, value)
+    return out
+
+
+def qwen4_ngram_hash(
+    contexts: torch.Tensor,
+    multipliers: torch.Tensor,
+    vocab_sizes: torch.Tensor,
+    offsets: torch.Tensor,
+    eos_token_id: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Qwen3.8 PLE n-gram ids for the last position of each 3-token context window.
+
+    With ``t0, t1, t2 = contexts[n]`` (``t2`` is the current token), the previous
+    tokens are masked by EOS so that n-grams never cross a sequence boundary:
+    ``p1 = t1`` and ``p2 = eos`` if ``t0`` or ``t1`` is EOS, else ``t0``.
+    Heads 0-7 use ``(t2 * m0) ^ (p1 * m1)`` and heads 8-15 additionally xor
+    ``p2 * m2``. The id of head ``h`` is ``floor_mod(mix, vocab_sizes[h]) + offsets[h]``.
+    Multiplication wraps modulo 2**64 like torch int64.
+
+    Parameters
+    ----------
+    contexts: torch.Tensor
+        int64 contiguous, shape ``(N, 3)``.
+    multipliers: torch.Tensor
+        int64 contiguous, 3 elements.
+    vocab_sizes, offsets: torch.Tensor
+        int64 contiguous, 16 elements each; ``vocab_sizes`` must be positive.
+    eos_token_id: int
+        EOS token id.
+    out: Optional[torch.Tensor]
+        Pre-allocated int64 contiguous output of shape ``(N, 16)``.
+    """
+    if out is None:
+        out = torch.empty(
+            (contexts.shape[0], 16), dtype=torch.int64, device=contexts.device
+        )
+    torch.ops.sgl_kernel.qwen4_ngram_hash(
+        out, contexts, multipliers, vocab_sizes, offsets, eos_token_id
+    )
+    return out
+
+
+def fused_sigmoid_mul(
+    input: torch.Tensor,
+    gate: torch.Tensor,
+    inplace: bool = False,
+) -> torch.Tensor:
+    r"""Attention output gating: ``input * sigmoid(gate)``.
+
+    The sigmoid is rounded to the input dtype before the multiply, matching the
+    eager ``input * torch.sigmoid(gate)``.
+
+    Parameters
+    ----------
+    input: torch.Tensor
+        BF16/FP16 contiguous, shape ``(N, H)``.
+    gate: torch.Tensor
+        Same dtype, shape ``(N, H)`` or ``(N, heads, head_dim)`` with
+        ``heads * head_dim == H``. May be strided (e.g. a chunk of the q/gate
+        projection) but must be contiguous in the last dim.
+    inplace: bool
+        Write the result into ``input`` and return it.
+    """
+    out = input if inplace else torch.empty_like(input)
+    torch.ops.sgl_kernel.fused_sigmoid_mul(out, input, gate)
+    return out
 
 
 def fused_inplace_qknorm_rope(

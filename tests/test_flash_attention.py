@@ -3241,6 +3241,69 @@ def test_flash_attn_varlen_output_noncontiguous(d, causal, dtype):
 
 
 @pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [72, 128])
+def test_flash_attn_varlen_seqused(d, causal, dtype):
+    """With seqused_q/seqused_k, cu_seqlens only give each sequence's offset: a
+    batch padded per sequence must match the same batch packed, row for row, and
+    the padding rows of the output must come back zero."""
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+    if is_cri_device():
+        pytest.skip("Xe35 does not support seqused_q / seqused_k")
+    torch.random.manual_seed(d + int(causal))
+    seqlens_q, seqlens_k = [96, 17, 128, 1], [128, 40, 128, 9]
+    max_q, max_k, nheads, nheads_kv = max(seqlens_q), max(seqlens_k), 8, 2
+    batch_size = len(seqlens_q)
+
+    def cu(lens):
+        return torch.tensor(
+            [0, *itertools.accumulate(lens)], dtype=torch.int32, device=device
+        )
+
+    def padded_rows(lens, max_len):
+        return torch.cat(
+            [torch.arange(b * max_len, b * max_len + n) for b, n in enumerate(lens)]
+        ).to(device)
+
+    q = torch.randn(batch_size * max_q, nheads, d, device=device, dtype=dtype)
+    k, v = (
+        torch.randn(batch_size * max_k, nheads_kv, d, device=device, dtype=dtype)
+        for _ in range(2)
+    )
+    rows_q, rows_k = padded_rows(seqlens_q, max_q), padded_rows(seqlens_k, max_k)
+
+    out = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu([max_q] * batch_size),
+        cu_seqlens_k=cu([max_k] * batch_size),
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        seqused_q=torch.tensor(seqlens_q, dtype=torch.int32, device=device),
+        seqused_k=torch.tensor(seqlens_k, dtype=torch.int32, device=device),
+        causal=causal,
+    )
+    out_packed = flash_attn_varlen_func(
+        q[rows_q],
+        k[rows_k],
+        v[rows_k],
+        cu_seqlens_q=cu(seqlens_q),
+        cu_seqlens_k=cu(seqlens_k),
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
+        causal=causal,
+    )
+
+    torch.testing.assert_close(out[rows_q], out_packed, atol=1e-2, rtol=1e-2)
+    padding = torch.ones(out.shape[0], dtype=torch.bool, device=device)
+    padding[rows_q] = False
+    assert (out[padding] == 0).all(), "rows past seqused_q must be zero"
+
+
+@pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
 @pytest.mark.parametrize("causal,local", [(False, False), (False, True), (True, False)])
 @pytest.mark.parametrize("use_sinks", [False, True])
 @pytest.mark.parametrize("head_dim", [64, 128, 256])

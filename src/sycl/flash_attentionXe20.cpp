@@ -78,6 +78,15 @@ get_per_tensor_descale_ptr(const at::Tensor& descale, const at::Tensor& ref, con
   return descale.data_ptr<float>();
 }
 
+// Device pointer of an optional per-sequence length tensor, or null when absent.
+int* get_seqused_ptr(const std::optional<const at::Tensor>& seqused, int batch_size, const char* name) {
+  if (!seqused.has_value()) return nullptr;
+  CHECK_INPUT(seqused.value());
+  TORCH_CHECK(seqused->dtype() == torch::kInt32, name, " must have dtype torch.int32");
+  TORCH_CHECK(seqused->dim() == 1 && seqused->size(0) == batch_size, name, " must have shape (batch_size,)");
+  return seqused->data_ptr<int>();
+}
+
 }  // namespace
 
 namespace decode {
@@ -794,7 +803,9 @@ void mha_fwd_nopage(
     float const softcap,
     at::Tensor& out,
     std::optional<at::Tensor>& softmax_lse,
-    std::optional<at::Tensor> skip_batch_mask_opt) {
+    std::optional<at::Tensor> skip_batch_mask_opt,
+    std::optional<const at::Tensor> seqused_q_,
+    std::optional<const at::Tensor> seqused_k_) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -879,6 +890,8 @@ void mha_fwd_nopage(
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
+  params.seqused_q = get_seqused_ptr(seqused_q_, batch_size, "seqused_q");
+  params.seqused_k = get_seqused_ptr(seqused_k_, batch_size, "seqused_k");
 
   params.softmax_lse_ptr = return_softmax_lse ? softmax_lse->data_ptr() : nullptr;
   params.return_softmax_lse = return_softmax_lse;
@@ -1015,7 +1028,9 @@ void mha_fwd(
     std::optional<at::Tensor>& softmax_lse,
     std::optional<at::Tensor> skip_batch_mask_opt = std::nullopt,
     std::optional<const at::Tensor> rel_bias_ = std::nullopt,
-    std::optional<const at::Tensor> block_id_ = std::nullopt) {
+    std::optional<const at::Tensor> block_id_ = std::nullopt,
+    std::optional<const at::Tensor> seqused_q_ = std::nullopt,
+    std::optional<const at::Tensor> seqused_k_ = std::nullopt) {
   auto q_type = q.scalar_type();
   TORCH_CHECK(
       q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
@@ -1061,7 +1076,9 @@ void mha_fwd(
         softcap,
         out,
         softmax_lse,
-        std::move(skip_batch_mask_opt));
+        std::move(skip_batch_mask_opt),
+        std::move(seqused_q_),
+        std::move(seqused_k_));
     return;
   }
 
@@ -1513,7 +1530,7 @@ void mha_fwd(
   // decode batches. The two complementary skip masks partition every query token
   // across the launches, so the shared buffers end up fully written with no
   // stitching or extra copies needed.
-  launch(prefill::mha_fwd, is_prefill.logical_not(), std::nullopt, block_id_);
+  launch(prefill::mha_fwd, is_prefill.logical_not(), std::nullopt, block_id_, std::nullopt, std::nullopt);
 }
 
 }  // namespace chunkprefill
@@ -1551,9 +1568,23 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     bool return_softmax_lse,
     std::optional<const at::Tensor>& rel_bias_,
     bool rel_bias_is_sheared,
-    std::optional<const at::Tensor>& bidirectional_block_ids_) {
+    std::optional<const at::Tensor>& bidirectional_block_ids_,
+    std::optional<const at::Tensor>& seqused_q_,
+    std::optional<const at::Tensor>& seqused_k_) {
   TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
-  at::Tensor out = out_.has_value() ? *out_ : at::empty({q.size(0), q.size(1), v.size(-1)}, q.options());
+  bool const has_seqused = seqused_q_.has_value() || seqused_k_.has_value();
+  TORCH_CHECK(
+      !has_seqused || (!page_table.has_value() && !rel_bias_.has_value()),
+      "seqused_q / seqused_k are supported only for non-paged attention without relative bias");
+  at::Tensor out;
+  if (out_.has_value()) {
+    out = *out_;
+  } else if (seqused_q_.has_value()) {
+    // The kernel does not write rows past seqused_q; return them as zeros.
+    out = at::zeros({q.size(0), q.size(1), v.size(-1)}, q.options());
+  } else {
+    out = at::empty({q.size(0), q.size(1), v.size(-1)}, q.options());
+  }
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)
   // for paged KV cache; sub-functions validate their own shapes.
   TORCH_CHECK(out.scalar_type() == q.scalar_type(), "out dtype must match q dtype");
@@ -1640,7 +1671,8 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
 
   bool const is_uniform_qlen = batch_size > 0 && q.size(0) == batch_size * static_cast<int64_t>(max_seqlen_q);
 
-  if (max_seqlen_q == 1) {
+  // The decode kernel does not read seqused, so those batches take the prefill path.
+  if (max_seqlen_q == 1 && !has_seqused) {
     // Pure decode path. Decode also supports the pre-sheared relative-bias fast
     // path, so forward both relative-bias tail arguments.
     dispatch(decode::mha_fwd, std::nullopt, rel_bias_, rel_bias_is_sheared);
@@ -1649,7 +1681,7 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     // Relative bias currently bypasses chunkprefill. For any request with
     // max_seqlen_q > 1, use the prefill sheared-bias layout for all rows,
     // including q_len == 1 rows in a mixed batch.
-    dispatch(prefill::mha_fwd, std::nullopt, rel_bias_, std::nullopt);
+    dispatch(prefill::mha_fwd, std::nullopt, rel_bias_, std::nullopt, std::nullopt, std::nullopt);
   } else if (!page_table.has_value() || is_uniform_qlen) {
     // Pure prefill path
     //
@@ -1661,7 +1693,7 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     //
     // This condition is sufficient but not necessary: a non-uniform
     // all-prefill batch falls through to chunkprefill, which is still correct.
-    dispatch(prefill::mha_fwd, std::nullopt, std::nullopt, bidirectional_block_ids_);
+    dispatch(prefill::mha_fwd, std::nullopt, std::nullopt, bidirectional_block_ids_, seqused_q_, seqused_k_);
   } else {
     // Non-uniform paged batches fall back to chunkprefill.
     dispatch(chunkprefill::mha_fwd, bidirectional_block_ids_);

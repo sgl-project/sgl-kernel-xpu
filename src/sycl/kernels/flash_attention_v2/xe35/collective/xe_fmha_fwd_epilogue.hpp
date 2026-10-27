@@ -173,9 +173,9 @@ class FMHAFwdEpilogue {
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < rA_sum.size(); i++) {
       if constexpr (CollectiveMainloop::PerTensorScale)
-        rA_sum(i) = ElementA(v_scale) / rA_sum(i);
+        rA_sum(i) = rA_sum(i) == ElementA(0) ? ElementA(0) : ElementA(v_scale) / rA_sum(i);
       else
-        rA_sum(i) = ElementA(1) / rA_sum(i);
+        rA_sum(i) = rA_sum(i) == ElementA(0) ? ElementA(0) : ElementA(1) / rA_sum(i);
     }
 
     /* Tile output */

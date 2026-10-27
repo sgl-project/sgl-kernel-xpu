@@ -3247,13 +3247,14 @@ def test_flash_attn_varlen_output_noncontiguous(d, causal, dtype):
 def test_flash_attn_varlen_seqused(d, causal, dtype):
     """With seqused_q/seqused_k, cu_seqlens only give each sequence's offset: a
     batch padded per sequence must match the same batch packed, row for row, and
-    the padding rows of the output must come back zero."""
+    the padding rows and a sequence with no keys must come back zero."""
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-    if is_cri_device():
-        pytest.skip("Xe35 does not support seqused_q / seqused_k")
+    skip_unsupported_attention_case(d, False, dtype)
+    if is_cri_device() and causal:
+        pytest.skip("Xe35 non-paged batched causal varlen is not supported")
     torch.random.manual_seed(d + int(causal))
-    seqlens_q, seqlens_k = [96, 17, 128, 1], [128, 40, 128, 9]
+    seqlens_q, seqlens_k = [96, 17, 128, 1, 33], [128, 40, 128, 9, 0]
     max_q, max_k, nheads, nheads_kv = max(seqlens_q), max(seqlens_k), 8, 2
     batch_size = len(seqlens_q)
 
@@ -3301,6 +3302,8 @@ def test_flash_attn_varlen_seqused(d, causal, dtype):
     padding = torch.ones(out.shape[0], dtype=torch.bool, device=device)
     padding[rows_q] = False
     assert (out[padding] == 0).all(), "rows past seqused_q must be zero"
+    no_keys = slice((batch_size - 1) * max_q, (batch_size - 1) * max_q + seqlens_q[-1])
+    assert (out[no_keys] == 0).all(), "a sequence with seqused_k == 0 must be zero"
 
 
 @pytest.mark.skipif(device.type != "xpu", reason="XPU not available")

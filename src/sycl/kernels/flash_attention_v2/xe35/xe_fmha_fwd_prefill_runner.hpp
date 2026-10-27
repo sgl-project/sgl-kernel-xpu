@@ -30,7 +30,9 @@ inline void run_xe35_prefill(
     int window_size_right,
     const cutlass::bfloat16_t* sm_sink,
     bool use_sink,
-    int num_kv_splits = 1) {
+    int num_kv_splits = 1,
+    int* seqused_q = nullptr,
+    int* seqused_k = nullptr) {
   dispatch_xe3_kernel<HeadDim, false, Paged, Element, cutlass::bfloat16_t>(
       q_dense,
       k_pool,
@@ -56,7 +58,9 @@ inline void run_xe35_prefill(
       window_size_right,
       sm_sink,
       use_sink,
-      num_kv_splits);
+      num_kv_splits,
+      seqused_q,
+      seqused_k);
 }
 
 }  // namespace xe35_fmha

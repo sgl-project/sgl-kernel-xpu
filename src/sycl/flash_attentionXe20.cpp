@@ -79,9 +79,11 @@ get_per_tensor_descale_ptr(const at::Tensor& descale, const at::Tensor& ref, con
 }
 
 // Device pointer of an optional per-sequence length tensor, or null when absent.
-int* get_seqused_ptr(const std::optional<const at::Tensor>& seqused, int batch_size, const char* name) {
+int* get_seqused_ptr(
+    const std::optional<const at::Tensor>& seqused, const at::Tensor& q, int batch_size, const char* name) {
   if (!seqused.has_value()) return nullptr;
   CHECK_INPUT(seqused.value());
+  TORCH_CHECK(seqused->device() == q.device(), name, " must be on q's device");
   TORCH_CHECK(seqused->dtype() == torch::kInt32, name, " must have dtype torch.int32");
   TORCH_CHECK(seqused->dim() == 1 && seqused->size(0) == batch_size, name, " must have shape (batch_size,)");
   return seqused->data_ptr<int>();
@@ -890,8 +892,8 @@ void mha_fwd_nopage(
 
   params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
   params.cu_seqlens_k = cu_seqlens_k.data_ptr<int>();
-  params.seqused_q = get_seqused_ptr(seqused_q_, batch_size, "seqused_q");
-  params.seqused_k = get_seqused_ptr(seqused_k_, batch_size, "seqused_k");
+  params.seqused_q = get_seqused_ptr(seqused_q_, q, batch_size, "seqused_q");
+  params.seqused_k = get_seqused_ptr(seqused_k_, q, batch_size, "seqused_k");
 
   params.softmax_lse_ptr = return_softmax_lse ? softmax_lse->data_ptr() : nullptr;
   params.return_softmax_lse = return_softmax_lse;

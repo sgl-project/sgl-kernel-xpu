@@ -42,12 +42,26 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
   TORCH_CHECK(!return_softmax_lse, "flash_attentionXe35: softmax LSE is not supported");
   TORCH_CHECK(!rel_bias_.has_value() && !rel_bias_is_sheared, "flash_attentionXe35: relative bias is not supported");
   TORCH_CHECK(!bidirectional_block_ids_.has_value(), "flash_attentionXe35: bidirectional blocks are not supported");
-  TORCH_CHECK(
-      !seqused_q_.has_value() && !seqused_k_.has_value(),
-      "flash_attentionXe35: seqused_q / seqused_k are not supported");
   const int batch = static_cast<int>(cu_seqlens_q.size(0) - 1);
   TORCH_CHECK(batch > 0, "flash_attentionXe35: empty batch is not supported");
   const bool is_paged = page_table.has_value();
+  TORCH_CHECK(
+      !is_paged || (!seqused_q_.has_value() && !seqused_k_.has_value()),
+      "flash_attentionXe35: seqused_q / seqused_k are supported only for non-paged attention");
+  // Real per-sequence lengths for a padded batch; cu_seqlens then only give the offsets.
+  auto get_seqused_ptr = [&](const std::optional<const at::Tensor>& seqused, const char* name) -> int* {
+    if (!seqused.has_value()) return nullptr;
+    TORCH_CHECK(seqused->device() == q.device(), "flash_attentionXe35: ", name, " must be on q's device");
+    TORCH_CHECK(seqused->scalar_type() == at::ScalarType::Int, "flash_attentionXe35: ", name, " must be int32");
+    TORCH_CHECK(
+        seqused->dim() == 1 && seqused->size(0) == batch && seqused->stride(0) == 1,
+        "flash_attentionXe35: ",
+        name,
+        " must be contiguous with shape (batch_size,)");
+    return seqused->data_ptr<int>();
+  };
+  int* const seqused_q = get_seqused_ptr(seqused_q_, "seqused_q");
+  int* const seqused_k = get_seqused_ptr(seqused_k_, "seqused_k");
 
   TORCH_CHECK(q.dim() == 3, "flash_attentionXe35: q must be (total_q, h, d)");
   TORCH_CHECK(cu_seqlens_q.dim() == 1, "flash_attentionXe35: cu_seqlens_q must be 1D");
@@ -339,7 +353,9 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
       window_size_right,
       sm_sink,
       sinks_.has_value(),
-      num_kv_splits);
+      num_kv_splits,
+      seqused_q,
+      seqused_k);
 
   if (is_fp8) {
     out.copy_(out_dense);

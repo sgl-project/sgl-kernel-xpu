@@ -2910,7 +2910,7 @@ def test_relative_attention(
     )
 
 
-@pytest.mark.skipif(device.type != "xpu", reason="ALiBi requires an XPU device")
+@pytest.mark.skipif(is_cri_device(), reason="Xe35 does not support ALiBi slopes")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("page_size", [64, 128])
 @pytest.mark.parametrize(

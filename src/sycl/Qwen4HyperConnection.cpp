@@ -47,8 +47,20 @@ inline float sigmoid(float v) {
   return sycl::native::recip(1.0f + sycl::native::exp(-v));
 }
 
+// The weight of the block output for one (token, stream) row. HAS_INJECTION is a compile-time choice where a runtime
+// branch around the injection load would delay other loads.
+template <bool HAS_INJECTION>
 inline float combine_weight(const bf16* injection, uint32_t row, float inv_hc) {
-  return injection == nullptr ? 1.0f : 2.0f * sigmoid(static_cast<float>(injection[row]) * inv_hc);
+  if constexpr (HAS_INJECTION) {
+    return 2.0f * sigmoid(static_cast<float>(injection[row]) * inv_hc);
+  } else {
+    return 1.0f;
+  }
+}
+
+inline float combine_weight_dynamic(const bf16* injection, uint32_t row, float inv_hc) {
+  return injection == nullptr ? combine_weight<false>(injection, row, inv_hc)
+                              : combine_weight<true>(injection, row, inv_hc);
 }
 
 template <int N>
@@ -67,6 +79,19 @@ inline bf16xV<N> to_bf16(const float (&input)[N]) {
     output[i] = static_cast<bf16>(input[i]);
   }
   return output;
+}
+
+// bf16(residual + block * w), accumulated in fp32.
+template <int N>
+inline bf16xV<N> combine_values(const bf16xV<N>& residual, const bf16xV<N>& block, float w) {
+  float rv[N], bv[N];
+  to_float<N>(residual, rv);
+  to_float<N>(block, bv);
+#pragma unroll
+  for (int k = 0; k < N; ++k) {
+    rv[k] += bv[k] * w;
+  }
+  return to_bf16<N>(rv);
 }
 
 template <int V>
@@ -158,15 +183,8 @@ struct CombineKernel {
     if (c >= vecs_per_row) return;
     const uint32_t token = row / hc;  // uniform across the work-group
     const uint32_t i = row * vecs_per_row + c;
-    const float w = HAS_INJECTION ? 2.0f * sigmoid(static_cast<float>(injection[row]) * inv_hc) : 1.0f;
-    float rv[V], bv[V];
-    to_float<V>(residual[i], rv);
-    to_float<V>(block[token * vecs_per_row + c], bv);
-#pragma unroll
-    for (int k = 0; k < V; ++k) {
-      rv[k] += bv[k] * w;
-    }
-    output[i] = to_bf16<V>(rv);
+    const float w = combine_weight<HAS_INJECTION>(injection, row, inv_hc);
+    output[i] = combine_values<V>(residual[i], block[token * vecs_per_row + c], w);
   }
 };
 
@@ -325,7 +343,7 @@ struct CombineNormVecKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       blocks[c] = block_row[index];
       weights[c] = weight_row[index];
     }
-    const float w = combine_weight(injection, row, inv_hc);
+    const float w = combine_weight_dynamic(injection, row, inv_hc);
 
     // `combined` may alias `residual`; each lane reads its own vectors before writing them.
     bf16x8* combined_row = combined + row * vecs_per_row;
@@ -334,14 +352,7 @@ struct CombineNormVecKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     for (int c = 0; c < VECS_PER_THREAD; ++c) {
       const int index = c * STRIDE + first;
       if (index > last) continue;
-      float rv[VEC_SIZE], bv[VEC_SIZE];
-      to_float<VEC_SIZE>(values[c], rv);
-      to_float<VEC_SIZE>(blocks[c], bv);
-#pragma unroll
-      for (int k = 0; k < VEC_SIZE; ++k) {
-        rv[k] += bv[k] * w;
-      }
-      values[c] = to_bf16<VEC_SIZE>(rv);
+      values[c] = combine_values<VEC_SIZE>(values[c], blocks[c], w);
       if (active) combined_row[index] = values[c];
       float mv[VEC_SIZE];
       to_float<VEC_SIZE>(values[c], mv);
@@ -408,7 +419,7 @@ struct CombineNormScalarKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const int64_t token = row / hc;
     const int64_t stream = row % hc;
     const int64_t base = row * hidden;
-    const float w = combine_weight(injection, row, inv_hc);
+    const float w = combine_weight_dynamic(injection, row, inv_hc);
     float sum_sq = 0.0f;
     for (int64_t d = item.get_local_id(0); d < hidden; d += item.get_local_range(0)) {
       const bf16 v =

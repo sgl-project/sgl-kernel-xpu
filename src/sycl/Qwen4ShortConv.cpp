@@ -219,10 +219,6 @@ struct VerifyConvKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 };
 
-void check_same_device(const torch::Tensor& t, const torch::Tensor& ref, const char* name) {
-  TORCH_CHECK(t.device() == ref.device(), name, " must be on the same device as x");
-}
-
 template <typename F>
 void dispatch_bf16_or_float(at::ScalarType dtype, const char* name, F&& f) {
   if (dtype == at::kBFloat16) {
@@ -374,17 +370,10 @@ SGL_KERNEL_EXPORT void qwen4_verify_conv(
       kernel_size,
       ", dilation=",
       dilation);
-  check_same_device(state, x, "state");
-  check_same_device(state_indices, x, "state_indices");
-  check_same_device(valid, x, "valid");
-  check_same_device(residual, x, "residual");
-  check_same_device(weight, x, "weight");
-  check_same_device(output, x, "output");
   const bool has_intermediate = intermediate.has_value() && state_len > 0;
   if (intermediate.has_value()) {
     const auto& inter = *intermediate;
     CHECK_DEVICE(inter);
-    check_same_device(inter, x, "intermediate");
     TORCH_CHECK(
         inter.dim() == 4 && inter.size(0) >= requests && inter.size(1) >= width && inter.size(2) == channels &&
             inter.size(3) == state_len,
@@ -409,7 +398,6 @@ SGL_KERNEL_EXPORT void qwen4_verify_conv(
   const int64_t channel_blocks = (channels + CHANNELS_PER_WG - 1) / CHANNELS_PER_WG;
   TORCH_CHECK(requests <= MAX_GRID_DIM && channel_blocks * WG_SIZE <= MAX_GRID_DIM, "qwen4_verify_conv: too large");
 
-  c10::DeviceGuard guard(x.device());
   auto q = c10::xpu::getCurrentXPUStream().queue();
   const auto inter_dtype = has_intermediate ? intermediate->scalar_type() : at::kBFloat16;
   dispatch_bf16_or_float(state.scalar_type(), "state", [&](auto state_tag) {

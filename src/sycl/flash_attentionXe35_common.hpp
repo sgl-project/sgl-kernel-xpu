@@ -110,7 +110,9 @@ struct Xe3FmhaConfig {
       int window_size_left,
       int window_size_right,
       const ElementInput* sm_sink,
-      int num_kv_splits = 1) {
+      int num_kv_splits = 1,
+      int* seqused_q = nullptr,
+      int* seqused_k = nullptr) {
     static constexpr bool BlockScale = false;
     static constexpr bool F8kvF16mma = false;
     static constexpr bool PerTensorScale = sizeof_bits_v<ElementInput> == 8;
@@ -218,8 +220,8 @@ struct Xe3FmhaConfig {
             {batch,
              num_heads_q,
              num_heads_kv,
-             {max_seqlen_q, static_cast<int>(q_dense.size(0)), cu_seqlens_q.data_ptr<int>(), nullptr},
-             {new_max, new_total, new_cu, nullptr},
+             {max_seqlen_q, static_cast<int>(q_dense.size(0)), cu_seqlens_q.data_ptr<int>(), nullptr, seqused_q},
+             {new_max, new_total, new_cu, nullptr, Paged ? nullptr : seqused_k},
              {cache_max, cache_total, cache_cu, nullptr},
              head_dim,
              head_dim},
@@ -415,7 +417,9 @@ void dispatch_xe3_kernel(
     int window_size_right,
     const cutlass::bfloat16_t* sm_sink,
     bool use_sink,
-    int num_kv_splits = 1) {
+    int num_kv_splits = 1,
+    int* seqused_q = nullptr,
+    int* seqused_k = nullptr) {
   const int gqa_group = num_heads_kv > 0 ? num_heads_q / num_heads_kv : 1;
   const int total_rows = gqa_group * max_seqlen_q;
 
@@ -445,7 +449,9 @@ void dispatch_xe3_kernel(
       window_size_left,                                                                                            \
       window_size_right,                                                                                           \
       SINKPTR,                                                                                                     \
-      num_kv_splits)
+      num_kv_splits,                                                                                               \
+      seqused_q,                                                                                                   \
+      seqused_k)
 
 #define XE35_RUN(CAUSAL, LOCAL, STAGES, GQA, QK, PV, OUT, SGL)                     \
   do {                                                                             \
@@ -669,7 +675,9 @@ using Xe35DispatchFn = void(
     int,
     const cutlass::bfloat16_t*,
     bool,
-    int);
+    int,
+    int*,
+    int*);
 #pragma once
 
 #include <ATen/ATen.h>

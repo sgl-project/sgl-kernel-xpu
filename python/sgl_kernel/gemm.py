@@ -31,6 +31,17 @@ def fp8_blockwise_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype):
     )
 
 
+def fp8_w8a16_mm(input, weight, weight_scale, out=None):
+    """bf16 input [M, K] @ (fp8 e4m3 weight [N, K] * fp32 block scales [ceil(N/128), K/128])^T -> bf16 [M, N].
+
+    Weight-only FP8 GEMM for Xe2; the activation stays in bf16.
+    """
+    if out is None:
+        out = input.new_empty((input.shape[0], weight.shape[0]))
+    torch.ops.sgl_kernel.fp8_w8a16_mm_xe20.default(out, input, weight, weight_scale)
+    return out
+
+
 def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     return torch.ops.sgl_kernel.fp8_scaled_mm.default(
         mat_a,

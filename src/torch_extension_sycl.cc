@@ -689,6 +689,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
       "int max_seq_len, bool clean_logits) -> Tensor");
   m.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
+
+  m.def("fp8_w8a16_mm_xe20(Tensor! output, Tensor input, Tensor weight, Tensor weight_scale, int config=-1) -> ()");
+  m.impl("fp8_w8a16_mm_xe20", torch::kXPU, &fp8_w8a16_mm_xe20);
 #endif  // SYCL_INTEL_TARGET == 20
 
   /*

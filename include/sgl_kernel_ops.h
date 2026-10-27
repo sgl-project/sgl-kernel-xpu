@@ -780,6 +780,16 @@ void moe_grouped_mm_nt_xe20_w8a16(
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts);
 
+// Dense W8A16 GEMM for Xe2: output[M, N] = input[M, K] @ (weight[N, K] * weight_scale)^T, with
+// bf16 input/output, float8_e4m3fn weight and [N/128, K/128] float32 block scales.
+// config < 0 picks the tile and K split; otherwise config = 10 * k_slices + tile_id.
+void fp8_w8a16_mm_xe20(
+    torch::Tensor& output,
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& weight_scale,
+    int64_t config);
+
 // Xe3 (CRI) plain bf16 grouped GEMM, tile heuristics tuned for Xe3.
 void moe_grouped_mm_nt_xe35(
     torch::Tensor& output,

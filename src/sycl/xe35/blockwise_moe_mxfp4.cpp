@@ -6,16 +6,16 @@
     \brief MXFP4 (E2M1 + UE8M0 scales, block=32) blockwise grouped GEMM for MoE on Intel XPU (xe35).
            HW-accelerated via XE_BDPAS.
 
-    NOTE: CUTE_ENABLE_XE_BLOCK_2D_ASSERT MUST be defined before any CUTE header
-    is included. It acts as a compiler barrier that prevents misoptimization of
-    the block-2D payload setup in Xe2DTraitsBase::device_init() (without it the
-    MXFP4 mainloop emits invalid surface descriptors). Keep this define at the
-    top of this TU and out of the MXFP8 TU (where it triggers spurious x%4
-    asserts on a D-store the hardware silently handles).
+    CUTE_ENABLE_XE_BLOCK_2D_ASSERT is deliberately not defined here, matching MXFP8.
+    It gates only assert(), and FindSYCL.cmake builds these TUs without -DNDEBUG, so
+    defining it makes the asserts live even in a Release build. The A-scale width one
+    then reads each expert's real token count rather than our padded allocation and
+    aborts on any count not divisible by 4 — most decode traffic. That load is safe
+    regardless: CUTLASS rounds the width up to 4 right after checking it and the
+    epilogue drops the extra rows.
 */
 
 // clang-format off
-#define CUTE_ENABLE_XE_BLOCK_2D_ASSERT
 
 #include "blockwise_moe_runner.hpp"
 #include "sgl_kernel_export.h"
@@ -26,8 +26,9 @@ using namespace cutlass::gemm;
 
 namespace at::native::xpu {
 
-// MXFP4: E2M1 + UE8M0 scales, block=32, A=RowMajor, B=ColumnMajor, symmetric MN-major scale strides
-struct MXFP4Types {
+// MXFP4: E2M1 + UE8M0 scales, block=32, A=RowMajor, B=ColumnMajor, symmetric MN-major scale strides.
+template <class TileShape_>
+struct MXFP4TypesT {
 
   using ElementType     = cutlass::mx_float4_t<float_e2m1_t>;
   using ElementInputA   = typename ElementType::DataType;    // float_e2m1_t
@@ -51,7 +52,6 @@ struct MXFP4Types {
 
 
   static constexpr int BlockSize = 32;
-  static constexpr int TileK     = 64;
 
   // Void selects CUTLASS's block-2D auto-detection path.
   using GmemTiledCopyA      = void;
@@ -59,7 +59,7 @@ struct MXFP4Types {
   using GmemTiledCopyScaleA = void;
   using GmemTiledCopyScaleB = void;
 
-  using TileShape = Shape<_512, _512, Int<TileK>>;
+  using TileShape = TileShape_;
 
   // Thread layout (8×4 SG tiling, n-major)
   using ThreadLayout = cute::Layout<Shape<_8, _4, _1>, cute::Stride<_4, _1, _0>>;
@@ -125,7 +125,16 @@ struct MXFP4Types {
   using StrideD = typename Gemm::GemmKernel::InternalStrideD;
 };
 
-using MXFP4Runner = BlockScaledGroupedGemmRunner<MXFP4Types>;
+// N_TILE=512 works here because 4-bit A/B packing halves per-stage L1 pressure
+// vs MXFP8. K_TILE=64 fixed (SG_K>=32, mainloop needs 2 K-slices).
+struct MXFP4TilePolicy {
+  using Decode  = MXFP4TypesT<Shape<_128, _512, _64>>;
+  using Step    = MXFP4TypesT<Shape<_256, _512, _64>>;
+  using Prefill = MXFP4TypesT<Shape<_512, _512, _64>>;
+
+  // Bucket-independent, so any member answers for it.
+  static constexpr int BlockSize = Step::BlockSize;
+};
 
 }  // namespace at::native::xpu
 
@@ -166,6 +175,22 @@ SGL_KERNEL_EXPORT void mxfp4_blockwise_scaled_grouped_mm(
 
   const bool need_prep = (a_ptrs.numel() == 0);
 
+  // Validate before the raw int32 reads below, which otherwise fault or throw
+  // an opaque dtype error rather than naming the offending argument.
+  TORCH_CHECK(problem_sizes.dim() == 2 && problem_sizes.size(1) == 3 &&
+                  problem_sizes.scalar_type() == torch::kInt32 &&
+                  problem_sizes.is_contiguous(),
+              "problem_sizes must be a contiguous int32 (num_experts, 3) tensor");
+
+  // Threaded into the runner so it skips its own D->H sync of problem_sizes.
+  torch::Tensor problem_sizes_host = problem_sizes.to(torch::kCPU);
+  const int32_t* psz = problem_sizes_host.data_ptr<int32_t>();
+  const int E = static_cast<int>(problem_sizes_host.size(0));
+  int max_m = 0;
+  for (int e = 0; e < E; ++e) {
+    if (psz[e * 3] > max_m) max_m = psz[e * 3];
+  }
+
   if (need_prep) {
     TORCH_CHECK(a.dim() == 2,
                 "On-device prep requires flat 2D A (sum_m_i, K/2), got ", a.dim(), " dimensions");
@@ -180,8 +205,9 @@ SGL_KERNEL_EXPORT void mxfp4_blockwise_scaled_grouped_mm(
                     a_scales_ptrs.numel() == 0 && b_scales_ptrs.numel() == 0,
                 "On-device prep requires all ptr-array tensors to be empty");
 
-    constexpr int BS = at::native::xpu::MXFP4Types::BlockSize;
-    const int E = static_cast<int>(expert_offsets.size(0));
+    constexpr int BS = at::native::xpu::MXFP4TilePolicy::BlockSize;
+    TORCH_CHECK(expert_offsets.size(0) == E,
+                "expert_offsets and problem_sizes disagree on num_experts");
     const int packed_K = static_cast<int>(a.size(1));   // K/2
     const int K = packed_K * 2;
     const int N = static_cast<int>(output.size(1));
@@ -204,19 +230,10 @@ SGL_KERNEL_EXPORT void mxfp4_blockwise_scaled_grouped_mm(
     const int64_t sa_elem = scales_a.element_size();
     const int64_t sb_elem = scales_b.element_size();
 
-    // max_m_i drives the padded A-scales scratch.
-    auto problem_sizes_cpu = problem_sizes.to(torch::kCPU);
-    const int32_t* psz = problem_sizes_cpu.data_ptr<int32_t>();
-    int max_m = 0;
-    for (int e = 0; e < E; ++e) {
-      if (psz[e * 3] > max_m) max_m = psz[e * 3];
-    }
-    TORCH_CHECK(max_m > 0, "max_m must be positive across experts");
-    // Xe block-2D scale loads require 4-byte aligned width/pitch: pad the
-    // per-column M stride up to ScaleAlignElems = ceil_div(4, sizeof(scale)).
-    // For u8 UE8M0 that's 4. Also zero-init so the extra rows don't feed garbage into the accumulator.
-    constexpr int scale_align = 4;
-    const int padded_max_m = (max_m + scale_align - 1) & ~(scale_align - 1);
+    // Keep each expert's A-scale base 64-byte aligned for the scale loader;
+    // zero-init because the transpose only fills the first m_i rows.
+    const int padded_max_m =
+        at::native::xpu::moe_pad_scale_m(max_m, scale_cols, static_cast<int>(sa_elem));
 
     scales_a_t_keep_alive = torch::zeros({E, scale_cols, padded_max_m}, opts_u8);
     scales_b_t_keep_alive = torch::empty({E, scale_cols, N}, opts_u8);
@@ -253,11 +270,15 @@ SGL_KERNEL_EXPORT void mxfp4_blockwise_scaled_grouped_mm(
   // Padded A-scales -> override M-stride to max_m; legacy path uses m_i.
   const int sa_m_stride_override =
       need_prep ? static_cast<int>(scales_a_t_keep_alive.stride(1)) : 0;
-  at::native::xpu::MXFP4Runner::run(
+
+  TORCH_CHECK(max_m > 0, "problem_sizes[:, 0] must contain at least one positive M");
+
+  at::native::xpu::moe_run_bucketed<at::native::xpu::MXFP4TilePolicy>(
+      at::native::xpu::moe_tile_bucket(max_m),
       output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
       a, b,
       need_prep ? scales_a_t_keep_alive : scales_a,
       need_prep ? scales_b_t_keep_alive : scales_b,
       problem_sizes, expert_offsets, workspace,
-      sa_m_stride_override);
+      sa_m_stride_override, &problem_sizes_host);
 }

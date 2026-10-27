@@ -68,6 +68,8 @@ struct BlockScaledMoETypes {
       cute::Layout<TileShape>,
       ThreadLayout>::TiledMMA;
 
+  // Stages>2 exceeds L1 residency for these tile sizes on Xe3P CRI; a simulator
+  // sweep showed +47% LSC bytes and +22% runtime at Stages=3.
   static constexpr int PipelineStages = 2;
   // ...GroupImpl (not the ...Group alias): the alias takes an `int` GroupSize,
   // while the variants here pass a type (cute::Int<32> or a cute::tuple).
@@ -122,24 +124,44 @@ struct BlockScaledMoETypes {
 };
 
 // FP8: fp32 scales, row-major B-scales, tuple GroupSize → SW-scaled mainloop.
-using FP8Types = BlockScaledMoETypes<
+// K_TILE stays at 32 (GroupSize.K=128 → 4 K-tiles per scale group amortizes the
+// fp32 scale multiply); K_TILE=64 not perf-swept for FP8 yet.
+template <class TileShape_>
+using FP8TypesT = BlockScaledMoETypes<
     /* ElementScale = */ float,
     /* StrideScaleB = */ cute::Stride<int64_t, cute::_1, int64_t>,
     /* GroupSize    = */ cute::tuple<cute::_1, cute::Int<128>, cute::Int<128>>,
-    /* TileShape    = */ Shape<_256, _256, _32>,
+    /* TileShape    = */ TileShape_,
     /* BlockSize    = */ 128>;
 
-using FP8Runner = BlockScaledGroupedGemmRunner<FP8Types>;
+struct FP8TilePolicy {
+  using Decode  = FP8TypesT<Shape<_128, _256, _32>>;
+  using Step    = FP8TypesT<Shape<_256, _256, _32>>;
+  using Prefill = FP8TypesT<Shape<_512, _512, _32>>;
+
+  // Bucket-independent, so any member answers for it.
+  static constexpr int BlockSize = Step::BlockSize;
+};
 
 // MXFP8: UE8M0 scales, MN-major B-scales, integer GroupSize → HW-scaled mainloop.
-using MXFP8Types = BlockScaledMoETypes<
-    /* ElementScale = */ typename cutlass::mx_float8_t<cutlass::float_e4m3_t>::ScaleFactorType,
-    /* StrideScaleB = */ cute::Stride<cute::_1, int64_t, int64_t>,
-    /* GroupSize    = */ cute::Int<32>,
-    /* TileShape    = */ Shape<_512, _256, _64>,
-    /* BlockSize    = */ 32>;
+// K_TILE=64 is fixed: SG_K>=32 and 2 K-slices per iteration are required by the
+// mainloop. K_TILE=128 aborted mid-kernel on the CRI simulator (suspected untested
+// SG_K=128 corner in CUTLASS-Xe), so it stays at 64.
+template <class TileShape_>
+using MXFP8TypesT = BlockScaledMoETypes<
+    typename cutlass::mx_float8_t<cutlass::float_e4m3_t>::ScaleFactorType,
+    cute::Stride<cute::_1, int64_t, int64_t>,
+    cute::Int<32>,
+    TileShape_,
+    32>;
 
-using MXFP8Runner = BlockScaledGroupedGemmRunner<MXFP8Types>;
+struct MXFP8TilePolicy {
+  using Decode  = MXFP8TypesT<Shape<_128, _256, _64>>;
+  using Step    = MXFP8TypesT<Shape<_256, _256, _64>>;
+  using Prefill = MXFP8TypesT<Shape<_512, _512, _64>>;
+
+  static constexpr int BlockSize = Step::BlockSize;
+};
 
 }  // namespace at::native::xpu
 
@@ -229,8 +251,8 @@ SGL_KERNEL_EXPORT void fp8_blockwise_scaled_grouped_mm(
                     a_scales_ptrs.numel() == 0 && b_scales_ptrs.numel() == 0,
                 "On-device prep requires all ptr-array tensors to be empty");
 
-    const int BS = is_mxfp8 ? at::native::xpu::MXFP8Types::BlockSize
-                            : at::native::xpu::FP8Types::BlockSize;
+    const int BS = is_mxfp8 ? at::native::xpu::MXFP8TilePolicy::BlockSize
+                            : at::native::xpu::FP8TilePolicy::BlockSize;
     const int E = static_cast<int>(expert_offsets.size(0));
     const int K = static_cast<int>(a.size(1));
     const int N = static_cast<int>(output.size(1));
@@ -270,12 +292,11 @@ SGL_KERNEL_EXPORT void fp8_blockwise_scaled_grouped_mm(
     const int max_m = static_cast<int>(a.size(0));
     TORCH_CHECK(max_m > 0, "flat A must have at least one row");
 
-    // Xe block-2D scale loads require 4-byte aligned width/pitch: pad the
-    // per-column M stride up to ScaleAlignElems = ceil_div(4, sizeof(scale)).
-    // For u8 UE8M0 that's 4; for fp32 it's 1 (already aligned). Also
-    // zero-init so the extra rows don't feed garbage into the accumulator.
-    const int scale_align = is_mxfp8 ? 4 : 1;
-    const int padded_max_m = (max_m + scale_align - 1) & ~(scale_align - 1);
+    // Keep each expert's A-scale base 64-byte aligned for the scale loader.
+    // Buffers below are zero-init so the padded rows don't feed garbage into
+    // the accumulator.
+    const int padded_max_m =
+        at::native::xpu::moe_pad_scale_m(max_m, scale_cols, static_cast<int>(sa_elem));
 
     if (is_mxfp8) {
       // uint8 A-scales + uint8 B-scales (both transposed on device).
@@ -307,8 +328,6 @@ SGL_KERNEL_EXPORT void fp8_blockwise_scaled_grouped_mm(
           scales_b_t_keep_alive.data_ptr<uint8_t>());
     } else {
       // fp32 A-scales only (B-scales stay untransposed for FP8 row-major).
-      // padded_max_m == max_m here (scale_align=1) but keep the name for
-      // symmetry with the MXFP8 branch above.
       auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(a.device());
       scales_a_t_keep_alive = torch::zeros({E, scale_cols, padded_max_m}, opts_f32);
 
@@ -342,20 +361,42 @@ SGL_KERNEL_EXPORT void fp8_blockwise_scaled_grouped_mm(
   const int sa_m_stride_override =
       need_prep ? static_cast<int>(scales_a_t_keep_alive.stride(1)) : 0;
 
+  // Validate before the raw int32 reads below, which otherwise fault or throw
+  // an opaque dtype error rather than naming the offending argument.
+  TORCH_CHECK(problem_sizes.dim() == 2 && problem_sizes.size(1) == 3 &&
+                  problem_sizes.scalar_type() == torch::kInt32 &&
+                  problem_sizes.is_contiguous(),
+              "problem_sizes must be a contiguous int32 (num_experts, 3) tensor");
+
+  // Threaded into the runner so it skips its own D->H sync of problem_sizes.
+  torch::Tensor problem_sizes_host = problem_sizes.to(torch::kCPU);
+  const int32_t* psz = problem_sizes_host.data_ptr<int32_t>();
+  const int E_ = static_cast<int>(problem_sizes_host.size(0));
+  int max_m = 0;
+  for (int e = 0; e < E_; ++e) {
+    const int m_e = psz[e * 3 + 0];
+    if (m_e > max_m) max_m = m_e;
+  }
+
+  const auto bucket = at::native::xpu::moe_tile_bucket(max_m);
+
+  // FP8 keeps B-scales row-major, so only MXFP8 passes the transposed copy.
   if (is_mxfp8) {
-    at::native::xpu::MXFP8Runner::run(
+    at::native::xpu::moe_run_bucketed<at::native::xpu::MXFP8TilePolicy>(
+        bucket,
         output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
         a, b,
         need_prep ? scales_a_t_keep_alive : scales_a,
         need_prep ? scales_b_t_keep_alive : scales_b,
         problem_sizes, expert_offsets, workspace,
-        sa_m_stride_override);
+        sa_m_stride_override, &problem_sizes_host);
   } else {
-    at::native::xpu::FP8Runner::run(
+    at::native::xpu::moe_run_bucketed<at::native::xpu::FP8TilePolicy>(
+        bucket,
         output, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs,
         a, b,
         need_prep ? scales_a_t_keep_alive : scales_a,
         scales_b, problem_sizes, expert_offsets, workspace,
-        sa_m_stride_override);
+        sa_m_stride_override, &problem_sizes_host);
   }
 }

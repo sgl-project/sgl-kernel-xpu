@@ -630,15 +630,20 @@ class TestFP8RaggedM:
             )
         skip_if_kernel_unavailable()
 
+    # max_m picks the tile shape: decode <=32, step <=512, prefill >512.
+    @pytest.mark.parametrize(
+        "m_per_expert",
+        [[1, 2, 3], [128, 256, 384, 256], [520, 600]],
+        ids=["decode", "step", "prefill"],
+    )
     @torch.inference_mode()
-    def test_flat_2d_ragged_distribution(self):
+    def test_flat_2d_ragged_distribution(self, m_per_expert):
         """Flat-2D layout: A / scales_a / output stored as (sum_m_i, ...) with
         per-expert row ranges located via expert_offsets. This is the layout
         sglang's cutlass_fused_experts_fp8 produces after shuffle_rows. B and
         scales_b stay 3D per-expert. Uses k=256 so scale_cols=2."""
         device = "xpu"
         n, k = 128, 256
-        m_per_expert = [128, 256, 384, 256]  # ragged
         num_experts = len(m_per_expert)
         total_m = sum(m_per_expert)
         scale_cols = k // FP8_BLOCK_SIZE
@@ -730,6 +735,7 @@ MXFP8_MNK_FACTORS = [
     (256, 512, 512),
     (512, 512, 512),
     (256, 256, 1024),
+    (1024, 128, 128),  # m > 512 selects the prefill tile; smallest N/K to stay cheap
 ]
 
 # Qwen3-30B-A3B fused-MoE GEMM shapes (K = hidden = 2048).

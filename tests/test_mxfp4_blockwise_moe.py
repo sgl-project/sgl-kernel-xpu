@@ -425,14 +425,21 @@ class TestMXFP4RaggedM:
             )
         skip_if_kernel_unavailable()
 
+    # max_m picks the tile shape: decode <=32, step <=512, prefill >512. The
+    # decode case also leaves max_m off a 4-byte boundary, which the u8 A-scale
+    # pitch has to round up on its own.
+    @pytest.mark.parametrize(
+        "m_per_expert",
+        [[1, 2, 3], [32, 64, 96, 64], [520, 600]],
+        ids=["decode", "step", "prefill"],
+    )
     @torch.inference_mode()
-    def test_flat_2d_ragged_distribution(self):
+    def test_flat_2d_ragged_distribution(self, m_per_expert):
         """k=64 (scale_cols=2) exercises per-expert A-scale M-stride."""
         from sgl_kernel import mxfp4_blockwise_scaled_grouped_mm
 
         device = "xpu"
         n, k = 64, 64
-        m_per_expert = [32, 64, 96, 64]
         num_experts = len(m_per_expert)
         total_m = sum(m_per_expert)
         packed_k = k // 2

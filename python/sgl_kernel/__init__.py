@@ -79,6 +79,7 @@ from sgl_kernel.elementwise import (
     multimodal_rotary_embedding,
     qwen4_gate_reduce,
     qwen4_gate_value,
+    qwen4_ngram_hash,
     rmsnorm,
     silu_and_mul,
     silu_and_mul_clamp,

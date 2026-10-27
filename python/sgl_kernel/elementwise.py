@@ -236,6 +236,46 @@ def qwen4_gate_reduce(
     return out
 
 
+def qwen4_ngram_hash(
+    contexts: torch.Tensor,
+    multipliers: torch.Tensor,
+    vocab_sizes: torch.Tensor,
+    offsets: torch.Tensor,
+    eos_token_id: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Qwen3.8 PLE n-gram ids for the last position of each 3-token context window.
+
+    With ``t0, t1, t2 = contexts[n]`` (``t2`` is the current token), the previous
+    tokens are masked by EOS so that n-grams never cross a sequence boundary:
+    ``p1 = t1`` and ``p2 = eos`` if ``t0`` or ``t1`` is EOS, else ``t0``.
+    Heads 0-7 use ``(t2 * m0) ^ (p1 * m1)`` and heads 8-15 additionally xor
+    ``p2 * m2``. The id of head ``h`` is ``floor_mod(mix, vocab_sizes[h]) + offsets[h]``.
+    Multiplication wraps modulo 2**64 like torch int64.
+
+    Parameters
+    ----------
+    contexts: torch.Tensor
+        int64 contiguous, shape ``(N, 3)``.
+    multipliers: torch.Tensor
+        int64 contiguous, 3 elements.
+    vocab_sizes, offsets: torch.Tensor
+        int64 contiguous, 16 elements each; ``vocab_sizes`` must be positive.
+    eos_token_id: int
+        EOS token id.
+    out: Optional[torch.Tensor]
+        Pre-allocated int64 contiguous output of shape ``(N, 16)``.
+    """
+    if out is None:
+        out = torch.empty(
+            (contexts.shape[0], 16), dtype=torch.int64, device=contexts.device
+        )
+    torch.ops.sgl_kernel.qwen4_ngram_hash(
+        out, contexts, multipliers, vocab_sizes, offsets, eos_token_id
+    )
+    return out
+
+
 def fused_sigmoid_mul(
     input: torch.Tensor,
     gate: torch.Tensor,

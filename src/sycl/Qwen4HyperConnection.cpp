@@ -41,7 +41,7 @@ constexpr int64_t COMBINE_NORM_MANY_ROWS = 8192;
 constexpr int64_t NARROW_MAX_OUTPUTS = 48 * 1024;
 constexpr int NARROW_VEC = 2;
 
-// The build uses correctly rounded fp32 division, which is slow; kernels use native math and multiply by host-side
+// Rounded fp32 division is slow; kernels use native math and multiply by host-side
 // reciprocals instead. The results are rounded to bf16.
 inline float sigmoid(float v) {
   return sycl::native::recip(1.0f + sycl::native::exp(-v));
@@ -173,9 +173,7 @@ struct CombineKernel {
 template <typename Kernel>
 void launch_flat(sycl::queue& q, int64_t items, const Kernel& kernel) {
   const int64_t groups = div_up(items, static_cast<int64_t>(FLAT_WG));
-  q.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * FLAT_WG), sycl::range<1>(FLAT_WG)), kernel);
-  });
+  sycl_kernel_submit(groups * FLAT_WG, static_cast<int64_t>(FLAT_WG), q, kernel);
 }
 
 // Launches `rows` x `cols` work-items as a 2D range of 1 x FLAT_WG work-groups.
@@ -183,9 +181,7 @@ template <typename Kernel>
 void launch_rows(sycl::queue& q, int64_t rows, int64_t cols, const Kernel& kernel) {
   const int64_t groups = div_up(cols, static_cast<int64_t>(FLAT_WG));
   TORCH_CHECK(rows * groups * FLAT_WG <= MAX_ID, "qwen4_hc: too many rows for the padded 2D range: ", rows);
-  q.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(rows, groups * FLAT_WG), sycl::range<2>(1, FLAT_WG)), kernel);
-  });
+  sycl_kernel_submit(sycl::range<2>(rows, groups * FLAT_WG), sycl::range<2>(1, FLAT_WG), q, kernel);
 }
 
 // Calls f(std::integral_constant<int, V>) for a runtime V in {8, 4, 2, 1}.
@@ -282,7 +278,7 @@ struct CombineNormArgs {
 // All loads are issued up front with clamped indices and only the stores are predicated, so the memory round-trips
 // of all chunks overlap instead of being serialized by per-chunk branches.
 template <int VECS_PER_THREAD, int SPLIT, int ROWS_PER_GROUP>
-struct CombineNormVecKernel {
+struct CombineNormVecKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr int GROUP_SIZE = SG_SIZE * SPLIT * ROWS_PER_GROUP;
   const bf16x8* residual;
   const bf16x8* block;
@@ -298,6 +294,10 @@ struct CombineNormVecKernel {
   float inv_hc;
   float inv_hidden;
   sycl::local_accessor<float, 1> partials;
+
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    partials = sycl::local_accessor<float, 1>(SPLIT * ROWS_PER_GROUP, cgh);
+  }
 
   [[sycl::reqd_sub_group_size(SG_SIZE)]] void operator()(sycl::nd_item<1> item) const {
     const auto sg = item.get_sub_group();
@@ -384,7 +384,7 @@ struct CombineNormVecKernel {
 };
 
 // One work-group per (token, stream) row for shapes the vector kernel does not cover.
-struct CombineNormScalarKernel {
+struct CombineNormScalarKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   const bf16* residual;
   const bf16* block;
   const bf16* injection;
@@ -398,6 +398,10 @@ struct CombineNormScalarKernel {
   float inv_hc;
   float inv_hidden;
   sycl::local_accessor<float, 1> scratch;
+
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    scratch = sycl::local_accessor<float, 1>(1, cgh);
+  }
 
   void operator()(sycl::nd_item<1> item) const {
     const int64_t row = item.get_group(0);
@@ -432,26 +436,26 @@ bool launch_combine_norm_vec(sycl::queue& q, const CombineNormArgs& args) {
   using Kernel = CombineNormVecKernel<VECS_PER_THREAD, SPLIT, ROWS_PER_GROUP>;
   if (args.vecs_per_row > VECS_PER_THREAD * SG_SIZE * SPLIT) return false;
   const int64_t groups = div_up(static_cast<int64_t>(args.rows), static_cast<int64_t>(ROWS_PER_GROUP));
-  q.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> partials(SPLIT * ROWS_PER_GROUP, cgh);
-    cgh.parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(groups * Kernel::GROUP_SIZE), sycl::range<1>(Kernel::GROUP_SIZE)),
-        Kernel{
-            args.residual,
-            args.block,
-            args.injection,
-            args.weight,
-            args.combined,
-            args.normalized,
-            args.rows,
-            args.hc,
-            args.vecs_per_row,
-            args.shared_weight,
-            args.eps,
-            args.inv_hc,
-            args.inv_hidden,
-            partials});
-  });
+  sycl_kernel_submit(
+      groups * Kernel::GROUP_SIZE,
+      static_cast<int64_t>(Kernel::GROUP_SIZE),
+      q,
+      Kernel{
+          {},
+          args.residual,
+          args.block,
+          args.injection,
+          args.weight,
+          args.combined,
+          args.normalized,
+          args.rows,
+          args.hc,
+          args.vecs_per_row,
+          args.shared_weight,
+          args.eps,
+          args.inv_hc,
+          args.inv_hidden,
+          {}});
   return true;
 }
 
@@ -633,25 +637,25 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine_norm(
     }
     if (launched) return;
   }
-  q.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> scratch(1, cgh);
-    cgh.parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(rows * FLAT_WG), sycl::range<1>(FLAT_WG)),
-        CombineNormScalarKernel{
-            as<bf16>(residual),
-            as<bf16>(block_output),
-            injection_data,
-            as<bf16>(weight),
-            as_mut<bf16>(combined),
-            as_mut<bf16>(normalized),
-            hidden,
-            hc_count,
-            shared_weight,
-            eps_f,
-            inv_hc,
-            inv_hidden,
-            scratch});
-  });
+  sycl_kernel_submit(
+      rows * FLAT_WG,
+      static_cast<int64_t>(FLAT_WG),
+      q,
+      CombineNormScalarKernel{
+          {},
+          as<bf16>(residual),
+          as<bf16>(block_output),
+          injection_data,
+          as<bf16>(weight),
+          as_mut<bf16>(combined),
+          as_mut<bf16>(normalized),
+          hidden,
+          hc_count,
+          shared_weight,
+          eps_f,
+          inv_hc,
+          inv_hidden,
+          {}});
 }
 
 }  // namespace at::native::xpu

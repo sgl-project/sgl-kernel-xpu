@@ -30,6 +30,7 @@ void Xe20MoEGEMMLauncher(
     const int gemm_k,
     const int* num_rows_per_expert_device,
     const int num_experts,
+    const int total_rows,
     int* workspace,
     float gemm1_alpha,
     float gemm1_limit,
@@ -93,6 +94,12 @@ void Xe20MoEGEMMLauncher(
       static_cast<float>(gemm1_alpha),
       static_cast<float>(gemm1_limit),
   };
+  // Below 64 experts the kernel's serial expert walk is as fast as the parallel locate (measured on B70).
+  const int n_out = (FuseAct && ActType != ActivationType::RELU2) ? gemm_n / 2 : gemm_n;
+  params.one_tile_per_group =
+      num_experts >= 64 && moe_xe20::m_tiles_upper_bound<size<0>(Tile{})>(total_rows, num_experts) *
+                                   ceil_div(n_out, size<1>(Tile{})) <=
+                               static_cast<int64_t>(global[1]);
 
   q.submit([&](sycl::handler& h) {
     sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
@@ -117,6 +124,7 @@ void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, static_cast<ActivationType>(@ACT_TY
     const int,
     const int*,
     const int,
+    const int,
     int*,
     float,
     float,
@@ -137,6 +145,7 @@ extern "C" __attribute__((visibility("default"))) void sgl_moe_gg_entry(
     int gemm_k,
     const int* num_rows_per_expert,
     int num_experts,
+    int total_rows,
     int* workspace,
     float gemm1_alpha,
     float gemm1_limit,
@@ -152,6 +161,7 @@ extern "C" __attribute__((visibility("default"))) void sgl_moe_gg_entry(
       gemm_k,
       num_rows_per_expert,
       num_experts,
+      total_rows,
       workspace,
       gemm1_alpha,
       gemm1_limit,

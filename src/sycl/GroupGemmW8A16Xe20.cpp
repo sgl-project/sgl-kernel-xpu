@@ -32,6 +32,7 @@ __attribute__((visibility("default"))) void Xe20MoEGEMMW8A16Launcher(
     const int gemm_k,
     const int* num_rows_per_expert_device,
     const int num_experts,
+    const int total_rows,
     int* workspace,
     int ld_b,
     int scale_mode,
@@ -59,6 +60,7 @@ using SG_4_2_1 = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
       const int,                                                                     \
       const int,                                                                     \
       const int*,                                                                    \
+      const int,                                                                     \
       const int,                                                                     \
       int*,                                                                          \
       int,                                                                           \
@@ -89,6 +91,7 @@ DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_128_128_16, SG_4_2_1)
       gemm_k,                                                \
       total_rows_for_experts.data_ptr<int>(),                \
       n_experts,                                             \
+      total_m,                                               \
       atomic_buffer.data_ptr<int>(),                         \
       ld_b,                                                  \
       scale_mode,                                            \
@@ -252,6 +255,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
           gemm_k,
           total_rows_for_experts.data_ptr<int>(),
           static_cast<int>(n_experts),
+          total_m,
           atomic_buffer.data_ptr<int>(),
           ld_b,
           static_scheduler,

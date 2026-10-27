@@ -14,7 +14,7 @@
 
 using namespace cute;
 
-template <typename, typename, typename, typename, typename, typename, bool>
+template <typename, typename, typename, typename, typename, typename, bool, bool>
 class GemmXe20W8A16Name;
 
 template <typename Tile, typename SGLayout, bool WeightScaleBlocked>
@@ -29,6 +29,7 @@ void Xe20MoEGEMMW8A16Launcher(
     const int gemm_k,
     const int* num_rows_per_expert_device,
     const int num_experts,
+    const int total_rows,
     int* workspace,
     int ld_b_param,
     int scale_mode,
@@ -55,46 +56,61 @@ void Xe20MoEGEMMW8A16Launcher(
   namespace syclex = sycl::ext::oneapi::experimental;
   namespace intelex = sycl::ext::intel::experimental;
   syclex::properties kernel_props{syclex::sub_group_size<16>, intelex::grf_size<256>};
-  using Kernel = moe_w8a16::W8A16Kernel<
-      Tile,
-      SGLayout,
-      TensorA,
-      TensorBPacked,
-      TensorD,
-      MMA,
-      !WeightScaleBlocked,
-      WeightScaleBlocked>;
-  typename Kernel::Params params{
-      static_cast<const uint8_t*>(activations),
-      static_cast<const uint8_t*>(weights),
-      weight_scales,
-      static_cast<const float*>(bias),
-      static_cast<ElementD*>(outputs),
-      num_rows_per_expert_device,
-      gemm_n,
-      gemm_k,
-      num_experts,
-      workspace,
-      mma,
-      static_cast<int32_t>(ld_b_param),
-      scale_mode,
-      static_scheduler};
-  q.submit([&](sycl::handler& h) {
-    sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
-    h.parallel_for<GemmXe20W8A16Name<
-      Tile, SGLayout, TensorA, TensorBPacked, TensorD, ElementD, WeightScaleBlocked>>(
-        sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {
-          int32_t* slm_mem =
-              static_cast<int32_t*>(local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
-          Kernel{}(params, item, slm_mem);
-        });
-  });
+  // The single-tile path is its own kernel; as a runtime branch of the serial kernel it ran ~2 us slower
+  // at one token (measured on B70).
+  auto launch = [&]<bool OneTilePerGroup>() {
+    using Kernel = moe_w8a16::W8A16Kernel<
+        Tile,
+        SGLayout,
+        TensorA,
+        TensorBPacked,
+        TensorD,
+        MMA,
+        !WeightScaleBlocked,
+        WeightScaleBlocked,
+        OneTilePerGroup>;
+    typename Kernel::Params params{
+        static_cast<const uint8_t*>(activations),
+        static_cast<const uint8_t*>(weights),
+        weight_scales,
+        static_cast<const float*>(bias),
+        static_cast<ElementD*>(outputs),
+        num_rows_per_expert_device,
+        gemm_n,
+        gemm_k,
+        num_experts,
+        workspace,
+        mma,
+        static_cast<int32_t>(ld_b_param),
+        scale_mode,
+        static_scheduler};
+    q.submit([&](sycl::handler& h) {
+      sycl::local_accessor<int32_t, 1> local_mem(sycl::range<1>(1), h);
+      h.parallel_for<GemmXe20W8A16Name<
+          Tile, SGLayout, TensorA, TensorBPacked, TensorD, ElementD, WeightScaleBlocked, OneTilePerGroup>>(
+          sycl::nd_range<3>(global * local, local), kernel_props, [=](sycl::nd_item<3> item) {
+            int32_t* slm_mem =
+                static_cast<int32_t*>(local_mem.template get_multi_ptr<sycl::access::decorated::no>().get());
+            Kernel{}(params, item, slm_mem);
+          });
+    });
+  };
+  // Below 64 experts the kernel's serial expert walk is as fast as the parallel locate (measured on B70).
+  const bool one_tile_per_group =
+      num_experts >= 64 && moe_xe20::m_tiles_upper_bound<size<0>(Tile{})>(total_rows, num_experts) *
+                                   ceil_div(gemm_n, size<1>(Tile{})) <=
+                               static_cast<int64_t>(global[1]);
+  if (one_tile_per_group) {
+    launch.template operator()<true>();
+  } else {
+    launch.template operator()<false>();
+  }
 }
 
 template __attribute__((visibility("default"))) void Xe20MoEGEMMW8A16Launcher<
   @TILE@, @SGLAYOUT@, @WEIGHT_SCALE_BLOCKED@>(
     sycl::queue, const void*, const void*, const void*, const void*, void*, const int, const int,
-    const int*, const int, int*, int, int, bool);
+    const int*, const int, const int, int*, int, int, bool);
 
 #ifdef SGL_W8A16_JIT_ENTRY
 extern "C" __attribute__((visibility("default"))) void sgl_moe_w8a16_entry(
@@ -108,6 +124,7 @@ extern "C" __attribute__((visibility("default"))) void sgl_moe_w8a16_entry(
     int gemm_k,
     const int* rows_per_expert,
     int num_experts,
+    int total_rows,
     int* workspace,
     int ld_b,
     int scale_mode,
@@ -123,6 +140,7 @@ extern "C" __attribute__((visibility("default"))) void sgl_moe_w8a16_entry(
       gemm_k,
       rows_per_expert,
       num_experts,
+      total_rows,
       workspace,
       ld_b,
       scale_mode,

@@ -262,6 +262,67 @@ def test_moe_gemm(
     )
 
 
+def _decode_rows(num_experts, pattern):
+    rows = torch.zeros(num_experts, dtype=torch.int32)
+    if pattern == "round_edges":
+        # One row each for experts at the ends of the 128-expert rounds and of the range.
+        for e in (
+            0,
+            7,
+            8,
+            127,
+            128,
+            num_experts // 2 + 3,
+            num_experts - 2,
+            num_experts - 1,
+        ):
+            rows[min(e, num_experts - 1)] += 1
+    elif pattern == "one_expert":
+        rows[num_experts - 3] = 8
+    else:  # "multi_tile": 2 tokens; one expert spans two 8-row m-tiles
+        rows[1], rows[num_experts // 3], rows[num_experts - 1] = 9, 2, 5
+    return rows
+
+
+@pytest.mark.parametrize("num_experts", [64, 136, 256, 512])
+@pytest.mark.parametrize("pattern", ["round_edges", "one_expert", "multi_tile"])
+@pytest.mark.parametrize("kind", ["bf16_fused", "bf16", "fp8_block"])
+def test_moe_grouped_mm_decode_routing(num_experts, pattern, kind):
+    """Decode-sized calls locate each tile's expert in parallel; every expert's rows must still land
+    on that expert's weights, including empty experts, experts at 128-expert round boundaries, and an
+    expert with more than one m-tile."""
+    torch.manual_seed(0)
+    k = 128
+    n = {"bf16_fused": 384, "bf16": 2048, "fp8_block": 1024}[kind]
+    rows = _decode_rows(num_experts, pattern)
+    total = int(rows.sum())
+    a = torch.randn(total, k, dtype=torch.bfloat16, device=device)
+    w = torch.randn(num_experts, n, k, device=device) / k**0.5
+    out_n = n // 2 if kind == "bf16_fused" else n
+    out = torch.empty(total, out_n, dtype=torch.bfloat16, device=device)
+    if kind == "fp8_block":
+        scale = torch.rand(num_experts, n // 128, k // 128, device=device) * 0.02 + 0.01
+        w_fp8 = (w / scale.repeat_interleave(128, 1).repeat_interleave(128, 2)).to(
+            torch.float8_e4m3fn
+        )
+        w = w_fp8.float() * scale.repeat_interleave(128, 1).repeat_interleave(128, 2)
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+            out, a, w_fp8, scale, None, rows.to(device), num_experts
+        )
+    else:
+        w = w.to(torch.bfloat16)
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20(
+            out, a, w, None, rows.to(device), num_experts, 0, kind == "bf16_fused"
+        )
+
+    ref = []
+    starts = torch.cumsum(rows, 0) - rows
+    for e in torch.nonzero(rows).flatten().tolist():
+        y = a[starts[e] : starts[e] + rows[e]].float() @ w[e].float().t()
+        ref.append(apply_act_and_mul(y, F.silu) if kind == "bf16_fused" else y)
+    torch.testing.assert_close(out.float(), torch.cat(ref), rtol=2e-2, atol=2e-2)
+
+
 # ---------------------------------------------------------------------------
 # MXFP4 expert-weight helpers (W4A16)
 # ---------------------------------------------------------------------------

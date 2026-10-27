@@ -72,7 +72,8 @@ def _reference(q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len):
 @pytest.mark.parametrize("batch", [1, 6, 13])
 @pytest.mark.parametrize("heads", [2, 8, 32, 64])
 @pytest.mark.parametrize("max_seq_len", [1, 63, 64, 65, 129, 512])
-def test_fp4_paged_mqa_logits(batch, heads, max_seq_len):
+@pytest.mark.parametrize("packed_query_layout", [False, True])
+def test_fp4_paged_mqa_logits(batch, heads, max_seq_len, packed_query_layout):
     device = torch.device("xpu")
     torch.manual_seed(batch * 1000 + heads * 10 + max_seq_len)
     pages_per_batch = (max_seq_len + PAGE_SIZE - 1) // PAGE_SIZE
@@ -108,8 +109,22 @@ def test_fp4_paged_mqa_logits(batch, heads, max_seq_len):
     seq_lens[-1] = max_seq_len
     page_order = torch.randperm(num_pages, device=device, dtype=torch.int32)
     block_tables = page_order.view(batch, pages_per_batch)
+    if packed_query_layout:
+        q_for_kernel = q.unsqueeze(1)
+        q_scale_for_kernel = (
+            q_scale.contiguous().view(torch.int32).squeeze(-1).unsqueeze(1)
+        )
+    else:
+        q_for_kernel = q
+        q_scale_for_kernel = q_scale
     got = fp4_paged_mqa_logits(
-        (q, q_scale), cache, weights, seq_lens, block_tables, None, max_seq_len
+        (q_for_kernel, q_scale_for_kernel),
+        cache,
+        weights,
+        seq_lens,
+        block_tables,
+        None,
+        max_seq_len,
     )
     ref = _reference(q, q_scale, cache, weights, seq_lens, block_tables, max_seq_len)
     torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)

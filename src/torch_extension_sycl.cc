@@ -554,7 +554,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("fused_q_indexer_rope_hadamard_fp4_quant", torch::kXPU, &fused_q_indexer_rope_hadamard_fp4_quant);
   m.def(
       "index_q_rope_pack_weights(Tensor input, Tensor freqs_cis, Tensor positions, Tensor head_weights, "
-      "Tensor(a!) payload, Tensor(b!) scale, Tensor(c!) weights_out, float weight_scale) -> ()");
+      "float weight_scale) -> (Tensor, Tensor, Tensor)");
   m.impl("index_q_rope_pack_weights", torch::kXPU, &index_q_rope_pack_weights);
   m.def(
       "index_k_norm_rope_pack_store(Tensor input, Tensor norm_weight, float eps, Tensor freqs_cis, "

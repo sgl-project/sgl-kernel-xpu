@@ -13,6 +13,8 @@ namespace {
 
 constexpr uint32_t kSubGroupSize = 32;
 constexpr uint32_t kBlockSize = 64;
+constexpr uint32_t kWorkgroupSize = 256;
+constexpr uint32_t kRowsPerWorkgroup = kWorkgroupSize / kSubGroupSize;
 constexpr int64_t kHeadDim = 128;
 constexpr int64_t kRopeDim = 64;
 constexpr int64_t kGroupSize = 32;
@@ -41,103 +43,104 @@ inline float subgroup_reduce_max(sycl::sub_group subgroup, float value) {
   return value;
 }
 
-inline void reduce_max_64(float* reduction, sycl::nd_item<1> item, sycl::sub_group subgroup, uint32_t local_id) {
-  const uint32_t lane_id = local_id & (kSubGroupSize - 1u);
-  const uint32_t subgroup_id = local_id / kSubGroupSize;
-  const float subgroup_max = subgroup_reduce_max(subgroup, reduction[local_id]);
-  item.barrier(sycl::access::fence_space::local_space);
-  if (lane_id == 0) reduction[subgroup_id] = subgroup_max;
-  item.barrier(sycl::access::fence_space::local_space);
-  if (subgroup_id == 0) {
-    const float block_max =
-        subgroup_reduce_max(subgroup, lane_id < kBlockSize / kSubGroupSize ? reduction[lane_id] : 0.0f);
-    if (lane_id == 0) reduction[0] = block_max;
-  }
-  item.barrier(sycl::access::fence_space::local_space);
-}
-
 template <typename input_t, typename position_t>
 struct FusedQIndexerRopeHadamardFp4QuantKernel {
   [[sycl::reqd_sub_group_size(kSubGroupSize)]]
   void operator()(sycl::nd_item<1> item) const {
-    const uint32_t row_id = static_cast<uint32_t>(item.get_group(0));
     const uint32_t local_id = static_cast<uint32_t>(item.get_local_id(0));
+    const uint32_t subgroup_id = local_id / kSubGroupSize;
+    const uint32_t lane_id = local_id % kSubGroupSize;
+    const uint32_t row_id = static_cast<uint32_t>(item.get_group(0)) * kRowsPerWorkgroup + subgroup_id;
     if (row_id >= num_rows) return;
 
-    float* data = local_data.template get_multi_ptr<sycl::access::decorated::no>().get();
-    float* reduction = local_reduction.template get_multi_ptr<sycl::access::decorated::no>().get();
-    float* group_inverse = local_group_inverse.template get_multi_ptr<sycl::access::decorated::no>().get();
-    uint8_t* group_scale = local_group_scale.template get_multi_ptr<sycl::access::decorated::no>().get();
-    const int64_t dim0 = static_cast<int64_t>(local_id);
-    const int64_t dim1 = dim0 + kBlockSize;
+    const auto subgroup = item.get_sub_group();
     const uint32_t batch_id = row_id / num_heads;
-    auto subgroup = item.get_sub_group();
-
     const input_t* input_row = q_input + static_cast<int64_t>(row_id) * kHeadDim;
-    data[dim0] = static_cast<float>(input_row[dim0]);
-    data[dim1] = static_cast<float>(input_row[dim1]);
-    item.barrier(sycl::access::fence_space::local_space);
+    float x0 = static_cast<float>(input_row[lane_id]);
+    float x1 = static_cast<float>(input_row[lane_id + kSubGroupSize]);
+    float x2 = static_cast<float>(input_row[lane_id + 2 * kSubGroupSize]);
+    float x3 = static_cast<float>(input_row[lane_id + 3 * kSubGroupSize]);
 
-    if (local_id < kRopeDim / 2) {
-      const int64_t rope_offset = kHeadDim - kRopeDim + 2 * static_cast<int64_t>(local_id);
-      const float* frequency = rope_cache + static_cast<int64_t>(positions[batch_id]) * kRopeDim;
-      const float real = data[rope_offset];
-      const float imaginary = data[rope_offset + 1];
-      const float cosine = frequency[2 * local_id];
-      const float sine = frequency[2 * local_id + 1];
-      data[rope_offset] = real * cosine - imaginary * sine;
-      data[rope_offset + 1] = real * sine + imaginary * cosine;
-    }
-    item.barrier(sycl::access::fence_space::local_space);
+    const float* frequency = rope_cache + static_cast<int64_t>(positions[batch_id]) * kRopeDim;
+    const bool is_even_lane = (lane_id & 1u) == 0;
+    const uint32_t rope_pair = lane_id / 2;
+    const float x2_peer = sycl::permute_group_by_xor(subgroup, x2, 1);
+    const float x3_peer = sycl::permute_group_by_xor(subgroup, x3, 1);
+    const float x2_real = is_even_lane ? x2 : x2_peer;
+    const float x2_imag = is_even_lane ? x2_peer : x2;
+    const float x3_real = is_even_lane ? x3 : x3_peer;
+    const float x3_imag = is_even_lane ? x3_peer : x3;
+    const float x2_cos = frequency[2 * rope_pair];
+    const float x2_sin = frequency[2 * rope_pair + 1];
+    const float x3_cos = frequency[kRopeDim / 2 + 2 * rope_pair];
+    const float x3_sin = frequency[kRopeDim / 2 + 2 * rope_pair + 1];
+    const float x2_rot_real = static_cast<float>(static_cast<input_t>(x2_real * x2_cos - x2_imag * x2_sin));
+    const float x2_rot_imag = static_cast<float>(static_cast<input_t>(x2_real * x2_sin + x2_imag * x2_cos));
+    const float x3_rot_real = static_cast<float>(static_cast<input_t>(x3_real * x3_cos - x3_imag * x3_sin));
+    const float x3_rot_imag = static_cast<float>(static_cast<input_t>(x3_real * x3_sin + x3_imag * x3_cos));
+    x2 = is_even_lane ? x2_rot_real : x2_rot_imag;
+    x3 = is_even_lane ? x3_rot_real : x3_rot_imag;
 
-    float first = data[dim0] + data[dim1];
-    float second = data[dim0] - data[dim1];
-    const uint32_t lane_id = local_id & (kSubGroupSize - 1u);
+    float sum0 = x0 + x2;
+    float sum1 = x1 + x3;
+    float diff0 = x0 - x2;
+    float diff1 = x1 - x3;
     for (uint32_t mask = 1; mask <= 16; mask <<= 1) {
-      const float first_other = sycl::permute_group_by_xor(subgroup, first, mask);
-      const float second_other = sycl::permute_group_by_xor(subgroup, second, mask);
-      first = (lane_id & mask) ? (first_other - first) : (first + first_other);
-      second = (lane_id & mask) ? (second_other - second) : (second + second_other);
+      const float sum0_other = sycl::permute_group_by_xor(subgroup, sum0, mask);
+      const float sum1_other = sycl::permute_group_by_xor(subgroup, sum1, mask);
+      const float diff0_other = sycl::permute_group_by_xor(subgroup, diff0, mask);
+      const float diff1_other = sycl::permute_group_by_xor(subgroup, diff1, mask);
+      sum0 = (lane_id & mask) ? (sum0_other - sum0) : (sum0 + sum0_other);
+      sum1 = (lane_id & mask) ? (sum1_other - sum1) : (sum1 + sum1_other);
+      diff0 = (lane_id & mask) ? (diff0_other - diff0) : (diff0 + diff0_other);
+      diff1 = (lane_id & mask) ? (diff1_other - diff1) : (diff1 + diff1_other);
     }
-    data[dim0] = first;
-    data[dim1] = second;
-    item.barrier(sycl::access::fence_space::local_space);
-    for (uint32_t mask = kSubGroupSize; mask < kBlockSize; mask <<= 1) {
-      const uint32_t peer = local_id ^ mask;
-      const float first_other = data[peer];
-      const float second_other = data[peer + kBlockSize];
-      first = (local_id & mask) ? (first_other - first) : (first + first_other);
-      second = (local_id & mask) ? (second_other - second) : (second + second_other);
-      item.barrier(sycl::access::fence_space::local_space);
-      data[dim0] = first;
-      data[dim1] = second;
-      item.barrier(sycl::access::fence_space::local_space);
-    }
+    x0 = sum0 + sum1;
+    x1 = sum0 - sum1;
+    x2 = diff0 + diff1;
+    x3 = diff0 - diff1;
+
     constexpr float kHadamardScale = 0.08838834764831845f;
-    data[dim0] = first * kHadamardScale;
-    data[dim1] = second * kHadamardScale;
-    item.barrier(sycl::access::fence_space::local_space);
+    x0 *= kHadamardScale;
+    x1 *= kHadamardScale;
+    x2 *= kHadamardScale;
+    x3 *= kHadamardScale;
 
-    for (int64_t group = 0; group < kNumGroups; ++group) {
-      const int64_t element = group * kGroupSize + static_cast<int64_t>(local_id);
-      reduction[local_id] = local_id < kGroupSize ? sycl::fabs(data[element]) : 0.0f;
-      reduce_max_64(reduction, item, subgroup, local_id);
-      if (local_id == 0) {
-        const uint8_t scale = at::native::xpu::castToUE8M0(sycl::fmax(1.0e-4f, reduction[0]) / 6.0f);
-        group_scale[group] = scale;
-        group_inverse[group] = at::native::xpu::invScaleUE8M0(scale);
-      }
-      item.barrier(sycl::access::fence_space::local_space);
+    const uint8_t scale0 =
+        at::native::xpu::castToUE8M0(sycl::fmax(1.0e-4f, subgroup_reduce_max(subgroup, sycl::fabs(x0))) / 6.0f);
+    const uint8_t scale1 =
+        at::native::xpu::castToUE8M0(sycl::fmax(1.0e-4f, subgroup_reduce_max(subgroup, sycl::fabs(x1))) / 6.0f);
+    const uint8_t scale2 =
+        at::native::xpu::castToUE8M0(sycl::fmax(1.0e-4f, subgroup_reduce_max(subgroup, sycl::fabs(x2))) / 6.0f);
+    const uint8_t scale3 =
+        at::native::xpu::castToUE8M0(sycl::fmax(1.0e-4f, subgroup_reduce_max(subgroup, sycl::fabs(x3))) / 6.0f);
+    const float inv0 = at::native::xpu::invScaleUE8M0(scale0);
+    const float inv1 = at::native::xpu::invScaleUE8M0(scale1);
+    const float inv2 = at::native::xpu::invScaleUE8M0(scale2);
+    const float inv3 = at::native::xpu::invScaleUE8M0(scale3);
+    const uint8_t code0 = quant_fp4_e2m1(x0 * inv0);
+    const uint8_t code1 = quant_fp4_e2m1(x1 * inv1);
+    const uint8_t code2 = quant_fp4_e2m1(x2 * inv2);
+    const uint8_t code3 = quant_fp4_e2m1(x3 * inv3);
+    const uint8_t code0_peer = sycl::permute_group_by_xor(subgroup, code0, 1);
+    const uint8_t code1_peer = sycl::permute_group_by_xor(subgroup, code1, 1);
+    const uint8_t code2_peer = sycl::permute_group_by_xor(subgroup, code2, 1);
+    const uint8_t code3_peer = sycl::permute_group_by_xor(subgroup, code3, 1);
+
+    if (lane_id == 0) {
+      q_scale[static_cast<int64_t>(row_id) * kNumGroups] = scale0;
+      q_scale[static_cast<int64_t>(row_id) * kNumGroups + 1] = scale1;
+      q_scale[static_cast<int64_t>(row_id) * kNumGroups + 2] = scale2;
+      q_scale[static_cast<int64_t>(row_id) * kNumGroups + 3] = scale3;
+      weights_out[row_id] = static_cast<float>(weight[row_id]) * weight_scale;
     }
-
-    const int64_t packed_dim0 = 2 * static_cast<int64_t>(local_id);
-    const int64_t packed_dim1 = packed_dim0 + 1;
-    const uint8_t first_code = quant_fp4_e2m1(data[packed_dim0] * group_inverse[packed_dim0 / kGroupSize]);
-    const uint8_t second_code = quant_fp4_e2m1(data[packed_dim1] * group_inverse[packed_dim1 / kGroupSize]);
-    q_fp4[static_cast<int64_t>(row_id) * kBlockSize + local_id] =
-        static_cast<uint8_t>((first_code & 0x0F) | ((second_code & 0x0F) << 4));
-    if (local_id < kNumGroups) q_scale[static_cast<int64_t>(row_id) * kNumGroups + local_id] = group_scale[local_id];
-    if (local_id == 0) weights_out[row_id] = static_cast<float>(weight[row_id]) * weight_scale;
+    if (is_even_lane) {
+      const int64_t row_offset = static_cast<int64_t>(row_id) * kBlockSize + lane_id / 2;
+      q_fp4[row_offset] = static_cast<uint8_t>((code0 & 0x0F) | ((code0_peer & 0x0F) << 4));
+      q_fp4[row_offset + 16] = static_cast<uint8_t>((code1 & 0x0F) | ((code1_peer & 0x0F) << 4));
+      q_fp4[row_offset + 32] = static_cast<uint8_t>((code2 & 0x0F) | ((code2_peer & 0x0F) << 4));
+      q_fp4[row_offset + 48] = static_cast<uint8_t>((code3 & 0x0F) | ((code3_peer & 0x0F) << 4));
+    }
   }
 
   const input_t* q_input;
@@ -150,10 +153,6 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
   uint32_t num_rows;
   uint32_t num_heads;
   float weight_scale;
-  sycl::local_accessor<float, 1> local_data;
-  sycl::local_accessor<float, 1> local_reduction;
-  sycl::local_accessor<float, 1> local_group_inverse;
-  sycl::local_accessor<uint8_t, 1> local_group_scale;
 };
 
 }  // namespace
@@ -218,10 +217,6 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_fp4_quant(
         AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
           using position_t = index_t;
           queue.submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> local_data(sycl::range<1>(kHeadDim), cgh);
-            sycl::local_accessor<float, 1> local_reduction(sycl::range<1>(kBlockSize), cgh);
-            sycl::local_accessor<float, 1> local_group_inverse(sycl::range<1>(kNumGroups), cgh);
-            sycl::local_accessor<uint8_t, 1> local_group_scale(sycl::range<1>(kNumGroups), cgh);
             FusedQIndexerRopeHadamardFp4QuantKernel<input_t, position_t> kernel{
                 q_input.data_ptr<input_t>(),
                 q_fp4.data_ptr<uint8_t>(),
@@ -232,13 +227,12 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_fp4_quant(
                 positions.data_ptr<position_t>(),
                 num_rows,
                 static_cast<uint32_t>(q_input.size(1)),
-                static_cast<float>(weight_scale),
-                local_data,
-                local_reduction,
-                local_group_inverse,
-                local_group_scale};
+                static_cast<float>(weight_scale)};
             cgh.parallel_for(
-                sycl::nd_range<1>(sycl::range<1>(num_rows * kBlockSize), sycl::range<1>(kBlockSize)), kernel);
+                sycl::nd_range<1>(
+                    sycl::range<1>(((num_rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup) * kWorkgroupSize),
+                    sycl::range<1>(kWorkgroupSize)),
+                kernel);
           });
         });
       });

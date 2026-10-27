@@ -61,14 +61,14 @@ def test_fp4_e2m1_midpoint_reference():
     )
 
 
-@pytest.mark.parametrize("midpoint,expected_code", [(1.75, 4), (3.5, 6)])
+@pytest.mark.parametrize("midpoint,expected_code", [(1.75, 3), (3.5, 6)])
 def test_fp4_fused_q_midpoint_rounding(midpoint, expected_code):
     device = torch.device("xpu")
     q = torch.zeros(1, 1, HEAD_DIM, device=device, dtype=torch.bfloat16)
     q[..., 64] = 1
     q[..., 66] = 1
     rope_cache = torch.zeros(1, 64, device=device)
-    # Two impulses produce +/-4 and +/-midpoint after normalized Hadamard.
+    # Two impulses exercise FP4 thresholds after RoPE rounds back to BF16.
     scale = torch.tensor(HEAD_DIM**-0.5, device=device)
     rope_cache[0, 0] = (4 + midpoint) / (2 * scale)
     rope_cache[0, 2] = (4 - midpoint) / (2 * scale)
@@ -151,13 +151,18 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int, input_scale: f
     frequency = rope_cache[positions].view(batch_size, 1, 32, 2)
     rope = reference[..., -64:].view(batch_size, num_heads, 32, 2)
     real, imaginary = rope[..., 0], rope[..., 1]
-    rotated = torch.stack(
-        [
-            real * frequency[..., 0] - imaginary * frequency[..., 1],
-            real * frequency[..., 1] + imaginary * frequency[..., 0],
-        ],
-        dim=-1,
-    ).flatten(-2)
+    rotated = (
+        torch.stack(
+            [
+                real * frequency[..., 0] - imaginary * frequency[..., 1],
+                real * frequency[..., 1] + imaginary * frequency[..., 0],
+            ],
+            dim=-1,
+        )
+        .flatten(-2)
+        .to(q_input.dtype)
+        .float()
+    )
     reference[..., -64:] = rotated
     reference = _fwht128(reference) * (HEAD_DIM**-0.5)
     ref_fp4, ref_scale = _ref_quantize_fp4_indexer(reference)

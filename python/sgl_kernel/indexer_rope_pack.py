@@ -14,31 +14,13 @@ def index_q_rope_pack_weights(
     exponents ``[tokens * heads]``, and scaled BF16-rounded weights
     ``[tokens, heads]`` widened to float32.
     """
-    if input.ndim != 3 or input.shape[-1] != 128:
-        raise ValueError(
-            f"input must have shape [tokens, heads, 128], got {input.shape}"
-        )
-    num_tokens, num_heads, _ = input.shape
-    payload = torch.empty(
-        (num_tokens * num_heads, 64), dtype=torch.int8, device=input.device
-    )
-    scale = torch.empty(
-        (num_tokens * num_heads,), dtype=torch.int32, device=input.device
-    )
-    weights_out = torch.empty(
-        (num_tokens, num_heads), dtype=torch.float32, device=input.device
-    )
-    torch.ops.sgl_kernel.index_q_rope_pack_weights.default(
+    return torch.ops.sgl_kernel.index_q_rope_pack_weights.default(
         input,
         freqs_cis,
         positions,
         head_weights,
-        payload,
-        scale,
-        weights_out,
         weight_scale,
     )
-    return payload, scale, weights_out
 
 
 def index_k_norm_rope_pack_store(
@@ -57,8 +39,6 @@ def index_k_norm_rope_pack_store(
     Slot zero is reserved and is not written. ``cache`` uses page-separated
     payload and scale regions with 68 bytes per slot.
     """
-    if input.ndim != 2 or input.shape[-1] != 128:
-        raise ValueError(f"input must have shape [tokens, 128], got {input.shape}")
     torch.ops.sgl_kernel.index_k_norm_rope_pack_store.default(
         input, norm_weight, eps, freqs_cis, positions, loc, cache, ratio
     )

@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <sycl/sycl.hpp>
+#include <vector>
 
 #include "QuantUtils.h"
 #include "Utils.h"
@@ -126,8 +127,8 @@ struct Fp4PagedMqaLogitsKernel {
 }  // namespace
 
 SGL_KERNEL_EXPORT torch::Tensor fp4_paged_mqa_logits(
-    const torch::Tensor& q_fp4,
-    const torch::Tensor& q_scale,
+    const torch::Tensor& q_fp4_input,
+    const torch::Tensor& q_scale_input,
     const torch::Tensor& kv_cache,
     const torch::Tensor& weights,
     const torch::Tensor& seq_lens,
@@ -137,12 +138,30 @@ SGL_KERNEL_EXPORT torch::Tensor fp4_paged_mqa_logits(
     bool clean_logits) {
   (void)schedule_metadata;
   (void)clean_logits;
-  CHECK_INPUT(q_fp4);
-  CHECK_INPUT(q_scale);
+  CHECK_INPUT(q_fp4_input);
+  CHECK_INPUT(q_scale_input);
   CHECK_INPUT(kv_cache);
   CHECK_INPUT(weights);
   CHECK_INPUT(seq_lens);
   CHECK_INPUT(block_tables);
+
+  auto q_fp4 = q_fp4_input;
+  auto q_scale = q_scale_input;
+  if (q_scale.scalar_type() != at::kByte) {
+    TORCH_CHECK(q_scale.dim() > 0, "q_scale must have at least one dimension");
+    const int64_t heads = q_scale.size(-1);
+    TORCH_CHECK(heads > 0, "q_scale head dimension must be positive");
+    auto q_scale_bytes = q_scale.view(at::kByte);
+    TORCH_CHECK(
+        q_scale_bytes.size(-1) % heads == 0, "q_scale byte representation must be divisible by its head dimension");
+    std::vector<int64_t> q_scale_shape(q_scale.sizes().begin(), q_scale.sizes().end() - 1);
+    q_scale_shape.push_back(heads);
+    q_scale_shape.push_back(q_scale_bytes.size(-1) / heads);
+    q_scale = q_scale_bytes.reshape(q_scale_shape);
+  }
+  if (q_fp4.dim() == 4) q_fp4 = q_fp4.squeeze(1);
+  if (q_scale.dim() == 4) q_scale = q_scale.squeeze(1);
+
   TORCH_CHECK(q_fp4.is_xpu() && q_scale.is_xpu() && kv_cache.is_xpu(), "FP4 tensors must be on XPU");
   TORCH_CHECK(q_fp4.dim() == 3 && q_scale.dim() == 3, "q_fp4/q_scale must be [B,H,D]");
   TORCH_CHECK(q_fp4.size(2) == kPackedDim && q_scale.size(2) == kNumGroups, "invalid FP4 Q shape");

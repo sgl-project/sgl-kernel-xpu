@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <sycl/sycl.hpp>
+#include <tuple>
 #include <type_traits>
 
 #include "Utils.h"
@@ -448,22 +449,16 @@ void launch_index_k(
 
 }  // namespace
 
-SGL_KERNEL_EXPORT void index_q_rope_pack_weights(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> index_q_rope_pack_weights(
     const at::Tensor& input,
     const at::Tensor& freqs_cis,
     const at::Tensor& positions,
     const at::Tensor& head_weights,
-    at::Tensor& payload,
-    at::Tensor& scale,
-    at::Tensor& weights_out,
     double weight_scale) {
   CHECK_INPUT(input);
   CHECK_INPUT(freqs_cis);
   CHECK_INPUT(positions);
   CHECK_INPUT(head_weights);
-  CHECK_INPUT(payload);
-  CHECK_INPUT(scale);
-  CHECK_INPUT(weights_out);
   TORCH_CHECK(input.dim() == 3 && input.size(2) == kHeadDim, "input must be [tokens, heads, 128]");
   TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be bfloat16");
   TORCH_CHECK(freqs_cis.dim() == 2 && freqs_cis.size(1) == kRopeDim, "freqs_cis must be [max_pos, 64]");
@@ -475,17 +470,11 @@ SGL_KERNEL_EXPORT void index_q_rope_pack_weights(
       head_weights.dim() == 2 && head_weights.size(0) == input.size(0) && head_weights.size(1) == input.size(1),
       "head_weights must be [tokens, heads]");
   TORCH_CHECK(head_weights.scalar_type() == at::kBFloat16, "head_weights must be bfloat16");
-  TORCH_CHECK(
-      payload.dim() == 2 && payload.size(0) == input.size(0) * input.size(1) && payload.size(1) == kPackedDim &&
-          payload.scalar_type() == at::kChar,
-      "payload must be int8 [tokens * heads, 64]");
-  TORCH_CHECK(
-      scale.dim() == 1 && scale.size(0) == input.size(0) * input.size(1) && scale.scalar_type() == at::kInt,
-      "scale must be int32 [tokens * heads]");
-  TORCH_CHECK(
-      weights_out.dim() == 2 && weights_out.size(0) == head_weights.size(0) &&
-          weights_out.size(1) == head_weights.size(1) && weights_out.scalar_type() == at::kFloat,
-      "weights_out must be float32 [tokens, heads]");
+
+  const int64_t num_rows = input.size(0) * input.size(1);
+  auto payload = at::empty({num_rows, kPackedDim}, input.options().dtype(at::kChar).requires_grad(false));
+  auto scale = at::empty({num_rows}, input.options().dtype(at::kInt).requires_grad(false));
+  auto weights_out = at::empty({input.size(0), input.size(1)}, input.options().dtype(at::kFloat).requires_grad(false));
 
   const float scale_value = static_cast<float>(weight_scale);
   if (positions.scalar_type() == at::kInt) {
@@ -493,6 +482,7 @@ SGL_KERNEL_EXPORT void index_q_rope_pack_weights(
   } else {
     launch_index_q<int64_t>(input, freqs_cis, positions, head_weights, payload, scale, weights_out, scale_value);
   }
+  return {payload, scale, weights_out};
 }
 
 SGL_KERNEL_EXPORT void index_k_norm_rope_pack_store(

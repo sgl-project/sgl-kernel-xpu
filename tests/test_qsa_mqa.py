@@ -27,7 +27,7 @@ def test_prefill_matches_reference(rows, columns, scale):
         device="xpu",
         dtype=torch.int32,
     )
-    actual = torch.ops.sgl_kernel.qsa_mqa_prefill(q, k, starts, ends, scale)
+    actual = sgl_kernel.qsa_mqa_prefill(q, k, starts, ends, scale)
     assert actual.shape == (rows, columns)
     if not rows or not columns:
         return
@@ -56,9 +56,7 @@ def test_decode_matches_reference(rows, page_size, width, extra):
         dtype=torch.int32,
     )
     columns = page_size * width + extra
-    actual = torch.ops.sgl_kernel.qsa_mqa_decode(
-        q, cache, pages, lengths, columns, None
-    )
+    actual = sgl_kernel.qsa_mqa_decode(q, cache, pages, lengths, columns, None)
     expected = torch.full((rows, columns), -float("inf"), device="xpu")
     for row in range(rows):
         for col in range(min(int(lengths[row]), columns)):
@@ -77,17 +75,17 @@ def test_rejects_invalid_inputs():
     k = torch.zeros(2, 1, 128, device="xpu", dtype=torch.bfloat16)
     starts = torch.zeros(1, device="xpu", dtype=torch.int32)
     with pytest.raises(RuntimeError, match="BF16 or float8_e4m3fn q"):
-        torch.ops.sgl_kernel.qsa_mqa_prefill(q.float(), k, starts, starts, None)
+        sgl_kernel.qsa_mqa_prefill(q.float(), k, starts, starts, None)
     with pytest.raises(RuntimeError, match="int32 row ranges"):
-        torch.ops.sgl_kernel.qsa_mqa_prefill(q, k, starts.long(), starts, None)
+        sgl_kernel.qsa_mqa_prefill(q, k, starts.long(), starts, None)
     with pytest.raises(RuntimeError, match="must be on XPU"):
-        torch.ops.sgl_kernel.qsa_mqa_prefill(q, k, starts, starts.cpu(), None)
+        sgl_kernel.qsa_mqa_prefill(q, k, starts, starts.cpu(), None)
     with pytest.raises(RuntimeError, match="score scale must be finite"):
-        torch.ops.sgl_kernel.qsa_mqa_prefill(q, k, starts, starts, float("nan"))
+        sgl_kernel.qsa_mqa_prefill(q, k, starts, starts, float("nan"))
     cache = k.reshape(1, 2, 1, 128)
     pages = starts.reshape(1, 1)
     with pytest.raises(RuntimeError, match="output width"):
-        torch.ops.sgl_kernel.qsa_mqa_decode(q, cache, pages, starts, -1, None)
+        sgl_kernel.qsa_mqa_decode(q, cache, pages, starts, -1, None)
 
 
 def test_prefill_dpas_maps_rows_heads_and_dimensions():
@@ -102,7 +100,7 @@ def test_prefill_dpas_maps_rows_heads_and_dimensions():
             k.zero_()
             q[:, head, dim] = 1
             k[:, 0, dim] = columns
-            actual = torch.ops.sgl_kernel.qsa_mqa_prefill(q, k, starts, ends, 1.0)
+            actual = sgl_kernel.qsa_mqa_prefill(q, k, starts, ends, 1.0)
             torch.testing.assert_close(actual, columns.float()[None, :].expand(5, -1))
 
 
@@ -118,7 +116,7 @@ def test_fp8_prefill_scores_and_ranges(scale):
     )
     starts = torch.tensor([0, 7, 131, 4, 140], device="xpu", dtype=torch.int32)
     ends = torch.tensor([135, 100, 135, 4, 150], device="xpu", dtype=torch.int32)
-    actual = torch.ops.sgl_kernel.qsa_mqa_prefill(q, k, starts, ends, scale)
+    actual = sgl_kernel.qsa_mqa_prefill(q, k, starts, ends, scale)
     scores = torch.einsum("rhd,cd->rch", q.float(), k[:, 0].float())
     expected = scores.relu().sum(-1) / (scale or math.sqrt(128))
     col = torch.arange(columns, device="xpu")
@@ -143,9 +141,7 @@ def test_fp8_decode_scores_and_masks(scale):
         [[0, 1, 2], [5, -1, 4], [2, 7, 1]], device="xpu", dtype=torch.int32
     )
     lengths = torch.tensor([0, 47, 47], device="xpu", dtype=torch.int32)
-    actual = torch.ops.sgl_kernel.qsa_mqa_decode(
-        q, cache, pages, lengths, columns, scale
-    )
+    actual = sgl_kernel.qsa_mqa_decode(q, cache, pages, lengths, columns, scale)
     expected = torch.full((rows, columns), -float("inf"), device="xpu")
     for row in range(rows):
         for col in range(min(int(lengths[row]), columns)):
@@ -170,8 +166,8 @@ def test_rejects_mixed_qk_dtypes():
     ):
         query, key = q.to(q_dtype), k.to(k_dtype)
         with pytest.raises(RuntimeError, match="Q/K dtype mismatch"):
-            torch.ops.sgl_kernel.qsa_mqa_prefill(query, key, starts, starts, None)
+            sgl_kernel.qsa_mqa_prefill(query, key, starts, starts, None)
         with pytest.raises(RuntimeError, match="Q/K dtype mismatch"):
-            torch.ops.sgl_kernel.qsa_mqa_decode(
+            sgl_kernel.qsa_mqa_decode(
                 query, key.reshape(1, 1, 1, 128), pages, starts, 1, None
             )

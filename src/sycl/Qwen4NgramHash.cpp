@@ -16,6 +16,8 @@ constexpr int64_t NGRAM_SIZE = 3;
 constexpr int64_t HEADS_PER_NGRAM = 8;
 constexpr int64_t NGRAM_HEADS = 2 * HEADS_PER_NGRAM;
 constexpr int WG_SIZE = 256;
+constexpr int SMALL_WG_SIZE = 32;
+constexpr int64_t SMALL_TOKEN_LIMIT = 1024;
 constexpr int TOKENS_PER_BLOCK = WG_SIZE / NGRAM_HEADS;
 constexpr int MAX_BLOCKS_PER_WG = WG_SIZE / TOKENS_PER_BLOCK;  // one token window hashed per thread
 constexpr int64_t TARGET_WGS = 80;  // enough resident work-groups to fill a B60 before batching blocks
@@ -48,6 +50,35 @@ struct FixedDivisor {
       r = r >= wrap_mod ? r - wrap_mod : r + d - wrap_mod;
     }
     return static_cast<int64_t>(r);
+  }
+};
+
+// One 16-lane subgroup per token avoids SLM staging and a work-group barrier for small batches.
+struct SmallNgramHashKernel {
+  const int64_t *contexts, *multipliers, *vocab_sizes, *offsets;
+  int64_t* output;
+  int64_t tokens, eos_token_id;
+
+  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
+    const int64_t idx = item.get_global_linear_id();
+    const int64_t token = idx / NGRAM_HEADS;
+    if (token >= tokens) {
+      return;  // Uniform within each subgroup, including the partial work-group tail.
+    }
+    const int head = idx % NGRAM_HEADS;
+    auto sg = item.get_sub_group();
+    int64_t bigram = 0, trigram = 0;
+    if (sg.get_local_linear_id() == 0) {
+      const int64_t* ctx = contexts + token * NGRAM_SIZE;
+      const int64_t previous_2 = (ctx[0] == eos_token_id || ctx[1] == eos_token_id) ? eos_token_id : ctx[0];
+      bigram = wrap_mul(ctx[2], multipliers[0]) ^ wrap_mul(ctx[1], multipliers[1]);
+      trigram = bigram ^ wrap_mul(previous_2, multipliers[2]);
+    }
+    bigram = sycl::group_broadcast(sg, bigram, 0);
+    trigram = sycl::group_broadcast(sg, trigram, 0);
+    const int64_t mix = head < HEADS_PER_NGRAM ? bigram : trigram;
+    const FixedDivisor divisor = FixedDivisor::make(static_cast<uint64_t>(vocab_sizes[head]));
+    output[idx] = divisor.floor_mod(mix) + offsets[head];
   }
 };
 
@@ -151,6 +182,19 @@ SGL_KERNEL_EXPORT void qwen4_ngram_hash(
 
   c10::DeviceGuard guard(contexts.device());
   auto q = c10::xpu::getCurrentXPUStream().queue();
+  if (tokens <= SMALL_TOKEN_LIMIT) {
+    SmallNgramHashKernel kernel{
+        contexts.data_ptr<int64_t>(),
+        multipliers.data_ptr<int64_t>(),
+        vocab_sizes.data_ptr<int64_t>(),
+        offsets.data_ptr<int64_t>(),
+        output.data_ptr<int64_t>(),
+        tokens,
+        eos_token_id};
+    const int64_t small_range = (tokens * NGRAM_HEADS + SMALL_WG_SIZE - 1) / SMALL_WG_SIZE * SMALL_WG_SIZE;
+    sycl_kernel_submit(small_range, static_cast<int64_t>(SMALL_WG_SIZE), q, kernel);
+    return;
+  }
   NgramHashKernel kernel{
       {},
       contexts.data_ptr<int64_t>(),

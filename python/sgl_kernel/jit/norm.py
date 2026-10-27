@@ -167,9 +167,6 @@ class _XPUQKNormWrapper:
 
         self._module = module
         self._head_dim = head_dim
-        # Mirrors qknorm_get_vec_size() in qknorm.hpp; the kernel reinterpret-casts
-        # head pointers to aligned_vector<T, N>, declared alignas(N * sizeof(T)).
-        self._vec_size = 8 if head_dim % 8 == 0 else 4 if head_dim % 4 == 0 else 2
         self._func_name = f"qknorm_forward_{dtype_str}_{head_dim}"
         self._argtypes = [
             ctypes.c_void_p,  # queue
@@ -188,17 +185,12 @@ class _XPUQKNormWrapper:
     def _check_qk_layout(self, name: str, t: torch.Tensor) -> None:
         # The kernel addresses a head as `base + token * stride(0) + head * head_dim`,
         # so only the per-token row stride is free. That admits a q/k slice of a
-        # packed QKV projection, which is not contiguous as a whole.
+        # packed QKV projection, which is not contiguous as a whole. Pointer/stride
+        # alignment is handled by the kernel, which narrows its vector width as needed.
         if t.stride(-1) != 1 or t.stride(1) != self._head_dim:
             raise ValueError(
                 f"XPU QKNorm requires {name} heads packed within a token, "
                 f"got stride={t.stride()}"
-            )
-        alignment = self._vec_size * t.element_size()
-        if t.data_ptr() % alignment or (t.stride(0) * t.element_size()) % alignment:
-            raise ValueError(
-                f"XPU QKNorm requires {name} rows {alignment}-byte aligned, "
-                f"got data_ptr={t.data_ptr()}, stride={t.stride()}"
             )
 
     def qknorm(self, q, k, q_weight, k_weight, eps):
@@ -249,7 +241,7 @@ def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
         return False
 
 
-def fused_inplace_qknorm(
+def fused_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
@@ -296,7 +288,7 @@ def rmsnorm(
 
 
 __all__ = [
-    "fused_inplace_qknorm",
+    "fused_qk_norm",
     "rmsnorm",
     "can_use_fused_inplace_qknorm",
 ]

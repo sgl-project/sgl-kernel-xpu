@@ -17,7 +17,7 @@ except ImportError:
 
 try:
     from sgl_kernel.jit import apply_rope_inplace as jit_rope
-    from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
+    from sgl_kernel.jit import fused_qk_norm as jit_qknorm
     from sgl_kernel.jit import gelu_and_mul as jit_gelu_and_mul
     from sgl_kernel.jit import gelu_tanh_and_mul as jit_gelu_tanh_and_mul
     from sgl_kernel.jit import moe_align_block_size as jit_moe_align_block_size

@@ -104,7 +104,7 @@ def benchmark(batch_size, num_heads, head_dim, provider):
     elif provider == "jit":
         # Import here to allow optional dependency
         try:
-            from sgl_kernel.jit import fused_inplace_qknorm as jit_qknorm
+            from sgl_kernel.jit import fused_qk_norm as jit_qknorm
 
             def fn():
                 q_clone = q.clone()
@@ -150,7 +150,7 @@ if __name__ == "__main__":
 
     print("Running QKNorm benchmarks...")
     print("Reference: PyTorch eager implementation")
-    print("JIT: sgl_kernel.jit.fused_inplace_qknorm (runtime JIT compilation)")
+    print("JIT: sgl_kernel.jit.fused_qk_norm (runtime JIT compilation)")
     print(
         "Note: No standalone AOT QKNorm available; comparing against PyTorch reference"
     )

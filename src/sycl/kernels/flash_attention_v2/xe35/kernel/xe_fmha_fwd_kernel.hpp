@@ -232,8 +232,9 @@ class XeFMHAFwdKernel {
   CUTLASS_DEVICE
   Shape<int, int, int> get_sequence_length_shape(ProblemShape const& problem_shape, int const& batch) {
     if constexpr (is_var_len) {
-      int seq_len_q =
-          problem_shape.seq_len_qo.cumulative_length[batch + 1] - problem_shape.seq_len_qo.cumulative_length[batch];
+      int seq_len_q = problem_shape.seq_len_qo.seqused ? problem_shape.seq_len_qo.seqused[batch]
+                                                       : problem_shape.seq_len_qo.cumulative_length[batch + 1] -
+                                                             problem_shape.seq_len_qo.cumulative_length[batch];
       int seq_len_k_new = 0;
       // Match Xe20 paged-KV handling: cu_seqlens_k carries per-batch cache lengths
       // directly in paged mode, while non-paged mode uses a cumulative prefix sum.
@@ -250,8 +251,9 @@ class XeFMHAFwdKernel {
         // The cache slot stays empty so the local-window / offset math remains in
         // the same coordinates as the upstream FMHA configuration.
         // cu_seqlens_k is cumulative (size batch+1), so per-batch length is the diff.
-        seq_len_k_new =
-            problem_shape.seq_len_kv.cumulative_length[batch + 1] - problem_shape.seq_len_kv.cumulative_length[batch];
+        seq_len_k_new = problem_shape.seq_len_kv.seqused ? problem_shape.seq_len_kv.seqused[batch]
+                                                         : problem_shape.seq_len_kv.cumulative_length[batch + 1] -
+                                                               problem_shape.seq_len_kv.cumulative_length[batch];
         seq_len_k_cache = 0;
       }
       return cute::make_tuple<int, int, int>(seq_len_q, seq_len_k_new, seq_len_k_cache);

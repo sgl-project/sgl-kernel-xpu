@@ -323,7 +323,7 @@ class FMHAFwdEpilogue {
         if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
           rA_sum(i) = safe_recip(rA_sum(i));
         } else {
-          rA_sum(i) = ElementA(1) / rA_sum(i);
+          rA_sum(i) = rA_sum(i) == ElementA(0) ? ElementA(0) : ElementA(1) / rA_sum(i);
         }
         if constexpr (CollectiveMainloop::Fp8KV) {
           rA_sum(i) *= ElementA(scale_v);

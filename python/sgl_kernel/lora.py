@@ -7,12 +7,13 @@ def embedding_lora_a_fwd(
     input_ids: torch.Tensor,
     weights: torch.Tensor,
     vocab_size: int,
-    max_len: int,
     seg_indptr: torch.Tensor,
     weight_indices: torch.Tensor,
     lora_ranks: torch.Tensor,
     extra_embeddings: Optional[torch.Tensor] = None,
     seg_lens: Optional[torch.Tensor] = None,
+    *,
+    max_len: Optional[int] = None,
 ) -> torch.Tensor:
     r"""LoRA embedding forward pass.
 
@@ -36,10 +37,6 @@ def embedding_lora_a_fwd(
         Weight tensor for embeddings, shape ``(num_loras, max_rank, vocab_size)``.
     vocab_size : int
         Vocabulary size.
-    max_len : int
-        Length of the longest segment (``max(seg_indptr[s + 1] - seg_indptr[s])``).
-        It sizes the kernel launch, so passing it avoids a device-to-host read of
-        ``seg_indptr``. Rows past ``max_len`` in a longer segment are not computed.
     seg_indptr : torch.Tensor
         Segment index pointer tensor, shape ``(num_segments + 1,)``.
     weight_indices : torch.Tensor
@@ -50,6 +47,11 @@ def embedding_lora_a_fwd(
         Optional extra embeddings tensor, shape ``(num_loras, num_extra_tokens, max_rank)``.
     seg_lens : Optional[torch.Tensor], optional
         Optional segment lengths tensor, shape ``(num_segments,)``.
+    max_len : Optional[int], optional, keyword-only
+        Upper bound on the segment length (``max(seg_indptr[s + 1] - seg_indptr[s])``).
+        It sizes the kernel launch. Defaults to ``input_ids.size(0)``, which needs no
+        device-to-host read; pass the longest segment length when known to launch
+        less work. Rows past ``max_len`` in a longer segment are not computed.
 
     Returns
     -------
@@ -73,12 +75,12 @@ def embedding_lora_a_fwd(
         input_ids,
         weights,
         vocab_size,
-        max_len,
         seg_indptr,
         weight_indices,
         lora_ranks,
         extra_embeddings,
         seg_lens,
+        max_len,
     )
 
     return output

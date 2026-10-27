@@ -223,13 +223,13 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
     const torch::Tensor& input_ids,  // [num_tokens,]
     const torch::Tensor& weights,    // [num_loras, max_rank, vocab_size]
     const int64_t vocab_size,
-    const int64_t max_len,                                 // longest segment (>= every seg_indptr[s+1] - seg_indptr[s])
     const torch::Tensor& seg_indptr,                       // [num_segments + 1,]
     const torch::Tensor& weight_indices,                   // [num_segments,]
     const torch::Tensor& lora_ranks,                       // [num_loras,]
     const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
     [[maybe_unused]] const std::optional<torch::Tensor>&
-        seg_lens  // [num_segments,] optional; currently unused, reserved for future per-segment optimizations
+        seg_lens,  // [num_segments,] optional; currently unused, reserved for future per-segment optimizations
+    std::optional<int64_t> max_len_opt  // upper bound on segment length; default num_tokens
 ) {
   CHECK_INPUT(input_ids);
   CHECK_INPUT(weights);
@@ -271,9 +271,11 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
   }
 
   lora_debug_checks::check_seg_indptr(seg_indptr, num_tokens_i64);
-  // max_len sizes the launch grid (token blocks per segment). It comes from the
-  // caller, which already knows it, so no device -> host read of seg_indptr is
-  // needed; rows of a segment longer than max_len would be silently skipped.
+  // max_len sizes the launch grid (token blocks per segment). num_tokens is an
+  // upper bound known on the host, so the default needs no device -> host read of
+  // seg_indptr; callers that know the longest segment pass it to launch fewer
+  // (otherwise empty) token blocks. Rows of a segment longer than max_len are skipped.
+  const int64_t max_len = max_len_opt.value_or(num_tokens_i64);
   TORCH_CHECK(max_len >= 0 && max_len <= num_tokens_i64, "max_len must be in [0, num_tokens]");
   lora_debug_checks::check_max_seg_len(seg_indptr, max_len);
 

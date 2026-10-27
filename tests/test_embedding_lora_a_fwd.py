@@ -115,7 +115,6 @@ def test_embedding_lora_a_fwd_large_vocab_boundaries(dtype, vocab_size):
         input_ids=input_ids,
         weights=weights,
         vocab_size=vocab_size,
-        max_len=_max_seg_len(seg_indptr),
         seg_indptr=seg_indptr,
         weight_indices=weight_indices,
         lora_ranks=lora_ranks,
@@ -162,7 +161,6 @@ def test_embedding_lora_a_fwd_large_num_tokens_many_small_segments(num_tokens):
         input_ids=input_ids,
         weights=weights,
         vocab_size=vocab_size,
-        max_len=_max_seg_len(seg_indptr),
         seg_indptr=seg_indptr,
         weight_indices=weight_indices,
         lora_ranks=lora_ranks,
@@ -193,7 +191,6 @@ def test_embedding_lora_a_fwd_empty_input():
         input_ids=input_ids,
         weights=weights,
         vocab_size=vocab_size,
-        max_len=_max_seg_len(seg_indptr),
         seg_indptr=seg_indptr,
         weight_indices=weight_indices,
         lora_ranks=lora_ranks,
@@ -221,7 +218,6 @@ def test_embedding_lora_a_fwd_zero_rank_all_zero_output():
         input_ids=input_ids,
         weights=weights,
         vocab_size=vocab_size,
-        max_len=_max_seg_len(seg_indptr),
         seg_indptr=seg_indptr,
         weight_indices=weight_indices,
         lora_ranks=lora_ranks,
@@ -230,6 +226,52 @@ def test_embedding_lora_a_fwd_zero_rank_all_zero_output():
     )
 
     assert torch.count_nonzero(out).item() == 0
+
+
+def test_embedding_lora_a_fwd_max_len_is_optional_and_backward_compatible():
+    # max_len is an optional, keyword-only trailing bound: legacy positional calls
+    # (no max_len), an omitted max_len (default num_tokens) and a tight max_len must
+    # all give the same result.
+    torch.manual_seed(16)
+    vocab_size, max_rank = 128, 4
+    input_ids = torch.randint(0, vocab_size, (37,), dtype=torch.int64, device="xpu")
+    seg_indptr = torch.tensor([0, 3, 4, 20, 37], dtype=torch.int32, device="xpu")
+    weight_indices = torch.tensor([2, 1, 0, 1], dtype=torch.int32, device="xpu")
+    lora_ranks = torch.tensor([4, 2, 3], dtype=torch.int32, device="xpu")
+    weights = torch.randn(3, max_rank, vocab_size, dtype=torch.float32, device="xpu")
+
+    legacy_positional = embedding_lora_a_fwd(
+        input_ids,
+        weights,
+        vocab_size,
+        seg_indptr,
+        weight_indices,
+        lora_ranks,
+        None,
+        None,
+    )
+    default_bound = embedding_lora_a_fwd(
+        input_ids=input_ids,
+        weights=weights,
+        vocab_size=vocab_size,
+        seg_indptr=seg_indptr,
+        weight_indices=weight_indices,
+        lora_ranks=lora_ranks,
+    )
+    tight_bound = embedding_lora_a_fwd(
+        input_ids=input_ids,
+        weights=weights,
+        vocab_size=vocab_size,
+        seg_indptr=seg_indptr,
+        weight_indices=weight_indices,
+        lora_ranks=lora_ranks,
+        max_len=_max_seg_len(seg_indptr),
+    )
+    ref = _reference_embedding_lora_a_fwd(
+        input_ids, weights, vocab_size, seg_indptr, weight_indices, lora_ranks, None
+    ).to("xpu")
+    for out in (legacy_positional, default_bound, tight_bound):
+        torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
 
 
 def test_embedding_lora_a_fwd_segment_boundaries_precise_routing():
@@ -252,7 +294,6 @@ def test_embedding_lora_a_fwd_segment_boundaries_precise_routing():
         input_ids=input_ids,
         weights=weights,
         vocab_size=vocab_size,
-        max_len=_max_seg_len(seg_indptr),
         seg_indptr=seg_indptr,
         weight_indices=weight_indices,
         lora_ranks=lora_ranks,
@@ -285,7 +326,6 @@ def test_embedding_lora_a_fwd_extra_tokens_without_extra_embeddings_are_zero():
         input_ids=input_ids,
         weights=weights,
         vocab_size=vocab_size,
-        max_len=_max_seg_len(seg_indptr),
         seg_indptr=seg_indptr,
         weight_indices=weight_indices,
         lora_ranks=lora_ranks,
@@ -313,7 +353,6 @@ def test_embedding_lora_a_fwd_rank_padding_zero_tail():
         input_ids=input_ids,
         weights=weights,
         vocab_size=vocab_size,
-        max_len=_max_seg_len(seg_indptr),
         seg_indptr=seg_indptr,
         weight_indices=weight_indices,
         lora_ranks=lora_ranks,
@@ -350,7 +389,6 @@ def test_embedding_lora_a_fwd_extra_embeddings_in_range():
         input_ids=input_ids,
         weights=weights,
         vocab_size=vocab_size,
-        max_len=_max_seg_len(seg_indptr),
         seg_indptr=seg_indptr,
         weight_indices=weight_indices,
         lora_ranks=lora_ranks,
@@ -390,7 +428,6 @@ def test_embedding_lora_a_fwd_extra_token_out_of_range_zeroed():
         input_ids=input_ids,
         weights=weights,
         vocab_size=vocab_size,
-        max_len=_max_seg_len(seg_indptr),
         seg_indptr=seg_indptr,
         weight_indices=weight_indices,
         lora_ranks=lora_ranks,
@@ -422,7 +459,6 @@ def test_embedding_lora_a_fwd_negative_token_id_zero_row():
         input_ids=input_ids,
         weights=weights,
         vocab_size=vocab_size,
-        max_len=_max_seg_len(seg_indptr),
         seg_indptr=seg_indptr,
         weight_indices=weight_indices,
         lora_ranks=lora_ranks,
@@ -478,7 +514,6 @@ def test_embedding_lora_a_fwd_input_validation(bad_case, expected_msg):
             input_ids=input_ids,
             weights=weights,
             vocab_size=vocab_size,
-            max_len=_max_seg_len(seg_indptr),
             seg_indptr=seg_indptr,
             weight_indices=weight_indices,
             lora_ranks=lora_ranks,

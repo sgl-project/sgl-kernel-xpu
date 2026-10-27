@@ -1378,12 +1378,12 @@ void embedding_lora_a_fwd(
     const torch::Tensor& input_ids,  // [num_tokens,]
     const torch::Tensor& weights,    // [num_loras, max_rank, vocab_size]
     const int64_t vocab_size,
-    const int64_t max_len,                                 // longest segment
     const torch::Tensor& seg_indptr,                       // [num_segments + 1,]
     const torch::Tensor& weight_indices,                   // [num_segments,]
     const torch::Tensor& lora_ranks,                       // [num_loras,]
     const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
-    const std::optional<torch::Tensor>& seg_lens           // [num_segments,]
+    const std::optional<torch::Tensor>& seg_lens,          // [num_segments,]
+    std::optional<int64_t> max_len                         // upper bound on segment length; default num_tokens
 );
 
 void sgemm_lora_a_fwd(

@@ -178,6 +178,7 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_fwd(
   auto queue = stream.queue();
 
   const int num_segments_ = static_cast<int>(num_segments_i64);
+  (void)num_segments;  // derived from seg_indptr; the explicit arg is informational
 
   const int64_t* perm_ptr = nullptr;
   torch::Tensor perm_i64;

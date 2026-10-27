@@ -27,6 +27,7 @@
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
+ **************************************************************************************************/
 /*!
   \file
   \brief Shared building blocks of the gather-fused DPAS LoRA kernels.
@@ -143,7 +144,13 @@ template <int V>
 inline sycl::vec<uint16_t, V> sg_block_read(const uint16_t* p) {
   sycl::vec<uint16_t, V> r;
 #ifdef __SYCL_DEVICE_ONLY__
+  // p always points into a torch XPU device allocation (global memory), so the
+  // generic -> global cast is valid. sycl::address_space_cast would add a runtime
+  // address-space test to the innermost loop, so the -Wsycl-strict note is silenced.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsycl-strict"
   auto gp = (const __attribute__((opencl_global)) uint16_t*)p;
+#pragma clang diagnostic pop
   if constexpr (V == 1) {
     r[0] = __spirv_SubgroupBlockReadINTEL<uint16_t>(gp);
   } else {
@@ -154,6 +161,8 @@ inline sycl::vec<uint16_t, V> sg_block_read(const uint16_t* p) {
       r[i] = v[i];
     }
   }
+#else
+  (void)p;  // host pass: the body is device-only
 #endif
   return r;
 }
@@ -161,7 +170,13 @@ inline sycl::vec<uint16_t, V> sg_block_read(const uint16_t* p) {
 template <int V>
 inline void sg_block_write(uint16_t* p, const sycl::vec<uint16_t, V>& r) {
 #ifdef __SYCL_DEVICE_ONLY__
+  // p always points into a torch XPU device allocation (global memory), so the
+  // generic -> global cast is valid. sycl::address_space_cast would add a runtime
+  // address-space test to the innermost loop, so the -Wsycl-strict note is silenced.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsycl-strict"
   auto gp = (__attribute__((opencl_global)) uint16_t*)p;
+#pragma clang diagnostic pop
   if constexpr (V == 1) {
     __spirv_SubgroupBlockWriteINTEL(gp, static_cast<uint16_t>(r[0]));
   } else {
@@ -173,6 +188,9 @@ inline void sg_block_write(uint16_t* p, const sycl::vec<uint16_t, V>& r) {
     }
     __spirv_SubgroupBlockWriteINTEL(gp, v);
   }
+#else
+  (void)p;  // host pass: the body is device-only
+  (void)r;
 #endif
 }
 

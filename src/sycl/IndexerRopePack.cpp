@@ -22,9 +22,7 @@ constexpr int64_t kPackedDim = kHeadDim / 2;
 constexpr int64_t kSlotBytes = kPackedDim + kNumGroups;
 constexpr uint32_t kWorkGroupSize = kHeadDim;
 constexpr uint32_t kQSubGroupSize = 16;
-// Avoid subgroup launch overhead for the small batches measured on XPU.
-constexpr uint32_t kQSubgroupThreshold = 64;
-constexpr float kFakeQuantAmaxFloor = 6.0f * 0x1p-126f;
+constexpr uint32_t kQHeadsCoarsen = 4;
 
 inline uint32_t ceil_ue8m0_exponent(float value) {
   const uint32_t bits = sycl::bit_cast<uint32_t>(value);
@@ -33,208 +31,95 @@ inline uint32_t ceil_ue8m0_exponent(float value) {
   return sycl::clamp(exponent + static_cast<uint32_t>(mantissa != 0), 1u, 254u);
 }
 
-inline float ue8m0_scale(uint32_t exponent) {
-  return sycl::bit_cast<float>(exponent << 23);
+inline float ue8m0_inverse_scale(uint32_t exponent) {
+  return sycl::bit_cast<float>(0x7f000000u - (exponent << 23));
 }
 
-inline uint8_t fp4_e2m1_rne(float value) {
+inline uint8_t fp4_e2m1_vllm(float value) {
   const float magnitude = sycl::fmin(sycl::fabs(value), 6.0f);
   uint8_t code = 0;
-  code += magnitude >= 0.25f;
-  code += magnitude >= 0.75f;
-  code += magnitude >= 1.25f;
-  code += magnitude >= 1.75f;
-  code += magnitude >= 2.5f;
-  code += magnitude >= 3.5f;
-  code += magnitude >= 5.0f;
-  const bool boundary = magnitude == 0.25f || magnitude == 0.75f || magnitude == 1.25f || magnitude == 1.75f ||
-                        magnitude == 2.5f || magnitude == 3.5f || magnitude == 5.0f;
-  if (boundary && (code & 1u)) --code;
-  if (value < 0.0f && code != 0) code |= 0x8u;
+  code += magnitude > 0.25f;
+  code += magnitude > 0.75f;
+  code += magnitude > 1.25f;
+  code += magnitude > 1.75f;
+  code += magnitude > 2.5f;
+  code += magnitude > 3.5f;
+  code += magnitude > 5.0f;
+  if (value < 0.0f) code |= 0x8u;
   return code;
-}
-
-inline float fp4_e2m1_value(uint8_t code) {
-  constexpr float kValues[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-  const float value = kValues[code & 7u];
-  return (code & 8u) ? -value : value;
-}
-
-inline void fake_quant_stage(sycl::nd_item<1> item, uint32_t local_id, float* values, float* reduction, float* scales) {
-  const uint32_t group = local_id / static_cast<uint32_t>(kGroupSize);
-  reduction[local_id] = sycl::fabs(values[local_id]);
-  item.barrier(sycl::access::fence_space::local_space);
-
-  if ((local_id % kGroupSize) == 0) {
-    float amax = 0.0f;
-    const uint32_t group_start = group * static_cast<uint32_t>(kGroupSize);
-    for (uint32_t i = 0; i < kGroupSize; ++i) {
-      amax = sycl::fmax(amax, reduction[group_start + i]);
-    }
-    const float scale_raw = sycl::fmax(amax, kFakeQuantAmaxFloor) * (1.0f / 6.0f);
-    const uint32_t exponent = ceil_ue8m0_exponent(scale_raw);
-    scales[group] = ue8m0_scale(exponent);
-  }
-  item.barrier(sycl::access::fence_space::local_space);
-
-  const float normalized = sycl::clamp(values[local_id] / scales[group], -6.0f, 6.0f);
-  const uint8_t code = fp4_e2m1_rne(normalized);
-  values[local_id] = static_cast<float>(static_cast<bf16_t>(fp4_e2m1_value(code) * scales[group]));
-  item.barrier(sycl::access::fence_space::local_space);
 }
 
 inline uint32_t pack_group_exponents(const uint32_t* exponents) {
   return exponents[0] | (exponents[1] << 8) | (exponents[2] << 16) | (exponents[3] << 24);
 }
 
-inline float quantize_fake_fp4(float value, float scale) {
-  const float normalized = sycl::clamp(value / scale, -6.0f, 6.0f);
-  const uint8_t code = fp4_e2m1_rne(normalized);
-  return static_cast<float>(static_cast<bf16_t>(fp4_e2m1_value(code) * scale));
-}
-
-template <typename position_t>
-struct IndexQLegacyKernel {
-  void operator()(sycl::nd_item<1> item) const {
-    const uint32_t row_id = static_cast<uint32_t>(item.get_group(0));
-    const uint32_t local_id = static_cast<uint32_t>(item.get_local_id(0));
-    if (row_id >= num_rows) return;
-
-    float* values = local_values.get_multi_ptr<sycl::access::decorated::no>().get();
-    float* reduction = local_reduction.get_multi_ptr<sycl::access::decorated::no>().get();
-    float* fake_scales = local_fake_scales.get_multi_ptr<sycl::access::decorated::no>().get();
-    uint32_t* exponents = local_exponents.get_multi_ptr<sycl::access::decorated::no>().get();
-    const uint32_t token_id = row_id / num_heads;
-    const int64_t position = static_cast<int64_t>(positions[token_id]);
-
-    values[local_id] = static_cast<float>(input[row_id * kHeadDim + local_id]);
-    item.barrier(sycl::access::fence_space::local_space);
-
-    if (local_id < kRopeDim / 2) {
-      const int64_t offset = kHeadDim - kRopeDim + 2 * static_cast<int64_t>(local_id);
-      const float* freq = freqs_cis + position * kRopeDim;
-      const float real = values[offset];
-      const float imag = values[offset + 1];
-      const float cosine = freq[2 * local_id];
-      const float sine = freq[2 * local_id + 1];
-      values[offset] = static_cast<float>(static_cast<bf16_t>(real * cosine - imag * sine));
-      values[offset + 1] = static_cast<float>(static_cast<bf16_t>(real * sine + imag * cosine));
-    }
-    item.barrier(sycl::access::fence_space::local_space);
-
-    fake_quant_stage(item, local_id, values, reduction, fake_scales);
-
-    reduction[local_id] = sycl::fabs(values[local_id]);
-    item.barrier(sycl::access::fence_space::local_space);
-    const uint32_t group = local_id / static_cast<uint32_t>(kGroupSize);
-    if ((local_id % kGroupSize) == 0) {
-      float amax = 0.0f;
-      const uint32_t group_start = group * static_cast<uint32_t>(kGroupSize);
-      for (uint32_t i = 0; i < kGroupSize; ++i) {
-        amax = sycl::fmax(amax, reduction[group_start + i]);
-      }
-      exponents[group] = ceil_ue8m0_exponent(sycl::fmax(amax / 6.0f, 1.0e-4f));
-    }
-    item.barrier(sycl::access::fence_space::local_space);
-
-    if (local_id < kPackedDim) {
-      const uint32_t dim0 = 2 * local_id;
-      const uint8_t code0 = fp4_e2m1_rne(values[dim0] / ue8m0_scale(exponents[dim0 / kGroupSize]));
-      const uint8_t code1 = fp4_e2m1_rne(values[dim0 + 1] / ue8m0_scale(exponents[(dim0 + 1) / kGroupSize]));
-      payload[static_cast<int64_t>(row_id) * kPackedDim + local_id] = static_cast<int8_t>(code0 | (code1 << 4));
-    }
-    if (local_id == 0) {
-      scale[row_id] = static_cast<int32_t>(pack_group_exponents(exponents));
-      const float scaled_weight = static_cast<float>(head_weights[row_id]) * weight_scale;
-      weights_out[row_id] = static_cast<float>(static_cast<bf16_t>(scaled_weight));
-    }
-  }
-
-  const bf16_t* input;
-  const float* freqs_cis;
-  const position_t* positions;
-  const bf16_t* head_weights;
-  int8_t* payload;
-  int32_t* scale;
-  float* weights_out;
-  uint32_t num_rows;
-  uint32_t num_heads;
-  float weight_scale;
-  sycl::local_accessor<float, 1> local_values;
-  sycl::local_accessor<float, 1> local_reduction;
-  sycl::local_accessor<float, 1> local_fake_scales;
-  sycl::local_accessor<uint32_t, 1> local_exponents;
-};
-
 template <typename position_t>
 struct IndexQSubgroupKernel {
   [[sycl::reqd_sub_group_size(kQSubGroupSize)]]
   void operator()(sycl::nd_item<2> item) const {
     const uint32_t token_id = static_cast<uint32_t>(item.get_group(0));
-    const uint32_t head = static_cast<uint32_t>(item.get_group(1));
+    const uint32_t head_group = static_cast<uint32_t>(item.get_group(1));
     const uint32_t lane = static_cast<uint32_t>(item.get_local_id(1));
-    if (token_id >= num_tokens || head >= num_heads) return;
+    if (token_id >= num_tokens) return;
 
     const auto subgroup = item.get_sub_group();
     const int64_t position = static_cast<int64_t>(positions[token_id]);
     const float* freq = freqs_cis + position * kRopeDim;
-    const uint32_t* head_words =
-        reinterpret_cast<const uint32_t*>(input + (static_cast<int64_t>(token_id) * num_heads + head) * kHeadDim);
-
-    float x0[kNumGroups];
-    float x1[kNumGroups];
-    float fake_scales[kNumGroups];
-    uint32_t exponents[kNumGroups];
-    uint8_t packed[kNumGroups];
-    for (uint32_t block = 0; block < kNumGroups; ++block) {
-      const uint32_t word = head_words[block * kQSubGroupSize + lane];
-      x0[block] = static_cast<float>(sycl::bit_cast<bf16_t>(static_cast<uint16_t>(word)));
-      x1[block] = static_cast<float>(sycl::bit_cast<bf16_t>(static_cast<uint16_t>(word >> 16)));
+    const int64_t q_stride = static_cast<int64_t>(num_heads) * kHeadDim;
+    const uint32_t first_head = head_group * kQHeadsCoarsen;
+    uint32_t data[kQHeadsCoarsen][kNumGroups];
+    for (uint32_t hc = 0; hc < kQHeadsCoarsen; ++hc) {
+      const uint32_t head = first_head + hc;
+      if (head >= num_heads) continue;
+      const uint32_t* head_words = reinterpret_cast<const uint32_t*>(
+          input + static_cast<int64_t>(token_id) * q_stride + static_cast<int64_t>(head) * kHeadDim);
+      for (uint32_t block = 0; block < kNumGroups; ++block) {
+        data[hc][block] = head_words[block * kQSubGroupSize + lane];
+      }
     }
 
-    const uint32_t rope_word0 = head_words[2 * kQSubGroupSize + lane];
-    const uint32_t rope_word1 = head_words[3 * kQSubGroupSize + lane];
-    const float r0 = static_cast<float>(sycl::bit_cast<bf16_t>(static_cast<uint16_t>(rope_word0)));
-    const float i0 = static_cast<float>(sycl::bit_cast<bf16_t>(static_cast<uint16_t>(rope_word0 >> 16)));
-    const float r1 = static_cast<float>(sycl::bit_cast<bf16_t>(static_cast<uint16_t>(rope_word1)));
-    const float i1 = static_cast<float>(sycl::bit_cast<bf16_t>(static_cast<uint16_t>(rope_word1 >> 16)));
-    const float cosine0 = freq[2 * lane];
-    const float sine0 = freq[2 * lane + 1];
-    const float cosine1 = freq[2 * (lane + kQSubGroupSize)];
-    const float sine1 = freq[2 * (lane + kQSubGroupSize) + 1];
-    x0[2] = static_cast<float>(static_cast<bf16_t>(r0 * cosine0 - i0 * sine0));
-    x1[2] = static_cast<float>(static_cast<bf16_t>(r0 * sine0 + i0 * cosine0));
-    x0[3] = static_cast<float>(static_cast<bf16_t>(r1 * cosine1 - i1 * sine1));
-    x1[3] = static_cast<float>(static_cast<bf16_t>(r1 * sine1 + i1 * cosine1));
+    for (uint32_t hc = 0; hc < kQHeadsCoarsen; ++hc) {
+      const uint32_t head = first_head + hc;
+      if (head >= num_heads) continue;
 
-    for (uint32_t block = 0; block < kNumGroups; ++block) {
-      const float local_amax = sycl::fmax(sycl::fabs(x0[block]), sycl::fabs(x1[block]));
-      const float amax = sycl::reduce_over_group(subgroup, local_amax, sycl::maximum<float>());
-      const float fake_scale_raw = sycl::fmax(amax, kFakeQuantAmaxFloor) * (1.0f / 6.0f);
-      exponents[block] = ceil_ue8m0_exponent(fake_scale_raw);
-      fake_scales[block] = ue8m0_scale(exponents[block]);
-      x0[block] = quantize_fake_fp4(x0[block], fake_scales[block]);
-      x1[block] = quantize_fake_fp4(x1[block], fake_scales[block]);
-    }
+      float x0[kNumGroups];
+      float x1[kNumGroups];
+      uint32_t exponents[kNumGroups];
+      uint8_t packed[kNumGroups];
+      for (uint32_t block = 0; block < kNumGroups; ++block) {
+        const uint32_t word = data[hc][block];
+        x0[block] = static_cast<float>(sycl::bit_cast<bf16_t>(static_cast<uint16_t>(word)));
+        x1[block] = static_cast<float>(sycl::bit_cast<bf16_t>(static_cast<uint16_t>(word >> 16)));
+      }
 
-    for (uint32_t block = 0; block < kNumGroups; ++block) {
-      const float local_amax = sycl::fmax(sycl::fabs(x0[block]), sycl::fabs(x1[block]));
-      const float amax = sycl::reduce_over_group(subgroup, local_amax, sycl::maximum<float>());
-      exponents[block] = ceil_ue8m0_exponent(sycl::fmax(amax / 6.0f, 1.0e-4f));
-      const float pack_scale = ue8m0_scale(exponents[block]);
-      const uint8_t code0 = fp4_e2m1_rne(x0[block] / pack_scale);
-      const uint8_t code1 = fp4_e2m1_rne(x1[block] / pack_scale);
-      packed[block] = static_cast<uint8_t>(code0 | (code1 << 4));
-    }
+      for (uint32_t block = 2; block < kNumGroups; ++block) {
+        const uint32_t rope_lane = lane + (block - 2) * kQSubGroupSize;
+        const float cosine = freq[2 * rope_lane];
+        const float sine = freq[2 * rope_lane + 1];
+        const float real = x0[block];
+        const float imag = x1[block];
+        x0[block] = static_cast<float>(static_cast<bf16_t>(real * cosine - imag * sine));
+        x1[block] = static_cast<float>(static_cast<bf16_t>(real * sine + imag * cosine));
+      }
 
-    const int64_t row_id = static_cast<int64_t>(token_id) * num_heads + head;
-    for (uint32_t block = 0; block < kNumGroups; ++block) {
-      payload[row_id * kPackedDim + block * kQSubGroupSize + lane] = static_cast<int8_t>(packed[block]);
-    }
-    if (lane == 0) {
-      scale[row_id] = static_cast<int32_t>(pack_group_exponents(exponents));
-      const float scaled_weight = static_cast<float>(head_weights[row_id]) * weight_scale;
-      weights_out[row_id] = static_cast<float>(static_cast<bf16_t>(scaled_weight));
+      for (uint32_t block = 0; block < kNumGroups; ++block) {
+        const float local_amax = sycl::fmax(sycl::fabs(x0[block]), sycl::fabs(x1[block]));
+        const float amax = sycl::reduce_over_group(subgroup, local_amax, sycl::maximum<float>());
+        exponents[block] = ceil_ue8m0_exponent(amax * (1.0f / 6.0f));
+        const float inv_scale = ue8m0_inverse_scale(exponents[block]);
+        const uint8_t code0 = fp4_e2m1_vllm(x0[block] * inv_scale);
+        const uint8_t code1 = fp4_e2m1_vllm(x1[block] * inv_scale);
+        packed[block] = static_cast<uint8_t>(code0 | (code1 << 4));
+      }
+
+      const int64_t row_id = static_cast<int64_t>(token_id) * num_heads + head;
+      for (uint32_t block = 0; block < kNumGroups; ++block) {
+        payload[row_id * kPackedDim + block * kQSubGroupSize + lane] = static_cast<int8_t>(packed[block]);
+      }
+      if (lane == 0) {
+        scale[row_id] = static_cast<int32_t>(pack_group_exponents(exponents));
+        weights_out[row_id] = static_cast<float>(head_weights[row_id]) * weight_scale;
+      }
     }
   }
 
@@ -262,7 +147,6 @@ struct IndexKernelStore {
 
     float* values = local_values.get_multi_ptr<sycl::access::decorated::no>().get();
     float* reduction = local_reduction.get_multi_ptr<sycl::access::decorated::no>().get();
-    float* fake_scales = local_fake_scales.get_multi_ptr<sycl::access::decorated::no>().get();
     uint32_t* exponents = local_exponents.get_multi_ptr<sycl::access::decorated::no>().get();
 
     const float input_value = static_cast<float>(input[row_id * kHeadDim + local_id]);
@@ -291,8 +175,6 @@ struct IndexKernelStore {
     }
     item.barrier(sycl::access::fence_space::local_space);
 
-    fake_quant_stage(item, local_id, values, reduction, fake_scales);
-
     reduction[local_id] = sycl::fabs(values[local_id]);
     item.barrier(sycl::access::fence_space::local_space);
     const uint32_t group = local_id / static_cast<uint32_t>(kGroupSize);
@@ -302,14 +184,16 @@ struct IndexKernelStore {
       for (uint32_t i = 0; i < kGroupSize; ++i) {
         amax = sycl::fmax(amax, reduction[group_start + i]);
       }
-      exponents[group] = ceil_ue8m0_exponent(sycl::fmax(amax / 6.0f, 1.0e-4f));
+      exponents[group] = ceil_ue8m0_exponent(amax * (1.0f / 6.0f));
     }
     item.barrier(sycl::access::fence_space::local_space);
 
     if (local_id < kPackedDim) {
       const uint32_t dim0 = 2 * local_id;
-      const uint8_t code0 = fp4_e2m1_rne(values[dim0] / ue8m0_scale(exponents[dim0 / kGroupSize]));
-      const uint8_t code1 = fp4_e2m1_rne(values[dim0 + 1] / ue8m0_scale(exponents[(dim0 + 1) / kGroupSize]));
+      const float inv_scale0 = ue8m0_inverse_scale(exponents[dim0 / kGroupSize]);
+      const float inv_scale1 = ue8m0_inverse_scale(exponents[(dim0 + 1) / kGroupSize]);
+      const uint8_t code0 = fp4_e2m1_vllm(values[dim0] * inv_scale0);
+      const uint8_t code1 = fp4_e2m1_vllm(values[dim0 + 1] * inv_scale1);
       const int64_t page = slot_id / page_size;
       const int64_t offset = slot_id % page_size;
       const int64_t page_base = page * cache_stride;
@@ -336,7 +220,6 @@ struct IndexKernelStore {
   float eps;
   sycl::local_accessor<float, 1> local_values;
   sycl::local_accessor<float, 1> local_reduction;
-  sycl::local_accessor<float, 1> local_fake_scales;
   sycl::local_accessor<uint32_t, 1> local_exponents;
 };
 
@@ -350,37 +233,13 @@ void launch_index_q(
     at::Tensor& scale,
     at::Tensor& weights_out,
     float weight_scale) {
-  const uint32_t num_rows = static_cast<uint32_t>(input.size(0) * input.size(1));
-  if (num_rows == 0) return;
+  const uint32_t num_tokens = static_cast<uint32_t>(input.size(0));
+  const uint32_t num_heads = static_cast<uint32_t>(input.size(1));
+  if (num_tokens == 0 || num_heads == 0) return;
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
-  if (input.size(0) >= kQSubgroupThreshold) {
-    queue.submit([&](sycl::handler& cgh) {
-      IndexQSubgroupKernel<position_t> kernel{
-          reinterpret_cast<const bf16_t*>(input.data_ptr<at::BFloat16>()),
-          freqs_cis.data_ptr<float>(),
-          positions.data_ptr<position_t>(),
-          reinterpret_cast<const bf16_t*>(head_weights.data_ptr<at::BFloat16>()),
-          payload.data_ptr<int8_t>(),
-          scale.data_ptr<int32_t>(),
-          weights_out.data_ptr<float>(),
-          static_cast<uint32_t>(input.size(0)),
-          static_cast<uint32_t>(input.size(1)),
-          weight_scale};
-      cgh.parallel_for(
-          sycl::nd_range<2>(
-              sycl::range<2>(input.size(0), input.size(1) * kQSubGroupSize), sycl::range<2>(1, kQSubGroupSize)),
-          kernel);
-    });
-    return;
-  }
-
   queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> values(sycl::range<1>(kHeadDim), cgh);
-    sycl::local_accessor<float, 1> reduction(sycl::range<1>(kHeadDim), cgh);
-    sycl::local_accessor<float, 1> fake_scales(sycl::range<1>(kNumGroups), cgh);
-    sycl::local_accessor<uint32_t, 1> exponents(sycl::range<1>(kNumGroups), cgh);
-    IndexQLegacyKernel<position_t> kernel{
+    IndexQSubgroupKernel<position_t> kernel{
         reinterpret_cast<const bf16_t*>(input.data_ptr<at::BFloat16>()),
         freqs_cis.data_ptr<float>(),
         positions.data_ptr<position_t>(),
@@ -388,15 +247,15 @@ void launch_index_q(
         payload.data_ptr<int8_t>(),
         scale.data_ptr<int32_t>(),
         weights_out.data_ptr<float>(),
-        num_rows,
-        static_cast<uint32_t>(input.size(1)),
+        num_tokens,
+        num_heads,
         weight_scale,
-        values,
-        reduction,
-        fake_scales,
-        exponents};
+    };
     cgh.parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(num_rows * kWorkGroupSize), sycl::range<1>(kWorkGroupSize)), kernel);
+        sycl::nd_range<2>(
+            sycl::range<2>(num_tokens, ((num_heads + kQHeadsCoarsen - 1) / kQHeadsCoarsen) * kQSubGroupSize),
+            sycl::range<2>(1, kQSubGroupSize)),
+        kernel);
   });
 }
 
@@ -418,7 +277,6 @@ void launch_index_k(
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> values(sycl::range<1>(kHeadDim), cgh);
     sycl::local_accessor<float, 1> reduction(sycl::range<1>(kHeadDim), cgh);
-    sycl::local_accessor<float, 1> fake_scales(sycl::range<1>(kNumGroups), cgh);
     sycl::local_accessor<uint32_t, 1> exponents(sycl::range<1>(kNumGroups), cgh);
     const norm_weight_t* norm_weight_ptr;
     if constexpr (std::is_same_v<norm_weight_t, bf16_t>) {
@@ -440,7 +298,6 @@ void launch_index_k(
         eps,
         values,
         reduction,
-        fake_scales,
         exponents};
     cgh.parallel_for(
         sycl::nd_range<1>(sycl::range<1>(num_rows * kWorkGroupSize), sycl::range<1>(kWorkGroupSize)), kernel);

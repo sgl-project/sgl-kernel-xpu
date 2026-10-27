@@ -8,11 +8,11 @@ def index_q_rope_pack_weights(
     head_weights: torch.Tensor,
     weight_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """RoPE and two-stage FP4 packing for DSV4.1 index queries.
+    """RoPE and single-stage FP4 packing for DSV4.1 index queries.
 
     Returns packed int8 payload ``[tokens * heads, 64]``, packed int32 UE8M0
-    exponents ``[tokens * heads]``, and scaled BF16-rounded weights
-    ``[tokens, heads]`` widened to float32.
+    exponents ``[tokens * heads]``, and scaled float32 weights
+    ``[tokens, heads]``.
     """
     return torch.ops.sgl_kernel.index_q_rope_pack_weights.default(
         input,
@@ -34,7 +34,7 @@ def index_k_norm_rope_pack_store(
     *,
     ratio: int,
 ) -> None:
-    """Normalize, RoPE, fake-quantize, and store DSV4.1 FP4 index keys.
+    """Normalize, RoPE, single-stage quantize, and store DSV4.1 FP4 index keys.
 
     Slot zero is reserved and is not written. ``cache`` uses page-separated
     payload and scale regions with 68 bytes per slot.

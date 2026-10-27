@@ -43,37 +43,23 @@ def _ceil_ue8m0_exponent(value: torch.Tensor) -> torch.Tensor:
     return (exponent + (mantissa != 0).to(torch.int32)).clamp(1, 254)
 
 
-def _e2m1_code_rne(value: torch.Tensor) -> torch.Tensor:
+def _e2m1_code_vllm(value: torch.Tensor) -> torch.Tensor:
     magnitude = value.abs().clamp_max(6.0)
     thresholds = torch.tensor(
         [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
         device=value.device,
     )
-    code = (magnitude.unsqueeze(-1) >= thresholds).sum(-1).to(torch.uint8)
-    boundary = (magnitude.unsqueeze(-1) == thresholds).any(-1)
-    code = torch.where(boundary & ((code & 1) != 0), code - 1, code)
-    sign = ((value < 0) & (code != 0)).to(torch.uint8) * 8
+    code = (magnitude.unsqueeze(-1) > thresholds).sum(-1).to(torch.uint8)
+    sign = (value < 0).to(torch.uint8) * 8
     return code | sign
 
 
-def _fake_quant_fp4(x: torch.Tensor) -> torch.Tensor:
+def _pack_fp4_vllm(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     groups = x.float().view(-1, NUM_GROUPS, GROUP_SIZE)
-    amax = groups.abs().amax(-1).clamp_min(6.0 * 2.0**-126)
-    exponent = _ceil_ue8m0_exponent(amax * (1.0 / 6.0))
-    scale = _scale_from_exponent(exponent)
-    normalized = groups / scale.unsqueeze(-1)
-    magnitude = normalized.abs()
-    step = torch.where(magnitude < 2.0, 0.5, torch.where(magnitude < 4.0, 1.0, 2.0))
-    dequantized = torch.round(magnitude / step) * step * torch.sign(normalized)
-    return (dequantized * scale.unsqueeze(-1)).flatten(-2).to(x.dtype)
-
-
-def _pack_fp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    rows = x.float().view(-1, HEAD_DIM)
-    groups = rows.view(-1, NUM_GROUPS, GROUP_SIZE)
-    exponent = _ceil_ue8m0_exponent((groups.abs().amax(-1) / 6.0).clamp_min(1.0e-4))
-    scale = _scale_from_exponent(exponent)
-    codes = _e2m1_code_rne(groups / scale.unsqueeze(-1)).view(-1, HEAD_DIM)
+    exponent = _ceil_ue8m0_exponent(groups.abs().amax(-1) * (1.0 / 6.0))
+    inverse_bits = 0x7F000000 - (exponent << 23)
+    inverse_scale = inverse_bits.contiguous().view(torch.float32)
+    codes = _e2m1_code_vllm(groups * inverse_scale.unsqueeze(-1)).view(-1, HEAD_DIM)
     packed = (
         codes[:, 0::2].to(torch.int16) | (codes[:, 1::2].to(torch.int16) << 4)
     ).to(torch.int8)
@@ -88,9 +74,8 @@ def _pack_fp4(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 def _reference_query(q, freqs_cis, positions, head_weights, weight_scale):
     rotated = _rope(q, freqs_cis, positions)
-    fake_quantized = _fake_quant_fp4(rotated)
-    payload, scale = _pack_fp4(fake_quantized)
-    weights = (head_weights.float() * weight_scale).to(torch.bfloat16).float()
+    payload, scale = _pack_fp4_vllm(rotated)
+    weights = head_weights.float() * weight_scale
     return payload, scale, weights
 
 
@@ -99,7 +84,7 @@ def _reference_key(input, norm_weight, eps, freqs_cis, positions):
     x = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
     x = (norm_weight.float() * x).to(input.dtype)
     rotated = _rope(x, freqs_cis, positions)
-    return _pack_fp4(_fake_quant_fp4(rotated))
+    return _pack_fp4_vllm(rotated)
 
 
 @pytest.mark.parametrize("batch,heads", [(3, 5), (64, 8), (64, 64)])

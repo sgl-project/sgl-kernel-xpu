@@ -164,7 +164,7 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int, input_scale: f
         .float()
     )
     reference[..., -64:] = rotated
-    reference = _fwht128(reference) * (HEAD_DIM**-0.5)
+    reference = (_fwht128(reference) * (HEAD_DIM**-0.5)).to(q_input.dtype).float()
     ref_fp4, ref_scale = _ref_quantize_fp4_indexer(reference)
     ref_fp4 = ref_fp4.view(batch_size, num_heads, FP4_DIM)
     ref_scale = (

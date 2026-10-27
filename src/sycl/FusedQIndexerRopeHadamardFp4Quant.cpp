@@ -105,6 +105,10 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
     x1 *= kHadamardScale;
     x2 *= kHadamardScale;
     x3 *= kHadamardScale;
+    x0 = static_cast<float>(static_cast<input_t>(x0));
+    x1 = static_cast<float>(static_cast<input_t>(x1));
+    x2 = static_cast<float>(static_cast<input_t>(x2));
+    x3 = static_cast<float>(static_cast<input_t>(x3));
 
     const uint8_t scale0 =
         at::native::xpu::castToUE8M0(sycl::fmax(1.0e-4f, subgroup_reduce_max(subgroup, sycl::fabs(x0))) / 6.0f);

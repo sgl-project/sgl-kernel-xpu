@@ -6,7 +6,7 @@
 #include <sycl/sycl.hpp>
 
 #include "sycl/SYCLHelpers.h"
-#include "sycl/kernels/flash_attention_v2/collective/fmha_relative_bias.hpp"
+#include "sycl/kernels/flash_attention_v2/xe20/collective/fmha_relative_bias.hpp"
 
 namespace flash_attention_v2::relative_attention {
 

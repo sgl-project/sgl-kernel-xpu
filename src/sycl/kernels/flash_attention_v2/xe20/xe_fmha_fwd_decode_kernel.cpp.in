@@ -29,62 +29,76 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  *
  **************************************************************************************************/
-// Auto-generated from xe_fmha_fwd_split_decode_kernel.cpp.in
+// Auto-generated from xe_fmha_fwd_decode_kernel.cpp.in
 // Template parameters: QG_SZ=@QG_SZ@, HEAD_DIM=@HEAD_DIM@, PAGE_SIZE=@PAGE_SIZE@, ELEM_TAG=@ELEM_TAG@
 #undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
-#include "sycl/kernels/flash_attention_v2/xe_fmha_fwd_decode_runner.hpp"
+#include "sycl/kernels/flash_attention_v2/xe20/xe_fmha_fwd_decode_runner.hpp"
 
 namespace decode {
 
 template <>
-__attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
+__attribute__((visibility("default"))) void FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
   using TileShapeQK = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<@PAGE_SIZE@>, cute::_64>;
   using TileShapePV = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<@PAGE_SIZE@>>;
   // Round the head-dim of the output tile up to a multiple of get<1>(TileShapePV) (32) so that
   // VTiles = get<1>(TileShapeOutput) / get<1>(TileShapePV) covers the full head dimension when
   // HEAD_DIM is not a multiple of 32 (e.g. HEAD_DIM=72 -> 96, VTiles=3). The actual O surface is
   // bounded by head_size_vo, so HW clips the OOB tail writes in the epilogue.
-  static constexpr int kOutputTile = @HEAD_DIM@ == 512 ? 256 : ((@HEAD_DIM@ + 31) / 32) * 32;
+
+  // The QG_SZ x kOutputTile fp32 accumulator spills registers when it exceeds
+  // kDecodeAccBudget (e.g. QG 8 x 512), so cap the V tile and split V across
+  // grid.x. Each V tile re-reads K, so only split when needed:
+  //   HEAD_DIM <= 256 : unchanged
+  //   HEAD_DIM = 512  : QG 1/2/4 -> 512, QG 8 -> 256, QG 16 -> 128
+  // Mirrors kDecodeAccBudget in vllm-xpu-kernels (csrc/xpu/attn/fmha_utils.hpp).
+  static constexpr int kHeadRounded = ((@HEAD_DIM@ + 31) / 32) * 32;
+  static constexpr int kDecodeAccBudget = 2048;
+  static constexpr int kBudgetTile = kDecodeAccBudget / @QG_SZ@;
+  static constexpr int kOutputTile =
+    (kHeadRounded <= 256 || kHeadRounded <= kBudgetTile) ? kHeadRounded : kBudgetTile;
+  static_assert(kOutputTile % 32 == 0, "output tile must be a multiple of the PV tile (32)");
   using TileShapeOutput = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<kOutputTile>>;
-  // Cap KV subgroups so the epilogue cross-subgroup reduction buffer fits in shared
-  // local memory (see kv_subgroups_for_slm); the full PAGE_SIZE/16 split overflows SLM
-  // for large head dims / GQA groups / page sizes and hangs the device.
-  static constexpr int kKvSubgroups =
-      kv_subgroups_for_slm(@PAGE_SIZE@ / 16, @QG_SZ@, kOutputTile);
+
+  // Cap KV subgroups so the epilogue reduction buffer (sized by the output tile)
+  // fits in SLM; overflowing it hangs the device.
+  static constexpr int kKvSubgroups = kv_subgroups_for_slm(@PAGE_SIZE@ / 16, @QG_SZ@, kOutputTile);
   using SubgroupLayoutQK = cute::Layout<cute::Shape<cute::_1, cute::Int<kKvSubgroups>, cute::_1>>;
 
-    // softmax_lse output is threaded as a template constexpr, so every mask
-    // combination that can emit it needs its own kernel instantiation. Decode is
-    // always non-causal, so only the local axis fans out here; the sink path
-    // keeps the always-off LSE instantiations only.
-    if (params.return_softmax_lse) {
-        TORCH_CHECK(!params.use_sink, "return_softmax_lse is not supported with sink masking");
-        AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-            using Element = @ELEM_TYPE@;
-            dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+  // softmax_lse output is threaded as a template constexpr, so every mask
+  // combination that can emit it needs its own kernel instantiation. Decode is
+  // always non-causal (a single query token cannot be masked by a causal rule),
+  // so only the local axis fans out here; the sink path keeps the always-off LSE
+  // instantiations only (sink + LSE is not compiled).
+  if (params.return_softmax_lse) {
+    TORCH_CHECK(!params.use_sink, "return_softmax_lse is not supported with sink masking");
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      using Element = @ELEM_TYPE@;
+      dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;
-            SplitDecodeConfig<
-                    false,
-                    LocalMask,
-                    false,
-                    Softcap,
-                    /*LSE=*/true,
-                    TileShapeQK,
-                    TileShapePV,
-                    TileShapeOutput,
-                    SubgroupLayoutQK,
-                    void,
-                    1,
-                    Element,
-                    Element,
-                    Element,
-                    Element>::run(params);
-            });
-        });
-        return;
-    }
+      DecodeConfig<
+          false,
+          LocalMask,
+          false,
+          Softcap,
+          /*LSE=*/true,
+          TileShapeQK,
+          TileShapePV,
+          TileShapeOutput,
+          SubgroupLayoutQK,
+          void,
+          1,
+          false,
+          Element,
+          Element,
+          Element,
+          Element,
+          /*PackGQAEnabled=*/false>::run_paged(params);
+      });
+    });
+    return;
+  }
 
 #if @HEAD_DIM@ == 128 || @HEAD_DIM@ == 512
   if (params.rel_bias_ptr != nullptr) {
@@ -100,7 +114,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
       using Element = @ELEM_TYPE@;
       // softcap+rel_bias is host-rejected (runner TORCH_CHECK); Softcap=false only.
       constexpr bool Softcap = false;
-      SplitDecodeConfig<
+      DecodeConfig<
           false,
           LocalMask,
           false,
@@ -112,21 +126,22 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
           SubgroupLayoutQK,
           void,
           1,
+          false,
           Element,
           Element,
           Element,
           Element,
+          /*PackGQAEnabled=*/false,
           void,
           cute::Stride<int, cute::_1, int, int>,
           cute::Stride<int, cute::_1, int, int>,
           cute::Stride<cute::_1, int, int, int>,
           cute::Stride<int, cute::_1, int, int>,
-          cute::Stride<int, cute::_1, int, int>,
           void,
           void,
           void,
           void,
-          true>::run(params);
+          true>::run_paged(params);
     });
     return;
   }
@@ -140,7 +155,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
           using Element = @ELEM_TYPE@;
           dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;
-          SplitDecodeConfig<
+          DecodeConfig<
               false,
               LocalMask,
               Sink,
@@ -152,10 +167,11 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
               SubgroupLayoutQK,
               void,
               1,
+              false,
               Element,
               Element,
               Element,
-              Element>::run(params);
+              Element>::run_paged(params);
           });
       });
     });
@@ -167,7 +183,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
         using Element = @ELEM_TYPE@;
         dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;
-        SplitDecodeConfig<
+        DecodeConfig<
             false,
             LocalMask,
             false,
@@ -179,22 +195,26 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
             SubgroupLayoutQK,
             void,
             1,
+            false,
             Element,
             Element,
             Element,
-              Element>::run(params);
+              Element>::run_paged(params);
         });
     });
 #endif
 }
 
-template struct FmhaSplitDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>;
+template struct FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>;
 
 }  // namespace decode
 
 #ifdef SGL_FMHA_JIT_ENTRY
+// Stable C ABI entry for the runtime-JIT path. Only emitted when this TU is
+// compiled as a standalone JIT module (one config per .so), so the fixed symbol
+// name never collides across the many AOT translation units.
 extern "C" __attribute__((visibility("default"))) void sgl_fmha_entry(const void* params) {
-  decode::FmhaSplitDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>{}(
+  decode::FmhaDecodeRunner<@QG_SZ@, @HEAD_DIM@, @PAGE_SIZE@, @ELEM_TYPE@>{}(
       *static_cast<const decode::Arguments*>(params));
 }
 #endif

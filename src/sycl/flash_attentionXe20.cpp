@@ -38,9 +38,9 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include "kernels/flash_attention_v2/relative_attention.hpp"
-#include "kernels/flash_attention_v2/xe_fmha_fwd_decode_dispatch.hpp"
-#include "kernels/flash_attention_v2/xe_fmha_fwd_prefill_dispatch.hpp"
+#include "kernels/flash_attention_v2/xe20/relative_attention.hpp"
+#include "kernels/flash_attention_v2/xe20/xe_fmha_fwd_decode_dispatch.hpp"
+#include "kernels/flash_attention_v2/xe20/xe_fmha_fwd_prefill_dispatch.hpp"
 #ifdef USE_FMHA_JIT
 #include "jit/fmha_jit.h"
 #endif

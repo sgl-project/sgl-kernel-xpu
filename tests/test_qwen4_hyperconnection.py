@@ -49,7 +49,7 @@ def combine_ref(residual, block, injection, hc):
 
 @pytest.mark.parametrize("hc", [4, 3])
 @pytest.mark.parametrize(
-    "numel", [1, 17, 320, 4 * 2560, 70000, 65536 * 5, 65536 * 5 + 3]
+    "numel", [1, 17, 320, 4 * 2560, 48 * 1024, 70000, 65536 * 5, 65536 * 5 + 3]
 )
 @pytest.mark.parametrize("offset", [0, 1])
 def test_hc_silu(hc, numel, offset):
@@ -65,6 +65,8 @@ def test_hc_silu(hc, numel, offset):
     [
         (1, 4, 2560, 0),  # decode
         (7, 4, 2560, 0),
+        (19, 4, 2560, 0),  # last 2-element vector call
+        (20, 4, 2560, 0),  # first 8-element vector call
         (1031, 4, 2560, 0),  # prefill
         (5, 4, 12, 0),  # scalar: hidden not a multiple of 8
         (5, 3, 64, 0),  # scalar: hc != 4
@@ -144,10 +146,14 @@ def grouped_norm_ref(x, weight, hc, eps):
     "tokens, hc, hidden, offset",
     [
         (1, 4, 2560, 0),  # decode
-        (63, 4, 2560, 0),  # 252 rows: last decode configuration
-        (64, 4, 2560, 0),  # 256 rows: first prefill configuration
+        (31, 4, 2560, 0),  # 124 rows: default configuration
+        (32, 4, 2560, 0),  # 128 rows: first mid configuration
+        (64, 4, 2560, 0),  # 256 rows: last mid configuration
+        (65, 4, 2560, 0),  # 260 rows: default configuration again
         (1031, 4, 2560, 0),
+        (2048, 4, 2560, 0),  # 8192 rows: many-rows configuration
         (3, 4, 256, 0),  # smaller row: lanes are partly idle
+        (3, 4, 1288, 0),  # last chunk holds a single vector per row
         (5, 4, 12, 0),  # scalar: hidden not a multiple of 8
         (5, 3, 64, 0),  # hc other than 4
         (5, 4, 2560, 1),  # scalar: misaligned

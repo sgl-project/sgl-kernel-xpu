@@ -32,11 +32,23 @@ static_assert(sizeof(bf16x8) == 16, "bf16x8 must be one 16-byte access");
 constexpr int SG_SIZE = 16;
 constexpr int FLAT_WG = 64;
 constexpr int64_t MAX_ID = std::numeric_limits<int32_t>::max();  // SYCL id queries are 32-bit
-// combine_norm calls with fewer (token, stream) rows use the decode configuration.
-constexpr int64_t COMBINE_NORM_FEW_ROWS = 256;
+// combine_norm tile selection by (token, stream) row count, tuned on BMG to avoid a partial last wave.
+constexpr int64_t COMBINE_NORM_MID_ROWS_MIN = 128;
+constexpr int64_t COMBINE_NORM_MID_ROWS_MAX = 256;
+constexpr int64_t COMBINE_NORM_MANY_ROWS = 8192;
+// silu and gate_mix calls with at most this many outputs are latency-bound and use 2-element vectors: twice as many
+// work-items, each with a shorter dependent chain of exp/reciprocal, spread over more EU threads.
+constexpr int64_t NARROW_MAX_OUTPUTS = 48 * 1024;
+constexpr int NARROW_VEC = 2;
 
+// The build uses correctly rounded fp32 division, which is slow; kernels use native math and multiply by host-side
+// reciprocals instead. The results are rounded to bf16.
 inline float sigmoid(float v) {
-  return 1.0f / (1.0f + sycl::exp(-v));
+  return sycl::native::recip(1.0f + sycl::native::exp(-v));
+}
+
+inline float combine_weight(const bf16* injection, uint32_t row, float inv_hc) {
+  return injection == nullptr ? 1.0f : 2.0f * sigmoid(static_cast<float>(injection[row]) * inv_hc);
 }
 
 template <int N>
@@ -62,7 +74,7 @@ struct SiluKernel {
   const bf16xV<V>* input;
   bf16xV<V>* output;
   uint32_t items;
-  float divisor;
+  float inv_hc;
 
   [[sycl::reqd_sub_group_size(SG_SIZE)]] void operator()(sycl::nd_item<1> item) const {
     const uint32_t i = item.get_global_id(0);
@@ -71,29 +83,30 @@ struct SiluKernel {
     to_float<V>(input[i], v);
 #pragma unroll
     for (int k = 0; k < V; ++k) {
-      const float s = v[k] / divisor;
+      const float s = v[k] * inv_hc;
       v[k] = s * sigmoid(s);
     }
     output[i] = to_bf16<V>(v);
   }
 };
 
-// Indices are 32-bit (numel <= MAX_ID is checked); 64-bit division is slow on the GPU.
+// Indices are 32-bit (numel <= MAX_ID is checked). The row kernels below use a 2D range (row, vector in row) so that
+// no work-item needs an integer division to locate its row.
 // One work-item per output vector; `vecs_per_row` is the hidden size in vectors.
 template <int V>
 struct GateMixKernel {
   const bf16xV<V>* input;
   const bf16xV<V>* gate;
   bf16xV<V>* output;
-  uint32_t items;
   uint32_t vecs_per_row;
   uint32_t hc;
+  float inv_hc;
 
-  [[sycl::reqd_sub_group_size(SG_SIZE)]] void operator()(sycl::nd_item<1> item) const {
-    const uint32_t i = item.get_global_id(0);
-    if (i >= items) return;
-    const uint32_t token = i / vecs_per_row;
-    const uint32_t base = token * hc * vecs_per_row + (i - token * vecs_per_row);
+  [[sycl::reqd_sub_group_size(SG_SIZE)]] void operator()(sycl::nd_item<2> item) const {
+    const uint32_t token = item.get_global_id(0);
+    const uint32_t c = item.get_global_id(1);
+    if (c >= vecs_per_row) return;
+    const uint32_t base = token * hc * vecs_per_row + c;
     float acc[V] = {};
     const auto accumulate = [&](const bf16xV<V>& x, const bf16xV<V>& g) {
       float xv[V], gv[V];
@@ -121,32 +134,34 @@ struct GateMixKernel {
     }
 #pragma unroll
     for (int k = 0; k < V; ++k) {
-      acc[k] /= static_cast<float>(hc);
+      acc[k] *= inv_hc;
     }
-    output[i] = to_bf16<V>(acc);
+    output[token * vecs_per_row + c] = to_bf16<V>(acc);
   }
 };
 
-// One work-item per vector of `residual`; the block row is re-read per stream from cache.
-template <int V>
+// One work-item per vector of `residual`; the block row is re-read per stream from cache. HAS_INJECTION is a template
+// parameter because a runtime branch around the injection load delays the other loads.
+template <int V, bool HAS_INJECTION>
 struct CombineKernel {
   const bf16xV<V>* residual;
   const bf16xV<V>* block;
   const bf16* injection;
   bf16xV<V>* output;
-  uint32_t items;
   uint32_t vecs_per_row;
   uint32_t hc;
+  float inv_hc;
 
-  [[sycl::reqd_sub_group_size(SG_SIZE)]] void operator()(sycl::nd_item<1> item) const {
-    const uint32_t i = item.get_global_id(0);
-    if (i >= items) return;
-    const uint32_t row = i / vecs_per_row;  // (token, stream)
-    const uint32_t token = row / hc;
-    const float w = injection == nullptr ? 1.0f : 2.0f * sigmoid(static_cast<float>(injection[row]) / hc);
+  [[sycl::reqd_sub_group_size(SG_SIZE)]] void operator()(sycl::nd_item<2> item) const {
+    const uint32_t row = item.get_global_id(0);  // (token, stream)
+    const uint32_t c = item.get_global_id(1);
+    if (c >= vecs_per_row) return;
+    const uint32_t token = row / hc;  // uniform across the work-group
+    const uint32_t i = row * vecs_per_row + c;
+    const float w = HAS_INJECTION ? 2.0f * sigmoid(static_cast<float>(injection[row]) * inv_hc) : 1.0f;
     float rv[V], bv[V];
     to_float<V>(residual[i], rv);
-    to_float<V>(block[token * vecs_per_row + (i - row * vecs_per_row)], bv);
+    to_float<V>(block[token * vecs_per_row + c], bv);
 #pragma unroll
     for (int k = 0; k < V; ++k) {
       rv[k] += bv[k] * w;
@@ -163,23 +178,46 @@ void launch_flat(sycl::queue& q, int64_t items, const Kernel& kernel) {
   });
 }
 
-// Calls f(std::integral_constant<int, V>) with V = 8 when `vectorizable`, else 1.
+// Launches `rows` x `cols` work-items as a 2D range of 1 x FLAT_WG work-groups.
+template <typename Kernel>
+void launch_rows(sycl::queue& q, int64_t rows, int64_t cols, const Kernel& kernel) {
+  const int64_t groups = div_up(cols, static_cast<int64_t>(FLAT_WG));
+  TORCH_CHECK(rows * groups * FLAT_WG <= MAX_ID, "qwen4_hc: too many rows for the padded 2D range: ", rows);
+  q.submit([&](sycl::handler& cgh) {
+    cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(rows, groups * FLAT_WG), sycl::range<2>(1, FLAT_WG)), kernel);
+  });
+}
+
+// Calls f(std::integral_constant<int, V>) for a runtime V in {8, 4, 2, 1}.
 template <typename F>
-void dispatch_vec(bool vectorizable, F&& f) {
-  if (vectorizable) {
-    f(std::integral_constant<int, VEC_SIZE>{});
-  } else {
-    f(std::integral_constant<int, 1>{});
+void dispatch_vec(int v, F&& f) {
+  switch (v) {
+    case 8:
+      return f(std::integral_constant<int, 8>{});
+    case 4:
+      return f(std::integral_constant<int, 4>{});
+    case 2:
+      return f(std::integral_constant<int, 2>{});
+    default:
+      return f(std::integral_constant<int, 1>{});
   }
 }
 
-// `inner` is the contiguous extent (in elements) every vector must tile; all tensors must be 16-byte aligned.
-bool can_vectorize(int64_t inner, std::initializer_list<const at::Tensor*> tensors) {
-  if (inner % VEC_SIZE != 0) return false;
-  for (const at::Tensor* t : tensors) {
-    if (reinterpret_cast<uintptr_t>(t->data_ptr()) % sizeof(bf16x8) != 0) return false;
+// Widest V <= max_v such that `inner` elements (the contiguous extent every vector must tile) and all pointers are
+// V-aligned.
+int pick_vec(int64_t inner, std::initializer_list<const at::Tensor*> tensors, int max_v = VEC_SIZE) {
+  for (int v = max_v; v > 1; v /= 2) {
+    bool ok = inner % v == 0;
+    for (const at::Tensor* t : tensors) {
+      ok = ok && reinterpret_cast<uintptr_t>(t->data_ptr()) % (v * sizeof(bf16)) == 0;
+    }
+    if (ok) return v;
   }
-  return true;
+  return 1;
+}
+
+bool can_vectorize(int64_t inner, std::initializer_list<const at::Tensor*> tensors) {
+  return pick_vec(inner, tensors) == VEC_SIZE;
 }
 
 void check_bf16_xpu(const at::Tensor& t, const char* name) {
@@ -228,17 +266,21 @@ struct CombineNormArgs {
   const bf16x8* weight;
   bf16x8* combined;
   bf16x8* normalized;
-  int64_t rows;
-  int hc;
-  int vecs_per_row;
+  uint32_t rows;
+  uint32_t hc;
+  uint32_t vecs_per_row;
   bool shared_weight;
   float eps;
+  float inv_hc;
+  float inv_hidden;
 };
 
 // The kernel repeats these fields instead of embedding CombineNormArgs: a nested struct argument is ~25% slower.
 // Each work-group owns ROWS_PER_GROUP rows of SPLIT sub-groups each. Lane l of part p handles vectors
 // c * SPLIT * SG + p * SG + l, so every load and store is a contiguous 16 * SG byte stripe. The whole row stays in
 // registers between the sum-of-squares reduction and the normalization.
+// All loads are issued up front with clamped indices and only the stores are predicated, so the memory round-trips
+// of all chunks overlap instead of being serialized by per-chunk branches.
 template <int VECS_PER_THREAD, int SPLIT, int ROWS_PER_GROUP>
 struct CombineNormVecKernel {
   static constexpr int GROUP_SIZE = SG_SIZE * SPLIT * ROWS_PER_GROUP;
@@ -248,11 +290,13 @@ struct CombineNormVecKernel {
   const bf16x8* weight;
   bf16x8* combined;
   bf16x8* normalized;
-  int64_t rows;
-  int hc;
-  int vecs_per_row;
+  uint32_t rows;
+  uint32_t hc;
+  uint32_t vecs_per_row;
   bool shared_weight;
   float eps;
+  float inv_hc;
+  float inv_hidden;
   sycl::local_accessor<float, 1> partials;
 
   [[sycl::reqd_sub_group_size(SG_SIZE)]] void operator()(sycl::nd_item<1> item) const {
@@ -261,40 +305,49 @@ struct CombineNormVecKernel {
     const int sg_id = sg.get_group_linear_id();
     const int local_row = sg_id / SPLIT;
     const int part = sg_id - local_row * SPLIT;
-    const int64_t row = static_cast<int64_t>(item.get_group(0)) * ROWS_PER_GROUP + local_row;
-    const bool active = row < rows;
-    const int64_t safe_row = active ? row : 0;
-    const int64_t token = safe_row / hc;
-    const int stream = static_cast<int>(safe_row - token * hc);
+    const uint32_t group_row = item.get_group(0) * ROWS_PER_GROUP + local_row;
+    const bool active = group_row < rows;
+    const uint32_t row = active ? group_row : 0;
+    const uint32_t token = row / hc;
+    const uint32_t stream = row - token * hc;
     const int first = part * SG_SIZE + lane;
+    const int last = static_cast<int>(vecs_per_row) - 1;
     constexpr int STRIDE = SG_SIZE * SPLIT;
 
-    const bf16x8* residual_row = residual + safe_row * vecs_per_row;
+    const bf16x8* residual_row = residual + row * vecs_per_row;
     const bf16x8* block_row = block + token * vecs_per_row;
-    bf16x8* combined_row = combined + safe_row * vecs_per_row;
-    const float w = injection == nullptr ? 1.0f : 2.0f * sigmoid(static_cast<float>(injection[safe_row]) / hc);
+    const bf16x8* weight_row = weight + (shared_weight ? 0 : stream * vecs_per_row);
+    bf16x8 values[VECS_PER_THREAD], blocks[VECS_PER_THREAD], weights[VECS_PER_THREAD];
+#pragma unroll
+    for (int c = 0; c < VECS_PER_THREAD; ++c) {
+      const int index = sycl::min(c * STRIDE + first, last);
+      values[c] = residual_row[index];
+      blocks[c] = block_row[index];
+      weights[c] = weight_row[index];
+    }
+    const float w = combine_weight(injection, row, inv_hc);
 
-    bf16x8 values[VECS_PER_THREAD];
+    // `combined` may alias `residual`; each lane reads its own vectors before writing them.
+    bf16x8* combined_row = combined + row * vecs_per_row;
     float sum_sq = 0.0f;
 #pragma unroll
     for (int c = 0; c < VECS_PER_THREAD; ++c) {
       const int index = c * STRIDE + first;
-      if (active && index < vecs_per_row) {
-        float rv[VEC_SIZE], bv[VEC_SIZE];
-        to_float<VEC_SIZE>(residual_row[index], rv);
-        to_float<VEC_SIZE>(block_row[index], bv);
+      if (index > last) continue;
+      float rv[VEC_SIZE], bv[VEC_SIZE];
+      to_float<VEC_SIZE>(values[c], rv);
+      to_float<VEC_SIZE>(blocks[c], bv);
 #pragma unroll
-        for (int k = 0; k < VEC_SIZE; ++k) {
-          rv[k] += bv[k] * w;
-        }
-        values[c] = to_bf16<VEC_SIZE>(rv);
-        combined_row[index] = values[c];
-        float mv[VEC_SIZE];
-        to_float<VEC_SIZE>(values[c], mv);
+      for (int k = 0; k < VEC_SIZE; ++k) {
+        rv[k] += bv[k] * w;
+      }
+      values[c] = to_bf16<VEC_SIZE>(rv);
+      if (active) combined_row[index] = values[c];
+      float mv[VEC_SIZE];
+      to_float<VEC_SIZE>(values[c], mv);
 #pragma unroll
-        for (int k = 0; k < VEC_SIZE; ++k) {
-          sum_sq += mv[k] * mv[k];
-        }
+      for (int k = 0; k < VEC_SIZE; ++k) {
+        sum_sq += mv[k] * mv[k];
       }
     }
 
@@ -311,23 +364,21 @@ struct CombineNormVecKernel {
       }
     }
     if (!active) return;
-    const float scale = sycl::rsqrt(sum_sq / static_cast<float>(vecs_per_row * VEC_SIZE) + eps);
+    const float scale = sycl::rsqrt(sum_sq * inv_hidden + eps);
 
-    const bf16x8* weight_row = weight + (shared_weight ? 0 : stream * vecs_per_row);
-    bf16x8* normalized_row = normalized + safe_row * vecs_per_row;
+    bf16x8* normalized_row = normalized + row * vecs_per_row;
 #pragma unroll
     for (int c = 0; c < VECS_PER_THREAD; ++c) {
       const int index = c * STRIDE + first;
-      if (index < vecs_per_row) {
-        float v[VEC_SIZE], wv[VEC_SIZE], out[VEC_SIZE];
-        to_float<VEC_SIZE>(values[c], v);
-        to_float<VEC_SIZE>(weight_row[index], wv);
+      if (index > last) continue;
+      float v[VEC_SIZE], wv[VEC_SIZE], out[VEC_SIZE];
+      to_float<VEC_SIZE>(values[c], v);
+      to_float<VEC_SIZE>(weights[c], wv);
 #pragma unroll
-        for (int k = 0; k < VEC_SIZE; ++k) {
-          out[k] = v[k] * scale * (1.0f + wv[k]);
-        }
-        normalized_row[index] = to_bf16<VEC_SIZE>(out);
+      for (int k = 0; k < VEC_SIZE; ++k) {
+        out[k] = v[k] * scale * (1.0f + wv[k]);
       }
+      normalized_row[index] = to_bf16<VEC_SIZE>(out);
     }
   }
 };
@@ -344,6 +395,8 @@ struct CombineNormScalarKernel {
   int64_t hc;
   bool shared_weight;
   float eps;
+  float inv_hc;
+  float inv_hidden;
   sycl::local_accessor<float, 1> scratch;
 
   void operator()(sycl::nd_item<1> item) const {
@@ -351,8 +404,7 @@ struct CombineNormScalarKernel {
     const int64_t token = row / hc;
     const int64_t stream = row % hc;
     const int64_t base = row * hidden;
-    const float w =
-        injection == nullptr ? 1.0f : 2.0f * sigmoid(static_cast<float>(injection[row]) / static_cast<float>(hc));
+    const float w = combine_weight(injection, row, inv_hc);
     float sum_sq = 0.0f;
     for (int64_t d = item.get_local_id(0); d < hidden; d += item.get_local_range(0)) {
       const bf16 v =
@@ -363,7 +415,7 @@ struct CombineNormScalarKernel {
     }
     sum_sq = sycl::reduce_over_group(item.get_group(), sum_sq, sycl::plus<float>());
     if (item.get_local_id(0) == 0) {
-      scratch[0] = sycl::rsqrt(sum_sq / static_cast<float>(hidden) + eps);
+      scratch[0] = sycl::rsqrt(sum_sq * inv_hidden + eps);
     }
     sycl::group_barrier(item.get_group());
     const int64_t weight_base = shared_weight ? 0 : stream * hidden;
@@ -379,7 +431,7 @@ template <int VECS_PER_THREAD, int SPLIT, int ROWS_PER_GROUP>
 bool launch_combine_norm_vec(sycl::queue& q, const CombineNormArgs& args) {
   using Kernel = CombineNormVecKernel<VECS_PER_THREAD, SPLIT, ROWS_PER_GROUP>;
   if (args.vecs_per_row > VECS_PER_THREAD * SG_SIZE * SPLIT) return false;
-  const int64_t groups = div_up(args.rows, static_cast<int64_t>(ROWS_PER_GROUP));
+  const int64_t groups = div_up(static_cast<int64_t>(args.rows), static_cast<int64_t>(ROWS_PER_GROUP));
   q.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> partials(SPLIT * ROWS_PER_GROUP, cgh);
     cgh.parallel_for(
@@ -396,6 +448,8 @@ bool launch_combine_norm_vec(sycl::queue& q, const CombineNormArgs& args) {
             args.vecs_per_row,
             args.shared_weight,
             args.eps,
+            args.inv_hc,
+            args.inv_hidden,
             partials});
   });
   return true;
@@ -417,11 +471,12 @@ SGL_KERNEL_EXPORT void qwen4_hc_silu(torch::Tensor& output, const torch::Tensor&
 
   c10::DeviceGuard guard(input.device());
   auto q = c10::xpu::getCurrentXPUStream().queue();
-  dispatch_vec(can_vectorize(n, {&input, &output}), [&](auto vec) {
+  const float inv_hc = 1.0f / static_cast<float>(hc_count);
+  const int max_v = n <= NARROW_MAX_OUTPUTS ? NARROW_VEC : VEC_SIZE;
+  dispatch_vec(pick_vec(n, {&input, &output}, max_v), [&](auto vec) {
     constexpr int V = decltype(vec)::value;
     const uint32_t items = n / V;
-    launch_flat(
-        q, items, SiluKernel<V>{as<bf16xV<V>>(input), as_mut<bf16xV<V>>(output), items, static_cast<float>(hc_count)});
+    launch_flat(q, items, SiluKernel<V>{as<bf16xV<V>>(input), as_mut<bf16xV<V>>(output), items, inv_hc});
   });
 }
 
@@ -441,20 +496,21 @@ qwen4_hc_gate_mix(torch::Tensor& output, const torch::Tensor& input, const torch
 
   c10::DeviceGuard guard(input.device());
   auto q = c10::xpu::getCurrentXPUStream().queue();
-  dispatch_vec(can_vectorize(hidden, {&input, &gate, &output}), [&](auto vec) {
+  const int max_v = rows * hidden <= NARROW_MAX_OUTPUTS ? NARROW_VEC : VEC_SIZE;
+  dispatch_vec(pick_vec(hidden, {&input, &gate, &output}, max_v), [&](auto vec) {
     constexpr int V = decltype(vec)::value;
     const uint32_t vecs_per_row = hidden / V;
-    const uint32_t items = rows * vecs_per_row;
-    launch_flat(
+    launch_rows(
         q,
-        items,
+        rows,
+        vecs_per_row,
         GateMixKernel<V>{
             as<bf16xV<V>>(input),
             as<bf16xV<V>>(gate),
             as_mut<bf16xV<V>>(output),
-            items,
             vecs_per_row,
-            static_cast<uint32_t>(hc_count)});
+            static_cast<uint32_t>(hc_count),
+            1.0f / static_cast<float>(hc_count)});
   });
 }
 
@@ -481,21 +537,28 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine(
 
   c10::DeviceGuard guard(residual.device());
   auto q = c10::xpu::getCurrentXPUStream().queue();
-  dispatch_vec(can_vectorize(hidden, {&residual, &block_output, &output}), [&](auto vec) {
+  dispatch_vec(pick_vec(hidden, {&residual, &block_output, &output}), [&](auto vec) {
     constexpr int V = decltype(vec)::value;
     const uint32_t vecs_per_row = hidden / V;
-    const uint32_t items = residual.numel() / V;
-    launch_flat(
-        q,
-        items,
-        CombineKernel<V>{
-            as<bf16xV<V>>(residual),
-            as<bf16xV<V>>(block_output),
-            injection_data,
-            as_mut<bf16xV<V>>(output),
-            items,
-            vecs_per_row,
-            static_cast<uint32_t>(hc_count)});
+    const auto launch = [&](auto has_injection) {
+      launch_rows(
+          q,
+          rows * hc_count,
+          vecs_per_row,
+          CombineKernel<V, decltype(has_injection)::value>{
+              as<bf16xV<V>>(residual),
+              as<bf16xV<V>>(block_output),
+              injection_data,
+              as_mut<bf16xV<V>>(output),
+              vecs_per_row,
+              static_cast<uint32_t>(hc_count),
+              1.0f / static_cast<float>(hc_count)});
+    };
+    if (injection_data != nullptr) {
+      launch(std::true_type{});
+    } else {
+      launch(std::false_type{});
+    }
   });
 }
 
@@ -540,6 +603,9 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine_norm(
   auto q = c10::xpu::getCurrentXPUStream().queue();
   const bool shared_weight = weight.numel() == hidden;
   const float eps_f = static_cast<float>(eps);
+  // Both kernels must compute the same combine weight as qwen4_hc_combine.
+  const float inv_hc = 1.0f / static_cast<float>(hc_count);
+  const float inv_hidden = 1.0f / static_cast<float>(hidden);
   if (can_vectorize(hidden, {&residual, &block_output, &weight, &combined, &normalized})) {
     const CombineNormArgs args{
         as<bf16x8>(residual),
@@ -548,17 +614,24 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine_norm(
         as<bf16x8>(weight),
         as_mut<bf16x8>(combined),
         as_mut<bf16x8>(normalized),
-        rows,
-        static_cast<int>(hc_count),
-        static_cast<int>(hidden / VEC_SIZE),
+        static_cast<uint32_t>(rows),
+        static_cast<uint32_t>(hc_count),
+        static_cast<uint32_t>(hidden / VEC_SIZE),
         shared_weight,
-        eps_f};
-    // Few rows (decode): 20 sub-groups per row, one vector per lane, for latency. Many rows (prefill): 4 sub-groups
-    // per row with 5 vectors per lane in registers and 4 rows per work-group.
-    if (rows < COMBINE_NORM_FEW_ROWS ? launch_combine_norm_vec<1, 20, 1>(q, args)
-                                     : launch_combine_norm_vec<5, 4, 4>(q, args)) {
-      return;
+        eps_f,
+        inv_hc,
+        inv_hidden};
+    // One row per work-group. By default 10 sub-groups per row with 2 vectors per lane; 4 sub-groups with 5 vectors
+    // in a middle range and 20 sub-groups with 1 vector for many rows, where those fill the GPU better.
+    bool launched;
+    if (rows >= COMBINE_NORM_MID_ROWS_MIN && rows <= COMBINE_NORM_MID_ROWS_MAX) {
+      launched = launch_combine_norm_vec<5, 4, 1>(q, args);
+    } else if (rows >= COMBINE_NORM_MANY_ROWS) {
+      launched = launch_combine_norm_vec<1, 20, 1>(q, args);
+    } else {
+      launched = launch_combine_norm_vec<2, 10, 1>(q, args);
     }
+    if (launched) return;
   }
   q.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<float, 1> scratch(1, cgh);
@@ -575,6 +648,8 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine_norm(
             hc_count,
             shared_weight,
             eps_f,
+            inv_hc,
+            inv_hidden,
             scratch});
   });
 }

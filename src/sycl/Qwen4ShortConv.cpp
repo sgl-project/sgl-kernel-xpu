@@ -271,9 +271,6 @@ SGL_KERNEL_EXPORT void qwen4_short_conv_state(
       conv_input.dim() == 3 && conv_input.size(0) == tokens && conv_input.size(1) == channels &&
           conv_input.size(2) == state_len + 1,
       "conv_input must have shape [N, C, L + 1]");
-  TORCH_CHECK(
-      state_indices.device() == state.device() && x.device() == state.device() && conv_input.device() == state.device(),
-      "all tensors must be on the same device");
   at::assert_no_overlap(conv_input, state);
   at::assert_no_overlap(conv_input, x);
   at::assert_no_overlap(state, x);
@@ -287,7 +284,6 @@ SGL_KERNEL_EXPORT void qwen4_short_conv_state(
   const bool vectorize = channels % STATE_VEC == 0 && reinterpret_cast<uintptr_t>(state.data_ptr()) % pack_bytes == 0 &&
                          reinterpret_cast<uintptr_t>(conv_input.data_ptr()) % pack_bytes == 0;
 
-  c10::DeviceGuard guard(state.device());
   auto q = c10::xpu::getCurrentXPUStream().queue();
   auto launch = [&](auto tag, auto vec) {
     using T = decltype(tag);

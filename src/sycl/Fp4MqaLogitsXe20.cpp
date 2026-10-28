@@ -5,56 +5,26 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
+#include "Fp4Utils.h"
 #include "QuantUtils.h"
+#include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
 namespace {
 
+namespace fp4_utils = at::native::xpu::fp4;
+
+// Bytes per packed 128-value FP4 row (two 4-bit values per byte).
 constexpr int64_t kPackedDim = 64;
+// Four groups of 32 values, each with one UE8M0 scale byte.
 constexpr int64_t kNumGroups = 4;
+// 64 payload bytes + 4 scale bytes per token; used for total page size,
+// not as the per-token offset within a page.
 constexpr int64_t kCacheBytesPerToken = 68;
 constexpr int kSubgroupSize = 16;
 constexpr int kWorkgroupSize = 128;
 constexpr int kTokensPerWorkgroup = kWorkgroupSize / kSubgroupSize;
-
-inline float scale_ue8m0(uint8_t ue8m0) {
-  if (ue8m0 == 0) return 0x1p-127f;
-  if (ue8m0 == 255) return sycl::nan(0u);
-  const uint32_t bits = static_cast<uint32_t>(ue8m0) << 23;
-  return sycl::bit_cast<float>(bits);
-}
-
-inline float decode_fp4(uint8_t code) {
-  const uint8_t magnitude = code & 0x7;
-  float value = 0.0f;
-  switch (magnitude) {
-    case 1:
-      value = 0.5f;
-      break;
-    case 2:
-      value = 1.0f;
-      break;
-    case 3:
-      value = 1.5f;
-      break;
-    case 4:
-      value = 2.0f;
-      break;
-    case 5:
-      value = 3.0f;
-      break;
-    case 6:
-      value = 4.0f;
-      break;
-    case 7:
-      value = 6.0f;
-      break;
-    default:
-      break;
-  }
-  return (code & 0x8) ? -value : value;
-}
 
 struct Fp4PagedMqaLogitsKernel {
   const uint8_t* q_fp4;
@@ -99,9 +69,9 @@ struct Fp4PagedMqaLogitsKernel {
 #pragma unroll
     for (int g = 0; g < kNumGroups; ++g) {
       const uint8_t packed = k_payload[g * kSubgroupSize + lane];
-      const float scale = scale_ue8m0(k_scales[g]);
-      key_values[g * 2] = decode_fp4(packed & 0xF) * scale;
-      key_values[g * 2 + 1] = decode_fp4(packed >> 4) * scale;
+      const float scale = fp4_utils::decode_ue8m0_scale(k_scales[g]);
+      key_values[g * 2] = fp4_utils::decode_e2m1(packed & 0xF) * scale;
+      key_values[g * 2 + 1] = fp4_utils::decode_e2m1(packed >> 4) * scale;
     }
 
     float score = 0.0f;
@@ -112,9 +82,9 @@ struct Fp4PagedMqaLogitsKernel {
 #pragma unroll
       for (int g = 0; g < kNumGroups; ++g) {
         const uint8_t packed = q_head[g * kSubgroupSize + lane];
-        const float scale = scale_ue8m0(q_head_scale[g]);
-        dot += (decode_fp4(packed & 0xF) * scale) * key_values[g * 2];
-        dot += (decode_fp4(packed >> 4) * scale) * key_values[g * 2 + 1];
+        const float scale = fp4_utils::decode_ue8m0_scale(q_head_scale[g]);
+        dot += (fp4_utils::decode_e2m1(packed & 0xF) * scale) * key_values[g * 2];
+        dot += (fp4_utils::decode_e2m1(packed >> 4) * scale) * key_values[g * 2 + 1];
       }
       dot = sycl::reduce_over_group(subgroup, dot, sycl::plus<float>());
       dot = sycl::fmax(dot, 0.0f);
@@ -202,12 +172,9 @@ SGL_KERNEL_EXPORT torch::Tensor fp4_paged_mqa_logits(
       static_cast<int>(kv_cache.size(1)),
       static_cast<int>(block_tables.size(1)),
       static_cast<int>(max_seq_len)};
-  queue.submit([&](sycl::handler& cgh) {
-    const int64_t token_groups = (max_seq_len + kTokensPerWorkgroup - 1) / kTokensPerWorkgroup;
-    cgh.parallel_for(
-        sycl::nd_range<2>(
-            sycl::range<2>(q_fp4.size(0), token_groups * kWorkgroupSize), sycl::range<2>(1, kWorkgroupSize)),
-        kernel);
-  });
+  const int64_t token_groups = (max_seq_len + kTokensPerWorkgroup - 1) / kTokensPerWorkgroup;
+  const sycl::range<2> global_range(q_fp4.size(0), token_groups * kWorkgroupSize);
+  const sycl::range<2> local_range(1, kWorkgroupSize);
+  sycl_kernel_submit(global_range, local_range, queue, kernel);
   return output;
 }

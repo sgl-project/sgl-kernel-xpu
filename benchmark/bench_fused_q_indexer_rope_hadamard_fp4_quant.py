@@ -1,9 +1,3 @@
-"""Benchmark the SYCL DeepSeek-V4 MXFP4 Indexer Q quantization kernel.
-
-Run inside the XPU container:
-  ZE_AFFINITY_MASK=4,5,6,7 python benchmark/bench_fused_q_indexer_rope_hadamard_fp4_quant.py
-"""
-
 from itertools import product
 
 import torch

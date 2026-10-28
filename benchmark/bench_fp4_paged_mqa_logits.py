@@ -1,9 +1,3 @@
-"""Benchmark the SYCL DeepSeek-V4 MXFP4 paged-MQA logits kernel.
-
-Run inside the XPU container:
-  ZE_AFFINITY_MASK=4,5,6,7 python benchmark/bench_fp4_paged_mqa_logits.py
-"""
-
 from itertools import product
 
 import torch

@@ -101,6 +101,9 @@ suites = {
         # --- norm / rope / quant ---
         BenchFile("bench_merge_states_v2.py", tee_log="merge_states.py.log"),
         BenchFile("bench_mrope.py", tee_log="mrope.py.log"),
+        BenchFile("bench_indexer_rope_pack.py"),
+        BenchFile("bench_fused_q_indexer_rope_hadamard_fp4_quant.py"),
+        BenchFile("bench_fp4_paged_mqa_logits.py"),
         BenchFile("bench_swiglu_alpha_limit.py", tee_log="swiglu_alpha_limit.py.log"),
         BenchFile("bench_fused_qk_rope_with_cache.py"),
         BenchFile("bench_per_token_group_quant_mxfp4.py"),

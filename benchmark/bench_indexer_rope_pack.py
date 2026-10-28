@@ -1,9 +1,3 @@
-"""Benchmark the DSV4.1 XPU indexer query and key packing kernels.
-
-Run inside the XPU container:
-  ZE_AFFINITY_MASK=0,1,2,3 python benchmark/bench_indexer_rope_pack.py
-"""
-
 from itertools import product
 
 import torch

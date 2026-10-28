@@ -7,10 +7,14 @@
 #include <tuple>
 #include <type_traits>
 
+#include "Fp4Utils.h"
+#include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
 namespace {
+
+namespace fp4_utils = at::native::xpu::fp4;
 
 using bf16_t = sycl::ext::oneapi::bfloat16;
 
@@ -40,33 +44,10 @@ inline float ue8m0_scale(uint32_t exponent) {
   return sycl::bit_cast<float>(exponent << 23);
 }
 
-inline uint8_t fp4_e2m1_rne(float value) {
-  const float magnitude = sycl::fmin(sycl::fabs(value), 6.0f);
-  uint8_t code = 0;
-  code += magnitude >= 0.25f;
-  code += magnitude >= 0.75f;
-  code += magnitude >= 1.25f;
-  code += magnitude >= 1.75f;
-  code += magnitude >= 2.5f;
-  code += magnitude >= 3.5f;
-  code += magnitude >= 5.0f;
-  const bool boundary = magnitude == 0.25f || magnitude == 0.75f || magnitude == 1.25f || magnitude == 1.75f ||
-                        magnitude == 2.5f || magnitude == 3.5f || magnitude == 5.0f;
-  if (boundary && (code & 1u)) --code;
-  if (value < 0.0f && code != 0) code |= 0x8u;
-  return code;
-}
-
-inline float fp4_e2m1_value(uint8_t code) {
-  constexpr float kValues[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-  const float value = kValues[code & 7u];
-  return (code & 8u) ? -value : value;
-}
-
 inline float quantize_fake_fp4(float value, float scale) {
   const float normalized = sycl::clamp(value / scale, -6.0f, 6.0f);
-  const uint8_t code = fp4_e2m1_rne(normalized);
-  return static_cast<float>(static_cast<bf16_t>(fp4_e2m1_value(code) * scale));
+  const uint8_t code = fp4_utils::encode_e2m1_ties_to_even(normalized);
+  return static_cast<float>(static_cast<bf16_t>(fp4_utils::decode_e2m1(code) * scale));
 }
 
 inline void fake_quant_stage(sycl::nd_item<1> item, uint32_t local_id, float* values, float* reduction, float* scales) {
@@ -156,8 +137,8 @@ struct IndexQSubgroupKernel {
         const float amax = sycl::reduce_over_group(subgroup, local_amax, sycl::maximum<float>());
         exponents[block] = ceil_ue8m0_exponent(sycl::fmax(amax / 6.0f, 1.0e-4f));
         const float inv_scale = ue8m0_inverse_scale(exponents[block]);
-        const uint8_t code0 = fp4_e2m1_rne(x0[block] * inv_scale);
-        const uint8_t code1 = fp4_e2m1_rne(x1[block] * inv_scale);
+        const uint8_t code0 = fp4_utils::encode_e2m1_ties_to_even(x0[block] * inv_scale);
+        const uint8_t code1 = fp4_utils::encode_e2m1_ties_to_even(x1[block] * inv_scale);
         packed[block] = static_cast<uint8_t>(code0 | (code1 << 4));
       }
 
@@ -186,7 +167,54 @@ struct IndexQSubgroupKernel {
 };
 
 template <typename norm_weight_t, typename position_t>
-struct IndexKernelStore {
+struct IndexKernelStore : public __SYCL_KER_CONFIG_CONVENTION__ {
+  const bf16_t* input;
+  const norm_weight_t* norm_weight;
+  const float* freqs_cis;
+  const position_t* positions;
+  const int64_t* loc;
+  uint8_t* cache;
+  uint32_t num_rows;
+  int64_t page_size;
+  int64_t cache_stride;
+  int64_t ratio;
+  float eps;
+  sycl::local_accessor<float, 1> local_values;
+  sycl::local_accessor<float, 1> local_reduction;
+  sycl::local_accessor<float, 1> local_fake_scales;
+  sycl::local_accessor<uint32_t, 1> local_exponents;
+
+  IndexKernelStore(
+      const bf16_t* input,
+      const norm_weight_t* norm_weight,
+      const float* freqs_cis,
+      const position_t* positions,
+      const int64_t* loc,
+      uint8_t* cache,
+      uint32_t num_rows,
+      int64_t page_size,
+      int64_t cache_stride,
+      int64_t ratio,
+      float eps)
+      : input(input),
+        norm_weight(norm_weight),
+        freqs_cis(freqs_cis),
+        positions(positions),
+        loc(loc),
+        cache(cache),
+        num_rows(num_rows),
+        page_size(page_size),
+        cache_stride(cache_stride),
+        ratio(ratio),
+        eps(eps) {}
+
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    local_values = sycl::local_accessor<float, 1>(sycl::range<1>(kHeadDim), cgh);
+    local_reduction = sycl::local_accessor<float, 1>(sycl::range<1>(kHeadDim), cgh);
+    local_fake_scales = sycl::local_accessor<float, 1>(sycl::range<1>(kNumGroups), cgh);
+    local_exponents = sycl::local_accessor<uint32_t, 1>(sycl::range<1>(kNumGroups), cgh);
+  }
+
   void operator()(sycl::nd_item<1> item) const {
     const uint32_t row_id = static_cast<uint32_t>(item.get_group(0));
     const uint32_t local_id = static_cast<uint32_t>(item.get_local_id(0));
@@ -245,8 +273,8 @@ struct IndexKernelStore {
       const uint32_t dim0 = 2 * local_id;
       const float inv_scale0 = ue8m0_inverse_scale(exponents[dim0 / kGroupSize]);
       const float inv_scale1 = ue8m0_inverse_scale(exponents[(dim0 + 1) / kGroupSize]);
-      const uint8_t code0 = fp4_e2m1_rne(values[dim0] * inv_scale0);
-      const uint8_t code1 = fp4_e2m1_rne(values[dim0 + 1] * inv_scale1);
+      const uint8_t code0 = fp4_utils::encode_e2m1_ties_to_even(values[dim0] * inv_scale0);
+      const uint8_t code1 = fp4_utils::encode_e2m1_ties_to_even(values[dim0 + 1] * inv_scale1);
       const int64_t page = slot_id / page_size;
       const int64_t offset = slot_id % page_size;
       const int64_t page_base = page * cache_stride;
@@ -259,22 +287,6 @@ struct IndexKernelStore {
       cache[scale_base + local_id] = static_cast<uint8_t>(exponents[local_id]);
     }
   }
-
-  const bf16_t* input;
-  const norm_weight_t* norm_weight;
-  const float* freqs_cis;
-  const position_t* positions;
-  const int64_t* loc;
-  uint8_t* cache;
-  uint32_t num_rows;
-  int64_t page_size;
-  int64_t cache_stride;
-  int64_t ratio;
-  float eps;
-  sycl::local_accessor<float, 1> local_values;
-  sycl::local_accessor<float, 1> local_reduction;
-  sycl::local_accessor<float, 1> local_fake_scales;
-  sycl::local_accessor<uint32_t, 1> local_exponents;
 };
 
 template <typename position_t>
@@ -292,25 +304,21 @@ void launch_index_q(
   if (num_tokens == 0 || num_heads == 0) return;
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
-  queue.submit([&](sycl::handler& cgh) {
-    IndexQSubgroupKernel<position_t> kernel{
-        reinterpret_cast<const bf16_t*>(input.data_ptr<at::BFloat16>()),
-        freqs_cis.data_ptr<float>(),
-        positions.data_ptr<position_t>(),
-        reinterpret_cast<const bf16_t*>(head_weights.data_ptr<at::BFloat16>()),
-        payload.data_ptr<int8_t>(),
-        scale.data_ptr<int32_t>(),
-        weights_out.data_ptr<float>(),
-        num_tokens,
-        num_heads,
-        weight_scale,
-    };
-    cgh.parallel_for(
-        sycl::nd_range<2>(
-            sycl::range<2>(num_tokens, ((num_heads + kQHeadsCoarsen - 1) / kQHeadsCoarsen) * kQSubGroupSize),
-            sycl::range<2>(1, kQSubGroupSize)),
-        kernel);
-  });
+  IndexQSubgroupKernel<position_t> kernel{
+      reinterpret_cast<const bf16_t*>(input.data_ptr<at::BFloat16>()),
+      freqs_cis.data_ptr<float>(),
+      positions.data_ptr<position_t>(),
+      reinterpret_cast<const bf16_t*>(head_weights.data_ptr<at::BFloat16>()),
+      payload.data_ptr<int8_t>(),
+      scale.data_ptr<int32_t>(),
+      weights_out.data_ptr<float>(),
+      num_tokens,
+      num_heads,
+      weight_scale,
+  };
+  const sycl::range<2> global_range(num_tokens, ((num_heads + kQHeadsCoarsen - 1) / kQHeadsCoarsen) * kQSubGroupSize);
+  const sycl::range<2> local_range(1, kQSubGroupSize);
+  sycl_kernel_submit(global_range, local_range, queue, kernel);
 }
 
 template <typename norm_weight_t, typename position_t>
@@ -327,37 +335,26 @@ void launch_index_k(
   const uint32_t num_rows = static_cast<uint32_t>(input.size(0));
   if (num_rows == 0) return;
 
+  const norm_weight_t* norm_weight_ptr;
+  if constexpr (std::is_same_v<norm_weight_t, bf16_t>) {
+    norm_weight_ptr = reinterpret_cast<const bf16_t*>(norm_weight.data_ptr<at::BFloat16>());
+  } else {
+    norm_weight_ptr = norm_weight.data_ptr<float>();
+  }
   auto queue = c10::xpu::getCurrentXPUStream().queue();
-  queue.submit([&](sycl::handler& cgh) {
-    sycl::local_accessor<float, 1> values(sycl::range<1>(kHeadDim), cgh);
-    sycl::local_accessor<float, 1> reduction(sycl::range<1>(kHeadDim), cgh);
-    sycl::local_accessor<float, 1> fake_scales(sycl::range<1>(kNumGroups), cgh);
-    sycl::local_accessor<uint32_t, 1> exponents(sycl::range<1>(kNumGroups), cgh);
-    const norm_weight_t* norm_weight_ptr;
-    if constexpr (std::is_same_v<norm_weight_t, bf16_t>) {
-      norm_weight_ptr = reinterpret_cast<const bf16_t*>(norm_weight.data_ptr<at::BFloat16>());
-    } else {
-      norm_weight_ptr = norm_weight.data_ptr<float>();
-    }
-    IndexKernelStore<norm_weight_t, position_t> kernel{
-        reinterpret_cast<const bf16_t*>(input.data_ptr<at::BFloat16>()),
-        norm_weight_ptr,
-        freqs_cis.data_ptr<float>(),
-        positions.data_ptr<position_t>(),
-        loc.data_ptr<int64_t>(),
-        cache.data_ptr<uint8_t>(),
-        num_rows,
-        page_size,
-        cache.stride(0),
-        ratio,
-        eps,
-        values,
-        reduction,
-        fake_scales,
-        exponents};
-    cgh.parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(num_rows * kWorkGroupSize), sycl::range<1>(kWorkGroupSize)), kernel);
-  });
+  IndexKernelStore<norm_weight_t, position_t> kernel{
+      reinterpret_cast<const bf16_t*>(input.data_ptr<at::BFloat16>()),
+      norm_weight_ptr,
+      freqs_cis.data_ptr<float>(),
+      positions.data_ptr<position_t>(),
+      loc.data_ptr<int64_t>(),
+      cache.data_ptr<uint8_t>(),
+      num_rows,
+      page_size,
+      cache.stride(0),
+      ratio,
+      eps};
+  sycl_kernel_submit(sycl::range<1>(num_rows * kWorkGroupSize), sycl::range<1>(kWorkGroupSize), queue, kernel);
 }
 
 }  // namespace
@@ -433,7 +430,7 @@ SGL_KERNEL_EXPORT void index_k_norm_rope_pack_store(
   const int64_t page_size = cache.size(1) / kSlotBytes;
   TORCH_CHECK(page_size > 0, "cache page size must be positive");
 
-  if (positions.scalar_type() == at::kInt) {
+  if (positions.scalar_type() == at::kInt) {  // positions is int32.
     if (norm_weight.scalar_type() == at::kBFloat16) {
       launch_index_k<bf16_t, int32_t>(
           input, norm_weight, freqs_cis, positions, loc, cache, ratio, page_size, static_cast<float>(eps));
@@ -441,11 +438,13 @@ SGL_KERNEL_EXPORT void index_k_norm_rope_pack_store(
       launch_index_k<float, int32_t>(
           input, norm_weight, freqs_cis, positions, loc, cache, ratio, page_size, static_cast<float>(eps));
     }
-  } else if (norm_weight.scalar_type() == at::kBFloat16) {
-    launch_index_k<bf16_t, int64_t>(
-        input, norm_weight, freqs_cis, positions, loc, cache, ratio, page_size, static_cast<float>(eps));
-  } else {
-    launch_index_k<float, int64_t>(
-        input, norm_weight, freqs_cis, positions, loc, cache, ratio, page_size, static_cast<float>(eps));
+  } else {  // positions is int64.
+    if (norm_weight.scalar_type() == at::kBFloat16) {
+      launch_index_k<bf16_t, int64_t>(
+          input, norm_weight, freqs_cis, positions, loc, cache, ratio, page_size, static_cast<float>(eps));
+    } else {
+      launch_index_k<float, int64_t>(
+          input, norm_weight, freqs_cis, positions, loc, cache, ratio, page_size, static_cast<float>(eps));
+    }
   }
 }

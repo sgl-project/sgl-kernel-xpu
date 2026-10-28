@@ -5,11 +5,15 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
+#include "Fp4Utils.h"
 #include "QuantUtils.h"
+#include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
 namespace {
+
+namespace fp4_utils = at::native::xpu::fp4;
 
 constexpr uint32_t kSubGroupSize = 32;
 constexpr uint32_t kBlockSize = 64;
@@ -19,20 +23,6 @@ constexpr int64_t kHeadDim = 128;
 constexpr int64_t kRopeDim = 64;
 constexpr int64_t kGroupSize = 32;
 constexpr int64_t kNumGroups = kHeadDim / kGroupSize;
-
-inline uint8_t quant_fp4_e2m1(float value) {
-  const float absolute_value = sycl::fmin(sycl::fabs(value), 6.0f);
-  uint8_t code = 0;
-  code += absolute_value > 0.25f;
-  code += absolute_value >= 0.75f;
-  code += absolute_value > 1.25f;
-  code += absolute_value >= 1.75f;
-  code += absolute_value > 2.5f;
-  code += absolute_value >= 3.5f;
-  code += absolute_value > 5.0f;
-  if (value < 0.0f && code != 0) code |= 0x8;
-  return code;
-}
 
 inline float subgroup_reduce_max(sycl::sub_group subgroup, float value) {
   value = sycl::fmax(value, sycl::permute_group_by_xor(subgroup, value, 8));
@@ -122,10 +112,10 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
     const float inv1 = at::native::xpu::invScaleUE8M0(scale1);
     const float inv2 = at::native::xpu::invScaleUE8M0(scale2);
     const float inv3 = at::native::xpu::invScaleUE8M0(scale3);
-    const uint8_t code0 = quant_fp4_e2m1(x0 * inv0);
-    const uint8_t code1 = quant_fp4_e2m1(x1 * inv1);
-    const uint8_t code2 = quant_fp4_e2m1(x2 * inv2);
-    const uint8_t code3 = quant_fp4_e2m1(x3 * inv3);
+    const uint8_t code0 = fp4_utils::encode_e2m1_ties_to_zero(x0 * inv0);
+    const uint8_t code1 = fp4_utils::encode_e2m1_ties_to_zero(x1 * inv1);
+    const uint8_t code2 = fp4_utils::encode_e2m1_ties_to_zero(x2 * inv2);
+    const uint8_t code3 = fp4_utils::encode_e2m1_ties_to_zero(x3 * inv3);
     const uint8_t code0_peer = sycl::permute_group_by_xor(subgroup, code0, 1);
     const uint8_t code1_peer = sycl::permute_group_by_xor(subgroup, code1, 1);
     const uint8_t code2_peer = sycl::permute_group_by_xor(subgroup, code2, 1);
@@ -220,24 +210,20 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_fp4_quant(
         using input_t = scalar_t;
         AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
           using position_t = index_t;
-          queue.submit([&](sycl::handler& cgh) {
-            FusedQIndexerRopeHadamardFp4QuantKernel<input_t, position_t> kernel{
-                q_input.data_ptr<input_t>(),
-                q_fp4.data_ptr<uint8_t>(),
-                q_scale.data_ptr<uint8_t>(),
-                weight.data_ptr<input_t>(),
-                weights_out.data_ptr<float>(),
-                rope_cache.data_ptr<float>(),
-                positions.data_ptr<position_t>(),
-                num_rows,
-                static_cast<uint32_t>(q_input.size(1)),
-                static_cast<float>(weight_scale)};
-            cgh.parallel_for(
-                sycl::nd_range<1>(
-                    sycl::range<1>(((num_rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup) * kWorkgroupSize),
-                    sycl::range<1>(kWorkgroupSize)),
-                kernel);
-          });
+          FusedQIndexerRopeHadamardFp4QuantKernel<input_t, position_t> kernel{
+              q_input.data_ptr<input_t>(),
+              q_fp4.data_ptr<uint8_t>(),
+              q_scale.data_ptr<uint8_t>(),
+              weight.data_ptr<input_t>(),
+              weights_out.data_ptr<float>(),
+              rope_cache.data_ptr<float>(),
+              positions.data_ptr<position_t>(),
+              num_rows,
+              static_cast<uint32_t>(q_input.size(1)),
+              static_cast<float>(weight_scale)};
+          const sycl::range<1> global_range(((num_rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup) * kWorkgroupSize);
+          const sycl::range<1> local_range(kWorkgroupSize);
+          sycl_kernel_submit(global_range, local_range, queue, kernel);
         });
       });
 }

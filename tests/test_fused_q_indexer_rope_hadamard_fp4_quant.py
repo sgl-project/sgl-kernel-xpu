@@ -39,29 +39,24 @@ def _fp4_e2m1_code_ref(x: torch.Tensor) -> torch.Tensor:
     absolute = torch.minimum(x.abs(), torch.tensor(E2M1_MAX, device=x.device))
     code = torch.zeros_like(absolute, dtype=torch.uint8)
     for threshold in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
-        comparison = (
-            absolute >= threshold
-            if threshold in (0.75, 1.75, 3.5)
-            else absolute > threshold
-        )
-        code += comparison.to(torch.uint8)
+        code += (absolute > threshold).to(torch.uint8)
     sign = ((x < 0) & (code != 0)).to(torch.uint8) * 8
     return code | sign
 
 
 def test_fp4_e2m1_midpoint_reference():
     midpoints = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], device="xpu")
-    expected = torch.tensor([0, 2, 2, 4, 4, 6, 6], device="xpu", dtype=torch.uint8)
+    expected = torch.tensor([0, 1, 2, 3, 4, 5, 6], device="xpu", dtype=torch.uint8)
     torch.testing.assert_close(_fp4_e2m1_code_ref(midpoints), expected, rtol=0, atol=0)
     negative_expected = torch.tensor(
-        [0, 10, 10, 12, 12, 14, 14], device="xpu", dtype=torch.uint8
+        [0, 9, 10, 11, 12, 13, 14], device="xpu", dtype=torch.uint8
     )
     torch.testing.assert_close(
         _fp4_e2m1_code_ref(-midpoints), negative_expected, rtol=0, atol=0
     )
 
 
-@pytest.mark.parametrize("midpoint,expected_code", [(1.75, 3), (3.5, 6)])
+@pytest.mark.parametrize("midpoint,expected_code", [(1.75, 3), (3.5, 5)])
 def test_fp4_fused_q_midpoint_rounding(midpoint, expected_code):
     device = torch.device("xpu")
     q = torch.zeros(1, 1, HEAD_DIM, device=device, dtype=torch.bfloat16)

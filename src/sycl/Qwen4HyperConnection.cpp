@@ -241,9 +241,8 @@ void check_bf16_xpu(const at::Tensor& t, const char* name) {
 }
 
 // An output may alias an input exactly (in place) but must not partially overlap it.
-void check_no_partial_overlap(const at::Tensor& output, std::initializer_list<const at::Tensor*> inputs) {
-  for (const at::Tensor* t : inputs)
-    at::assert_no_partial_overlap(output, *t);
+void check_no_partial_overlap(const at::Tensor& output, const at::Tensor& input) {
+  at::assert_no_partial_overlap(output, input);
 }
 
 void check_no_overlap(const at::Tensor& output, std::initializer_list<const at::Tensor*> inputs) {
@@ -289,22 +288,22 @@ struct CombineNormArgs {
   float inv_hidden;
 };
 
-// The kernel repeats these fields instead of embedding CombineNormArgs: a nested struct argument is ~25% slower.
-// Each work-group owns ROWS_PER_GROUP rows of SPLIT sub-groups each. Lane l of part p handles vectors
-// c * SPLIT * SG + p * SG + l, so every load and store is a contiguous 16 * SG byte stripe. The whole row stays in
-// registers between the sum-of-squares reduction and the normalization.
-// All loads are issued up front with clamped indices and only the stores are predicated, so the memory round-trips
-// of all chunks overlap instead of being serialized by per-chunk branches.
-template <int VECS_PER_THREAD, int SPLIT, int ROWS_PER_GROUP>
+// One work-group per (token, stream) row, made of SPLIT sub-groups. Lane l of sub-group p handles vectors
+// c * SPLIT * SG + p * SG + l (c < VECS_PER_THREAD), so every load and store is a contiguous 16 * SG byte stripe.
+// The whole row stays in registers between the sum-of-squares reduction and the normalization; the per-sub-group
+// partial sums are combined through local memory when SPLIT > 1.
+// All loads are issued up front with clamped indices and only the stores are predicated on the index being inside
+// the row, so the memory round-trips of all chunks overlap instead of being serialized by per-chunk branches.
+template <int VECS_PER_THREAD, int SPLIT>
 struct CombineNormVecKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
-  static constexpr int GROUP_SIZE = SG_SIZE * SPLIT * ROWS_PER_GROUP;
+  // The kernel repeats these fields instead of embedding CombineNormArgs: a nested struct argument is ~25% slower.
+  static constexpr int GROUP_SIZE = SG_SIZE * SPLIT;
   const bf16x8* residual;
   const bf16x8* block;
   const bf16* injection;
   const bf16x8* weight;
   bf16x8* combined;
   bf16x8* normalized;
-  uint32_t rows;
   uint32_t hc;
   uint32_t vecs_per_row;
   bool shared_weight;
@@ -314,21 +313,17 @@ struct CombineNormVecKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   sycl::local_accessor<float, 1> partials;
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    partials = sycl::local_accessor<float, 1>(SPLIT * ROWS_PER_GROUP, cgh);
+    partials = sycl::local_accessor<float, 1>(SPLIT, cgh);
   }
 
   [[sycl::reqd_sub_group_size(SG_SIZE)]] void operator()(sycl::nd_item<1> item) const {
     const auto sg = item.get_sub_group();
     const int lane = sg.get_local_linear_id();
     const int sg_id = sg.get_group_linear_id();
-    const int local_row = sg_id / SPLIT;
-    const int part = sg_id - local_row * SPLIT;
-    const uint32_t group_row = item.get_group(0) * ROWS_PER_GROUP + local_row;
-    const bool active = group_row < rows;
-    const uint32_t row = active ? group_row : 0;
+    const uint32_t row = item.get_group(0);
     const uint32_t token = row / hc;
     const uint32_t stream = row - token * hc;
-    const int first = part * SG_SIZE + lane;
+    const int first = sg_id * SG_SIZE + lane;
     const int last = static_cast<int>(vecs_per_row) - 1;
     constexpr int STRIDE = SG_SIZE * SPLIT;
 
@@ -353,7 +348,7 @@ struct CombineNormVecKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       const int index = c * STRIDE + first;
       if (index > last) continue;
       values[c] = combine_values<VEC_SIZE>(values[c], blocks[c], w);
-      if (active) combined_row[index] = values[c];
+      combined_row[index] = values[c];
       float mv[VEC_SIZE];
       to_float<VEC_SIZE>(values[c], mv);
 #pragma unroll
@@ -371,10 +366,9 @@ struct CombineNormVecKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       sum_sq = 0.0f;
 #pragma unroll
       for (int other = 0; other < SPLIT; ++other) {
-        sum_sq += partials[local_row * SPLIT + other];
+        sum_sq += partials[other];
       }
     }
-    if (!active) return;
     const float scale = sycl::rsqrt(sum_sq * inv_hidden + eps);
 
     bf16x8* normalized_row = normalized + row * vecs_per_row;
@@ -442,13 +436,12 @@ struct CombineNormScalarKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 };
 
 // Returns false when a row does not fit the register tile.
-template <int VECS_PER_THREAD, int SPLIT, int ROWS_PER_GROUP>
+template <int VECS_PER_THREAD, int SPLIT>
 bool launch_combine_norm_vec(sycl::queue& q, const CombineNormArgs& args) {
-  using Kernel = CombineNormVecKernel<VECS_PER_THREAD, SPLIT, ROWS_PER_GROUP>;
+  using Kernel = CombineNormVecKernel<VECS_PER_THREAD, SPLIT>;
   if (args.vecs_per_row > VECS_PER_THREAD * SG_SIZE * SPLIT) return false;
-  const int64_t groups = div_up(static_cast<int64_t>(args.rows), static_cast<int64_t>(ROWS_PER_GROUP));
   sycl_kernel_submit(
-      groups * Kernel::GROUP_SIZE,
+      static_cast<int64_t>(args.rows) * Kernel::GROUP_SIZE,
       static_cast<int64_t>(Kernel::GROUP_SIZE),
       q,
       Kernel{
@@ -459,7 +452,6 @@ bool launch_combine_norm_vec(sycl::queue& q, const CombineNormArgs& args) {
           args.weight,
           args.combined,
           args.normalized,
-          args.rows,
           args.hc,
           args.vecs_per_row,
           args.shared_weight,
@@ -479,7 +471,7 @@ SGL_KERNEL_EXPORT void qwen4_hc_silu(torch::Tensor& output, const torch::Tensor&
   check_bf16_xpu(output, "output");
   TORCH_CHECK(output.sizes() == input.sizes(), "output must have the same shape as input");
   TORCH_CHECK(hc_count > 0, "hc_count must be positive");
-  check_no_partial_overlap(output, {&input});
+  check_no_partial_overlap(output, input);
   const int64_t n = input.numel();
   if (n == 0) return;
   TORCH_CHECK(n <= MAX_ID, "qwen4_hc_silu: input too large: ", input.sizes());
@@ -544,7 +536,7 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine(
   TORCH_CHECK(block_output.size(0) == rows && block_output.size(1) == hidden, "block_output must be [tokens, hidden]");
   TORCH_CHECK(output.sizes() == residual.sizes(), "output must have the same shape as residual");
   const bf16* injection_data = injection_ptr(injection, rows, hc_count);
-  check_no_partial_overlap(output, {&residual});
+  check_no_partial_overlap(output, residual);
   check_no_overlap(output, {&block_output});
   if (injection_data != nullptr) check_no_overlap(output, {&*injection});
   if (rows == 0 || hidden == 0) return;
@@ -603,7 +595,7 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine_norm(
       combined.sizes() == residual.sizes() && normalized.sizes() == residual.sizes(),
       "combined and normalized must have the same shape as residual");
   const bf16* injection_data = injection_ptr(injection, tokens, hc_count);
-  check_no_partial_overlap(combined, {&residual});
+  check_no_partial_overlap(combined, residual);
   check_no_overlap(combined, {&block_output, &weight});
   check_no_overlap(normalized, {&residual, &block_output, &combined, &weight});
   if (injection_data != nullptr) {
@@ -640,11 +632,11 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine_norm(
     // in a middle range and 20 sub-groups with 1 vector for many rows, where those fill the GPU better.
     bool launched;
     if (rows >= COMBINE_NORM_MID_ROWS_MIN && rows <= COMBINE_NORM_MID_ROWS_MAX) {
-      launched = launch_combine_norm_vec<5, 4, 1>(q, args);
+      launched = launch_combine_norm_vec<5, 4>(q, args);
     } else if (rows >= COMBINE_NORM_MANY_ROWS) {
-      launched = launch_combine_norm_vec<1, 20, 1>(q, args);
+      launched = launch_combine_norm_vec<1, 20>(q, args);
     } else {
-      launched = launch_combine_norm_vec<2, 10, 1>(q, args);
+      launched = launch_combine_norm_vec<2, 10>(q, args);
     }
     if (launched) return;
   }

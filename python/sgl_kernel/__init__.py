@@ -76,10 +76,6 @@ from sgl_kernel.elementwise import (
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
     grouped_gemma_rmsnorm,
-    hc_combine,
-    hc_combine_norm,
-    hc_gate_mix,
-    hc_silu,
     multimodal_rotary_embedding,
     qwen4_gate_reduce,
     qwen4_gate_value,
@@ -94,6 +90,7 @@ from sgl_kernel.flash_compress_128 import (
     flash_compress128_decode,
     flash_compress128_prefill,
 )
+from sgl_kernel.hc import hc_combine, hc_combine_norm, hc_gate_mix, hc_silu
 
 try:
     from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton

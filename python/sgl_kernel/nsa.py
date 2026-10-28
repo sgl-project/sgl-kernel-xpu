@@ -196,6 +196,7 @@ def fp4_paged_mqa_logits(
     clean_logits: bool = False,
 ) -> torch.Tensor:
     """FP4 E2M1/UE8M0 paged MQA logits on XPU."""
+
     q_fp4, q_scale = q_fp4
     return torch.ops.sgl_kernel.fp4_paged_mqa_logits.default(
         q_fp4,

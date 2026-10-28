@@ -110,7 +110,7 @@ def test_fp4_paged_mqa_logits(batch, heads, max_seq_len, packed_query_layout):
     page_order = torch.randperm(num_pages, device=device, dtype=torch.int32)
     block_tables = page_order.view(batch, pages_per_batch)
     if packed_query_layout:
-        q_for_kernel = q.unsqueeze(1)
+        q_for_kernel = q.view(torch.int8).unsqueeze(1)
         q_scale_for_kernel = (
             q_scale.contiguous().view(torch.int32).squeeze(-1).unsqueeze(1)
         )

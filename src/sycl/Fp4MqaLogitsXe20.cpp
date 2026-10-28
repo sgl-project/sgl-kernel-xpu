@@ -115,7 +115,9 @@ SGL_KERNEL_EXPORT torch::Tensor fp4_paged_mqa_logits(
   CHECK_INPUT(seq_lens);
   CHECK_INPUT(block_tables);
 
-  auto q_fp4 = q_fp4_input;
+  TORCH_CHECK(
+      q_fp4_input.scalar_type() == at::kByte || q_fp4_input.scalar_type() == at::kChar, "q_fp4 must be uint8 or int8");
+  auto q_fp4 = q_fp4_input.scalar_type() == at::kChar ? q_fp4_input.view(at::kByte) : q_fp4_input;
   auto q_scale = q_scale_input;
   if (q_scale.scalar_type() != at::kByte) {
     TORCH_CHECK(q_scale.dim() > 0, "q_scale must have at least one dimension");
@@ -147,7 +149,7 @@ SGL_KERNEL_EXPORT torch::Tensor fp4_paged_mqa_logits(
       "seq_lens/block_tables must be int32");
   TORCH_CHECK(
       q_fp4.scalar_type() == at::kByte && q_scale.scalar_type() == at::kByte && kv_cache.scalar_type() == at::kByte,
-      "FP4 buffers must be uint8");
+      "FP4 buffers must be uint8 (q_fp4 may be provided as int8)");
   TORCH_CHECK(weights.scalar_type() == at::kFloat, "weights must be float32");
   TORCH_CHECK(block_tables.dim() == 2 && block_tables.size(0) == q_fp4.size(0), "block_tables shape mismatch");
   TORCH_CHECK(

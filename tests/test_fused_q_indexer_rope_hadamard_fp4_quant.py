@@ -69,7 +69,7 @@ def test_fp4_fused_q_midpoint_rounding(midpoint, expected_code):
     rope_cache[0, 2] = (4 - midpoint) / (2 * scale)
     positions = torch.zeros(1, device=device, dtype=torch.int32)
     weight = torch.ones(1, 1, device=device, dtype=torch.bfloat16)
-    payload = torch.empty(1, 1, FP4_DIM, device=device, dtype=torch.uint8)
+    payload = torch.empty(1, 1, FP4_DIM, device=device, dtype=torch.int8)
     scales = torch.empty(1, 1, SCALE_GROUPS, device=device, dtype=torch.uint8)
     weights_out = torch.empty(1, 1, 1, device=device)
     fused_q_indexer_rope_hadamard_fp4_quant(
@@ -78,7 +78,7 @@ def test_fp4_fused_q_midpoint_rounding(midpoint, expected_code):
     indices = torch.arange(HEAD_DIM, device=device)
     codes = torch.where((indices & 2) == 0, 6, expected_code)
     codes = (codes | torch.where((indices & 64) != 0, 8, 0)).to(torch.uint8)
-    expected = (codes[0::2] | (codes[1::2] << 4)).view(1, 1, FP4_DIM)
+    expected = (codes[0::2] | (codes[1::2] << 4)).to(torch.int8).view(1, 1, FP4_DIM)
     torch.testing.assert_close(payload, expected, rtol=0, atol=0)
     torch.testing.assert_close(scales, torch.full_like(scales, 127), rtol=0, atol=0)
 
@@ -92,7 +92,7 @@ def _ref_quantize_fp4_indexer(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     codes = _fp4_e2m1_code_ref((groups / scale.unsqueeze(-1)).view(-1, HEAD_DIM))
     packed = (
         codes[:, 0::2].to(torch.int16) | (codes[:, 1::2].to(torch.int16) << 4)
-    ).to(torch.uint8)
+    ).to(torch.int8)
     packed_scale = scale_exp[:, 0].clone()
     for group_id in range(1, SCALE_GROUPS):
         packed_scale |= scale_exp[:, group_id] << (8 * group_id)
@@ -121,7 +121,7 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int, input_scale: f
     positions = (torch.arange(batch_size, device=device, dtype=torch.int32) * 7) % 63
     rope_cache = torch.view_as_real(_make_freqs_cis(64, device)).flatten(-2)
     q_fp4 = torch.empty(
-        (batch_size, num_heads, FP4_DIM), device=device, dtype=torch.uint8
+        (batch_size, num_heads, FP4_DIM), device=device, dtype=torch.int8
     )
     q_scale = torch.empty(
         (batch_size, num_heads, SCALE_GROUPS), device=device, dtype=torch.uint8
@@ -142,6 +142,7 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int, input_scale: f
     )
     torch.xpu.synchronize()
 
+    assert q_fp4.dtype == torch.int8
     reference = q_input.float()
     frequency = rope_cache[positions].view(batch_size, 1, 32, 2)
     rope = reference[..., -64:].view(batch_size, num_heads, 32, 2)

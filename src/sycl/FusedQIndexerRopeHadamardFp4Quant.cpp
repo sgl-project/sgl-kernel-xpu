@@ -130,15 +130,15 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
     }
     if (is_even_lane) {
       const int64_t row_offset = static_cast<int64_t>(row_id) * kBlockSize + lane_id / 2;
-      q_fp4[row_offset] = static_cast<uint8_t>((code0 & 0x0F) | ((code0_peer & 0x0F) << 4));
-      q_fp4[row_offset + 16] = static_cast<uint8_t>((code1 & 0x0F) | ((code1_peer & 0x0F) << 4));
-      q_fp4[row_offset + 32] = static_cast<uint8_t>((code2 & 0x0F) | ((code2_peer & 0x0F) << 4));
-      q_fp4[row_offset + 48] = static_cast<uint8_t>((code3 & 0x0F) | ((code3_peer & 0x0F) << 4));
+      q_fp4[row_offset] = static_cast<int8_t>((code0 & 0x0F) | ((code0_peer & 0x0F) << 4));
+      q_fp4[row_offset + 16] = static_cast<int8_t>((code1 & 0x0F) | ((code1_peer & 0x0F) << 4));
+      q_fp4[row_offset + 32] = static_cast<int8_t>((code2 & 0x0F) | ((code2_peer & 0x0F) << 4));
+      q_fp4[row_offset + 48] = static_cast<int8_t>((code3 & 0x0F) | ((code3_peer & 0x0F) << 4));
     }
   }
 
   const input_t* q_input;
-  uint8_t* q_fp4;
+  int8_t* q_fp4;
   uint8_t* q_scale;
   const input_t* weight;
   float* weights_out;
@@ -191,7 +191,8 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_fp4_quant(
       q_input.scalar_type() == at::kBFloat16 || q_input.scalar_type() == at::kHalf, "q_input must be bf16 or fp16");
   TORCH_CHECK(weight.scalar_type() == q_input.scalar_type(), "weight dtype must match q_input");
   TORCH_CHECK(
-      q_fp4.scalar_type() == at::kByte && q_scale.scalar_type() == at::kByte, "q_fp4 and q_scale must be uint8");
+      q_fp4.scalar_type() == at::kChar && q_scale.scalar_type() == at::kByte,
+      "q_fp4 must be int8 and q_scale must be uint8");
   TORCH_CHECK(
       weights_out.scalar_type() == at::kFloat && rope_cache.scalar_type() == at::kFloat,
       "weights_out and rope_cache must be float32");
@@ -212,7 +213,7 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_fp4_quant(
           using position_t = index_t;
           FusedQIndexerRopeHadamardFp4QuantKernel<input_t, position_t> kernel{
               q_input.data_ptr<input_t>(),
-              q_fp4.data_ptr<uint8_t>(),
+              q_fp4.data_ptr<int8_t>(),
               q_scale.data_ptr<uint8_t>(),
               weight.data_ptr<input_t>(),
               weights_out.data_ptr<float>(),

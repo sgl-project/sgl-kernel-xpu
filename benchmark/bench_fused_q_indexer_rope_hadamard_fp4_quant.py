@@ -39,7 +39,7 @@ def benchmark(batch: int, heads: int, provider: str):
     weight = torch.randn(batch, heads, device=device, dtype=torch.bfloat16)
     positions = torch.randint(0, 512, (batch,), device=device, dtype=torch.int32)
     rope_cache = _make_rope_cache(512, device)
-    q_fp4 = torch.empty(batch, heads, PACKED_DIM, device=device, dtype=torch.uint8)
+    q_fp4 = torch.empty(batch, heads, PACKED_DIM, device=device, dtype=torch.int8)
     q_scale = torch.empty(batch, heads, GROUPS, device=device, dtype=torch.uint8)
     weights_out = torch.empty(batch, heads, 1, device=device, dtype=torch.float32)
 

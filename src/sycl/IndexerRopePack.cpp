@@ -237,6 +237,7 @@ struct IndexKernelStore : public __SYCL_KER_CONFIG_CONVENTION__ {
     }
 
     const float inv_rms = sycl::rsqrt(values[0] / static_cast<float>(kHeadDim) + eps);
+    item.barrier(sycl::access::fence_space::local_space);
     const float norm_value = static_cast<float>(norm_weight[local_id]) * (input_value * inv_rms);
     values[local_id] = static_cast<float>(static_cast<bf16_t>(norm_value));
     item.barrier(sycl::access::fence_space::local_space);

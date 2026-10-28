@@ -124,6 +124,7 @@ def test_index_q_rope_pack_weights(batch, heads):
 
     got = index_q_rope_pack_weights(q, freqs_cis, positions, weights, weight_scale)
     expected = _reference_query(q, freqs_cis, positions, weights, weight_scale)
+    assert got[0].dtype == torch.int8
     for actual, reference in zip(got, expected):
         torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
@@ -178,4 +179,6 @@ def test_index_k_norm_rope_pack_store(norm_dtype, ratio):
             rtol=0,
             atol=0,
         )
-    assert torch.all(cache[0, :SLOT_BYTES] == 0xA5)
+    assert torch.all(cache[0, :PACKED_DIM] == 0xA5)
+    scale_start = page_size * PACKED_DIM
+    assert torch.all(cache[0, scale_start : scale_start + NUM_GROUPS] == 0xA5)

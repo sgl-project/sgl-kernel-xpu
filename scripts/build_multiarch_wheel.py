@@ -156,6 +156,10 @@ def main() -> None:
         help="pip install the merged wheel and print the selected backend",
     )
     args = ap.parse_args()
+    # Subprocesses run with cwd=PROJECT_ROOT, so relative paths must be anchored
+    # to the caller's cwd here or they would resolve differently for the children.
+    args.out_dir = args.out_dir.resolve()
+    args.build_dir = args.build_dir.resolve()
 
     targets = [t.strip() for t in args.targets.split(",") if t.strip()]
     unknown = [t for t in targets if t not in TARGETS]

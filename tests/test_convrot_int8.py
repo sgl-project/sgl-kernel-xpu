@@ -140,7 +140,7 @@ def test_grouped_gemm_partial_band(device, m, with_bias):
 @pytest.mark.parametrize(
     "k,n", [(5376, 5376), (1792, 5376), (5376, 7168), (3584, 5376)]
 )
-def test_two_stage_h3_widths(k, n):
+def test_two_stage_projection_widths(k, n):
     torch.manual_seed(59)
     x = torch.randn(32, k, device="xpu", dtype=torch.bfloat16)
     weight = torch.randint(-127, 128, (n, k), device="xpu", dtype=torch.int8)

@@ -20,8 +20,10 @@ set(CHUNKED_SGMV_LORA_EXPAND_FWD_ELEM_TORCH_TYPES "at::Half" "at::BFloat16")
 
 # Tile-configuration axis. Each tag maps to an option-tag type defined in
 # chunked_sgmv_lora_expand_fwd_types.hpp.
-set(CHUNKED_SGMV_LORA_EXPAND_FWD_TILE_TAGS wide)
-set(CHUNKED_SGMV_LORA_EXPAND_FWD_TILE_TYPES "chunked_sgmv_lora_expand_fwd_impl::ChunkedExpandTileWide")
+set(CHUNKED_SGMV_LORA_EXPAND_FWD_TILE_TAGS wide tall)
+set(CHUNKED_SGMV_LORA_EXPAND_FWD_TILE_TYPES
+    "chunked_sgmv_lora_expand_fwd_impl::ChunkedExpandTileWide"
+    "chunked_sgmv_lora_expand_fwd_impl::ChunkedExpandTileTall")
 
 
 list(LENGTH CHUNKED_SGMV_LORA_EXPAND_FWD_ELEM_TAGS _num_elems)

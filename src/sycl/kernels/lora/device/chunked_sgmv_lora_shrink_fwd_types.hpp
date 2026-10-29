@@ -40,16 +40,26 @@
 
 #pragma once
 
+#include "sycl/kernels/lora/common/gather_scatter_group_gemm_types.hpp"
+
 namespace chunked_sgmv_lora_shrink_fwd_impl {
 
-// Sub-group tile (8 * MB) rows x (16 * NT) columns, KB k-elements per step, SGK
-// sub-groups splitting K inside one work-group (SLM reduction). Tuned on BMG
-// (B580) over the decode shapes in benchmark/bench_chunked_sgmv_lora_shrink_fwd.py.
+// Sub-group tile 16 x 32, k-blocks of 32, 8 sub-groups splitting K inside one work-group (the
+// split-K epilogue reduces them through SLM). BM = 16 keeps the kernel at 128 GRF (twice the
+// hardware threads of a 32-row tile). Measured on BMG (B580) over the decode shapes in
+// benchmark/bench_chunked_sgmv_lora_shrink_fwd.py. Types<T, BLOCK_B> is the assembled gather /
+// scatter grouped-GEMM bundle (sycl-tla GemmUniversal with the LoRA collectives).
 struct ChunkedShrinkTileSplitK {
-  static constexpr int MB = 4;
-  static constexpr int NT = 2;
-  static constexpr int KB = 32;
-  static constexpr int SGK = 8;
+  template <typename T, bool BLOCK_B>
+  using Types = at::native::xpu::lora::GatherScatterGroupGemmTypes<
+      T,
+      /*BM=*/16,
+      /*SG_N=*/32,
+      /*BK=*/32,
+      /*NSG_N=*/1,
+      /*SGK=*/8,
+      cutlass::lora::collective::SplitKScatterGroupEpilogue,
+      BLOCK_B>;
 };
 
 }  // namespace chunked_sgmv_lora_shrink_fwd_impl

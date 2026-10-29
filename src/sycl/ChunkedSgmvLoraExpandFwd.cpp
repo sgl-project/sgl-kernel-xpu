@@ -36,14 +36,17 @@
     uses adapter l = weight_indices[s]. It is the "expand" counterpart of the
     chunked-SGMV shrink.
 
-    Implementation (device/chunked_sgmv_lora_expand_fwd_kernel.hpp, launched through
-    the generated per-(dtype, tile) launchers declared in
-    chunked_sgmv_lora_expand_fwd_dispatch.hpp): a single DPAS kernel that reads
-    x (and base_output) rows through the permutation, applies the per-adapter
+    Implementation (launched through the generated per-(dtype, tile) launchers
+    declared in chunked_sgmv_lora_expand_fwd_dispatch.hpp): a single kernel that
+    reads x (and base_output) rows through the permutation, applies the per-adapter
     scaling and residual in the epilogue, and writes each output row straight to
-    its physical position -- no sorted copies, no host syncs. Any rank, slice
-    layout and pointer alignment is supported (masked rank tail; alignment-free
-    loads / stores where 16-byte block accesses are not possible).
+    its physical position -- no sorted copies, no host syncs.
+    The kernel is sycl-tla's grouped GemmUniversal, launched through GemmUniversalAdapter and
+    assembled in common/gather_scatter_group_gemm_types.hpp, with LoRA collectives plugged in: the
+    gathered-A mainloop, the scale / residual scatter epilogue,
+    and an on-device segment scheduler.
+    Weights a 2D block load cannot read (see expand_weights_block2d_ok()) take the generic cute weight path.
+    Any rank, slice layout and pointer alignment is supported.
 
     The per-slice partition (qkv=3, gate_up=2, else 1) is generic: slice_offsets
     gives the output-column boundaries of each stacked projection, and x packs the
@@ -67,6 +70,7 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <algorithm>
 #include <optional>
 #include <sycl/sycl.hpp>
 
@@ -79,12 +83,16 @@
 namespace {
 
 //----------------- Per-(dtype, tile) dispatch macros --------------------//
-// One tile (wide) for now. Add tiles to DISPATCH_CHUNKED_SGMV_LORA_EXPAND_FWD_TILE
-// (and to ChunkedSgmvLoraExpandFwd.cmake + chunked_sgmv_lora_expand_fwd_dispatch.hpp
-// + chunked_sgmv_lora_expand_fwd_types.hpp) with a runtime heuristic picking the tag.
-#define DISPATCH_CHUNKED_SGMV_LORA_EXPAND_FWD_TILE(ELEM, ...)                                          \
-  do {                                                                                                 \
-    chunked_sgmv_lora_expand_fwd_impl::launch_chunked_sgmv_lora_expand_fwd_##ELEM##_wide(__VA_ARGS__); \
+// Two tiles (see chunked_sgmv_lora_expand_fwd_types.hpp); `use_tall` (set by the caller)
+// picks one. Add tiles here, in ChunkedSgmvLoraExpandFwd.cmake,
+// chunked_sgmv_lora_expand_fwd_dispatch.hpp and chunked_sgmv_lora_expand_fwd_types.hpp.
+#define DISPATCH_CHUNKED_SGMV_LORA_EXPAND_FWD_TILE(ELEM, ...)                                            \
+  do {                                                                                                   \
+    if (use_tall) {                                                                                      \
+      chunked_sgmv_lora_expand_fwd_impl::launch_chunked_sgmv_lora_expand_fwd_##ELEM##_tall(__VA_ARGS__); \
+    } else {                                                                                             \
+      chunked_sgmv_lora_expand_fwd_impl::launch_chunked_sgmv_lora_expand_fwd_##ELEM##_wide(__VA_ARGS__); \
+    }                                                                                                    \
   } while (0)
 
 #define DISPATCH_CHUNKED_SGMV_LORA_EXPAND_FWD_DTYPE(...)                                                               \
@@ -234,8 +242,14 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_expand_fwd(
     perm_ptr = perm_i64.data_ptr<int64_t>();
   }
 
-  // One gather-fused DPAS kernel: x / base_output rows are read through the
+  // One gather-fused kernel: x / base_output rows are read through the
   // permutation and the scaled result is scattered through it.
+  // Tall tiles when rank >= 64 and segments are short (<= 64 rows on average): there each
+  // weight load is shared by more rows. Measured on BMG; see the tile tags in
+  // chunked_sgmv_lora_expand_fwd_types.hpp. Host-known values only, so no sync.
+  // The generic (non block-2D) weight path is also faster with tall tiles.
+  const bool use_tall = (max_rank_i64 >= 64 && num_tokens_i64 <= 64 * std::max<int64_t>(num_segments_i64, 1)) ||
+                        !cutlass::lora::collective::block2d_rows_ok(weights.data_ptr(), n_total_i64, max_rank_i64);
   DISPATCH_CHUNKED_SGMV_LORA_EXPAND_FWD_DTYPE(
       x,
       weights,

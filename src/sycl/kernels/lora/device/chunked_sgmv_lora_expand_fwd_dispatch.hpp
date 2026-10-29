@@ -38,7 +38,7 @@
 
          Naming: launch_chunked_sgmv_lora_expand_fwd_<ELEM_TAG>_<TILE_TAG>
            ELEM_TAG  in {half, bf16}
-           TILE_TAG  in {wide}                 -- see chunked_sgmv_lora_expand_fwd_types.hpp
+           TILE_TAG  in {wide, tall}           -- see chunked_sgmv_lora_expand_fwd_types.hpp
 */
 
 #pragma once
@@ -49,6 +49,8 @@
 #include <cstdint>
 #include <optional>
 #include <sycl/sycl.hpp>
+
+#include "sycl/kernels/lora/collective/xe_gather_scatter_copy.hpp"
 
 namespace chunked_sgmv_lora_expand_fwd_impl {
 
@@ -68,7 +70,9 @@ namespace chunked_sgmv_lora_expand_fwd_impl {
       sycl::queue& queue);
 
 // One declaration per registered tile. Extend as tiles are added.
-#define DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_ALL(ELEM) DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_LAUNCH(ELEM, wide)
+#define DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_ALL(ELEM)    \
+  DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_LAUNCH(ELEM, wide) \
+  DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_LAUNCH(ELEM, tall)
 
 DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_ALL(half)
 DECLARE_CHUNKED_SGMV_LORA_EXPAND_FWD_ALL(bf16)

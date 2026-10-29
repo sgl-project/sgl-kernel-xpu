@@ -40,17 +40,34 @@
 
 #pragma once
 
+#include "sycl/kernels/lora/common/gather_scatter_group_gemm_types.hpp"
+
 namespace chunked_sgmv_lora_expand_fwd_impl {
 
-// Sub-group tile (8 * MB) rows x (16 * NT) columns, K = rank in KB-wide steps
-// (KB = 16: the rank-tail path assumes 16-wide steps), SGN sub-groups side by
-// side along N. Tuned on BMG (B580) over the decode shapes in
-// benchmark/bench_chunked_sgmv_lora_expand_fwd.py.
-struct ChunkedExpandTileWide {
-  static constexpr int MB = 4;
-  static constexpr int NT = 4;
-  static constexpr int KB = 16;
-  static constexpr int SGN = 4;
+// Work-group tile = BM rows x (NSG_N * SG_N) columns of one slice, NSG_N sub-groups side by
+// side along N, rank in 16-wide k-blocks, no split-K. Measured on BMG (B580) over the decode
+// shapes in benchmark/bench_chunked_sgmv_lora_expand_fwd.py; the entrypoint picks a tag.
+// Types<T, BLOCK_B> is the assembled gather / scatter grouped-GEMM bundle (sycl-tla GemmUniversal
+// with the LoRA collectives).
+template <int BM, int SG_N, int NSG_N>
+struct ChunkedExpandTile {
+  template <typename T, bool BLOCK_B>
+  using Types = at::native::xpu::lora::GatherScatterGroupGemmTypes<
+      T,
+      BM,
+      SG_N,
+      /*BK=*/16,
+      NSG_N,
+      /*SGK=*/1,
+      cutlass::lora::collective::ScaleResidualScatterGroupEpilogue,
+      BLOCK_B>;
 };
+
+// Default: short, wide tiles (16 x 128 per sub-group, 8 sub-groups).
+struct ChunkedExpandTileWide : ChunkedExpandTile<16, 128, 8> {};
+
+// Taller tiles share each weight load across more rows: used when rank >= 64 with short
+// segments, and for weights that need the generic (non block-2D) B path.
+struct ChunkedExpandTileTall : ChunkedExpandTile<32, 64, 4> {};
 
 }  // namespace chunked_sgmv_lora_expand_fwd_impl

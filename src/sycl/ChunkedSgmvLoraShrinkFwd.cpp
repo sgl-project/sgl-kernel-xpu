@@ -41,13 +41,17 @@
     batch is already contiguous by adapter (prefill) and seg_indptr /
     weight_indices are in *physical* layout.
 
-    Implementation (device/chunked_sgmv_lora_shrink_fwd_kernel.hpp, launched through
-    the generated per-(dtype, tile) launchers declared in
-    chunked_sgmv_lora_shrink_fwd_dispatch.hpp): a single DPAS kernel that reads
-    x rows through the permutation and scatters output rows through it, with an
-    intra-work-group split-K for the long K = input_dim reduction -- no sorted
-    copies, no host syncs. Any input_dim, N and pointer alignment is supported
-    (masked K tail; alignment-free loads where 16-byte block reads are not possible).
+    Implementation (launched through the generated per-(dtype, tile) launchers
+    declared in chunked_sgmv_lora_shrink_fwd_dispatch.hpp): a single kernel that
+    reads x rows through the permutation and scatters output rows through it, with
+    an intra-work-group split-K for the long K = input_dim reduction -- no sorted
+    copies, no host syncs.
+    The kernel is sycl-tla's grouped GemmUniversal, launched through GemmUniversalAdapter and
+    assembled in common/gather_scatter_group_gemm_types.hpp, with LoRA collectives plugged in: the
+    gathered-A mainloop, the split-K reduce scatter epilogue,
+    and an on-device segment scheduler.
+    Weights a 2D block load cannot read (see shrink_weights_block2d_ok()) take the generic cute weight path.
+    Any input_dim, N and pointer alignment is supported.
 */
 
 // These kernels use the Xe2 copy atoms, so the target is pinned to 20 even on
@@ -192,7 +196,7 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_fwd(
     perm_ptr = perm_i64.data_ptr<int64_t>();
   }
 
-  // One gather-fused DPAS kernel: rows are read through the permutation and
+  // One gather-fused kernel: rows are read through the permutation and
   // outputs scattered through it, so no sorted copies exist.
   DISPATCH_CHUNKED_SGMV_LORA_SHRINK_FWD_DTYPE(
       x, weights, output, seg_indptr_i32, weight_indices_i32, perm_ptr, num_segments_, queue);

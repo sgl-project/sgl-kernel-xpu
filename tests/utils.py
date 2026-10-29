@@ -1,5 +1,6 @@
 import functools
 
+import pytest
 import torch
 
 FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
@@ -36,13 +37,12 @@ def is_xe3_device() -> bool:
     return is_xe3_arch()
 
 
-def cri_only(values):
-    """Extra parametrize values that are only exercised on CRI (Xe3) devices.
-
-    Returns ``values`` on CRI and an empty list everywhere else, so the CRI
-    topology shapes do not change coverage or runtime on other devices.
-    """
-    return list(values) if is_xe3_device() else []
+# Marks tests whose shapes are large enough to risk OOM on smaller-memory
+# devices; they only run on CRI (Xe3). Keep small shapes in the regular tests so
+# they run on every device.
+cri_only_large_shapes = pytest.mark.skipif(
+    not is_xe3_device(), reason="large shapes only run on CRI (Xe3)"
+)
 
 
 def get_reference_device():

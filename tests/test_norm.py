@@ -75,9 +75,10 @@ def fused_add_rms_norm(x, residual, weight, eps):
     [
         *[
             (batch_size, hidden_size, dtype)
-            for batch_size in [1, 19, 99, 989] + utils.cri_only([128])
-            for hidden_size in [111, 500, 1024, 2880, 3072, 3584, 4096, 8192, 16384]
-            + utils.cri_only([2048, 5120])
+            for batch_size in [1, 19, 99, 128, 989]
+            for hidden_size in [
+                111, 500, 1024, 2048, 2880, 3072, 3584, 4096, 5120, 8192, 16384
+            ]
             for dtype in [torch.float16, torch.bfloat16]
         ],
         # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
@@ -108,9 +109,10 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
     [
         *[
             (batch_size, hidden_size, dtype)
-            for batch_size in [1, 19, 99, 989] + utils.cri_only([128])
-            for hidden_size in [111, 500, 1024, 2880, 3072, 3584, 4096, 8192, 16384]
-            + utils.cri_only([2048, 5120])
+            for batch_size in [1, 19, 99, 128, 989]
+            for hidden_size in [
+                111, 500, 1024, 2048, 2880, 3072, 3584, 4096, 5120, 8192, 16384
+            ]
             for dtype in [torch.float16, torch.bfloat16, torch.float32]
         ],
         # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
@@ -138,29 +140,18 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     )
 
 
-# The gemma sweeps are CRI (Xe3) topology expansions: on Xe3 the full
-# batch x hidden x dtype product is exercised, while every other device keeps
-# the original fp16 sweep plus the three sparse dtype / large-hidden cases.
-_GEMMA_BATCH_SIZES = [1, 19, 99, 989] + utils.cri_only([2, 128])
-_GEMMA_HIDDEN_SIZES = [111, 500, 1024, 3072, 3584, 4096, 8192, 16384] + utils.cri_only(
-    [2048, 5120, 32768]
-)
-_GEMMA_DTYPES = [torch.float16] + utils.cri_only([torch.bfloat16, torch.float32])
+_GEMMA_BATCH_SIZES = [1, 2, 19, 99, 128, 989]
+_GEMMA_HIDDEN_SIZES = [
+    111, 500, 1024, 2048, 3072, 3584, 4096, 5120, 8192, 16384, 32768
+]
+_GEMMA_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
 _GEMMA_CASES = [
     (batch_size, hidden_size, dtype)
     for batch_size in _GEMMA_BATCH_SIZES
     for hidden_size in _GEMMA_HIDDEN_SIZES
     for dtype in _GEMMA_DTYPES
-] + (
-    []
-    if utils.is_xe3_device()
-    else [
-        (19, 1024, torch.bfloat16),
-        (19, 1024, torch.float32),
-        (2, 32768, torch.float16),
-    ]
-)
+]
 
 # Spell the dtype out in the test id. pytest has no clean repr for a torch
 # dtype, so it would otherwise number the whole case as `dtype0`, `dtype1`, ...

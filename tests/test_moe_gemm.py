@@ -159,8 +159,8 @@ def torch_naive_moe(
 
 
 # Expert weights are E*(2*I*H + H*I) elements, i.e. 6*E*H*I bytes at bf16.
-# Unioning HEAD's 4096 shapes with the CRI-only num_experts=128 produces cells
-# that neither sweep ever ran (E=128,H=4096,I=4096 is ~12 GiB); skip those.
+# The sweep below crosses num_experts=128 with the 4096 shapes, which would
+# need up to ~12 GiB (E=128,H=4096,I=4096); skip those cells.
 _MOE_WEIGHT_BUDGET_BYTES = 8 * 1024**3
 
 
@@ -256,13 +256,11 @@ def _check_moe_gemm(
     ],  # (act_type, gemm1_alpha, gemm1_limit)
 )
 @pytest.mark.parametrize("bias_dtype", [False, "bfloat16", "float32"])
-@pytest.mark.parametrize(
-    "intermediate_size", [512, 1024, 4096] + utils.cri_only([128, 768])
-)
-@pytest.mark.parametrize("hidden_size", [1024, 4096] + utils.cri_only([128, 2048]))
-@pytest.mark.parametrize("num_experts", [8, 64] + utils.cri_only([128]))
-@pytest.mark.parametrize("topk", [1, 2, 6] + utils.cri_only([8]))
-@pytest.mark.parametrize("num_tokens", [1, 4, 33, 64, 222] + utils.cri_only([128]))
+@pytest.mark.parametrize("intermediate_size", [128, 512, 768, 1024, 4096])
+@pytest.mark.parametrize("hidden_size", [128, 1024, 2048, 4096])
+@pytest.mark.parametrize("num_experts", [8, 64, 128])
+@pytest.mark.parametrize("topk", [1, 2, 6, 8])
+@pytest.mark.parametrize("num_tokens", [1, 4, 33, 64, 128, 222])
 def test_moe_gemm(
     num_tokens,
     topk,

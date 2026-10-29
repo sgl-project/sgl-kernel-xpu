@@ -2,7 +2,6 @@
 
 import pytest
 import torch
-import utils
 
 
 @pytest.fixture(autouse=True)
@@ -108,9 +107,7 @@ class TestStoreCacheXPU:
         torch.testing.assert_close(k_cache[42], k[0])
         torch.testing.assert_close(v_cache[42], v[0])
 
-    # num_heads expanded to include the CRI-only 32 and 64 to cover PO
-    # store_cache_xpu CFGs.
-    @pytest.mark.parametrize("num_heads", [2, 10] + utils.cri_only([32, 64]))
+    @pytest.mark.parametrize("num_heads", [2, 10, 32, 64])
     @pytest.mark.parametrize("head", [0, 1])
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.uint8])
     def test_strided_head_slice(self, num_heads, head, dtype):

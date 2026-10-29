@@ -46,8 +46,8 @@ def sglang_per_token_quant_fp8(
     "num_tokens,hidden_dim",
     list(
         itertools.product(
-            [128, 256, 512, 8192] + utils.cri_only([1]),
-            [512, 1076, 1368, 2048, 4096] + utils.cri_only([5120, 8192]),
+            [1, 128, 256, 512, 8192],
+            [512, 1076, 1368, 2048, 4096, 5120, 8192],
         )
     ),
 )

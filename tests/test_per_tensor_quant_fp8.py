@@ -42,8 +42,8 @@ def torch_scaled_fp8_quant(tensor, inv_scale):
     "num_tokens,hidden_dim",
     list(
         itertools.product(
-            [128, 256, 512, 1024] + utils.cri_only([1]),
-            [512, 2048, 4096, 8192] + utils.cri_only([5120]),
+            [1, 128, 256, 512, 1024],
+            [512, 2048, 4096, 5120, 8192],
         )
     ),
 )

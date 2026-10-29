@@ -68,10 +68,9 @@ TIGHT_TOL = {
             # hidden_size is the 2H dim (must be even). The values here all make
             # B*H a multiple of the kernel's vector width, so they never reach
             # the tail path -- see test_swiglu_vector_tail.
-            [64, 128, 256, 512, 1024, 2048, 4096]
-            + utils.cri_only([5120, 8192]),  # hidden_size
-            [0.5, 1.0, 2.0] + utils.cri_only([1.702]),  # alpha
-            [1.0, 5.0, 10.0] + utils.cri_only([7.0]),  # limit
+            [64, 128, 256, 512, 1024, 2048, 4096, 5120, 8192],  # hidden_size
+            [0.5, 1.0, 1.702, 2.0],  # alpha
+            [1.0, 5.0, 7.0, 10.0],  # limit
             [torch.float32, torch.bfloat16, torch.float16],  # dtype
         )
     ),

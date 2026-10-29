@@ -5,7 +5,6 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-import utils
 from sgl_kernel import moe_align_block_size, moe_sum
 
 
@@ -146,7 +145,7 @@ def moe_align_block_size_triton(
             [32, 64, 128, 256],  # block_size
             [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096],  # num_tokens
             [1, 2, 4, 8, 16, 32, 64],  # topk
-            [16, 64, 160, 256, 257, 260, 264] + utils.cri_only([128]),  #  num_experts
+            [16, 64, 128, 160, 256, 257, 260, 264],  #  num_experts
             [True, False],  # pad_sorted_token_ids
         )
     ),

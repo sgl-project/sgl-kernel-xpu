@@ -30,9 +30,7 @@ inline void run_xe35_decode(
     int window_size_right,
     const cutlass::bfloat16_t* sm_sink,
     bool use_sink,
-    int num_kv_splits = 1,
-    int* seqused_q = nullptr,
-    int* seqused_k = nullptr) {
+    int num_kv_splits = 1) {
   dispatch_xe3_kernel<HeadDim, true, Paged, Element, cutlass::bfloat16_t>(
       q_dense,
       k_pool,
@@ -58,9 +56,7 @@ inline void run_xe35_decode(
       window_size_right,
       sm_sink,
       use_sink,
-      num_kv_splits,
-      seqused_q,
-      seqused_k);
+      num_kv_splits);
 }
 
 }  // namespace xe35_fmha

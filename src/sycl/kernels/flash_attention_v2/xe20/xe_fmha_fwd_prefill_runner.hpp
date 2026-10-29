@@ -129,8 +129,8 @@ struct Arguments {
   int* __restrict__ leftpad_k;
 
   // If provided, the actual length of each q/k sequence.
-  int* __restrict__ seqused_q;
-  int* __restrict__ seqused_k;
+  int* __restrict__ seqused_q = nullptr;
+  int* __restrict__ seqused_k = nullptr;
 
   // The stride between rows of Oaccum.
   int64_t oaccum_split_stride;
@@ -357,6 +357,8 @@ struct PrefillRunner {
       shape.seq_len_qo.cumulative_length = params.cu_seqlens_q;
       shape.seq_len_kv.cumulative_length = params.cu_seqlens_knew;
       shape.seq_len_kv_cache.cumulative_length = params.cu_seqlens_k;
+      shape.seq_len_qo.seqused = params.seqused_q;
+      shape.seq_len_kv_cache.seqused = params.seqused_k;
     }
 
     return shape;
@@ -377,6 +379,12 @@ struct PrefillRunner {
       }
       if (args.kernel.shape.seq_len_kv_cache.cumulative_length != nullptr) {
         args.kernel.shape.seq_len_kv_cache.cumulative_length += batch_lo;
+      }
+      if (args.kernel.shape.seq_len_qo.seqused != nullptr) {
+        args.kernel.shape.seq_len_qo.seqused += batch_lo;
+      }
+      if (args.kernel.shape.seq_len_kv_cache.seqused != nullptr) {
+        args.kernel.shape.seq_len_kv_cache.seqused += batch_lo;
       }
     }
     if (args.mainloop.ptr_page_table != nullptr) {

@@ -774,6 +774,106 @@ def test_gemma_norm_4d_non_flattenable(
 
 
 ###############################################################################
+# Strided last-dim tests for gemma_rmsnorm (stride(-1) != 1)
+###############################################################################
+
+
+def _make_strided_last_dim(shape, dtype):
+    """Create a tensor of `shape` whose last dim is not unit-stride by
+    transposing the last two dims of a contiguous buffer, e.g. a
+    (batch, hidden, tokens) activation viewed as (batch, tokens, hidden)."""
+    full = torch.randn(*shape[:-2], shape[-1], shape[-2], device=device, dtype=dtype)
+    x = full.transpose(-1, -2)
+    assert x.stride(-1) == shape[-2]
+    return x
+
+
+# (37, 111) leaves a partial group of rows; (5, 8) is narrower than the number
+# of sub-groups splitting a row; (2, 256, 1152) has leading dims that do not
+# fold.  The larger shapes load several adjacent rows per lane as one vector;
+# (40, 100, 64) caps that vector at 4 rows.
+@pytest.mark.parametrize(
+    "shape",
+    [
+        (37, 111),
+        (5, 8),
+        (1, 256, 1152),
+        (2, 256, 1152),
+        (2, 3, 5, 128),
+        (4, 16384),
+        (8, 256, 1152),
+        (32, 256, 1152),
+        (40, 100, 64),
+        (4, 4, 128, 256),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("specify_out", [True, False])
+def test_gemma_norm_strided_last_dim(shape, dtype, specify_out):
+    x = _make_strided_last_dim(shape, dtype)
+    w = torch.randn(shape[-1], device=device, dtype=dtype)
+
+    y_ref = gemma_rms_norm(x.clone(), w)
+    if specify_out:
+        y = torch.empty(shape, device=device, dtype=dtype)
+        sgl_kernel.gemma_rmsnorm(x, w, out=y)
+    else:
+        # empty_like keeps the strided layout, so the output is strided too.
+        y = sgl_kernel.gemma_rmsnorm(x, w)
+        assert y.stride() == x.stride()
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
+
+
+def test_gemma_norm_strided_output():
+    x = torch.randn(2, 256, 1152, device=device, dtype=torch.bfloat16)
+    w = torch.randn(x.size(-1), device=device, dtype=x.dtype)
+    y = torch.empty(2, 1152, 256, device=device, dtype=x.dtype).transpose(1, 2)
+
+    y_ref = gemma_rms_norm(x.clone(), w)
+    sgl_kernel.gemma_rmsnorm(x, w, out=y)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(x.dtype))
+
+
+def test_gemma_norm_strided_last_dim_unaligned():
+    # Adjacent rows, but the view starts one element into the buffer, so rows
+    # cannot be loaded as an aligned vector.
+    b, hidden, tokens = 32, 1152, 256
+    buf = torch.randn(b * hidden * tokens + 1, device=device, dtype=torch.bfloat16)
+    x = buf[1:].view(b, hidden, tokens).transpose(1, 2)
+    w = torch.randn(hidden, device=device, dtype=x.dtype)
+
+    y_ref = gemma_rms_norm(x.clone(), w)
+    y = sgl_kernel.gemma_rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(x.dtype))
+
+
+def test_gemma_norm_step_sliced_last_dim():
+    full = torch.randn(19, 2 * 1024, device=device, dtype=torch.float16)
+    x = full[:, ::2]
+    assert x.stride() == (2048, 2)
+    w = torch.randn(x.size(-1), device=device, dtype=x.dtype)
+
+    y_ref = gemma_rms_norm(x.clone(), w)
+    y = sgl_kernel.gemma_rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(x.dtype))
+
+
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
+def test_gemma_norm_strided_last_dim_mixed_dtype(input_dtype):
+    x = _make_strided_last_dim((2, 256, 1152), input_dtype)
+    w = torch.randn(x.size(-1), device=device, dtype=torch.float32)
+
+    y_ref = gemma_rms_norm(x.clone(), w)
+    y = sgl_kernel.gemma_rmsnorm(x, w)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(input_dtype))
+
+
+###############################################################################
 # Mixed input/weight dtype tests
 ###############################################################################
 

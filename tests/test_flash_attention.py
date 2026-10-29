@@ -3250,9 +3250,8 @@ def test_flash_attn_varlen_seqused(d, causal, dtype):
     the padding rows and a sequence with no keys must come back zero."""
     from sgl_kernel.flash_attn import flash_attn_varlen_func
 
-    skip_unsupported_attention_case(d, False, dtype)
-    if is_cri_device() and causal:
-        pytest.skip("Xe35 non-paged batched causal varlen is not supported")
+    if is_cri_device():
+        pytest.skip("Xe35 does not support seqused_q / seqused_k")
     torch.random.manual_seed(d + int(causal))
     seqlens_q, seqlens_k = [96, 17, 128, 1, 33], [128, 40, 128, 9, 0]
     max_q, max_k, nheads, nheads_kv = max(seqlens_q), max(seqlens_k), 8, 2

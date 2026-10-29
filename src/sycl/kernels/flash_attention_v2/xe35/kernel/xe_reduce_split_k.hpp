@@ -85,9 +85,7 @@ class ReduceSplitK {
       if (shape.seq_len_kv_cache.cumulative_length != nullptr) {
         return {get<0>(q_len), shape.seq_len_kv_cache.cumulative_length[batch]};
       } else if (shape.seq_len_kv.cumulative_length != nullptr) {
-        int kv_len = shape.seq_len_kv.seqused
-                         ? shape.seq_len_kv.seqused[batch]
-                         : shape.seq_len_kv.cumulative_length[batch + 1] - shape.seq_len_kv.cumulative_length[batch];
+        int kv_len = shape.seq_len_kv.cumulative_length[batch + 1] - shape.seq_len_kv.cumulative_length[batch];
         return {get<0>(q_len), kv_len};
       } else {
         return {get<0>(q_len), 0};

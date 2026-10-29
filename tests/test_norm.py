@@ -77,7 +77,17 @@ def fused_add_rms_norm(x, residual, weight, eps):
             (batch_size, hidden_size, dtype)
             for batch_size in [1, 19, 99, 128, 989]
             for hidden_size in [
-                111, 500, 1024, 2048, 2880, 3072, 3584, 4096, 5120, 8192, 16384
+                111,
+                500,
+                1024,
+                2048,
+                2880,
+                3072,
+                3584,
+                4096,
+                5120,
+                8192,
+                16384,
             ]
             for dtype in [torch.float16, torch.bfloat16]
         ],
@@ -111,7 +121,17 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
             (batch_size, hidden_size, dtype)
             for batch_size in [1, 19, 99, 128, 989]
             for hidden_size in [
-                111, 500, 1024, 2048, 2880, 3072, 3584, 4096, 5120, 8192, 16384
+                111,
+                500,
+                1024,
+                2048,
+                2880,
+                3072,
+                3584,
+                4096,
+                5120,
+                8192,
+                16384,
             ]
             for dtype in [torch.float16, torch.bfloat16, torch.float32]
         ],
@@ -141,9 +161,7 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
 
 
 _GEMMA_BATCH_SIZES = [1, 2, 19, 99, 128, 989]
-_GEMMA_HIDDEN_SIZES = [
-    111, 500, 1024, 2048, 3072, 3584, 4096, 5120, 8192, 16384, 32768
-]
+_GEMMA_HIDDEN_SIZES = [111, 500, 1024, 2048, 3072, 3584, 4096, 5120, 8192, 16384, 32768]
 _GEMMA_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 
 _GEMMA_CASES = [

@@ -91,10 +91,11 @@ struct UpdateTokenTableKernel {
 
   void operator()(sycl::nd_item<1> item) const {
     const int req = static_cast<int>(item.get_group(0));
-    int start = 0;
-    for (int i = 0; i < req; i++) {
-      start += req_lens_[i];
+    int partial = 0;
+    for (int i = static_cast<int>(item.get_local_id(0)); i < req; i += static_cast<int>(item.get_local_range(0))) {
+      partial += req_lens_[i];
     }
+    const int start = sycl::reduce_over_group(item.get_group(), partial, sycl::plus<int>());
     int* row = ne_token_table_ + row_indices_[req] * static_cast<int64_t>(max_context_len_) + column_starts_[req];
     for (int i = static_cast<int>(item.get_local_id(0)); i < req_lens_[req];
          i += static_cast<int>(item.get_local_range(0))) {

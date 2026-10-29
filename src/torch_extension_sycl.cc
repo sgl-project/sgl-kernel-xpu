@@ -26,6 +26,13 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kXPU, &awq_dequantize);
 
+  m.def("gptq_entry_probe(Tensor device_index) -> ()");
+  m.impl("gptq_entry_probe", torch::kXPU, &gptq_entry_probe);
+
+  m.def(
+      "gptq_gemm(Tensor a, Tensor b_q_weight, Tensor b_gptq_qzeros, Tensor b_gptq_scales, Tensor b_g_idx, bool use_shuffle, int bit, int zero_format=1) -> Tensor");
+  m.impl("gptq_gemm", torch::kXPU, &gptq_gemm);
+
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kXPU, &silu_and_mul);
 

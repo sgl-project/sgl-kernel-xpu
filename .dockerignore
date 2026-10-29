@@ -1,0 +1,17 @@
+.git
+.github
+.specify
+specs
+build
+dist
+*.egg-info
+__pycache__
+.venv
+venv
+.env
+.env.*
+*.log
+.DS_Store
+benchmark/*.log
+tests/__pycache__
+*.pyc

@@ -43,11 +43,56 @@
 # python build files
 *.pyc
 *.pyo
+__pycache__/
+*.egg-info/
+.venv/
+venv/
+dist/
+.env
+.env.*
 
 build
 
 # vscode
 .vscode/
+.idea/
+.DS_Store
+*.tmp
+*.swp
 
 # benchmark run logs (benchmark/run_suite.py writes one per benchmark)
 benchmark/*.log
+
+# AI assistant scratch.
+# Spec Kit plans stay local. .claude/skills/ stays tracked.
+# Ignore tool indexes, transcripts, and generation scratch only.
+.specify/
+specs/
+.cursor/
+.cursor-*/
+*.cursor-*
+.cursorrules
+.cursorindexingignore
+agent-transcripts/
+agent-logs/
+*agent-transcript*
+*agent-state*
+*.agent.jsonl
+*.agent.log
+
+# Claude Code local state (not project skills)
+.claude/settings.local.json
+.claude/*.local.json
+.claude/*.local.md
+.claude/local/
+.claude/projects/
+.claude/sessions/
+.claude/cache/
+.claude/debug/
+.claude/todos/
+.claude/shell-snapshots/
+.claude/ide/
+.claude/statsig/
+.claude/transcripts/
+.claude/history.jsonl
+.claude/**/*.jsonl

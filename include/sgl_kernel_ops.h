@@ -595,6 +595,16 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
+void gptq_entry_probe(torch::Tensor device_index);
+torch::Tensor gptq_gemm(
+    torch::Tensor a,
+    torch::Tensor b_q_weight,
+    torch::Tensor b_gptq_qzeros,
+    torch::Tensor b_gptq_scales,
+    torch::Tensor b_g_idx,
+    bool use_shuffle,
+    int64_t bit,
+    int64_t zero_format);
 void cutlass_scaled_fp4_mm(
     torch::Tensor& D,
     torch::Tensor const& A,

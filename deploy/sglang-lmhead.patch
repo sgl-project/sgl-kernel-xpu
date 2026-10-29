@@ -1,0 +1,33 @@
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -1016,4 +1016,27 @@
+             else:
+-                logits = torch.matmul(
+-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+-                )
++                if (
++                    hidden_states.is_xpu
++                    and hidden_states.dim() == 2
++                    and lm_head.weight.is_contiguous()
++                    and hidden_states.shape[-1] == lm_head.weight.shape[1]
++                ):
++                    import os
++                    import time
++                    _time_head = os.environ.get("SGL_GPTQ_STEP") == "1"
++                    if _time_head:
++                        torch.xpu.synchronize()
++                        _head_t = time.perf_counter()
++                    logits = torch.ops.sgl_kernel.lm_head_gemv(
++                        hidden_states.to(lm_head.weight.dtype).contiguous(),
++                        lm_head.weight,
++                    )
++                    if _time_head:
++                        torch.xpu.synchronize()
++                        print(
++                            f"SGL_GPTQ_LMHEAD_DT M={hidden_states.shape[0]} N={lm_head.weight.shape[0]} dt={time.perf_counter() - _head_t:.4f}",
++                            flush=True,
++                        )
++                else:
++                    logits = torch.matmul(
++                        hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
++                    )

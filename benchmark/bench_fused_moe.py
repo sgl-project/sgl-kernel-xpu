@@ -3,7 +3,12 @@ from itertools import product
 
 import torch
 import triton
-from sgl_kernel import fused_experts, topk_softmax
+from sgl_kernel import (
+    convert_weights_to_col_major,
+    fused_experts,
+    is_xe2_arch,
+    topk_softmax,
+)
 from torch.nn import functional as F
 
 # GPT-OSS SwiGLU parameters
@@ -475,6 +480,9 @@ def benchmark(
     if with_bias:
         b1 = torch.randn(w1.shape[:2], dtype=dtype)
         b2 = torch.randn(w2.shape[:2], dtype=dtype)
+
+    if provider == "sgl_kernel" and is_xe2_arch():
+        w1, w2 = convert_weights_to_col_major(w1, w2)
 
     input_gating = torch.randn(num_tokens, num_experts, dtype=dtype)
 

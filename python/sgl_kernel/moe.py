@@ -488,6 +488,14 @@ def _validate_fp8_weight_scale(
     allow_scalar: bool,
 ) -> None:
     """Validate an FP8 expert scale tensor against its physical weight shape."""
+    is_transposed = getattr(weights, "_xpu_weights_transposed", False)
+    if is_transposed:
+        n_dim = weights.shape[2]
+        k_dim = weights.shape[1]
+    else:
+        n_dim = weights.shape[1]
+        k_dim = weights.shape[2]
+
     is_mxfp8 = scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
     if is_mxfp8:
         assert scale.ndim == 3, f"{name} MXFP8 scales must be 3D [E, N, K/32]"
@@ -495,16 +503,16 @@ def _validate_fp8_weight_scale(
             f"{name} expert dimension {scale.shape[0]} must match weights "
             f"expert dimension {weights.shape[0]}"
         )
-        assert scale.shape[1] == weights.shape[1], (
+        assert scale.shape[1] == n_dim, (
             f"{name} MXFP8 scale N dimension {scale.shape[1]} must match weights "
-            f"N dimension {weights.shape[1]}"
+            f"N dimension {n_dim}"
         )
         assert (
-            weights.shape[2] % 32 == 0
-        ), f"{name} MXFP8 scale requires K divisible by 32, got K={weights.shape[2]}"
-        assert scale.shape[2] == weights.shape[2] // 32, (
+            k_dim % 32 == 0
+        ), f"{name} MXFP8 scale requires K divisible by 32, got K={k_dim}"
+        assert scale.shape[2] == k_dim // 32, (
             f"{name} MXFP8 scale K dimension {scale.shape[2]} must equal K/32 "
-            f"({weights.shape[2] // 32})"
+            f"({k_dim // 32})"
         )
         return
 
@@ -532,16 +540,39 @@ def _validate_fp8_weight_scale(
 
     expected_shape = (
         weights.shape[0],
-        (weights.shape[1] + 127) // 128,
-        (weights.shape[2] + 127) // 128,
+        (n_dim + 127) // 128,
+        (k_dim + 127) // 128,
     )
     assert tuple(scale.shape) == expected_shape, (
-        f"{name} block scales must have shape [E, ceil(N/128), ceil(K/128)] "
-        f"={expected_shape}, got {tuple(scale.shape)}"
+        f"{name} block scales must have shape [E, ceil(N/128), ceil(K/128)], "
+        f"got {tuple(scale.shape)}"
     )
     assert (
-        weights.shape[2] % 128 == 0
-    ), f"{name} block scales require K divisible by 128, got K={weights.shape[2]}"
+        k_dim % 128 == 0
+    ), f"{name} block scales require K divisible by 128, got K={k_dim}"
+
+
+def mark_weights_col_major(w: torch.Tensor) -> torch.Tensor:
+    """Mark weight tensor as column-major [E, K, N] (Layout B) on Intel Xe2."""
+    setattr(w, "_xpu_weights_transposed", True)
+    return w
+
+
+def convert_weights_to_col_major(
+    w1: torch.Tensor, w2: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Convert legacy MoE weights once before entering the Xe2 hot path."""
+    w1_marked = bool(getattr(w1, "_xpu_weights_transposed", False))
+    w2_marked = bool(getattr(w2, "_xpu_weights_transposed", False))
+    assert w1_marked == w2_marked, (
+        "w1 and w2 must use the same layout: both must be marked "
+        "_xpu_weights_transposed or neither must be marked"
+    )
+    if w1_marked:
+        return w1, w2
+    w1_col = w1.transpose(1, 2).contiguous()
+    w2_col = w2.transpose(1, 2).contiguous()
+    return mark_weights_col_major(w1_col), mark_weights_col_major(w2_col)
 
 
 def fused_experts(
@@ -840,32 +871,105 @@ def fused_experts(
         if (is_xe2_arch() or is_xe3_arch()) and b2.dtype == torch.bfloat16:
             # cast b2 to float32, since bias is accumulated in float32 in the kernel
             b2 = b2.float()
-    # Shape check
-    # For packed 4-bit weights the last dim of w1/w2 is halved (2 values per
-    # byte), so compute the actual (unpacked) inner dimensions for validation.
-    _w1_inner = w1.shape[-1] * 2 if use_4bit_w4a16 else w1.shape[-1]
-    _w2_inner = w2.shape[-1] * 2 if use_4bit_w4a16 else w2.shape[-1]
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
-    assert (
-        hidden_states.shape[-1] == _w1_inner
-    ), f"hidden_states shape[-1] {hidden_states.shape} must equal w1 inner dim {_w1_inner} (w1.shape={w1.shape})"
-    assert (2 * _w2_inner == w1.shape[1]) or (
-        (_w2_inner == w1.shape[1]) and (activation == "relu2")
-    ), f"w2 inner dim {_w2_inner} must be half of w1 shape[1] {w1.shape[1]} except non-gate"
-    assert (topk_ids.shape == topk_weights.shape) and (
-        topk_ids.shape[0] == hidden_states.shape[0]
-    ), f"topk_ids shape {topk_ids.shape} and topk_weights shape {topk_weights.shape} must be equal and match hidden_states shape[0] {hidden_states.shape[0]}"
-
     num_tokens, hidden_dims = hidden_states.shape
 
-    E, _, K = w1.shape
-    E, OutK, N = w2.shape
-    w1_group_size = 0
-    w2_group_size = 0
     use_mxfp4_xe3 = use_mxfp4_w4a16 and is_xe3_arch()
     w1_scale_xe35 = None
     w2_scale_xe35 = None
-    if use_4bit_w4a16:
+
+    # FP8 and BF16 unquantized weights:
+    # Column-major weights [E, K, N] are adopted on Xe2 for both FP8 and BF16.
+    # On Xe3 (CRI), plain BF16 continues to expect legacy row-major [E, N, K].
+    # TODO: Optimize Xe3 MoE kernel layout in a future PR to adopt column-major Layout B.
+    use_col_major_weights = is_xe2_arch() and (use_fp8_weight or not use_4bit_w4a16)
+
+    if use_col_major_weights:
+        w1_marked_col_major = bool(getattr(w1, "_xpu_weights_transposed", False))
+        w2_marked_col_major = bool(getattr(w2, "_xpu_weights_transposed", False))
+        assert w1_marked_col_major == w2_marked_col_major, (
+            "w1 and w2 must use the same layout: both must be marked "
+            "_xpu_weights_transposed or both must be legacy row-major"
+        )
+        weights_already_transposed = w1_marked_col_major
+
+        if weights_already_transposed:
+            E, K, w1_out = w1.shape
+            E, w2_in_dim, OutK = w2.shape
+            w1_in = w1
+            w2_in = w2
+        else:
+            # Upgrade legacy callers in place. The new contiguous buffers are
+            # temporary only; assigning through .data changes the original
+            # Parameter/Tensor object, so later forwards reuse the converted
+            # storage without a second cached weight copy.
+            with torch.no_grad():
+                w1.data = w1.transpose(1, 2).contiguous()
+                w2.data = w2.transpose(1, 2).contiguous()
+            mark_weights_col_major(w1)
+            mark_weights_col_major(w2)
+            E, K, w1_out = w1.shape
+            E, w2_in_dim, OutK = w2.shape
+            w1_in = w1
+            w2_in = w2
+
+        assert K == hidden_dims, (
+            f"w1 K dim {K} mismatch with hidden_dims {hidden_dims}: "
+            f"w1 shape={tuple(w1_in.shape)}"
+        )
+        assert OutK == hidden_dims, (
+            f"w2 OutK dim {OutK} mismatch with hidden_dims {hidden_dims}: "
+            f"w2 shape={tuple(w2_in.shape)}"
+        )
+        assert (2 * w2_in_dim == w1_out) or (
+            (w2_in_dim == w1_out) and (activation == "relu2")
+        ), f"w2 inner dim {w2_in_dim} must be half of w1 out dim {w1_out} except non-gate"
+
+        N = w2_in_dim
+        if b1 is not None:
+            assert b1.shape == (E, w1_out), f"b1 shape must match (E={E}, {w1_out})"
+        if b2 is not None:
+            assert b2.shape == (E, OutK), f"b2 shape must match (E={E}, {OutK})"
+        w1_group_size = 0
+        w2_group_size = 0
+    elif not use_4bit_w4a16:
+        # Plain BF16 on Xe3: keep standard row-major [E, 2*I, K] and [E, K, I]
+        _w1_inner = w1.shape[-1]
+        _w2_inner = w2.shape[-1]
+        assert (
+            hidden_states.shape[-1] == _w1_inner
+        ), f"hidden_states shape[-1] {hidden_states.shape} must equal w1 inner dim {_w1_inner} (w1.shape={w1.shape})"
+        assert (2 * _w2_inner == w1.shape[1]) or (
+            (_w2_inner == w1.shape[1]) and (activation == "relu2")
+        ), f"w2 inner dim {_w2_inner} must be half of w1 shape[1] {w1.shape[1]} except non-gate"
+        E, w1_out, K = w1.shape
+        E, OutK, N = w2.shape
+        w1_in = w1
+        w2_in = w2
+        if b1 is not None:
+            assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
+        if b2 is not None:
+            assert b2.shape == w2.shape[:2], "b2 shape must match w2 shape[:2]"
+        w1_group_size = 0
+        w2_group_size = 0
+    else:
+        _w1_inner = w1.shape[-1] * 2
+        _w2_inner = w2.shape[-1] * 2
+        assert (
+            hidden_states.shape[-1] == _w1_inner
+        ), f"hidden_states shape[-1] {hidden_states.shape} must equal w1 inner dim {_w1_inner} (w1.shape={w1.shape})"
+        assert (2 * _w2_inner == w1.shape[1]) or (
+            (_w2_inner == w1.shape[1]) and (activation == "relu2")
+        ), f"w2 inner dim {_w2_inner} must be half of w1 shape[1] {w1.shape[1]} except non-gate"
+
+        E, _, K = w1.shape
+        E, OutK, N = w2.shape
+        w1_in = w1
+        w2_in = w2
+        if b1 is not None:
+            assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
+        if b2 is not None:
+            assert b2.shape == w2.shape[:2], "b2 shape must match w2 shape[:2]"
         # w1/w2 last dims are packed (H//2, I//2); recover actual dims
         K = K * 2
         N = N * 2
@@ -884,10 +988,10 @@ def fused_experts(
             # TODO: Decodes E8M0 bytes on-device on Xe3, and remove this host-side decode.
             w1_scale_xe35 = _mxfp4_e8m0_to_fp32(w1_scale)
             w2_scale_xe35 = _mxfp4_e8m0_to_fp32(w2_scale)
-    if b1 is not None:
-        assert b1.shape == w1.shape[:2], "b1 shape must match w1 shape[:2]"
-    if b2 is not None:
-        assert b2.shape == w2.shape[:2], "b2 shape must match w2 shape[:2]"
+
+    assert (topk_ids.shape == topk_weights.shape) and (
+        topk_ids.shape[0] == hidden_states.shape[0]
+    ), f"topk_ids shape {topk_ids.shape} and topk_weights shape {topk_weights.shape} must be equal and match hidden_states shape[0] {hidden_states.shape[0]}"
 
     M = num_tokens
     TopK = topk_ids.shape[1]
@@ -998,10 +1102,13 @@ def fused_experts(
             hidden_states.dtype,
             hidden_states.device,
         )
+        assert (
+            w1_in.shape[1] == input_A_shuffle.shape[1]
+        ), f"w1 must be in column-major [E, K, N] format with K={input_A_shuffle.shape[1]}, got {tuple(w1_in.shape)}"
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
             intermediate_cache1,
             input_A_shuffle,
-            w1,
+            w1_in,
             w1_scale,
             b1,
             expert_offsets,
@@ -1039,10 +1146,13 @@ def fused_experts(
                     f"unsupported FP8 activation type: {activation_type}"
                 )
 
+        assert (
+            w2_in.shape[1] == intermediate_cache2.shape[1]
+        ), f"w2 must be in column-major [E, K, N] format with K={intermediate_cache2.shape[1]}, got {tuple(w2_in.shape)}"
         torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
             intermediate_cache3,
             intermediate_cache2,
-            w2,
+            w2_in,
             w2_scale,
             b2,
             expert_offsets,
@@ -1087,10 +1197,10 @@ def fused_experts(
         raise ValueError(f"Unsupported activation {activation}")
 
     # Gated activations (silu/gelu/swiglu) split w1's output into gate+up, so
-    # w1.shape[1] == 2*N; non-gated relu2 has w1.shape[1] == N. Compare against
-    # the recovered (unpacked) N — w2.shape[2] is the packed I/2 under MXFP4,
-    # which would mis-detect the gated case as non-gated (gate_factor=1).
-    gate_factor = 2 if (2 * N == w1.shape[1]) else 1
+    # w1's output dimension == 2*N; non-gated relu2 has w1's output dimension == N.
+    # On Xe2 column-major weights, w1 is [E, K, 2*N] (output dim is 2); on Xe3 / 4-bit, w1 is [E, 2*N, ...] (dim 1).
+    w1_out_dim = w1_in.shape[2] if use_col_major_weights else w1_in.shape[1]
+    gate_factor = 2 if (2 * N == w1_out_dim) else 1
 
     if use_mxfp4_xe3:
         # moe_grouped_mm_nt_xe35_mxfp4_w4a16's AOT instantiation matrix is
@@ -1117,7 +1227,16 @@ def fused_experts(
     # The 4-bit W4A16 grouped GEMM uses a two-GEMM path. Keep GEMM1 independent
     # and apply the gated activation with its dedicated elementwise kernel.
     # This preserves GEMM N-dimension parallelism.
-    use_unfused_act = use_4bit_w4a16 or (avg_m <= 128 and big_weight)
+    # SWIGLU_GPT_OSS (type 2) has interleaved gate/up columns and also uses the
+    # independent GEMM1 -> dedicated elementwise swiglu_gpt_oss_sigmoid_alpha path.
+    use_unfused_act = (
+        use_4bit_w4a16
+        or (
+            activation_type == 2
+            and not getattr(w1_in, "_xpu_gate_up_block_split", False)
+        )
+        or (activation_type != 2 and avg_m <= 128 and big_weight)
+    )
     # Plain bf16 grouped GEMM: dispatch to the Xe3 (CRI) op when running on
     # Xe3, otherwise the Xe2 (BMG) op. use_fp8_weight and
     # use_int4_w4a16 are asserted unsupported on Xe3 above; use_mxfp4_w4a16
@@ -1167,7 +1286,7 @@ def fused_experts(
             moe_grouped_mm_nt(
                 intermediate_cache1,
                 input_A_shuffle,
-                w1,
+                w1_in,
                 b1,
                 expert_offsets,
                 E,
@@ -1240,7 +1359,7 @@ def fused_experts(
             moe_grouped_mm_nt(
                 intermediate_cache3,
                 intermediate_cache2,
-                w2,
+                w2_in,
                 b2,
                 expert_offsets,
                 E,
@@ -1262,7 +1381,7 @@ def fused_experts(
         moe_grouped_mm_nt(
             intermediate_cache1,
             input_A_shuffle,
-            w1,
+            w1_in,
             b1,
             expert_offsets,
             E,
@@ -1270,12 +1389,13 @@ def fused_experts(
             fuse_act=True,
             gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
             gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
+            gate_up_interleaved=not getattr(w1_in, "_xpu_gate_up_block_split", False),
         )
         # GEMM2: B = w2 (down). Always fuse_act=False on the second GEMM.
         moe_grouped_mm_nt(
             intermediate_cache3,
             intermediate_cache1,
-            w2,
+            w2_in,
             b2,
             expert_offsets,
             E,

@@ -39,7 +39,12 @@
 #include "cute/atom/mma_atom.hpp"
 #include "cute/util/sycl_vec.hpp"
 #include "cutlass/cutlass.h"
+// Public sycl-tla has the make_scaled_* helpers in xe_common_blockscaled_mxfp.hpp.
+#if __has_include("cutlass/gemm/collective/xe_mma_blockscaled_scale_traits.hpp")
 #include "cutlass/gemm/collective/xe_mma_blockscaled_scale_traits.hpp"
+#else
+#include "cutlass/gemm/collective/xe_common_blockscaled_mxfp.hpp"
+#endif
 #include "cutlass/gemm/dispatch_policy.hpp"
 #include "fmha_fusion.hpp"
 

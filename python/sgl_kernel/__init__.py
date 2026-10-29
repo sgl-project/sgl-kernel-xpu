@@ -220,7 +220,11 @@ from sgl_kernel.qsa_prepare import (
     qsa_index_k_compress_store,
     qsa_index_q_norm_rope_store,
 )
-from sgl_kernel.qsa_sparse_attention import qsa_sparse_attention
+from sgl_kernel.qsa_sparse_attention import (
+    qsa_mqa_decode,
+    qsa_mqa_prefill,
+    qsa_sparse_attention,
+)
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_renorm_prob,

@@ -41,7 +41,6 @@ if os.path.exists(cuda_path):
     ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)
 
 from sgl_kernel import common_ops
-from sgl_kernel.convrot import convrot_int8_linear_prequant, convrot_rotate_quantize
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     flash_mla_decode,
@@ -61,6 +60,7 @@ from sgl_kernel.compress_plan import (
     plan_compress_prefill,
     plan_compress_prefill_legacy,
 )
+from sgl_kernel.convrot import convrot_int8_linear_prequant, convrot_rotate_quantize
 from sgl_kernel.diffusion import fused_scale_residual_norm_scale_shift
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,

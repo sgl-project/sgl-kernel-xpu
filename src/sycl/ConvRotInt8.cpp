@@ -26,7 +26,7 @@ void check_tensor(const at::Tensor& tensor, const at::Device& device, at::Scalar
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
-template <int StaticK, int Threads>
+template <int FixedK, int Threads>
 struct ConvRotQuantKernel {
   const at::BFloat16* input;
   int8_t* output;
@@ -35,7 +35,7 @@ struct ConvRotQuantKernel {
   sycl::local_accessor<float, 1> values;
 
   void operator()(sycl::nd_item<1> item) const {
-    const int k = StaticK ? StaticK : this->k;
+    const int k = FixedK ? FixedK : this->k;
     const int tid = item.get_local_id(0);
     const int64_t row = item.get_group(0);
     // Fuse input loading with the first H4 stage, avoiding an SLM round trip.
@@ -68,7 +68,7 @@ struct ConvRotQuantKernel {
     }
     float maximum = 0;
     // Specialized rows retain BF16 results in the producing threads across the reduction.
-    constexpr int Chunks = StaticK ? (StaticK + 4 * Threads - 1) / (4 * Threads) : 1;
+    constexpr int Chunks = FixedK ? (FixedK + 4 * Threads - 1) / (4 * Threads) : 1;
     at::BFloat16 rounded_values[Chunks][4];
     // Fuse the final H4 stage with BF16 rounding and the local row maximum.
     for (int b = tid; b < k / 4; b += Threads) {
@@ -77,13 +77,11 @@ struct ConvRotQuantKernel {
       const float b1 = values[base + 64];
       const float c = values[base + 128];
       const float d = values[base + 192];
-      const float final_values[4] = {
-          ((a + b1) + c) - d, ((a + b1) - c) + d,
-          ((a - b1) + c) + d, ((-a + b1) + c) + d};
+      const float final_values[4] = {((a + b1) + c) - d, ((a + b1) - c) + d, ((a - b1) + c) + d, ((-a + b1) + c) + d};
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
         const float rotated = static_cast<float>(static_cast<at::BFloat16>(final_values[i] * 0.0625f));
-        if constexpr (StaticK) {
+        if constexpr (FixedK) {
           rounded_values[(b - tid) / Threads][i] = static_cast<at::BFloat16>(rotated);
         } else {
           values[base + i * 64] = rotated;
@@ -91,7 +89,7 @@ struct ConvRotQuantKernel {
         maximum = sycl::fmax(maximum, sycl::fabs(rotated));
       }
     }
-    if constexpr (!StaticK) {
+    if constexpr (!FixedK) {
       sycl::group_barrier(item.get_group());
     }
     maximum = sycl::reduce_over_group(item.get_group(), maximum, sycl::maximum<float>());
@@ -100,7 +98,7 @@ struct ConvRotQuantKernel {
       scales[row] = scale;
     }
     const float math_scale = static_cast<float>(static_cast<at::BFloat16>(scale));
-    if constexpr (StaticK) {
+    if constexpr (FixedK) {
 #pragma unroll
       for (int chunk = 0; chunk < Chunks; ++chunk) {
         const int b = tid + chunk * Threads;
@@ -110,8 +108,7 @@ struct ConvRotQuantKernel {
           for (int i = 0; i < 4; ++i) {
             const float quotient = static_cast<float>(
                 static_cast<at::BFloat16>(static_cast<float>(rounded_values[chunk][i]) / math_scale));
-            output[row * k + base + i * 64] =
-                static_cast<int8_t>(sycl::clamp(sycl::rint(quotient), -128.0f, 127.0f));
+            output[row * k + base + i * 64] = static_cast<int8_t>(sycl::clamp(sycl::rint(quotient), -128.0f, 127.0f));
           }
         }
       }
@@ -226,18 +223,28 @@ CUTLASS_DEVICE auto convrot_tile_coord(Coord coord, int m, int n) {
 struct Mainloop : BaseMainloop {
   template <class D, class A, class B, class C, class Iterator, class Coord>
   CUTLASS_DEVICE void operator()(
-      D& accum, A, B, C const& source, Iterator iterator, int count,
-      Coord coord, int const& start, int thread, Params const& params) {
+      D& accum,
+      A,
+      B,
+      C const& source,
+      Iterator iterator,
+      int count,
+      Coord coord,
+      int const& start,
+      int thread,
+      Params const& params) {
     const int m = size<0>(params.mA_mkl);
     const int n = size<0>(params.mB_nkl);
     const int k = size<1>(params.mA_mkl);
     const int l = size<2>(params.mA_mkl);
     const auto mapped = convrot_tile_coord(coord, m, n);
     const auto a = local_tile(
-        make_identity_tensor(make_shape(m, k, l)), select<0, 2>(ConvRotTile{}),
+        make_identity_tensor(make_shape(m, k, l)),
+        select<0, 2>(ConvRotTile{}),
         make_coord(get<0>(mapped), _, get<3>(mapped)));
     const auto b = local_tile(
-        make_identity_tensor(make_shape(n, k, l)), select<1, 2>(ConvRotTile{}),
+        make_identity_tensor(make_shape(n, k, l)),
+        select<1, 2>(ConvRotTile{}),
         make_coord(get<1>(mapped), _, get<3>(mapped)));
     BaseMainloop::operator()(accum, a, b, source, iterator, count, mapped, start, thread, params);
   }
@@ -247,8 +254,7 @@ struct Epilogue : BaseEpilogue {
   using BaseEpilogue::BaseEpilogue;
 
   template <class Problem, class Tile, class Coord, class Accumulator, class Mma>
-  CUTLASS_DEVICE void operator()(
-      Problem problem, Tile tile, Coord coord, Accumulator accum, Mma mma, int thread) {
+  CUTLASS_DEVICE void operator()(Problem problem, Tile tile, Coord coord, Accumulator accum, Mma mma, int thread) {
     const auto mapped = convrot_tile_coord(coord, get<0>(problem), get<1>(problem));
     BaseEpilogue::operator()(problem, tile, mapped, accum, mma, thread);
   }
@@ -274,16 +280,17 @@ convrot_rotate_quantize(const at::Tensor& input, int64_t group_size) {
   auto scales = at::empty({input.size(0)}, input.options().dtype(at::kFloat));
   if (input.size(0) > 0) {
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
-    const auto launch = [&]<int StaticK, int Threads = 256>() {
+    const auto launch = [&]<int FixedK, int Threads = 256>() {
       queue.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<float, 1> values(sycl::range<1>(k), cgh);
         cgh.parallel_for(
-          sycl::nd_range<1>(sycl::range<1>(input.size(0) * Threads), sycl::range<1>(Threads)),
-          ConvRotQuantKernel<StaticK, Threads>{
-              input.data_ptr<at::BFloat16>(),
-              output.data_ptr<int8_t>(),
-              scales.data_ptr<float>(),
-              static_cast<int>(k), values});
+            sycl::nd_range<1>(sycl::range<1>(input.size(0) * Threads), sycl::range<1>(Threads)),
+            ConvRotQuantKernel<FixedK, Threads>{
+                input.data_ptr<at::BFloat16>(),
+                output.data_ptr<int8_t>(),
+                scales.data_ptr<float>(),
+                static_cast<int>(k),
+                values});
       });
     };
     if (k == 1792) {
@@ -348,11 +355,12 @@ SGL_KERNEL_EXPORT at::Tensor convrot_int8_linear_prequant(
         status == cutlass::Status::kSuccess,
         "ConvRot INT8 GEMM cannot implement shape: ",
         cutlassGetStatusString(status));
-    auto workspace = at::empty(
-        {static_cast<int64_t>(DeviceGemm::get_workspace_size(args))}, input.options().dtype(at::kByte));
+    auto workspace =
+        at::empty({static_cast<int64_t>(DeviceGemm::get_workspace_size(args))}, input.options().dtype(at::kByte));
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
     status = gemm.run(args, workspace.data_ptr(), &queue);
-    TORCH_CHECK(status == cutlass::Status::kSuccess, "ConvRot INT8 GEMM launch failed: ", cutlassGetStatusString(status));
+    TORCH_CHECK(
+        status == cutlass::Status::kSuccess, "ConvRot INT8 GEMM launch failed: ", cutlassGetStatusString(status));
   };
   if (n == 7168 && k == 5376 && m >= 16384) {
     launch.template operator()<GroupedGemm>();

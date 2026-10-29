@@ -1,10 +1,6 @@
 import pytest
 import torch
-
-from sgl_kernel.convrot import (
-    convrot_int8_linear_prequant,
-    convrot_rotate_quantize,
-)
+from sgl_kernel.convrot import convrot_int8_linear_prequant, convrot_rotate_quantize
 
 pytestmark = pytest.mark.arch("xe20")
 
@@ -22,9 +18,7 @@ def reference_rotate_quantize(x):
     rotated = rotated.reshape_as(x)
     scale = (rotated.abs().amax(-1).float() / 127).clamp_min(1e-30)
     math_scale = scale.to(x.dtype)
-    math_scale = torch.where(
-        math_scale == 0, torch.finfo(x.dtype).tiny, math_scale
-    )
+    math_scale = torch.where(math_scale == 0, torch.finfo(x.dtype).tiny, math_scale)
     q = (rotated / math_scale[:, None]).round().clamp(-128, 127).to(torch.int8)
     return q, scale
 
@@ -37,7 +31,23 @@ def reference_linear(q, weight, scale, weight_scale, bias=None):
 
 @pytest.mark.parametrize(
     "k",
-    [256, 512, 768, 1024, 1280, 1792, 2048, 2304, 3584, 4096, 4352, 5376, 6144, 6400, 8192],
+    [
+        256,
+        512,
+        768,
+        1024,
+        1280,
+        1792,
+        2048,
+        2304,
+        3584,
+        4096,
+        4352,
+        5376,
+        6144,
+        6400,
+        8192,
+    ],
 )
 @pytest.mark.parametrize("m", [0, 1, 17])
 def test_rotate_quantize(m, k):
@@ -77,8 +87,12 @@ def test_rotation_butterfly_order(k):
         blocks = values.reshape(17, k // (4 * stride), 4, stride)
         a, b, c, d = blocks.unbind(2)
         values = torch.stack(
-            (((a + b) + c) - d, ((a + b) - c) + d,
-             ((a - b) + c) + d, ((-a + b) + c) + d),
+            (
+                ((a + b) + c) - d,
+                ((a + b) - c) + d,
+                ((a - b) + c) + d,
+                ((-a + b) + c) + d,
+            ),
             dim=2,
         ).reshape_as(values)
     rotated = (values * 0.0625).bfloat16()
@@ -131,7 +145,9 @@ def test_grouped_gemm_partial_band(device, m, with_bias):
         weight = torch.randint(-128, 128, (n, k), device=q.device, dtype=torch.int8)
         scale = torch.rand(m, device=q.device) / 128
         weight_scale = torch.rand(n, device=q.device) / 128
-        bias = torch.randn(n, device=q.device, dtype=torch.bfloat16) if with_bias else None
+        bias = (
+            torch.randn(n, device=q.device, dtype=torch.bfloat16) if with_bias else None
+        )
         out = convrot_int8_linear_prequant(q, weight, scale, weight_scale, bias)
         expected = reference_linear(q, weight, scale, weight_scale, bias)
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
@@ -179,7 +195,10 @@ def test_invalid_gemm_inputs():
         ((q, weight[:31], scale, weight_scale[:31]), "N must"),
         ((q, weight, scale[:, None], weight_scale), "input_scale"),
         ((q, weight, scale, weight_scale[:1]), "weight_scale"),
-        ((q, weight, scale, weight_scale, torch.zeros(32, device="xpu")), "bias.*dtype"),
+        (
+            (q, weight, scale, weight_scale, torch.zeros(32, device="xpu")),
+            "bias.*dtype",
+        ),
     ]:
         with pytest.raises(RuntimeError, match=message):
             convrot_int8_linear_prequant(*args)

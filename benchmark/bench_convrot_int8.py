@@ -4,12 +4,11 @@ import argparse
 import gc
 import json
 import os
-from pathlib import Path
 import statistics
 import time
+from pathlib import Path
 
 import torch
-
 from sgl_kernel.convrot import convrot_int8_linear_prequant, convrot_rotate_quantize
 
 

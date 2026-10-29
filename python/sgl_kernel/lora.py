@@ -49,9 +49,10 @@ def embedding_lora_a_fwd(
         Optional segment lengths tensor, shape ``(num_segments,)``.
     max_len : Optional[int], optional, keyword-only
         Upper bound on the segment length (``max(seg_indptr[s + 1] - seg_indptr[s])``).
-        It sizes the kernel launch. Defaults to ``input_ids.size(0)``, which needs no
-        device-to-host read; pass the longest segment length when known to launch
-        less work. Rows past ``max_len`` in a longer segment are not computed.
+        It sizes the kernel launch. When omitted, the longest segment is read from
+        ``seg_indptr`` with one device-to-host sync; pass it when known (for example
+        from the LoRA batch info) to avoid that sync. Rows past ``max_len`` in a
+        longer segment are not computed.
 
     Returns
     -------

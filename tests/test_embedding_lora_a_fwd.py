@@ -230,8 +230,8 @@ def test_embedding_lora_a_fwd_zero_rank_all_zero_output():
 
 def test_embedding_lora_a_fwd_max_len_is_optional_and_backward_compatible():
     # max_len is an optional, keyword-only trailing bound: legacy positional calls
-    # (no max_len), an omitted max_len (default num_tokens) and a tight max_len must
-    # all give the same result.
+    # (no max_len), an omitted max_len (longest segment read on the host) and a tight
+    # max_len must all give the same result.
     torch.manual_seed(16)
     vocab_size, max_rank = 128, 4
     input_ids = torch.randint(0, vocab_size, (37,), dtype=torch.int64, device="xpu")

@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/OpMathType.h>
 #include <ATen/Parallel.h>
 #include <c10/xpu/XPUStream.h>
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <sycl/sycl.hpp>
 #include <vector>
 
@@ -161,10 +163,10 @@ class RMSNormNoRstdForward : public NormNoRstdForward<scalar_t> {
     return static_cast<scalar_t>(x * rstd * gamma);
   }
 
-  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename index_t>
+  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename index_t, typename Cfg>
   void reduce_combine(
       sycl::nd_item<1> item_id,
-      const NormConfig& cfg,
+      const Cfg& cfg,
       index_t x_group_offset,
       accscalar_t& sum_value,
       vec_t (&reg)[cache_inputs ? ITERS : 1]) const {
@@ -197,17 +199,25 @@ class RMSNormNoRstdForward : public NormNoRstdForward<scalar_t> {
     }
   }
 
-  accscalar_t reduce_project(sycl::nd_item<1> item_id, const NormConfig& cfg, accscalar_t sum_value) const {
+  template <typename Cfg>
+  accscalar_t reduce_project(sycl::nd_item<1> item_id, const Cfg& cfg, accscalar_t sum_value) const {
     sum_value = sycl::reduce_over_group(item_id.get_group(), sum_value, sycl::plus<accscalar_t>());
     sum_value = sum_value < static_cast<accscalar_t>(0) ? static_cast<accscalar_t>(0) : sum_value;
     return Numerics<accscalar_t>::rsqrt(
         sum_value / static_cast<accscalar_t>(cfg.Plane) + static_cast<accscalar_t>(NF::eps));
   }
 
-  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename weight_vec_t, typename index_t>
+  template <
+      int vec_size,
+      int ITERS,
+      bool cache_inputs,
+      typename vec_t,
+      typename weight_vec_t,
+      typename index_t,
+      typename Cfg>
   void update(
       sycl::nd_item<1> item_id,
-      const NormConfig& cfg,
+      const Cfg& cfg,
       index_t x_group_offset,
       index_t y_group_offset,
       accscalar_t rstd,
@@ -272,10 +282,10 @@ class AddNoRstdForward : public BaseNorm {
     return NF::get_aligned_update_vec_size(Plane, vec_size, NF::X_data, NF::Y_data, Base::gamma_data, add_data);
   }
 
-  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename index_t>
+  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename index_t, typename Cfg>
   void reduce_combine(
       sycl::nd_item<1> item_id,
-      const NormConfig& cfg,
+      const Cfg& cfg,
       index_t x_group_offset,
       accscalar_t& sum_value,
       vec_t (&reg)[cache_inputs ? ITERS : 1]) const {
@@ -320,10 +330,17 @@ class AddNoRstdForward : public BaseNorm {
     }
   }
 
-  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename weight_vec_t, typename index_t>
+  template <
+      int vec_size,
+      int ITERS,
+      bool cache_inputs,
+      typename vec_t,
+      typename weight_vec_t,
+      typename index_t,
+      typename Cfg>
   void update(
       sycl::nd_item<1> item_id,
-      const NormConfig& cfg,
+      const Cfg& cfg,
       index_t x_group_offset,
       index_t y_group_offset,
       accscalar_t rstd,
@@ -370,10 +387,17 @@ class GemmaRMSNormNoRstdForward : public RMSNormNoRstdForward<scalar_t, weight_t
     return static_cast<scalar_t>(x * rstd * (static_cast<accscalar_t>(1.0) + gamma));
   }
 
-  template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename weight_vec_t, typename index_t>
+  template <
+      int vec_size,
+      int ITERS,
+      bool cache_inputs,
+      typename vec_t,
+      typename weight_vec_t,
+      typename index_t,
+      typename Cfg>
   void update(
       sycl::nd_item<1> item_id,
-      const NormConfig& cfg,
+      const Cfg& cfg,
       index_t x_group_offset,
       index_t y_group_offset,
       accscalar_t rstd,
@@ -422,7 +446,8 @@ template <
     int ITERS,
     typename Norm,
     bool cache_inputs,
-    typename index_t = uint32_t>
+    typename index_t = uint32_t,
+    typename Cfg = NormConfig>
 struct RMSNormNoRstdKernelFunctor {
   using accscalar_t = acc_type<scalar_t>;
   using vec_t = aligned_vector_loop<scalar_t, vec_size>;
@@ -454,11 +479,11 @@ struct RMSNormNoRstdKernelFunctor {
         item_id, cfg, x_group_offset, y_group_offset, rstd, reg);
   }
 
-  RMSNormNoRstdKernelFunctor(Norm norm_, NormConfig cfg_) : norm(norm_), cfg(cfg_) {}
+  RMSNormNoRstdKernelFunctor(Norm norm_, Cfg cfg_) : norm(norm_), cfg(cfg_) {}
 
  private:
   Norm norm;
-  const NormConfig cfg;
+  const Cfg cfg;
 };
 
 template <typename scalar_t, typename weight_t, int vec_size, int ITERS, typename Norm, bool cache_inputs>
@@ -530,6 +555,44 @@ void launch_vectorized_rmsnorm_no_rstd_kernel(Norm& norm, const NormConfig& conf
 #undef DISPATCH_RMSNORM_NO_RSTD_VEC
 }
 
+// Launch for contiguous rows built with NormConfig(FastRowTag): NormFastParams makes every inner
+// size/stride a compile-time constant, so compute_row_offset folds its integer div/mod (Xe has no
+// hardware divide) to row * batch_stride. 1, 2, 4 or 8 passes per row are instantiated; any other
+// count takes the general launcher.
+template <typename scalar_t, typename weight_t, int vec_size, typename Norm>
+void launch_fast_rmsnorm_no_rstd_kernel(Norm& norm, const NormConfig& config) {
+  const int iters = (config.WGPlane + config.workgroup_size * vec_size - 1) / (config.workgroup_size * vec_size);
+  auto launch = [&](auto iters_tag) {
+    using KernelFunctor = RMSNormNoRstdKernelFunctor<
+        scalar_t,
+        weight_t,
+        vec_size,
+        decltype(iters_tag)::value,
+        Norm,
+        /*cache_inputs=*/true,
+        uint32_t,
+        NormFastParams>;
+    const NormFastParams fast_config{
+        config.Plane, config.workgroup_size, config.input_batch_stride, config.output_batch_stride};
+    const sycl::range<1> local_range{static_cast<size_t>(config.workgroup_size)};
+    const sycl::range<1> global_range{
+        static_cast<size_t>(config.workgroup_num) * static_cast<size_t>(config.workgroup_size)};
+    sycl_kernel_submit(
+        global_range, local_range, at::xpu::getCurrentXPUStream().queue(), KernelFunctor(norm, fast_config));
+  };
+  if (iters == 1) {
+    launch(std::integral_constant<int, 1>{});
+  } else if (iters == 2) {
+    launch(std::integral_constant<int, 2>{});
+  } else if (iters == 4) {
+    launch(std::integral_constant<int, 4>{});
+  } else if (iters == 8) {
+    launch(std::integral_constant<int, 8>{});
+  } else {
+    launch_vectorized_rmsnorm_no_rstd_kernel<scalar_t, weight_t>(norm, config);
+  }
+}
+
 template <typename scalar_t, typename weight_t>
 void RMSNormKernelImplInternal(
     const Tensor& X,
@@ -580,6 +643,28 @@ void FusedAddRMSNormKernelImplInternal(
   scalar_t* residual_data = residual.data_ptr<scalar_t>();
   AddRMSNormNoRstdForward<scalar_t, weight_t> add_rms_norm_no_rstd_forward(
       X_data, X_data, gemma_data, eps, residual_data);
+
+  // A 2-byte dtype with a same-dtype weight whose rows split into full 16-byte vectors takes the
+  // fast launch: FastRowTag caches the workgroup-sizing device properties (this op is host-bound
+  // at decode sizes) and NormFastParams drops the per-row div/mod.
+  if constexpr (std::is_same_v<scalar_t, weight_t> && sizeof(scalar_t) == 2) {
+    // Alignment is tested directly: get_update_vec_size() looks up device properties once per
+    // pointer, which cost 0.44 us per call here (9% of a decode-size call on Arc Pro B60).
+    constexpr std::uintptr_t kAlignBytes = 16;
+    constexpr int kVec = kAlignBytes / sizeof(scalar_t);
+    const auto aligned = [](const void* p) { return reinterpret_cast<std::uintptr_t>(p) % kAlignBytes == 0; };
+    if (N % kVec == 0 && aligned(X_data) && aligned(gemma_data) && aligned(residual_data)) {
+      const NormConfig config(
+          NormConfig::FastRowTag{},
+          static_cast<int>(M),
+          static_cast<int>(N),
+          static_cast<int>(sizeof(scalar_t)),
+          kVec,
+          static_cast<int>(N));
+      launch_fast_rmsnorm_no_rstd_kernel<scalar_t, weight_t, kVec>(add_rms_norm_no_rstd_forward, config);
+      return;
+    }
+  }
 
   auto config = NormConfig(
       M,
@@ -756,13 +841,16 @@ SGL_KERNEL_EXPORT void
 fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps) {
   TORCH_CHECK(input.is_contiguous(), "fused_add_rmsnorm: input must be contiguous");
   TORCH_CHECK(residual.is_contiguous(), "fused_add_rmsnorm: residual must be contiguous");
+
+  TORCH_CHECK(
+      residual.sizes() == input.sizes(),
+      "fused_add_rmsnorm: residual shape ",
+      residual.sizes(),
+      " must match input shape ",
+      input.sizes());
   std::optional<torch::Tensor> opt_weight = weight;
   std::optional<torch::Tensor> opt_bias;
   auto [M, N] = _check_layer_norm_inputs(input, c10::IntArrayRef({input.size(-1)}), opt_weight, opt_bias);
-
-  // Flatten leading dimensions to 2D for the kernel
-  Tensor input_ = flatten_to_2d(input, M, N);
-  Tensor residual_ = flatten_to_2d(residual, M, N);
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
@@ -770,12 +858,13 @@ fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor wei
   timer.start();
 #endif
 
+  // input and residual are contiguous and the same shape, so the kernel indexes them as M rows of N.
   SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
+      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
         SYCL_DISPATCH_WEIGHT_TYPES(
             at::ScalarType::Half, at::ScalarType::BFloat16, weight.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
               FusedAddRMSNormKernelImplInternal<scalar_t, weight_t>(
-                  input_, weight, M, N, static_cast<acc_type<scalar_t>>(eps), residual_);
+                  input, weight, M, N, static_cast<acc_type<scalar_t>>(eps), residual);
             });
       });
 
@@ -787,8 +876,8 @@ fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor wei
   const double flops = 5.0 * static_cast<double>(M) * static_cast<double>(N);
   const double tflops = elapsed_s > 0.0 ? (flops * 1e-12) / elapsed_s : 0.0;
 
-  const double in_elem = static_cast<double>(input_.element_size());
-  const double res_elem = static_cast<double>(residual_.element_size());
+  const double in_elem = static_cast<double>(input.element_size());
+  const double res_elem = static_cast<double>(residual.element_size());
   const double w_elem = static_cast<double>(weight.element_size());
   // read input, read+write residual, write normalized output back to input, read weight.
   const double bytes = 2.0 * static_cast<double>(M) * static_cast<double>(N) * in_elem +
@@ -959,6 +1048,149 @@ gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Te
         "CUTLASS_SYCL_PROFILING_ENABLED build flag.\n");
   }
 #endif
+}
+
+// One work-group per (row, group) pair of group_size elements; weights are loaded together with the input so their
+// latency overlaps the reduction.
+template <typename scalar_t, int vec_size, int ITERS>
+struct GroupedGemmaRMSNormFunctor {
+  using accscalar_t = acc_type<scalar_t>;
+  using vec_t = aligned_vector_loop<scalar_t, vec_size>;
+
+  [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item) const {
+    const uint32_t wg = item.get_group(0);
+    const uint32_t lid = item.get_local_id(0);
+    const uint32_t wg_size = item.get_local_range(0);
+    const uint32_t num_vecs = group_size / vec_size;
+    const vec_t* x = reinterpret_cast<const vec_t*>(input + static_cast<int64_t>(wg) * group_size);
+    vec_t* y = reinterpret_cast<vec_t*>(output + static_cast<int64_t>(wg) * group_size);
+    const vec_t* w = reinterpret_cast<const vec_t*>(weight + (wg % num_groups) * group_size);
+
+    vec_t reg[ITERS];
+    vec_t wreg[ITERS];
+    accscalar_t sum_sq = 0;
+#pragma unroll
+    for (int it = 0; it < ITERS; ++it) {
+      const uint32_t idx = it * wg_size + lid;
+      if (idx < num_vecs) {
+        reg[it] = x[idx];
+        wreg[it] = w[idx];
+#pragma unroll
+        for (int i = 0; i < vec_size; ++i) {
+          const accscalar_t f = static_cast<accscalar_t>(reg[it][i]);
+          sum_sq += f * f;
+        }
+      }
+    }
+    sum_sq = sycl::reduce_over_group(item.get_group(), sum_sq, sycl::plus<accscalar_t>());
+    const accscalar_t rstd = sycl::rsqrt(sum_sq / static_cast<accscalar_t>(group_size) + eps);
+#pragma unroll
+    for (int it = 0; it < ITERS; ++it) {
+      const uint32_t idx = it * wg_size + lid;
+      if (idx < num_vecs) {
+        vec_t out;
+#pragma unroll
+        for (int i = 0; i < vec_size; ++i) {
+          out[i] = GemmaRMSNormNoRstdForward<scalar_t, scalar_t>::apply_weight(
+              static_cast<accscalar_t>(reg[it][i]), rstd, static_cast<accscalar_t>(wreg[it][i]));
+        }
+        y[idx] = out;
+      }
+    }
+  }
+
+  const scalar_t* input;
+  const scalar_t* weight;
+  scalar_t* output;
+  uint32_t group_size;
+  uint32_t num_groups;
+  accscalar_t eps;
+};
+
+// Past 4 register-cached passes a wider work-group is faster than more passes per thread.
+constexpr int kMaxIters = 4;
+constexpr int64_t kMaxWorkGroupSize = 512;
+
+template <typename scalar_t, int vec_size, int ITERS>
+void launch_grouped_gemma_rmsnorm(
+    const scalar_t* x, const scalar_t* w, scalar_t* y, int64_t rows, int64_t N, int64_t num_groups, double eps) {
+  const int64_t vecs = N / vec_size;
+  const int64_t wg_size = std::min<int64_t>(kMaxWorkGroupSize, div_up(div_up(vecs, int64_t{ITERS}), int64_t{16}) * 16);
+  GroupedGemmaRMSNormFunctor<scalar_t, vec_size, ITERS> fn{
+      x, w, y, static_cast<uint32_t>(N), static_cast<uint32_t>(num_groups), static_cast<acc_type<scalar_t>>(eps)};
+  sycl_kernel_submit(
+      sycl::range<1>(rows * wg_size), sycl::range<1>(wg_size), at::xpu::getCurrentXPUStream().queue(), fn);
+}
+
+template <typename scalar_t>
+void GroupedGemmaRMSNormKernelImplInternal(
+    const Tensor& X, const Tensor& gemma, int64_t M, int64_t N, int64_t num_groups, double eps, Tensor& Y) {
+  constexpr int kVec = 16 / sizeof(scalar_t);
+  const int64_t min_iters = div_up<int64_t>(N / kVec, 256);
+  scalar_t* x = X.data_ptr<scalar_t>();
+  scalar_t* w = gemma.data_ptr<scalar_t>();
+  scalar_t* y = Y.data_ptr<scalar_t>();
+  if (min_iters <= 1) {
+    launch_grouped_gemma_rmsnorm<scalar_t, kVec, 1>(x, w, y, M, N, num_groups, eps);
+  } else if (min_iters <= 2) {
+    launch_grouped_gemma_rmsnorm<scalar_t, kVec, 2>(x, w, y, M, N, num_groups, eps);
+  } else {
+    launch_grouped_gemma_rmsnorm<scalar_t, kVec, kMaxIters>(x, w, y, M, N, num_groups, eps);
+  }
+}
+
+// Gemma RMSNorm with the variance computed per group_size slice of the last dim. weight has the full hidden size.
+SGL_KERNEL_EXPORT void grouped_gemma_rmsnorm(
+    torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps, int64_t group_size) {
+  CHECK_INPUT(input);
+  CHECK_INPUT(weight);
+  CHECK_INPUT(output);
+  TORCH_CHECK(input.dim() >= 1, "input must have at least 1 dim");
+  TORCH_CHECK(input.sizes() == output.sizes(), "output must have the same shape as input");
+  TORCH_CHECK(
+      input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
+      "grouped_gemma_rmsnorm supports bfloat16 and float16, got ",
+      input.scalar_type());
+  TORCH_CHECK(output.scalar_type() == input.scalar_type(), "output dtype must match input");
+  TORCH_CHECK(weight.scalar_type() == input.scalar_type(), "weight dtype must match input");
+  constexpr int64_t kVecElems = 8;
+  TORCH_CHECK(group_size > 0 && group_size % kVecElems == 0, "group_size must be a positive multiple of ", kVecElems);
+  constexpr int64_t kMaxGroupSize = kMaxIters * kMaxWorkGroupSize * kVecElems;
+  TORCH_CHECK(
+      group_size <= kMaxGroupSize,
+      "grouped_gemma_rmsnorm: group_size ",
+      group_size,
+      " is too large (max ",
+      kMaxGroupSize,
+      ")");
+
+  const int64_t hidden = input.size(-1);
+  TORCH_CHECK(hidden % group_size == 0, "hidden size ", hidden, " must be divisible by group_size ", group_size);
+  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == hidden, "weight must be 1-D with hidden_size elements");
+  TORCH_CHECK(
+      weight.device() == input.device() && output.device() == input.device(),
+      "input, weight and output must be on the same device");
+  for (const auto* t : {&input, &weight, &output}) {
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0, "tensors must be 16-byte aligned");
+  }
+
+  if (input.numel() == 0) {
+    return;
+  }
+  at::assert_no_partial_overlap(output, input);
+  at::assert_no_overlap(output, weight);
+  TORCH_CHECK(
+      input.numel() <= std::numeric_limits<int32_t>::max(),
+      "grouped_gemma_rmsnorm: input is too large (",
+      input.numel(),
+      " elements)");
+
+  const int64_t M = input.numel() / group_size;
+  c10::DeviceGuard guard(input.device());
+  SYCL_DISPATCH_FLOATING_TYPES(
+      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "grouped_gemma_rmsnorm", [&]() {
+        GroupedGemmaRMSNormKernelImplInternal<scalar_t>(input, weight, M, group_size, hidden / group_size, eps, output);
+      });
 }
 
 }  // namespace at::native::xpu

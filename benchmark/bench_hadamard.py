@@ -1,3 +1,4 @@
+import argparse
 import math
 from itertools import product
 
@@ -76,6 +77,30 @@ def benchmark_hadamard(bs, dim, dtype_name, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--dims", nargs="+", type=int, default=dim_range, help="Hadamard dims to sweep"
+    )
+    parser.add_argument(
+        "--dtypes",
+        nargs="+",
+        choices=["float16", "bfloat16", "float32"],
+        default=["float16", "bfloat16", "float32"],
+        help="Input dtypes to sweep",
+    )
+    args = parser.parse_args()
+
+    benchmark_hadamard.benchmarks.x_vals = [
+        (bs, dim, dtype_name)
+        for bs, dim, dtype_name in product(args.batch_sizes, args.dims, args.dtypes)
+    ]
     benchmark_hadamard.run(print_data=False)
     print("Benchmark finished!")
 

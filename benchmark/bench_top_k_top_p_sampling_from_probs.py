@@ -92,6 +92,25 @@ def benchmark(batch_size, vocab_size, top_p, provider):
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=batch_size_range)
+    parser.add_argument("--vocab-sizes", nargs="+", type=int, default=vocab_size_range)
+    parser.add_argument(
+        "--top-ps",
+        nargs="+",
+        type=float,
+        default=top_p_range,
+        help="top_k = 50%% of vocab for p=0.1, else 10%%",
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = [
+        (bs, vocab_size, top_p)
+        for bs, vocab_size in product(args.batch_sizes, args.vocab_sizes)
+        for top_p in args.top_ps
+    ]
+
     benchmark.run(print_data=False)
     print("Benchmark finished!")
 

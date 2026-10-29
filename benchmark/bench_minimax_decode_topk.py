@@ -1,3 +1,4 @@
+import argparse
 import itertools
 import os
 
@@ -193,21 +194,15 @@ BATCH_SIZES = [1, 16, 64]
 blockid_configs = list(itertools.product(NUM_BLOCKS, BATCH_SIZES))
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["num_blocks", "batch"],
-        x_vals=blockid_configs,
-        line_arg="provider",
-        line_vals=["sglang"],
-        line_names=["sglang (SYCL)"],
-        styles=[("blue", "-")],
-        ylabel="us",
-        plot_name="minimax-decode-topk-block-id-performance",
-        args={},
-    )
-)
-def benchmark_block_id(num_blocks, batch, provider):
-    state = _make_topk_state(num_blocks, batch, NUM_QO_HEADS, TOPK, BLOCK_SIZE)
+def benchmark_block_id(
+    num_blocks,
+    batch,
+    provider,
+    num_heads=NUM_QO_HEADS,
+    topk=TOPK,
+    block_size=BLOCK_SIZE,
+):
+    state = _make_topk_state(num_blocks, batch, num_heads, topk, block_size)
     ms, min_ms, max_ms = triton.testing.do_bench(
         lambda: _sglang_topk_block_ids(state), quantiles=[0.5, 0.2, 0.8]
     )
@@ -215,31 +210,26 @@ def benchmark_block_id(num_blocks, batch, provider):
         "minimax_decode_topk",
         num_blocks,
         batch,
-        NUM_QO_HEADS,
-        TOPK,
+        num_heads,
+        topk,
         ms,
-        _bytes_block_id(num_blocks, batch, NUM_QO_HEADS, TOPK),
+        _bytes_block_id(num_blocks, batch, num_heads, topk),
     )
     _release(state)
     return 1000 * ms, 1000 * min_ms, 1000 * max_ms
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["num_blocks", "batch"],
-        x_vals=blockid_configs,
-        line_arg="provider",
-        line_vals=["sglang"],
-        line_names=["sglang (SYCL)"],
-        styles=[("green", "-")],
-        ylabel="us",
-        plot_name="minimax-decode-topk-page-table-performance",
-        args={},
-    )
-)
-def benchmark_page_table(num_blocks, batch, provider):
+def benchmark_page_table(
+    num_blocks,
+    batch,
+    provider,
+    num_heads=NUM_KV_HEADS,
+    topk=TOPK,
+    block_size=BLOCK_SIZE,
+    page_size=PAGE_SIZE,
+):
     state = _make_page_table_state(
-        num_blocks, batch, NUM_KV_HEADS, TOPK, BLOCK_SIZE, PAGE_SIZE
+        num_blocks, batch, num_heads, topk, block_size, page_size
     )
     ms, min_ms, max_ms = triton.testing.do_bench(
         lambda: _sglang_page_table(state), quantiles=[0.5, 0.2, 0.8]
@@ -248,10 +238,10 @@ def benchmark_page_table(num_blocks, batch, provider):
         "minimax_decode_topk_page_table",
         num_blocks,
         batch,
-        NUM_KV_HEADS,
-        TOPK,
+        num_heads,
+        topk,
         ms,
-        _bytes_page_table(num_blocks, batch, NUM_KV_HEADS, TOPK, BLOCK_SIZE, PAGE_SIZE),
+        _bytes_page_table(num_blocks, batch, num_heads, topk, block_size, page_size),
     )
     _release(state)
     return 1000 * ms, 1000 * min_ms, 1000 * max_ms
@@ -262,37 +252,45 @@ TOPK_SWEEP_BATCH = 16
 TOPK_VALUES = [1, 4, 16, 32]  # 32 == kMaxTopK
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["topk"],
-        x_vals=TOPK_VALUES,
-        line_arg="provider",
-        line_vals=["sglang"],
-        line_names=["sglang (SYCL)"],
-        styles=[("blue", "-")],
-        ylabel="us",
-        plot_name="minimax-decode-topk-vs-topk-performance",
-        args={},
-    )
-)
-def benchmark_topk_sweep(topk, provider):
-    state = _make_topk_state(
-        TOPK_SWEEP_NUM_BLOCKS, TOPK_SWEEP_BATCH, NUM_QO_HEADS, topk, BLOCK_SIZE
-    )
+def benchmark_topk_sweep(
+    topk,
+    provider,
+    num_blocks=TOPK_SWEEP_NUM_BLOCKS,
+    batch=TOPK_SWEEP_BATCH,
+    num_heads=NUM_QO_HEADS,
+    block_size=BLOCK_SIZE,
+):
+    state = _make_topk_state(num_blocks, batch, num_heads, topk, block_size)
     ms, min_ms, max_ms = triton.testing.do_bench(
         lambda: _sglang_topk_block_ids(state), quantiles=[0.5, 0.2, 0.8]
     )
     _record(
         "minimax_decode_topk (topk sweep)",
-        TOPK_SWEEP_NUM_BLOCKS,
-        TOPK_SWEEP_BATCH,
-        NUM_QO_HEADS,
+        num_blocks,
+        batch,
+        num_heads,
         topk,
         ms,
-        _bytes_block_id(TOPK_SWEEP_NUM_BLOCKS, TOPK_SWEEP_BATCH, NUM_QO_HEADS, topk),
+        _bytes_block_id(num_blocks, batch, num_heads, topk),
     )
     _release(state)
     return 1000 * ms, 1000 * min_ms, 1000 * max_ms
+
+
+def _perf_report(fn, x_names, x_vals, color, plot_name, args):
+    return triton.testing.perf_report(
+        triton.testing.Benchmark(
+            x_names=x_names,
+            x_vals=x_vals,
+            line_arg="provider",
+            line_vals=["sglang"],
+            line_names=["sglang (SYCL)"],
+            styles=[(color, "-")],
+            ylabel="us",
+            plot_name=plot_name,
+            args=args,
+        )
+    )(fn)
 
 
 def _report_bandwidth(df, case_label, title):
@@ -326,7 +324,59 @@ def _report_bandwidth(df, case_label, title):
         print(line)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num-blocks",
+        nargs="+",
+        type=int,
+        default=NUM_BLOCKS,
+        help="Score-row lengths (blocks) to sweep",
+    )
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=BATCH_SIZES,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--block-size", type=int, default=BLOCK_SIZE, help="Tokens per score block"
+    )
+    parser.add_argument(
+        "--page-size", type=int, default=PAGE_SIZE, help="Tokens per KV page"
+    )
+    parser.add_argument("--topk", type=int, default=TOPK, help="Blocks selected")
+    parser.add_argument(
+        "--num-qo-heads", type=int, default=NUM_QO_HEADS, help="Block-id kernel heads"
+    )
+    parser.add_argument(
+        "--num-kv-heads", type=int, default=NUM_KV_HEADS, help="Page-table kernel heads"
+    )
+    parser.add_argument(
+        "--topk-values",
+        nargs="+",
+        type=int,
+        default=TOPK_VALUES,
+        help="Topk values for the topk sweep",
+    )
+    parser.add_argument(
+        "--topk-sweep-num-blocks",
+        type=int,
+        default=TOPK_SWEEP_NUM_BLOCKS,
+        help="num_blocks for the topk sweep",
+    )
+    parser.add_argument(
+        "--topk-sweep-batch",
+        type=int,
+        default=TOPK_SWEEP_BATCH,
+        help="Batch for the topk sweep",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = parse_args()
     if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
         print("ERROR: no XPU device available.")
         raise SystemExit(1)
@@ -337,26 +387,62 @@ if __name__ == "__main__":
     print(f"device={torch.xpu.get_device_properties(0).name}")
     print(f"peak bandwidth={f'{peak:.0f} GB/s' if peak else 'unknown'}")
     print(
-        f"block_size={BLOCK_SIZE} page_size={PAGE_SIZE} topk={TOPK} "
-        f"qo_heads={NUM_QO_HEADS} kv_heads={NUM_KV_HEADS}"
+        f"block_size={args.block_size} page_size={args.page_size} topk={args.topk} "
+        f"qo_heads={args.num_qo_heads} kv_heads={args.num_kv_heads}"
     )
+    blockid_configs = list(itertools.product(args.num_blocks, args.batch_sizes))
     print("=" * 80)
     print("minimax_decode_topk (block-id output)")
     print("=" * 80)
-    benchmark_block_id.run(print_data=True)
+    _perf_report(
+        benchmark_block_id,
+        ["num_blocks", "batch"],
+        blockid_configs,
+        "blue",
+        "minimax-decode-topk-block-id-performance",
+        {
+            "num_heads": args.num_qo_heads,
+            "topk": args.topk,
+            "block_size": args.block_size,
+        },
+    ).run(print_data=True)
 
     print("\n" + "=" * 80)
     print("minimax_decode_topk_page_table (fused top-k + page table)")
     print("=" * 80)
-    benchmark_page_table.run(print_data=True)
+    _perf_report(
+        benchmark_page_table,
+        ["num_blocks", "batch"],
+        blockid_configs,
+        "green",
+        "minimax-decode-topk-page-table-performance",
+        {
+            "num_heads": args.num_kv_heads,
+            "topk": args.topk,
+            "block_size": args.block_size,
+            "page_size": args.page_size,
+        },
+    ).run(print_data=True)
 
     print("\n" + "=" * 80)
     print(
         f"minimax_decode_topk vs topk "
-        f"(num_blocks={TOPK_SWEEP_NUM_BLOCKS}, batch={TOPK_SWEEP_BATCH})"
+        f"(num_blocks={args.topk_sweep_num_blocks}, batch={args.topk_sweep_batch})"
     )
     print("=" * 80)
-    benchmark_topk_sweep.run(print_data=True)
+    _perf_report(
+        benchmark_topk_sweep,
+        ["topk"],
+        args.topk_values,
+        "blue",
+        "minimax-decode-topk-vs-topk-performance",
+        {
+            "num_blocks": args.topk_sweep_num_blocks,
+            "batch": args.topk_sweep_batch,
+            "num_heads": args.num_qo_heads,
+            "block_size": args.block_size,
+        },
+    ).run(print_data=True)
 
     df = pd.DataFrame(all_results)
     df["time_us"] = df["time_us"].round(2)

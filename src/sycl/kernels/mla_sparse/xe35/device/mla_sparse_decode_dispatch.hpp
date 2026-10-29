@@ -83,14 +83,19 @@ DECLARE_MLA_SPARSE_DECODE_LAUNCH(bf16)
 // Two-stage variant (gather+dequant to HBM, then dense flash-decode). Selected at
 // compile time via SGLANG_USE_SPARSE_MLA_2STAGE. Generated from
 // mla_sparse_decode_2stage_kernel.cpp.in, one TU per (ELEM_TAG, D_QK, B_H,
-// HAS_ATTN_SINK) -- D_QK is the QK head dim (always 512 for decode) and B_H the
-// sparse-decode analog of the fused path's PAGE_SIZE, together keying the Stage-2
-// config; HAS_ATTN_SINK selects the sink epilogue variant. One variant lands in its
-// own object file (heavy CUTLASS instantiation split per file).
+// HAS_ATTN_SINK) -- D_QK is the QK head dim and B_H the sparse-decode analog of the
+// fused path's PAGE_SIZE, together keying the Stage-2 config; HAS_ATTN_SINK selects the
+// sink epilogue variant. One variant lands in its own object file (heavy CUTLASS
+// instantiation split per file).
+//
+// D_QK additionally selects the packed fp8 KV cache byte layout, since the two are 1:1
+// in production (512 -> DSv4 584 B/token, 576 -> DSv3.2 / GLM-DSA 656 B/token); see
+// sparse_mla_decode_fp8_head_bytes below and SparseMlaFp8KvLayout in
+// device/xe_mla_sparse_2stage_common.hpp. Same {512, 576} pair as sparse prefill.
 //
 // Naming: launch_mla_sparse_decode_2stage_<ELEM_TAG>_<D_QK>_<B_H>_<HAS_ATTN_SINK>
 //   ELEM_TAG      in {half, bf16}
-//   D_QK          in {512}
+//   D_QK          in {512, 576}
 //   B_H           in {8, 16, 32, 64}
 //   HAS_ATTN_SINK in {0, 1}
 #define DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, D_QK, B_H, SINK)   \
@@ -109,17 +114,18 @@ DECLARE_MLA_SPARSE_DECODE_LAUNCH(bf16)
       int64_t head_dim_v,                                                \
       bool is_fp8_kvcache);
 
-#define DECLARE_MLA_SPARSE_DECODE_2STAGE_ALL_B_H(ELEM)      \
-  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 8, 0)  \
-  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 8, 1)  \
-  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 16, 0) \
-  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 16, 1) \
-  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 32, 0) \
-  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 32, 1) \
-  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 64, 0) \
-  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, 512, 64, 1)
+#define DECLARE_MLA_SPARSE_DECODE_2STAGE_ALL_B_H(ELEM, D_QK) \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, D_QK, 8, 0)  \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, D_QK, 8, 1)  \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, D_QK, 16, 0) \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, D_QK, 16, 1) \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, D_QK, 32, 0) \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, D_QK, 32, 1) \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, D_QK, 64, 0) \
+  DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH(ELEM, D_QK, 64, 1)
 
-DECLARE_MLA_SPARSE_DECODE_2STAGE_ALL_B_H(bf16)
+DECLARE_MLA_SPARSE_DECODE_2STAGE_ALL_B_H(bf16, 512)
+DECLARE_MLA_SPARSE_DECODE_2STAGE_ALL_B_H(bf16, 576)
 
 #undef DECLARE_MLA_SPARSE_DECODE_2STAGE_LAUNCH
 #undef DECLARE_MLA_SPARSE_DECODE_2STAGE_ALL_B_H
@@ -135,6 +141,28 @@ inline int sparse_mla_decode_select_b_h(int h_q) {
   if (h_q <= 16) return 16;
   if (h_q <= 32) return 32;
   return 64;
+}
+
+// Expected packed fp8 KV cache last-dim (bytes per token) for a decode d_qk; 0 for an
+// unsupported d_qk. The two layouts are 1:1 with d_qk, so this pairing is what the op
+// validates k_cache against before dispatching.
+//
+//   512 -> 584: DSv4          448 fp8 nope + 128 B bf16 rope + 8 B page-END UE8M0 scales
+//   576 -> 656: DSv3.2/GLM-DSA 512 fp8 nope + 16 B INLINE fp32 scales + 128 B bf16 rope
+//
+// Host-side mirror of SparseMlaFp8KvLayout<D_QK>::HEAD_BYTES, kept here (rather than
+// read off the trait) so the op TU can validate without pulling in the heavy Stage-2
+// config header. runMlaSparse2Stage static_asserts the two against each other, so the
+// mirror cannot drift.
+constexpr int sparse_mla_decode_fp8_head_bytes(int d_qk) {
+  switch (d_qk) {
+    case 512:
+      return 584;
+    case 576:
+      return 656;
+    default:
+      return 0;
+  }
 }
 
 }  // namespace mla_sparse_decode

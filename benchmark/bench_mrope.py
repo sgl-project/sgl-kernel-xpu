@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import itertools
 from typing import List, Optional
 
@@ -121,7 +122,7 @@ def calculate_bandwidth(
 all_results = []
 
 
-def get_benchmark(device="xpu"):
+def get_benchmark(device="xpu", configs=None, dtype=torch.bfloat16):
     @triton.testing.perf_report(
         triton.testing.Benchmark(
             x_names=[
@@ -149,7 +150,6 @@ def get_benchmark(device="xpu"):
         max_position_embeddings,
         provider,
     ):
-        dtype = torch.bfloat16
         q_heads, kv_heads = num_head_pairs[0], num_head_pairs[1]
         q = torch.randn((num_tokens, q_heads * head_dim), device=device, dtype=dtype)
         k = torch.randn((num_tokens, kv_heads * head_dim), device=device, dtype=dtype)
@@ -202,24 +202,45 @@ def get_benchmark(device="xpu"):
 
 
 if __name__ == "__main__":
+    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=[1, 2, 4, 8])
+    parser.add_argument("--seq-len", type=int, default=1024)
+    # configs from qwen3.5-9b(16-4) and qwen3.5-35b-a3b(4-1 with tp=4)
+    parser.add_argument(
+        "--num-head-pairs",
+        nargs="+",
+        type=lambda s: [int(x) for x in s.split(",")],
+        default=[[4, 1], [16, 4]],
+        help="q_heads,kv_heads pairs, e.g. 4,1 16,4",
+    )
+    parser.add_argument("--head-dims", nargs="+", type=int, default=[256])
+    parser.add_argument(
+        "--partial-rotary-factors", nargs="+", type=float, default=[0.25]
+    )
+    parser.add_argument(
+        "--max-position-embeddings", nargs="+", type=int, default=[262400]
+    )
+    parser.add_argument("--dtype", choices=list(dtype_map), default="bfloat16")
+    args = parser.parse_args()
+
     # Run correctness test on small configs if not using a real model
 
-    bs = [1, 2, 4, 8]
+    bs = args.batch_sizes
     # bs = [16, 32, 64]
-    seq_len = 1024
+    seq_len = args.seq_len
     num_tokens = [seq_len * b for b in bs]
-    # configs from qwen3.5-9b(16-4) and qwen3.5-35b-a3b(4-1 with tp=4)
-    num_head_pairs = [[4, 1], [16, 4]]
-    head_dim = [256]
+    num_head_pairs = args.num_head_pairs
+    head_dim = args.head_dims
     is_neox = [True]
-    dtype = [torch.bfloat16]
+    dtype = [dtype_map[args.dtype]]
 
     sweep_params = {
         "num_tokens": num_tokens,
         "num_head_pairs": num_head_pairs,
         "head_dim": head_dim,
-        "partial_rotary_factor": [0.25],
-        "max_position_embeddings": [262400],
+        "partial_rotary_factor": args.partial_rotary_factors,
+        "max_position_embeddings": args.max_position_embeddings,
     }
 
     keys = sweep_params.keys()
@@ -230,7 +251,7 @@ if __name__ == "__main__":
 
     # Run benchmark
     print("Starting performance benchmark...")
-    benchmark = get_benchmark()
+    benchmark = get_benchmark(configs=configs, dtype=dtype[0])
     benchmark.run(print_data=False)
 
     df = pd.DataFrame(all_results)

@@ -1,3 +1,5 @@
+import argparse
+
 import torch
 import triton
 from sgl_kernel import moe_sum_reduce as moe_sum_reduce_sycl
@@ -22,8 +24,12 @@ def compute_sum_scaled_compiled(
     return out
 
 
-def get_benchmark():
-    num_tokens_range = [2**i for i in range(0, 13)]
+def get_benchmark(
+    num_tokens_range=[2**i for i in range(0, 13)],
+    topk=9,
+    hidden_size=4096,
+    dtype=torch.bfloat16,
+):
 
     @triton.testing.perf_report(
         triton.testing.Benchmark(
@@ -39,9 +45,6 @@ def get_benchmark():
         )
     )
     def benchmark(num_tokens, version):
-        topk = 9
-        hidden_size = 4096
-        dtype = torch.bfloat16
         scaling_factor = 0.3
 
         x = torch.randn(num_tokens, topk, hidden_size, dtype=dtype, device="xpu")
@@ -121,11 +124,27 @@ def verify_correctness(num_tokens=1024):
 
 
 if __name__ == "__main__":
+    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16}
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num-tokens",
+        nargs="+",
+        type=int,
+        default=[2**i for i in range(0, 13)],
+        help="List of token counts",
+    )
+    parser.add_argument("--topk", type=int, default=9)
+    parser.add_argument("--hidden-size", type=int, default=4096)
+    parser.add_argument("--dtype", choices=list(dtype_map), default="bfloat16")
+    args = parser.parse_args()
+
     print("Running correctness verification...")
     verify_correctness()
 
     print("\nRunning performance benchmark...")
-    benchmark = get_benchmark()
+    benchmark = get_benchmark(
+        args.num_tokens, args.topk, args.hidden_size, dtype_map[args.dtype]
+    )
     benchmark.run(
         print_data=True,
         # save_path="./configs/benchmark_ops/sum_scaled/"

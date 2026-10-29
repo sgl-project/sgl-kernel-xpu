@@ -23,6 +23,7 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
+import argparse
 import itertools
 
 import pandas as pd
@@ -148,6 +149,33 @@ def benchmark(M, N, K, out_dtype, with_bias, provider):
 
 
 if __name__ == "__main__":
+    dtype_map = {
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+    }
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--m", nargs="+", type=int, default=M_range, help="List of M")
+    parser.add_argument("--n", nargs="+", type=int, default=N_range, help="List of N")
+    parser.add_argument("--k", nargs="+", type=int, default=K_range, help="List of K")
+    parser.add_argument(
+        "--out-dtypes",
+        nargs="+",
+        choices=list(dtype_map),
+        default=["float32", "bfloat16", "float16"],
+        help="List of output dtypes",
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = list(
+        itertools.product(
+            args.m,
+            args.n,
+            args.k,
+            [dtype_map[d] for d in args.out_dtypes],
+            with_bias_range,
+        )
+    )
+
     # Smoke correctness check on a small case before perf
     device = "xpu"
     M, N, K = 128, 256, 64

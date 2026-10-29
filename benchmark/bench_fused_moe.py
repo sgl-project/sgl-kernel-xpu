@@ -191,14 +191,30 @@ def _cfg_vals(d):
 shape_values = [_cfg_vals(d) for d in shape_configs]
 bs = [1, 128, 512, 1024, 2048, 4096, 8192]
 with_bias = [False, True]
-configs = [(k, *v, b, "silu") for k, v, b in product(bs, shape_values, with_bias)]
 shape_values_gelu = [_cfg_vals(d) for d in shape_configs_gelu]
-configs += [(k, *v, b, "gelu") for k, v, b in product(bs, shape_values_gelu, with_bias)]
 shape_values_swiglu_gpt_oss = [_cfg_vals(d) for d in shape_configs_swiglu_gpt_oss]
-configs += [
-    (k, *v, b, "silu")
-    for k, v, b in product(bs, shape_values_swiglu_gpt_oss, with_bias)
-]
+SHAPE_GROUPS = ["silu", "gelu", "swiglu_gpt_oss"]
+
+
+def build_configs(bs=bs, with_bias=with_bias, groups=SHAPE_GROUPS):
+    configs = []
+    if "silu" in groups:
+        configs += [
+            (k, *v, b, "silu") for k, v, b in product(bs, shape_values, with_bias)
+        ]
+    if "gelu" in groups:
+        configs += [
+            (k, *v, b, "gelu") for k, v, b in product(bs, shape_values_gelu, with_bias)
+        ]
+    if "swiglu_gpt_oss" in groups:
+        configs += [
+            (k, *v, b, "silu")
+            for k, v, b in product(bs, shape_values_swiglu_gpt_oss, with_bias)
+        ]
+    return configs
+
+
+configs = build_configs()
 
 all_results = []
 
@@ -547,6 +563,32 @@ def benchmark(
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--num-tokens", nargs="+", type=int, default=bs, help="Token counts"
+    )
+    parser.add_argument(
+        "--with-bias",
+        nargs="+",
+        type=int,
+        choices=[0, 1],
+        default=[int(b) for b in with_bias],
+        help="Bias modes (0=no bias, 1=bias)",
+    )
+    parser.add_argument(
+        "--shape-groups",
+        nargs="+",
+        choices=SHAPE_GROUPS,
+        default=SHAPE_GROUPS,
+        help="Shape config groups to run",
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = build_configs(
+        args.num_tokens, [bool(b) for b in args.with_bias], args.shape_groups
+    )
+
     benchmark.run(print_data=False)
     print("Benchmark finished!")
 

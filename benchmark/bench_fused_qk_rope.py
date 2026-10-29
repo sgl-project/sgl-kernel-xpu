@@ -12,6 +12,7 @@ Key differences vs bench_fused_qk_norm_rope.py:
   - FLOPs: weight-scale is 1 FLOP/elem instead of 4 (no variance computation)
 """
 
+import argparse
 import gc
 import itertools
 import os
@@ -201,13 +202,8 @@ head_config_range = [
 is_neox_range = [True, False]
 dtype_range = ["fp16", "bf16", "fp8_e4m3fn"]
 
-configs = []
-for batch_size, seq_len, (nq, nk, nv, hd), is_neox, dtype in itertools.product(
-    batch_size_range, seq_len_range, head_config_range, is_neox_range, dtype_range
-):
-    configs.append((batch_size, seq_len, nq, nk, nv, hd, is_neox, dtype))
-
 all_results = []
+
 
 # -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
 # Chunked / single - config mode(set env vars for parallel sweeps)
@@ -216,35 +212,52 @@ all_results = []
 # SINGLE_CONFIG           – run exactly one config given as CSV:
 # "batch_size,seq_len,nq,nk,nv,head_dim,is_neox,dtype"
 # -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- --
-num_chunks = int(os.environ.get("NUM_CHUNKS", "1"))
-chunk_idx = int(os.environ.get("CHUNK_IDX", "0"))
+def build_configs(
+    batch_sizes=batch_size_range,
+    seq_lens=seq_len_range,
+    head_configs=head_config_range,
+    is_neox_values=is_neox_range,
+    dtypes=dtype_range,
+):
+    configs = []
+    for batch_size, seq_len, (nq, nk, nv, hd), is_neox, dtype in itertools.product(
+        batch_sizes, seq_lens, head_configs, is_neox_values, dtypes
+    ):
+        configs.append((batch_size, seq_len, nq, nk, nv, hd, is_neox, dtype))
 
-single_cfg = os.environ.get("SINGLE_CONFIG", "")
-if single_cfg:
-    parts = [p.strip() for p in single_cfg.split(",")]
-    if len(parts) != 8:
-        raise RuntimeError(
-            "SINGLE_CONFIG must have 8 comma-separated fields: "
-            "batch_size,seq_len,nq,nk,nv,head_dim,is_neox,dtype"
-        )
-    bsz = int(parts[0])
-    sl = int(parts[1])
-    nq = int(parts[2])
-    nk = int(parts[3])
-    nv = int(parts[4])
-    hd = int(parts[5])
-    is_neox_val = parts[6].lower() in ("1", "true", "yes")
-    dtype_val = parts[7]
-    configs = [(bsz, sl, nq, nk, nv, hd, is_neox_val, dtype_val)]
-    num_chunks = 1
-    chunk_idx = 0
+    num_chunks = int(os.environ.get("NUM_CHUNKS", "1"))
+    chunk_idx = int(os.environ.get("CHUNK_IDX", "0"))
 
-if num_chunks > 1:
-    total = len(configs)
-    chunk_size = (total + num_chunks - 1) // num_chunks
-    start = chunk_idx * chunk_size
-    end = min(start + chunk_size, total)
-    configs = configs[start:end]
+    single_cfg = os.environ.get("SINGLE_CONFIG", "")
+    if single_cfg:
+        parts = [p.strip() for p in single_cfg.split(",")]
+        if len(parts) != 8:
+            raise RuntimeError(
+                "SINGLE_CONFIG must have 8 comma-separated fields: "
+                "batch_size,seq_len,nq,nk,nv,head_dim,is_neox,dtype"
+            )
+        bsz = int(parts[0])
+        sl = int(parts[1])
+        nq = int(parts[2])
+        nk = int(parts[3])
+        nv = int(parts[4])
+        hd = int(parts[5])
+        is_neox_val = parts[6].lower() in ("1", "true", "yes")
+        dtype_val = parts[7]
+        configs = [(bsz, sl, nq, nk, nv, hd, is_neox_val, dtype_val)]
+        num_chunks = 1
+        chunk_idx = 0
+
+    if num_chunks > 1:
+        total = len(configs)
+        chunk_size = (total + num_chunks - 1) // num_chunks
+        start = chunk_idx * chunk_size
+        end = min(start + chunk_size, total)
+        configs = configs[start:end]
+    return configs
+
+
+configs = build_configs()
 
 
 # -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
@@ -504,6 +517,31 @@ def benchmark(
 # Entry point
 # -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -- -
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=batch_size_range)
+    parser.add_argument("--seq-lens", nargs="+", type=int, default=seq_len_range)
+    parser.add_argument(
+        "--head-configs",
+        nargs="+",
+        type=lambda s: tuple(int(x) for x in s.split(",")),
+        default=head_config_range,
+        help="nq,nk,nv,head_dim tuples, e.g. 32,8,8,128",
+    )
+    parser.add_argument(
+        "--is-neox",
+        nargs="+",
+        type=lambda s: s.lower() in ("1", "true", "yes"),
+        default=is_neox_range,
+        help="is_neox values (true/false)",
+    )
+    parser.add_argument(
+        "--dtypes", nargs="+", choices=list(DTYPE_MAP), default=dtype_range
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = build_configs(
+        args.batch_sizes, args.seq_lens, args.head_configs, args.is_neox, args.dtypes
+    )
+
     print("Running fused_qk_rope benchmarks...")
     benchmark.run(print_data=True)
 

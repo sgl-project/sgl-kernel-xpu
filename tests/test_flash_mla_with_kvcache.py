@@ -1,12 +1,12 @@
 """
-Tests for V4 Sparse MLA Decode — matches DeepSeek V4 actual parameters.
+Tests for Sparse MLA Decode.
 
 Reference implementation: _sm120_sparse_decode_fwd inlined from
 https://github.com/AliceChenyy/sglang/blob/7cc3aa4819525d9d95f048786eb21853b08cbade/
   python/sglang/srt/layers/attention/flash_mla_sm120_fallback.py
 
-DeepSeek V4 KV cache layout (FP8 packed, PAGE-END scales):
-  Physical page structure (total_page_bytes = page_size*576 + ceil_576(page_size*8)):
+(A) DeepSeek V4 — d_qk=512, 584 B/token, page-internal SECTIONS:
+  Physical page (total_page_bytes = page_size*576 + ceil_576(page_size*8)):
     [0 .. page_size*576)           Token data section
       Per token (576 bytes):
         bytes   0-447: K_nope  FP8_E4M3  (448B = 7 tiles × 64)
@@ -16,27 +16,18 @@ DeepSeek V4 KV cache layout (FP8 packed, PAGE-END scales):
         bytes 0-6: 7 nope tile scales UE8M0
         byte  7:   1 reserved
 
-  as_strided view (as seen by kernel):
-    shape:  (num_pages, page_size, 1, 584)
-    stride: (total_page_bytes, 584, 584, 1)
-    dtype:  float8_e4m3fn
+(B) DeepSeek V3.2 / GLM-DSA — d_qk=576, 656 B/token, one CONTIGUOUS record per token:
+    bytes   0-511: K_nope  FP8_E4M3  (512B = 4 tiles × 128)
+    bytes 512-527: 4 nope tile scales FP32
+    bytes 528-655: K_rope  BF16      (128B = 64 dims × 2 bytes)
 
-  stride(1) = 584 is a metadata value (= shape[3]), NOT physical token spacing.
-  stride(0) = total_page_bytes encodes the real page stride for raw byte access.
-  The kernel uses stride(0) to locate pages and computes internal offsets manually.
-
-DeepSeek V4 constants (from production trace):
-  D_QK = 512, D_NOPE = 448, D_ROPE = 64, D_V = 512
-  num_heads = 64, num_kv_heads = 1, page_size = 256
-  SWA_WINDOW = 128 tokens, extra_topk ∈ {64, 512, 8256}
-  sm_scale = 1/sqrt(512) = 0.04419417382415922
 """
 
 import gc
 import math
 import os
 import sys
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import pytest
 import torch
@@ -60,33 +51,13 @@ if not _HAS_FP8:
         allow_module_level=True,
     )
 
-# Page layout constants for DSv4-Flash (MODEL1):
-#   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
-#   nope_rope_stride = 448 + 64*2 = 576 bytes per token
-#   scale_stride = ceil(448/64) + 1 = 8 bytes per token (7 scales + 1 pad)
-#   bytes_per_token = 448 + 128 + 8 = 584
-#   page_bytes = ceil_div(page_size * 584, 576) * 576
-
-# ── DeepSeek V4 fixed constants (from production trace) ──
-_NOPE_DIM = 448
-_ROPE_DIM = 64
-D_QK = 512  # D_NOPE + D_ROPE
+# ── Layout-independent constants (from the DeepSeek V4 production trace) ──
 D_V = 512
 H_Q = 64
 H_KV = 1
 SWA_WINDOW = 128
-SM_SCALE = 1.0 / math.sqrt(D_QK)  # 1/sqrt(512) = 0.04419...
-
-# FP8 packed layout constants (page-end scales)
-_NOPE_ROPE_STRIDE = _NOPE_DIM + _ROPE_DIM * 2  # 576 bytes per token in data section
-_TILE_SIZE = 64
-_NUM_TILES = _NOPE_DIM // _TILE_SIZE  # 7
-_SCALE_STRIDE = _NUM_TILES + 1  # 8 bytes per token in scale section
-_D = _NOPE_DIM + _ROPE_DIM  # 512 (dequantized output dim)
-
-# Default page size from trace
 PAGE_SIZE = 256
-
+SMOKE_POOL_TOKENS = 16384
 _GATHER_CHUNK = 16384  # tokens per chunk; ~16k * 1024 B ≈ 16 MiB output per chunk
 
 # Per-chunk peak-memory budget for the sparse decode fallback (MiB).  Read
@@ -95,18 +66,87 @@ _GATHER_CHUNK = 16384  # tokens per chunk; ~16k * 1024 B ≈ 16 MiB output per c
 _SM120_SPARSE_CHUNK_MIB = int(os.environ.get("SGLANG_SM120_SPARSE_CHUNK_MIB", "256"))
 
 
-def _ceil_to_576(x):
-    """Align x up to the next multiple of 576."""
-    return ((x + 575) // 576) * 576
+class KvLayout(NamedTuple):
+    """Byte geometry of one packed FP8 KV cache layout, keyed by d_qk.
 
-
-def _total_page_bytes(page_size):
-    """Compute total page bytes matching production allocation.
-
-    total = page_size * 576 (data) + ceil_576(page_size * 8) (scales)
-    Verified against trace stride(0) for page_size = 256, 64, 2.
+    This class encapsulates the layout of the KV cache for a given d_qk, including
+    the dimensions of the NoPE and RoPE components, the tile size for NoPE, and
+    whether scales are stored inline and in FP32 format.
     """
-    return page_size * _NOPE_ROPE_STRIDE + _ceil_to_576(page_size * _SCALE_STRIDE)
+
+    name: str
+    nope_dim: int
+    rope_dim: int
+    tile_size: int  # nope values sharing one scale
+    scales_inline: bool  # inline in the token record vs a separate page-end section
+    scales_fp32: bool  # fp32 scales vs UE8M0 exponent bytes
+
+    @property
+    def d_qk(self) -> int:
+        return self.nope_dim + self.rope_dim
+
+    @property
+    def num_tiles(self) -> int:
+        return self.nope_dim // self.tile_size
+
+    @property
+    def scale_bytes(self) -> int:
+        """Per-token scale footprint: 4 B per fp32 tile scale, or 1 B per UE8M0 + 1 pad."""
+        return self.num_tiles * 4 if self.scales_fp32 else self.num_tiles + 1
+
+    @property
+    def token_stride(self) -> int:
+        """Spacing between consecutive token records in the data region."""
+        inline = self.scale_bytes if self.scales_inline else 0
+        return self.nope_dim + inline + self.rope_dim * 2
+
+    @property
+    def rope_byte_offset(self) -> int:
+        """Where RoPE starts in a token record (after NoPE, and after inline scales)."""
+        return self.nope_dim + (self.scale_bytes if self.scales_inline else 0)
+
+    @property
+    def head_bytes(self) -> int:
+        """k_cache.shape[-1] -- the per-token width the kernel validates d_qk against."""
+        return self.token_stride + (0 if self.scales_inline else self.scale_bytes)
+
+    @property
+    def sm_scale(self) -> float:
+        return 1.0 / math.sqrt(self.d_qk)
+
+    def total_page_bytes(self, page_size: int) -> int:
+        """Real byte stride between pages (k_cache.stride(0))."""
+        data = page_size * self.token_stride
+        if self.scales_inline:
+            # Records are self-contained, so a page is exactly its data region.
+            return data
+        # DSv4: the page-end scale section is padded up to a 576-byte boundary.
+        scale_section = page_size * self.scale_bytes
+        return data + ((scale_section + 575) // 576) * 576
+
+
+DSV4_LAYOUT = KvLayout(
+    name="dsv4-584",
+    nope_dim=448,
+    rope_dim=64,
+    tile_size=64,
+    scales_inline=False,
+    scales_fp32=False,
+)
+DSA_LAYOUT = KvLayout(
+    name="dsa-656",
+    nope_dim=512,
+    rope_dim=64,
+    tile_size=128,
+    scales_inline=True,
+    scales_fp32=True,
+)
+ALL_LAYOUTS = [DSV4_LAYOUT, DSA_LAYOUT]
+
+# Pin the derived geometry to the two production widths the kernel dispatches on.
+assert (DSV4_LAYOUT.d_qk, DSV4_LAYOUT.head_bytes) == (512, 584), DSV4_LAYOUT
+assert (DSA_LAYOUT.d_qk, DSA_LAYOUT.head_bytes) == (576, 656), DSA_LAYOUT
+assert (DSA_LAYOUT.rope_byte_offset, DSA_LAYOUT.num_tiles) == (528, 4), DSA_LAYOUT
 
 
 def clear_memory():
@@ -125,20 +165,19 @@ def reset_torch_defaults():
 # ===========================================================================
 # Reference: _gather_and_dequant + _sm120_sparse_decode_fwd
 # ===========================================================================
-
-
-def _gather_and_dequant(k_cache, indices, page_size):
+def _gather_and_dequant(k_cache, indices, page_size, layout):
     """Gather KV entries from the paged buffer using correct page-internal addressing.
 
     Args:
-        k_cache: (num_pages, page_size, 1, bytes_per_token) float8_e4m3fn
-                 Non-contiguous view of the raw page buffer.
+        k_cache: (num_pages, page_size, 1, layout.head_bytes) float8_e4m3fn.
+                 May be a non-contiguous view of the raw page buffer (DSv4).
         indices: (...) int32/int64, token-level indices. Invalid indices are
                  expected to already be clamped into [0, num_pages*page_size).
         page_size: tokens per page (e.g. 256, 64, 2)
+        layout: KvLayout deciding where a token's scale bytes live and how they decode.
 
     Returns:
-        kv: (..., _D) bfloat16, dequantized KV vectors
+        kv: (..., layout.d_qk) bfloat16, dequantized KV vectors
     """
     idx_shape = indices.shape
     flat_idx = indices.reshape(-1)  # (N,)
@@ -149,7 +188,7 @@ def _gather_and_dequant(k_cache, indices, page_size):
     num_pages = k_cache.shape[0]
 
     # Flatten the raw byte buffer so we can gather with a single int64 index
-    # per byte instead of paying for a full (N, 448) int64 index tensor up
+    # per byte instead of paying for a full (N, nope_dim) int64 index tensor up
     # front. flat_buf has nelems = num_pages * page_bytes uint8.
     raw_pages = k_cache.as_strided(
         (num_pages, page_bytes),
@@ -157,13 +196,17 @@ def _gather_and_dequant(k_cache, indices, page_size):
     ).view(torch.uint8)
     flat_buf = raw_pages.reshape(-1)
 
-    scale_section_offset = page_size * _NOPE_ROPE_STRIDE
+    scale_section_offset = page_size * layout.token_stride
 
-    nope_arange = torch.arange(_NOPE_DIM, device=device, dtype=torch.long)
-    rope_arange = torch.arange(_ROPE_DIM * 2, device=device, dtype=torch.long)
-    scale_arange = torch.arange(_NUM_TILES, device=device, dtype=torch.long)
+    nope_arange = torch.arange(layout.nope_dim, device=device, dtype=torch.long)
+    rope_arange = torch.arange(layout.rope_dim * 2, device=device, dtype=torch.long)
+    # UE8M0 scales are 1 byte each (the pad byte is skipped); fp32 scales are 4.
+    scale_byte_width = 4 if layout.scales_fp32 else 1
+    scale_arange = torch.arange(
+        layout.num_tiles * scale_byte_width, device=device, dtype=torch.long
+    )
 
-    result = torch.empty(N, _D, dtype=torch.bfloat16, device=device)
+    result = torch.empty(N, layout.d_qk, dtype=torch.bfloat16, device=device)
 
     # Process in chunks to bound peak memory of the int64 advanced-index
     # tensors (which would otherwise be N * 448 * 8 bytes — multiple GB on
@@ -178,36 +221,47 @@ def _gather_and_dequant(k_cache, indices, page_size):
 
         # Per-token base byte offset into the flat raw buffer.
         page_base = pages.to(torch.long) * page_bytes  # (n,)
-        nope_base = page_base + offsets.to(torch.long) * _NOPE_ROPE_STRIDE  # (n,)
+        rec_base = page_base + offsets.to(torch.long) * layout.token_stride  # (n,)
 
-        nope_idx = nope_base.unsqueeze(-1) + nope_arange  # (n, 448)
-        rope_idx = nope_base.unsqueeze(-1) + (_NOPE_DIM + rope_arange)  # (n, 128)
-        scale_idx = (
-            page_base.unsqueeze(-1)
-            + scale_section_offset
-            + offsets.to(torch.long).unsqueeze(-1) * _SCALE_STRIDE
-            + scale_arange
-        )  # (n, 7)
-
-        nope_bytes = flat_buf[nope_idx.reshape(-1)].view(n, _NOPE_DIM)
-        rope_bytes = flat_buf[rope_idx.reshape(-1)].view(n, _ROPE_DIM * 2)
-        scale_bytes = flat_buf[scale_idx.reshape(-1)].view(n, _NUM_TILES)
-
-        nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)  # (n, 448)
-        rope_bf16 = rope_bytes.contiguous().view(torch.bfloat16)  # (n, 64)
-        scale_e8m0 = scale_bytes.view(torch.float8_e8m0fnu)  # (n, 7)
-
-        result[start:end, :_NOPE_DIM] = (
-            (
-                nope_fp8.view(n, _NUM_TILES, _TILE_SIZE).float()
-                * scale_e8m0.view(n, _NUM_TILES, 1).float()
+        nope_idx = rec_base.unsqueeze(-1) + nope_arange  # (n, nope_dim)
+        rope_idx = rec_base.unsqueeze(-1) + (
+            layout.rope_byte_offset + rope_arange
+        )  # (n, 2*rope_dim)
+        if layout.scales_inline:
+            # DSv3.2 / GLM-DSA: scales sit inside the record, right after NoPE.
+            scale_idx = rec_base.unsqueeze(-1) + layout.nope_dim + scale_arange
+        else:
+            # DSv4: scales live in a page-end section indexed by in-page token offset.
+            scale_idx = (
+                page_base.unsqueeze(-1)
+                + scale_section_offset
+                + offsets.to(torch.long).unsqueeze(-1) * layout.scale_bytes
+                + scale_arange
             )
-            .view(n, _NOPE_DIM)
+
+        nope_bytes = flat_buf[nope_idx.reshape(-1)].view(n, layout.nope_dim)
+        rope_bytes = flat_buf[rope_idx.reshape(-1)].view(n, layout.rope_dim * 2)
+        scale_bytes = flat_buf[scale_idx.reshape(-1)].view(
+            n, layout.num_tiles * scale_byte_width
+        )
+
+        nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)  # (n, nope_dim)
+        rope_bf16 = rope_bytes.contiguous().view(torch.bfloat16)  # (n, rope_dim)
+        scales = scale_bytes.contiguous().view(
+            torch.float32 if layout.scales_fp32 else torch.float8_e8m0fnu
+        )  # (n, num_tiles)
+
+        result[start:end, : layout.nope_dim] = (
+            (
+                nope_fp8.view(n, layout.num_tiles, layout.tile_size).float()
+                * scales.view(n, layout.num_tiles, 1).float()
+            )
+            .view(n, layout.nope_dim)
             .to(torch.bfloat16)
         )
-        result[start:end, _NOPE_DIM:] = rope_bf16
+        result[start:end, layout.nope_dim :] = rope_bf16
 
-    return result.reshape(*idx_shape, _D)
+    return result.reshape(*idx_shape, layout.d_qk)
 
 
 def _sm120_sparse_decode_fwd(
@@ -218,6 +272,7 @@ def _sm120_sparse_decode_fwd(
     attn_sink,
     head_dim_v,
     softmax_scale,
+    layout,
     extra_k_cache=None,
     extra_indices=None,
     extra_topk_length=None,
@@ -272,11 +327,11 @@ def _sm120_sparse_decode_fwd(
     lse_rows = torch.empty(R, H_q, dtype=torch.float32, device=device)
 
     # Bound per-chunk peak memory. Dominant bf16 tensor is gathered KV:
-    # chunk * total_topk * _D * 2 bytes; fp32 working set adds ~3x on top.
+    # chunk * total_topk * d_qk * 2 bytes; fp32 working set adds ~3x on top.
     # On Intel L0, per-launch overhead is high (~hundreds of us), so prefer
     # fewer/larger chunks. Target 256 MiB peak (override via
     # SGLANG_SM120_SPARSE_CHUNK_MIB at import time).
-    bytes_per_row = total_topk * _D * 2
+    bytes_per_row = total_topk * layout.d_qk * 2
     chunk_rows = max(
         1, min(R, (_SM120_SPARSE_CHUNK_MIB * 1024 * 1024) // max(1, bytes_per_row))
     )
@@ -287,13 +342,13 @@ def _sm120_sparse_decode_fwd(
 
         # Gather KV for this chunk only.
         kv_chunk = _gather_and_dequant(
-            k_cache, safe_indices_rows[start:end], page_size
-        )  # (n, topk, _D)
+            k_cache, safe_indices_rows[start:end], page_size, layout
+        )  # (n, topk, d_qk)
         inv_chunk = invalid_rows[start:end]  # (n, topk)
         if have_extra:
             extra_kv_chunk = _gather_and_dequant(
-                extra_k_cache, extra_safe_rows[start:end], extra_page_size
-            )  # (n, extra_topk, _D)
+                extra_k_cache, extra_safe_rows[start:end], extra_page_size, layout
+            )  # (n, extra_topk, d_qk)
             kv_chunk = torch.cat([kv_chunk, extra_kv_chunk], dim=1)
             inv_chunk = torch.cat([inv_chunk, extra_invalid_rows[start:end]], dim=1)
             del extra_kv_chunk
@@ -362,8 +417,10 @@ def call_kernel(
     extra_indices=None,
     topk_length=None,
     extra_topk_length=None,
+    *,
+    layout,
 ):
-    """Calls flash_mla_sparse_decode with FP8 packed KV cache (page-end scales)."""
+    """Calls flash_mla_sparse_decode with a packed FP8 KV cache in `layout`'s format."""
     return flash_mla_with_kvcache(
         q=q,
         k_cache=k_cache,
@@ -372,7 +429,7 @@ def call_kernel(
         head_dim_v=D_V,
         tile_scheduler_metadata=None,
         num_splits=None,
-        softmax_scale=SM_SCALE,
+        softmax_scale=layout.sm_scale,
         causal=False,
         is_fp8_kvcache=True,
         indices=indices,
@@ -384,60 +441,72 @@ def call_kernel(
     )
 
 
-# ===========================================================================
-# Helpers — create FP8 packed KV cache matching DeepSeek V4 production format
-# ===========================================================================
+def _tile_scale_values(num_tiles, varied):
+    """Per-tile NoPE scale multipliers. Powers of two so UE8M0 can represent them exactly.
 
-
-def make_fp8_kv_cache(num_pages, page_size=PAGE_SIZE):
+    Unit scales (varied=False) keep the historical DSv4 fixture behavior. Varied scales
+    make a wrong scale-group index or a mis-decoded scale section observable, which unit
+    scales cannot.
     """
-    Create FP8 packed KV cache matching DeepSeek V4 production format.
+    if not varied:
+        return [1.0] * num_tiles
+    return [2.0 ** ((t % 3) - 1) for t in range(num_tiles)]  # 0.5, 1.0, 2.0, ...
 
-    Page-end scales layout:
+
+def make_fp8_kv_cache(num_pages, layout, page_size=PAGE_SIZE, varied_scales=False):
+    """Create a packed FP8 KV cache in `layout`'s production byte format.
+
+    DSv4 (page-end scales):
       [0 .. page_size*576)    Token data: [nope0|rope0|nope1|rope1|...|nopeN|ropeN]
-      [page_size*576 .. end)  Scale section: [scale0|scale1|...|scaleN] (padded to 576)
+      [page_size*576 .. end)  Scale section: [scale0|...|scaleN] UE8M0 (padded to 576)
 
-    Returns k_cache as_strided view:
-      shape:  (num_pages, page_size, 1, 584)
-      stride: (total_page_bytes, 584, 584, 1)
-      dtype:  float8_e4m3fn
+    DSv3.2 / GLM-DSA (inline scales): page_size contiguous self-contained records
+      [nope(512B) | scales(16B fp32) | rope(128B)]
     """
-    total_pb = _total_page_bytes(page_size)
-
-    # Allocate raw uint8 buffer
+    total_pb = layout.total_page_bytes(page_size)
     raw = torch.zeros(num_pages, total_pb, dtype=torch.uint8, device=device)
+    scale_values = _tile_scale_values(layout.num_tiles, varied_scales)
 
-    # Fill token data section: [nope_i(448B) | rope_i(128B)] × page_size
+    # Token data records: NoPE, then RoPE at the layout's offset (past inline scales).
     for t in range(page_size):
-        t_offset = t * _NOPE_ROPE_STRIDE
-        # Nope: bf16 randn → fp8 → store bytes
+        rec = t * layout.token_stride
         nope_bf16 = torch.randn(
-            num_pages, _NOPE_DIM, dtype=torch.bfloat16, device=device
+            num_pages, layout.nope_dim, dtype=torch.bfloat16, device=device
         )
         nope_fp8 = nope_bf16.to(torch.float8_e4m3fn)
-        raw[:, t_offset : t_offset + _NOPE_DIM] = nope_fp8.view(torch.uint8)
-        # Rope: bf16 randn → store bytes
+        raw[:, rec : rec + layout.nope_dim] = nope_fp8.view(torch.uint8)
+
         rope_bf16 = torch.randn(
-            num_pages, _ROPE_DIM, dtype=torch.bfloat16, device=device
+            num_pages, layout.rope_dim, dtype=torch.bfloat16, device=device
         )
-        raw[:, t_offset + _NOPE_DIM : t_offset + _NOPE_DIM + _ROPE_DIM * 2] = (
-            rope_bf16.view(torch.uint8)
+        r0 = rec + layout.rope_byte_offset
+        raw[:, r0 : r0 + layout.rope_dim * 2] = rope_bf16.view(torch.uint8)
+
+        if layout.scales_inline:
+            # fp32 tile scales, inline immediately after NoPE.
+            s0 = rec + layout.nope_dim
+            scales = torch.tensor(
+                scale_values, dtype=torch.float32, device=device
+            ).expand(num_pages, layout.num_tiles)
+            raw[:, s0 : s0 + layout.scale_bytes] = scales.contiguous().view(torch.uint8)
+
+    if not layout.scales_inline:
+        # UE8M0 page-end section: byte b encodes 2^(b-127), so 127 is a unit scale.
+        scale_bytes = torch.tensor(
+            [127 + int(math.log2(v)) for v in scale_values],
+            dtype=torch.uint8,
+            device=device,
         )
+        scale_section_start = page_size * layout.token_stride
+        for t in range(page_size):
+            s0 = scale_section_start + t * layout.scale_bytes
+            raw[:, s0 : s0 + layout.num_tiles] = scale_bytes
 
-    # Fill scale section at page end: [scale_i(8B)] × page_size
-    scale_section_start = page_size * _NOPE_ROPE_STRIDE
-    for t in range(page_size):
-        s_offset = scale_section_start + t * _SCALE_STRIDE
-        # Set 7 tile scales = 127 → exp2(127-127) = 1.0 (unit scale)
-        raw[:, s_offset : s_offset + _NUM_TILES] = 127
-
-    # Create as_strided view matching production format
-    k_cache = raw.as_strided(
-        (num_pages, page_size, 1, 584),
-        (total_pb, 584, 584, 1),
+    hb = layout.head_bytes
+    return raw.as_strided(
+        (num_pages, page_size, 1, hb),
+        (total_pb, hb, hb, 1),
     ).view(torch.float8_e4m3fn)
-
-    return k_cache
 
 
 def make_indices(B, topk, n_valid_list, num_pages, page_size=PAGE_SIZE, s_q=1):
@@ -462,13 +531,9 @@ def make_attn_sink(h_q=H_Q):
     return sink
 
 
-# ===========================================================================
-# Tests — DeepSeek V4 parameters
-# ===========================================================================
-
-
 @pytest.mark.arch("xe20", "xe35")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("layout", ALL_LAYOUTS, ids=lambda lo: lo.name)
 @pytest.mark.parametrize("bs", [7, 384, 512])
 @pytest.mark.parametrize("num_heads", [16, 32, 64])
 @pytest.mark.parametrize("have_extra", [False, True])
@@ -476,15 +541,17 @@ def make_attn_sink(h_q=H_Q):
 @pytest.mark.parametrize("have_topk_length", [False, True])
 @pytest.mark.parametrize("variable_topk", [False, True])
 @pytest.mark.parametrize(
-    "page_size,extra_page_size,extra_topk",
+    "page_size,num_swa_pages,extra_page_size,extra_topk,num_ext_pages",
     [
-        (256, 64, 512),  # DeepSeek V4 default (from trace)
-        (256, 2, 64),  # V4 small extra page variant (from trace)
-        (256, 2, 8256),  # V4 large extra_topk variant (from trace)
+        (256, 64, 64, 512, 640),
+        (256, 64, 2, 64, 640),
+        (256, 64, 2, 8256, 640),
+        (64, 256, 64, 512, 160),
     ],
 )
-def test_dsv4_sparse_decode_correctness(
+def test_sparse_decode_correctness(
     dtype,
+    layout,
     bs,
     num_heads,
     have_extra,
@@ -492,33 +559,35 @@ def test_dsv4_sparse_decode_correctness(
     have_topk_length,
     variable_topk,
     page_size,
+    num_swa_pages,
     extra_page_size,
     extra_topk,
+    num_ext_pages,
 ):
-    """Correctness test covering all V4 sparse decode parameter combinations."""
     torch.manual_seed(42)
+    assert num_swa_pages * page_size >= SWA_WINDOW
 
-    num_swa_pages = 64
-    num_ext_pages = 640
-
-    q = torch.randn(bs, 1, num_heads, D_QK, dtype=dtype, device=device)
-    if variable_topk:
-        q = q.clamp(-1, 1)
-    k_cache = make_fp8_kv_cache(num_swa_pages, page_size=page_size)
+    q = torch.randn(bs, 1, num_heads, layout.d_qk, dtype=dtype, device=device)
+    k_cache = make_fp8_kv_cache(
+        num_swa_pages, layout, page_size=page_size, varied_scales=True
+    )
+    assert k_cache.shape[-1] == layout.head_bytes
     indices = make_indices(
         bs, SWA_WINDOW, [SWA_WINDOW] * bs, num_swa_pages, page_size=page_size
     )
 
     extra_k_cache = (
-        make_fp8_kv_cache(num_ext_pages, page_size=extra_page_size)
+        make_fp8_kv_cache(
+            num_ext_pages, layout, page_size=extra_page_size, varied_scales=True
+        )
         if have_extra
         else None
     )
+    extra_max_valid = min(extra_topk, num_ext_pages * extra_page_size)
     if variable_topk:
-        max_valid = min(extra_topk, num_ext_pages * extra_page_size)
-        extra_valid_list = [min(b * 10, max_valid) for b in range(bs)]
+        extra_valid_list = [min(b * 10, extra_max_valid) for b in range(bs)]
     else:
-        extra_valid_list = [min(256, extra_topk)] * bs
+        extra_valid_list = [min(256, extra_max_valid)] * bs
     extra_indices = (
         make_indices(
             bs,
@@ -555,6 +624,7 @@ def test_dsv4_sparse_decode_correctness(
         extra_indices,
         topk_length=topk_length,
         extra_topk_length=extra_topk_length,
+        layout=layout,
     )
     ref_out, ref_lse = _sm120_sparse_decode_fwd(
         q,
@@ -563,7 +633,8 @@ def test_dsv4_sparse_decode_correctness(
         topk_length=topk_length,
         attn_sink=attn_sink,
         head_dim_v=D_V,
-        softmax_scale=SM_SCALE,
+        softmax_scale=layout.sm_scale,
+        layout=layout,
         extra_k_cache=extra_k_cache,
         extra_indices=extra_indices,
         extra_topk_length=extra_topk_length,
@@ -574,17 +645,21 @@ def test_dsv4_sparse_decode_correctness(
 
 
 @pytest.mark.arch("xe20", "xe35")
-def test_dsv4_attn_sink_dampens_output():
+@pytest.mark.parametrize("layout", ALL_LAYOUTS, ids=lambda lo: lo.name)
+def test_attn_sink_dampens_output(layout):
     """Large positive attn_sink should scale output toward zero."""
     torch.manual_seed(42)
     bs = 7
 
-    q = torch.randn(bs, 1, H_Q, D_QK, dtype=torch.bfloat16, device=device).clamp(-1, 1)
-    k_cache = make_fp8_kv_cache(64, page_size=PAGE_SIZE)
-    indices = make_indices(bs, SWA_WINDOW, [SWA_WINDOW] * bs, 64, page_size=PAGE_SIZE)
+    q = torch.randn(bs, 1, H_Q, layout.d_qk, dtype=torch.bfloat16, device=device)
+    num_pages = SMOKE_POOL_TOKENS // PAGE_SIZE
+    k_cache = make_fp8_kv_cache(num_pages, layout, page_size=PAGE_SIZE)
+    indices = make_indices(
+        bs, SWA_WINDOW, [SWA_WINDOW] * bs, num_pages, page_size=PAGE_SIZE
+    )
 
     large_sink = torch.full((H_Q,), 100.0, dtype=torch.float32, device=device)
-    out, _ = call_kernel(q, k_cache, indices, large_sink)
+    out, _ = call_kernel(q, k_cache, indices, large_sink, layout=layout)
 
     assert (
         out.abs().max() < 1e-3

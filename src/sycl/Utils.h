@@ -197,7 +197,7 @@ static inline int64_t dpcppMaxWorkItemsPerEU(DeviceId dev_id = dpcppGetDeviceIdO
   return simd_width * hw_threads;
 }
 
-static inline int64_t dpcppMaxDSSNum(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
+static inline int64_t dpcppMaxDSSNum([[maybe_unused]] DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
   // TODO: We need to got this info from DPC++ Runtime
   // Hardcode to 32 for ATS
   int64_t dss_num = 32;

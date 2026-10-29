@@ -82,7 +82,7 @@
 #pragma once
 
 #ifndef SYCL_INTEL_TARGET
-#define SYCL_INTEL_TARGET 20
+#define SYCL_INTEL_TARGET 35
 #endif
 
 #include <ATen/ATen.h>

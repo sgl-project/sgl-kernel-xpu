@@ -42,6 +42,14 @@ def gemma_fused_add_rms_norm(x, residual, w, eps=1e-6):
     return x, residual
 
 
+def grouped_gemma_rms_norm(x, w, group_size, eps=1e-6):
+    orig_dtype = x.dtype
+    xf = x.float().reshape(*x.shape[:-1], x.shape[-1] // group_size, group_size)
+    xf = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    xf = xf.reshape(x.shape) * (1.0 + w.float())
+    return xf.to(orig_dtype)
+
+
 def norm_tolerances(dtype):
     if dtype == torch.float32:
         return dict(rtol=1e-4, atol=1e-4)
@@ -67,8 +75,20 @@ def fused_add_rms_norm(x, residual, weight, eps):
     [
         *[
             (batch_size, hidden_size, dtype)
-            for batch_size in [1, 19, 99, 989]
-            for hidden_size in [111, 500, 1024, 2880, 3072, 3584, 4096, 8192, 16384]
+            for batch_size in [1, 19, 99, 128, 989]
+            for hidden_size in [
+                111,
+                500,
+                1024,
+                2048,
+                2880,
+                3072,
+                3584,
+                4096,
+                5120,
+                8192,
+                16384,
+            ]
             for dtype in [torch.float16, torch.bfloat16]
         ],
         # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
@@ -99,8 +119,20 @@ def test_norm(batch_size, hidden_size, dtype, specify_out):
     [
         *[
             (batch_size, hidden_size, dtype)
-            for batch_size in [1, 19, 99, 989]
-            for hidden_size in [111, 500, 1024, 2880, 3072, 3584, 4096, 8192, 16384]
+            for batch_size in [1, 19, 99, 128, 989]
+            for hidden_size in [
+                111,
+                500,
+                1024,
+                2048,
+                2880,
+                3072,
+                3584,
+                4096,
+                5120,
+                8192,
+                16384,
+            ]
             for dtype in [torch.float16, torch.bfloat16, torch.float32]
         ],
         # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
@@ -128,19 +160,27 @@ def test_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     )
 
 
-@pytest.mark.parametrize(
-    "batch_size, hidden_size, dtype",
-    [
-        *[
-            (batch_size, hidden_size, torch.float16)
-            for batch_size in [1, 19, 99, 989]
-            for hidden_size in [111, 500, 1024, 3072, 3584, 4096, 8192, 16384]
-        ],
-        (19, 1024, torch.bfloat16),
-        (19, 1024, torch.float32),
-        (2, 32768, torch.float16),
-    ],
-)
+_GEMMA_BATCH_SIZES = [1, 2, 19, 99, 128, 989]
+_GEMMA_HIDDEN_SIZES = [111, 500, 1024, 2048, 3072, 3584, 4096, 5120, 8192, 16384, 32768]
+_GEMMA_DTYPES = [torch.float16, torch.bfloat16, torch.float32]
+
+_GEMMA_CASES = [
+    (batch_size, hidden_size, dtype)
+    for batch_size in _GEMMA_BATCH_SIZES
+    for hidden_size in _GEMMA_HIDDEN_SIZES
+    for dtype in _GEMMA_DTYPES
+]
+
+# Spell the dtype out in the test id. pytest has no clean repr for a torch
+# dtype, so it would otherwise number the whole case as `dtype0`, `dtype1`, ...
+# by its position in the list.
+_GEMMA_IDS = [
+    f"{batch_size}-{hidden_size}-{str(dtype).rsplit('.', 1)[-1]}"
+    for batch_size, hidden_size, dtype in _GEMMA_CASES
+]
+
+
+@pytest.mark.parametrize("batch_size, hidden_size, dtype", _GEMMA_CASES, ids=_GEMMA_IDS)
 @pytest.mark.parametrize("specify_out", [True, False])
 def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
     x = torch.randn(batch_size, hidden_size).to(device).to(dtype)
@@ -156,19 +196,7 @@ def test_gemma_norm(batch_size, hidden_size, dtype, specify_out):
     torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
 
 
-@pytest.mark.parametrize(
-    "batch_size, hidden_size, dtype",
-    [
-        *[
-            (batch_size, hidden_size, torch.float16)
-            for batch_size in [1, 19, 99, 989]
-            for hidden_size in [111, 500, 1024, 3072, 3584, 4096, 8192, 16384]
-        ],
-        (19, 1024, torch.bfloat16),
-        (19, 1024, torch.float32),
-        (2, 32768, torch.float16),
-    ],
-)
+@pytest.mark.parametrize("batch_size, hidden_size, dtype", _GEMMA_CASES, ids=_GEMMA_IDS)
 def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype):
     eps = 1e-6
 
@@ -379,6 +407,34 @@ def test_fused_add_rmsnorm_3d(batch_size, seq_len, hidden_size, dtype):
 
     torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [1, 3])
+@pytest.mark.parametrize("seq_len", [1, 7])
+@pytest.mark.parametrize("num_groups", [2, 4])
+@pytest.mark.parametrize("hidden_size", [1024, 2048, 8192])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_fused_add_rmsnorm_4d(batch_size, seq_len, num_groups, hidden_size, dtype):
+    eps = 1e-6
+
+    x = torch.randn(
+        batch_size, seq_len, num_groups, hidden_size, dtype=dtype, device=device
+    )
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=dtype, device=device)
+
+    x_native, residual_native = fused_add_rms_norm(
+        x.clone(), residual.clone(), weight, eps
+    )
+
+    x_fused = x.clone()
+    residual_fused = residual.clone()
+    sgl_kernel.fused_add_rmsnorm(x_fused, residual_fused, weight, eps)
+
+    torch.testing.assert_close(x_fused, x_native, **norm_tolerances(dtype))
+    torch.testing.assert_close(
+        residual_fused, residual_native, **norm_tolerances(dtype)
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 19])
@@ -842,6 +898,173 @@ def test_gemma_fused_add_rmsnorm_mixed_dtype(
     tol = 1e-2 if input_dtype == torch.bfloat16 else 1e-3
     torch.testing.assert_close(x_fused, x_native, rtol=tol, atol=tol)
     torch.testing.assert_close(residual_fused, residual_native, rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "batch_size, hidden_size, group_size",
+    [
+        (1, 10240, 2560),  # Qwen3.8 PLE: 4 groups of 2560
+        (7, 10240, 2560),
+        (64, 10240, 2560),
+        (1001, 10240, 2560),
+        (5, 2048, 2048),  # single group == plain Gemma RMSNorm
+        (5, 4096, 512),
+        (3, 1024, 8),  # smallest supported group
+        (3, 48, 24),  # work-group smaller than one sub-group of vectors
+        (3, 16384, 8192),  # multiple vectors per thread
+        (2, 32768, 16384),  # largest supported group
+    ],
+)
+@pytest.mark.parametrize("specify_out", [True, False])
+def test_grouped_gemma_rmsnorm(batch_size, hidden_size, group_size, dtype, specify_out):
+    torch.manual_seed(0)
+    x = torch.randn(batch_size, hidden_size).to(device).to(dtype)
+    w = torch.randn(hidden_size).to(device).to(dtype)
+
+    y_ref = grouped_gemma_rms_norm(x, w, group_size)
+    if specify_out:
+        y = torch.empty_like(x)
+        sgl_kernel.grouped_gemma_rmsnorm(x, w, group_size, out=y)
+    else:
+        y = sgl_kernel.grouped_gemma_rmsnorm(x, w, group_size)
+
+    torch.testing.assert_close(y_ref, y, **norm_tolerances(dtype))
+
+
+def test_grouped_gemma_rmsnorm_matches_per_group_gemma_rmsnorm():
+    torch.manual_seed(0)
+    x = torch.randn(37, 4 * 2560).to(device).to(torch.bfloat16)
+    w = torch.randn(4 * 2560).to(device).to(torch.bfloat16)
+    expected = torch.cat(
+        [
+            sgl_kernel.gemma_rmsnorm(
+                x[:, g * 2560 : (g + 1) * 2560].contiguous(),
+                w[g * 2560 : (g + 1) * 2560].contiguous(),
+            )
+            for g in range(4)
+        ],
+        dim=-1,
+    )
+    y = sgl_kernel.grouped_gemma_rmsnorm(x, w, 2560)
+    torch.testing.assert_close(y, expected, **norm_tolerances(torch.bfloat16))
+
+
+@pytest.mark.parametrize(
+    "shape", [(0, 10240), (10240,), (2, 3, 10240), (2, 3, 4, 10240)]
+)
+def test_grouped_gemma_rmsnorm_nd_and_empty(shape):
+    torch.manual_seed(0)
+    x = torch.randn(*shape).to(device).to(torch.bfloat16)
+    w = torch.randn(shape[-1]).to(device).to(torch.bfloat16)
+    y = sgl_kernel.grouped_gemma_rmsnorm(x, w, 2560)
+    assert y.shape == x.shape
+    torch.testing.assert_close(
+        y, grouped_gemma_rms_norm(x, w, 2560), **norm_tolerances(torch.bfloat16)
+    )
+
+
+def test_grouped_gemma_rmsnorm_in_place():
+    torch.manual_seed(0)
+    x = torch.randn(9, 10240).to(device).to(torch.bfloat16)
+    w = torch.randn(10240).to(device).to(torch.bfloat16)
+    expected = grouped_gemma_rms_norm(x, w, 2560)
+    y = sgl_kernel.grouped_gemma_rmsnorm(x, w, 2560, out=x)
+    assert y.data_ptr() == x.data_ptr()
+    torch.testing.assert_close(x, expected, **norm_tolerances(torch.bfloat16))
+
+
+def test_grouped_gemma_rmsnorm_rejects_partial_input_overlap():
+    base = torch.randn(24).to(device).to(torch.float16)
+    w = torch.randn(8).to(device).to(torch.float16)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        sgl_kernel.grouped_gemma_rmsnorm(
+            base[:16].view(2, 8), w, 8, out=base[8:].view(2, 8)
+        )
+
+
+def test_grouped_gemma_rmsnorm_rejects_weight_overlap():
+    base = torch.randn(24).to(device).to(torch.float16)
+    x = torch.randn(2, 8).to(device).to(torch.float16)
+    with pytest.raises(RuntimeError, match="single memory location"):
+        sgl_kernel.grouped_gemma_rmsnorm(x, base[8:16], 8, out=base[:16].view(2, 8))
+
+
+def test_grouped_gemma_rmsnorm_max_group_boundary():
+    max_group = 16384  # MAX_ITERS * MAX_WG_SIZE * VEC
+    for group_size, should_pass in ((max_group, True), (max_group + 8, False)):
+        x = torch.randn(1, group_size).to(device).to(torch.bfloat16)
+        w = torch.randn(group_size).to(device).to(torch.bfloat16)
+        if should_pass:
+            sgl_kernel.grouped_gemma_rmsnorm(x, w, group_size)
+        else:
+            with pytest.raises(RuntimeError, match="too large"):
+                sgl_kernel.grouped_gemma_rmsnorm(x, w, group_size)
+
+
+def test_grouped_gemma_rmsnorm_small_values_and_eps():
+    x = (torch.randn(8, 3 * 512) * 1e-4).to(device).to(torch.float16)
+    w = torch.randn(3 * 512).to(device).to(torch.float16)
+    for eps in (1e-6, 1e-2):
+        y = sgl_kernel.grouped_gemma_rmsnorm(x, w, 512, eps)
+        torch.testing.assert_close(
+            y,
+            grouped_gemma_rms_norm(x, w, 512, eps),
+            **norm_tolerances(torch.float16),
+        )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "hidden_not_divisible",
+        "group_not_multiple_of_8",
+        "float32",
+        "weight_dtype_mismatch",
+        "weight_wrong_size",
+        "non_contiguous_input",
+        "group_too_large",
+        "output_wrong_shape",
+        "output_non_contiguous",
+        "misaligned_input",
+    ],
+)
+def test_grouped_gemma_rmsnorm_rejects_invalid(case):
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    x = torch.randn(4, 1024).to(device).to(dtype)
+    w = torch.randn(1024).to(device).to(dtype)
+    group_size = 256
+    if case == "hidden_not_divisible":
+        group_size = 384
+    elif case == "group_not_multiple_of_8":
+        group_size = 4
+    elif case == "float32":
+        x, w = x.float(), w.float()
+    elif case == "weight_dtype_mismatch":
+        w = w.to(torch.float16)
+    elif case == "weight_wrong_size":
+        w = w[:512]
+    elif case == "non_contiguous_input":
+        x = torch.randn(1024, 4).to(device).to(dtype).t()
+    elif case == "group_too_large":
+        x = torch.randn(1, 65536 * 2).to(device).to(dtype)
+        w = torch.randn(65536 * 2).to(device).to(dtype)
+        group_size = 65536 * 2
+    out = None
+    if case == "output_wrong_shape":
+        out = torch.empty(4, 512).to(device).to(dtype)
+    elif case == "output_non_contiguous":
+        out = torch.empty(1024, 4).to(device).to(dtype).t()
+    elif case == "misaligned_input":
+        x = (
+            torch.randn(4 * 1024 + 8)
+            .to(device)
+            .to(dtype)[1 : 1 + 4 * 1024]
+            .view(4, 1024)
+        )
+    with pytest.raises(RuntimeError):
+        sgl_kernel.grouped_gemma_rmsnorm(x, w, group_size, out=out)
 
 
 if __name__ == "__main__":

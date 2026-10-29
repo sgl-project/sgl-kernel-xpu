@@ -4,29 +4,11 @@
  **************************************************************************************************/
 /*!
   \file
-  \brief Two-stage sparse MLA shared device declarations for DeepSeek V4.
+  \brief Two-stage sparse MLA shared device declarations.
 
   Shared by BOTH two-stage paths (decode and prefill): the Stage-2 dense kernel,
   its collectives, and its tile geometry are path-agnostic, and the Stage-1 gather
   params keep their common base here with one child per path.
-
-  Contains:
-    - LOG_2_E / LOG_E_2 log-base constants + packed FP8 KV layout constants.
-    - SparseDecode2StageProblemShape: pure problem geometry.
-    - The per-layer param blocks (Kernel2StageParams / Mainloop2StageParams /
-      Epilogue2StageParams / TileScheduler2StageParams) bundled into the Stage-2
-      dense SparseAttn2StageParams, plus the independent Stage-1 Gather2StageParams
-      and its decode / prefill children.
-    - DISPATCH_BOOLEAN_FLAG: compile-time boolean dispatch.
-    - FLASH_MLA_PREFILL_V_SPLIT: dense-decode V-split knob.
-    - MlaSparseDecode2StageTileTraits: the Stage-2 DPAS / tile geometry (element
-      types, MMA atoms, tile shapes, subgroup layouts, sizes) that the collectives
-      and the dense kernel wrapper receive as their `Traits`. The *assembly* around
-      it (which collectives / gather kernel / runner) is MlaSparseDecode2StageXe in
-      device/mla_sparse_decode_2stage_types.hpp.
-
-  reference: tests/test_flash_mla_with_kvcache.py
-    _gather_and_dequant (Stage 1) + _sm120_sparse_decode_fwd (Stage 2).
 */
 
 #pragma once
@@ -83,33 +65,92 @@ struct SparseMlaToCutlassElementType<sycl::ext::oneapi::bfloat16> {
 };
 
 // ---------------------------------------------------------------------------
-// log-base constants + packed FP8 KV layout.
+// log-base constants.
 // ---------------------------------------------------------------------------
 static constexpr float LOG_2_E = 1.4426950408889634f;
 static constexpr float LOG_E_2 = 0.6931471805599453f;
 
-// specific for DeepSeek V4 packed fp8 sparse MLA decode KV cache layout.
-static constexpr int SPARSE_MLA_FP8_NOPE_BYTES = 448;
-static constexpr int SPARSE_MLA_FP8_ROPE_DIM = 64;
-static constexpr int SPARSE_MLA_FP8_DATA_BYTES_PER_TOKEN = 576;
-static constexpr int SPARSE_MLA_FP8_SCALE_BYTES_PER_TOKEN = 8;
-static constexpr int SPARSE_MLA_FP8_HEAD_BYTES = 584;
+// ---------------------------------------------------------------------------
+// Packed FP8 KV cache layout for sparse MLA decode, keyed by the QK head dim.
+//
+//   D_QK = 512 -- DeepSeek V4 ("MODEL1"), 584 B/token. Page-internal *sections*:
+//     a data section of page_block_size records
+//         [448 B fp8 NoPE | 128 B bf16 RoPE]     (record stride 576 B)
+//     followed by a page-END scale section of page_block_size records
+//         [7 UE8M0 scale bytes | 1 pad]          (record stride 8 B, one scale per 64)
+//     k_cache is an as_strided view whose stride(1) == 584 is a metadata value, NOT
+//     physical token spacing; stride(0) carries the real (576-aligned) page stride.
+//
+//   D_QK = 576 -- DeepSeek V3.2 / GLM-DSA, 656 B/token. One contiguous, self-contained
+//     record per token, no page-end section:
+//         [512 B fp8 NoPE | 16 B = 4 fp32 scales | 128 B bf16 RoPE]
+//     one scale per 128 NoPE values, inline. The tensor is plain contiguous, so
+//     stride(1) == 656 IS real token spacing and the page stride is exactly
+//     page_block_size * 656.
+//
+// ---------------------------------------------------------------------------
+template <int D_QK>
+struct SparseMlaFp8KvLayout;
+
+template <>
+struct SparseMlaFp8KvLayout<512> {
+  static constexpr int NOPE_DIM = 448;  // fp8_e4m3 values
+  static constexpr int ROPE_DIM = 64;   // bf16 values
+
+  static constexpr int QUANT_GROUP = 64;                     // NoPE values sharing one scale
+  static constexpr int NUM_SCALES = NOPE_DIM / QUANT_GROUP;  // 7
+  static constexpr int SCALE_BYTES = 8;                      // 7 UE8M0 bytes + 1 pad
+
+  // Spacing between consecutive token records inside the page's data section.
+  static constexpr int TOKEN_STRIDE_BYTES = NOPE_DIM + ROPE_DIM * 2;  // 576
+  static constexpr int ROPE_BYTE_OFFSET = NOPE_DIM;                   // 448, within the record
+  static constexpr int SCALE_BYTE_OFFSET = 0;                         // unused (page-end scales)
+
+  static constexpr bool SCALES_INLINE = false;    // separate page-end scale section
+  static constexpr bool SCALES_ARE_FP32 = false;  // UE8M0 exponent bytes
+
+  // Scales live outside the record, so the advertised per-token width adds them on.
+  static constexpr int HEAD_BYTES = TOKEN_STRIDE_BYTES + SCALE_BYTES;  // 584
+
+  static_assert(NOPE_DIM + ROPE_DIM == 512, "NoPE + RoPE must equal the D_QK this layout is keyed by");
+  static_assert(NOPE_DIM % QUANT_GROUP == 0, "NoPE must tile evenly over the quant group");
+  static_assert(NUM_SCALES == SCALE_BYTES - 1, "only the first seven scale bytes are valid for 448 NoPE values");
+};
+
+template <>
+struct SparseMlaFp8KvLayout<576> {
+  static constexpr int NOPE_DIM = 512;  // fp8_e4m3 values
+  static constexpr int ROPE_DIM = 64;   // bf16 values
+
+  static constexpr int QUANT_GROUP = 128;                    // NoPE values sharing one scale
+  static constexpr int NUM_SCALES = NOPE_DIM / QUANT_GROUP;  // 4
+  static constexpr int SCALE_BYTES = NUM_SCALES * 4;         // 16, fp32 scales
+
+  // The whole record is contiguous and includes its own scales, so this is both the
+  // record width and the per-token width the host sees.
+  static constexpr int TOKEN_STRIDE_BYTES = NOPE_DIM + SCALE_BYTES + ROPE_DIM * 2;  // 656
+  static constexpr int SCALE_BYTE_OFFSET = NOPE_DIM;                                // 512
+  static constexpr int ROPE_BYTE_OFFSET = NOPE_DIM + SCALE_BYTES;                   // 528
+
+  static constexpr bool SCALES_INLINE = true;    // inline, immediately after NoPE
+  static constexpr bool SCALES_ARE_FP32 = true;  // fp32  scales
+
+  static constexpr int HEAD_BYTES = TOKEN_STRIDE_BYTES;  // 656
+
+  static_assert(NOPE_DIM + ROPE_DIM == 576, "NoPE + RoPE must equal the D_QK this layout is keyed by");
+  static_assert(NOPE_DIM % QUANT_GROUP == 0, "NoPE must tile evenly over the quant group");
+  static_assert(HEAD_BYTES == 656, "DeepSeek V3.2 / GLM-DSA packed fp8 KV cache is 656 bytes per token");
+};
 
 // ---------------------------------------------------------------------------
-// Problem shape for the two-stage sparse MLA decode. Structural analog of the
-// fused path's FSparseMlAProblemShape (device/mla_sparse_decode_types.hpp): the
-// pure problem geometry (batch/heads/dims/topk/paging), separated from the data
-// pointers and strides so it can be reasoned about on its own. The host adapter
-// builds one of these, then distributes the dims it needs into the per-layer
-// param blocks below (each layer carries only the individual shape scalars it
-// reads).
+// Problem shape for the two-stage sparse MLA decode.
 // ---------------------------------------------------------------------------
 struct SparseDecode2StageProblemShape {
   int b = 0;                      // batch (prefill: mapped from query rows s_q)
   int s_q = 0;                    // query seqlen (1 for decode; 1 per mapped row for prefill)
   int h_q = 0;                    // number of query heads
   int h_kv = 0;                   // number of KV heads (1 for MLA)
-  int d_qk = 0;                   // QK head dim (512 = 448 nope + 64 rope; prefill uses dense 512)
+  int d_qk = 0;                   // QK head dim: 512 (448 nope + 64 rope) or 576 (512 nope + 64 rope)
   int d_v = 0;                    // V head dim (512)
   int num_blocks = 0;             // primary KV cache pages
   int page_block_size = 0;        // primary KV cache page size
@@ -123,40 +164,12 @@ struct SparseDecode2StageProblemShape {
   SparseDecode2StageProblemShape() = default;
 };
 
-// ===========================================================================
-// Per-layer parameter blocks for the two-stage sparse MLA path.
-//
-// The former monolithic SparseAttnDecodeParams is decomposed into one block per
-// consuming layer, mirroring the fused MLA kernel's Params fan-out
-// (kernel/xe_mla_sparse_kernel.hpp: KernelParams / MainloopParams /
-// EpilogueParams / TileSchedulerParams). Each block carries ONLY the scalars,
-// pointers, and strides its own layer actually reads, so the coupling between a
-// layer and the fields it touches is explicit. SparseAttn2StageParams below
-// assembles the Stage-2 blocks into the dense kernel's Params; the Stage-1 gather
-// blocks stay separate and are the gather kernel's own Params (the runner holds one
-// Params per stage and shares only the gathered-KV HBM buffers between them).
-//
-// Unused monolith fields (plain sm_scale, is_fp8_query, h_kv, the SplitKV block)
-// are intentionally dropped: they were host-set but never read on device.
-// ===========================================================================
-
-// Tile scheduler: decodes the launch grid into (batch, seq, head-block, v-split).
-// Reads only the two dims needed to enumerate head-blocks per query tile.
 struct TileScheduler2StageParams {
   int h_q = 0;
   int s_q = 0;
-  // Split-K factor over the gathered topk dim, mapped onto grid.z. 1 disables split-K
-  // (grid.z == 1, kv_split_idx == 0) and is the non-split path unchanged. Runtime
-  // rather than compile-time because the useful factor depends on gathered_topk, which
-  // is only known per call -- same reason the paged path carries num_kv_splits in its
-  // scheduler params (kernel/mla_tile_scheduler.hpp:52).
   int num_kv_splits = 1;
 };
 
-// Stage-2 dense kernel wrapper: builds the per-tile Q / O / gathered-K/V gmem
-// views and the launch grid. Owns the query, output, and gathered-KV tensors.
-// Carries the whole problem shape (like the fused path's KernelParams, which holds
-// a ProblemShape member); the kernel reads b / s_q / h_q / gathered_topk off it.
 struct Kernel2StageParams {
   SparseDecode2StageProblemShape shape;
 
@@ -170,24 +183,10 @@ struct Kernel2StageParams {
   int stride_o_b = 0, stride_o_s_q = 0, stride_o_h_q = 0;
 
   // --- Split-K over the gathered topk dim (num_kv_splits > 1 only) ---
-  //
-  // Per-split UNNORMALIZED partial O, written by the split-KV epilogue and consumed by
-  // the reduction kernel (kernel/xe_mla_sparse_2stage_reduce_split_kv.hpp), which
-  // combines the splits and writes `out` / `epilogue.lse`. Laid out
-  // [b, s_q, num_kv_splits, h_q, d_v] so that for a fixed (b, s_q, kv_split) it is a
-  // [h_q, d_v] 2D view -- structurally identical to the `out` view above, which lets the
-  // split epilogue reuse the non-split block-2D store path verbatim (only the base
-  // pointer and the skipped normalization differ).
-  //
-  // Element type is ElementO (bf16), matching the paged MLA split-KV path
-  // (mla/kernel/xe_mla_reduce_split_kv.hpp), so the existing TiledCopyO applies
-  // unchanged. The partials are unnormalized, so this does cost precision relative to
-  // an fp32 accumulator buffer; the reduction accumulates in fp32.
   cutlass::bfloat16_t* __restrict__ o_accum = nullptr;
   int stride_o_accum_b = 0, stride_o_accum_s_q = 0, stride_o_accum_split = 0, stride_o_accum_h_q = 0;
 };
 
-// Stage-2 mainloop collective: QK/PV GEMM + online softmax over the gathered tile.
 struct Mainloop2StageParams {
   int h_q = 0, topk = 0, extra_topk = 0, gathered_topk = 0;
   float sm_scale_div_log2 = 0.f;
@@ -206,17 +205,8 @@ struct Mainloop2StageParams {
   int stride_extra_topk_length_b = 0;
 };
 
-// Stage-2 epilogue collective: cross-subgroup reduce, normalize, LSE / max_logits,
-// optional attn_sink merge, store. max_logits is populated only by the prefill
-// path; the decode epilogue is templated HAS_MAX_LOGITS=false and compiles the
-// write out (leaving these fields null/0).
 struct Epilogue2StageParams {
   int h_q = 0;
-  // Batch / query-seqlen (and, for split-K, the split count) the stat tensors are sliced
-  // from: lse / max_logits are [b, s_q, h_q]; the split stats are [b, s_q, num_kv_splits,
-  // h_q]. The epilogue builds those CuTe views and indexes by (batch, seq, [kv-split,] head)
-  // instead of a flattened base + idx*stride. num_kv_splits is read only by the split-K
-  // publish path (IS_SPLIT_KV); non-split leaves it 1.
   int b = 0, s_q = 0, num_kv_splits = 1;
   float sm_scale_div_log2 = 0.f;
 
@@ -229,30 +219,11 @@ struct Epilogue2StageParams {
   int stride_max_logits_b = 0, stride_max_logits_s_q = 0;
 
   // --- Split-K over the gathered topk dim (num_kv_splits > 1 only) ---
-  //
-  // Per-split softmax row stats published by the split-KV epilogue alongside the
-  // unnormalized partial O in Kernel2StageParams::o_accum, and consumed by the
-  // reduction kernel. Both are [b, s_q, num_kv_splits, h_q]; split_max_logits is in the
-  // *log2* domain and already scaled by sm_scale_div_log2 (it is the mainloop's tA_max
-  // verbatim), matching what the paged MLA reduction expects of its max_logits.
-  //
-  // An empty trailing split (blk_start >= num_topk_blocks) publishes
-  // split_exp_sums == 0, which is the reduction's "skip this split" signal -- the same
-  // contract as the paged path (mla/kernel/xe_mla_kernel.hpp:557).
-  //
-  // These are *not* epilogue.lse / epilogue.max_logits: those stay the final per-row
-  // outputs and, under split-K, are written by the reduction kernel instead of here.
   float* __restrict__ split_exp_sums = nullptr;
   float* __restrict__ split_max_logits = nullptr;
   int stride_split_stats_b = 0, stride_split_stats_s_q = 0, stride_split_stats_split = 0;
 };
 
-// Stage-1 gather common params (base). This is the standalone Stage-1 kernel's own
-// Params (its decode / prefill child below is what SparseGatherKernel launches with)
-// -- independent of the Stage-2 SparseAttn2StageParams. The subgroup-coalesced
-// gather grid, the per-(batch, seq) index/gathered base pointers, and the valid-mask
-// write are shared by decode and prefill; the path-specific KV *source* fields live
-// in the children below.
 struct Gather2StageParams {
   int b = 0, s_q = 0, topk = 0, gathered_topk = 0;
 
@@ -269,7 +240,6 @@ struct Gather2StageParams {
   int stride_gathered_mask_b = 0, stride_gathered_mask_s_q = 0;
 };
 
-// Decode gather child: dual packed-fp8 *paged* pools (primary + extra), dequantized.
 struct DecodeGather2StageParams : Gather2StageParams {
   int num_blocks = 0, page_block_size = 0;
   int extra_num_blocks = 0, extra_page_block_size = 0, extra_topk = 0;
@@ -291,27 +261,12 @@ struct DecodeGather2StageParams : Gather2StageParams {
   int stride_extra_topk_length_b = 0;
 };
 
-// Prefill gather child: dense bf16 *unpaged* source, plain D_QK-wide copy.
 struct PrefillGather2StageParams : Gather2StageParams {
   int s_kv = 0;
   cutlass::bfloat16_t* __restrict__ kv_dense = nullptr;  // [s_kv, h_kv=1, d_qk]
   int stride_kv_dense_s = 0;
 };
 
-// ---------------------------------------------------------------------------
-// Stage-2 dense params: the layers the dense flash kernel actually consumes,
-// bundled the way a normal (non-sparse) MLA kernel bundles its Params fan-out.
-// It carries NO gather slice: Stage 1 is a separate kernel with its own Params
-// (the Gather2StageParams children above). The runner (device::MLASparse) holds one
-// Params member per stage and launches both, exactly as device::MLA does for the
-// split-KV attention + reduction pair. The two stages communicate only through the
-// gathered_k / gathered_valid_mask HBM buffers, whose pointers+strides each side
-// records in its own params.
-//
-// Both paths (decode / prefill) share this one type -- the Stage-2 dense kernel,
-// collectives, and tile scheduler are path-agnostic; the path-specific bits live
-// entirely in the Stage-1 gather params.
-// ---------------------------------------------------------------------------
 struct SparseAttn2StageParams {
   Kernel2StageParams kernel;
   Mainloop2StageParams mainloop;
@@ -322,22 +277,11 @@ struct SparseAttn2StageParams {
 // ---------------------------------------------------------------------------
 // Split-K (over the gathered topk dim) HBM scratch sizing + strides.
 //
-// Host-only helper, the sparse analog of the paged path's SplitKVWorkspaceLayout
-// (mla/kernel/xe_mla_kernel.hpp:47). Two differences, both from the fact that Stage 2
-// is decode-*shaped* rather than decode-only: it carries an s_q dim (paged MLA decode
-// has seq_len_qo == 1 and omits it), and it reports the per-tensor strides directly so
-// the caller can drop them straight into Kernel2StageParams / Epilogue2StageParams
-// instead of building CuTe strides.
-//
 // Layouts (all tightly packed, row-major in the listed order):
 //   o_accum          [b, s_q, num_kv_splits, h_q, d_v]  ElementO (bf16)
 //   split_exp_sums   [b, s_q, num_kv_splits, h_q]       float
 //   split_max_logits [b, s_q, num_kv_splits, h_q]       float
-//
-// Offsets are 256B-aligned like the paged layout so a single blob can back all three,
-// but the sparse host path allocates them as separate tensors (the way it already
-// allocates Stage 1's gathered_k / gathered_valid_mask) and only uses the byte totals
-// for the workspace accounting that bounds the batch-chunk size.
+// ---------------------------------------------------------------------------
 struct SparseSplitKV2StageWorkspaceLayout {
   size_t o_accum_bytes = 0;
   size_t stats_bytes = 0;  // per stats tensor (exp_sums and max_logits are the same size)
@@ -369,93 +313,23 @@ struct SparseSplitKV2StageWorkspaceLayout {
 };
 
 // ===========================================================================
-// Stage-2 dense-decode DPAS/tile configuration knob, consumed by
-// MlaSparseDecode2StageTileTraits below. The config struct that assembles the
-// collectives, kernels, and device::MLASparse runner around those traits is
-// MlaSparseDecode2StageXe in device/mla_sparse_decode_2stage_types.hpp (host side,
-// matching the fused path's MlaSparseXe convention), and it forwards this knob.
+// Stage-2 dense-decode/prefill DPAS/tile configuration knob, consumed by
+// MlaSparseDecode2StageTileTraits below.
 // ===========================================================================
-
 #ifndef FLASH_MLA_PREFILL_V_SPLIT
 #define FLASH_MLA_PREFILL_V_SPLIT 4
 #endif
 
-// Prefill maps each query row to a decode "batch" (shape.b = s_q), so the Stage-2
-// grid (ceil_div(h_q, B_H) * s_q * b) is already saturated at V_SPLIT=1 for the
-// hundreds-to-thousands of query rows. A larger V_SPLIT there is mostly redundant:
-// every v-split work-group re-reads the full K tile and recomputes the full QK GEMM
-// (the PV split only narrows the output slice). So prefill uses a smaller V-split
-// than decode -- 2 roughly halves the redundant K re-reads / QK recompute.
-//
-// This smaller value is applied ONLY for B_H >= 32 (see sparse_mla_prefill_v_split
-// in mla_sparse_prefill_2stage_types.hpp). For B_H <= 16 the PV subgroup layout
-// splits the topk dim (ReduceK > 1), so the epilogue's SharedStorageReduceK SLM
-// scales with D_V_PER_SPLIT = D_V / V_SPLIT; shrinking V_SPLIT there doubles that
-// SLM and drops occupancy (measured ~50% slower at h_q=16), so those configs keep
-// the decode-sized V-split of 4. For B_H >= 32 the layout splits heads (ReduceK==1,
-// no epilogue SLM), so the smaller split is a pure win (measured ~35% faster).
 #ifndef FLASH_MLA_SPARSE_PREFILL_V_SPLIT
 #define FLASH_MLA_SPARSE_PREFILL_V_SPLIT 2
 #endif
 
 // ===========================================================================
 // Stage-2 dense-decode DPAS / tile geometry.
-//
-// MlaSparseDecode2StageTileTraits is the inner half of what used to be one
-// monolithic config struct: the pure Stage-2 *geometry* -- element types, DPAS MMA
-// atoms, tile shapes, subgroup layouts, and the derived size constants. It is what
-// the collectives and the dense kernel wrapper receive as their `Traits` template
-// parameter and read members off (Traits::B_H, Traits::TiledMMAQK, ...), which is
-// why it lives here in the shared header alongside the params blocks they also read.
-//
-// The outer half -- the *assembly* (which collectives, which tile scheduler, which
-// Stage-1 gather kernel, which runner) -- stays in the host types header as
-// MlaSparseDecode2StageXe (device/mla_sparse_decode_2stage_types.hpp).
-//
-// Why the split. The config struct previously passed *itself* as its collectives'
-// Traits, i.e. it was named as a template argument while still incomplete:
-//
-//     MlaSparseDecode2StageXe -> CollectiveMainloop<..., MlaSparseDecode2StageXe>
-//                             -> CollectiveEpilogue<CollectiveMainloop, ...>
-//                             -> DenseKernel -> Fmla
-//
-// That self-reference compiled only because every alias in the chain is lazy and
-// nothing inside them touched the enclosing type eagerly; a single member needing the
-// complete type would break it with an error that points nowhere useful. It also let
-// the collectives reach members that are none of their business -- including Fmla, the
-// runner that contains them, and GatherKernel, the other stage.
-//
-// With the geometry here, the traits type is COMPLETE before any collective names it,
-// the cycle is gone, and a collective can only see geometry. This also matches how the
-// dense (non-sparse) MLA path parameterizes XeMlaMainloop with explicit geometry
-// (TiledMMAQK / TiledMMAPV / VTiles / Tensor*), just bundled instead of spelled out
-// per-parameter -- there are 16 distinct members in use, which is well past the point
-// where individual template params are the clearer option.
-//
-// This is purely a compile-time / coupling concern: the traits type is never
-// instantiated (no object, no sizeof, no pass-by-value anywhere), so it costs no
-// registers, no SLM, and no kernel-argument bytes. Every use is
-// `typename Traits::X` or `Traits::kConstant`.
-//
-// T is the op's query dtype (sycl::half / sycl::ext::oneapi::bfloat16), resolved to a
-// cutlass element via SparseMlaToCutlassElementType exactly like the fused path's
-// MlaSparseXe, so the geometry can be instantiated straight from the dispatched dtype
-// without branching on it.
-//
-// Keyed by (T, D_QK, B_H, V_SPLIT) only -- the flags that select *behavior* rather
-// than geometry (HAS_ATTN_SINK, HAS_MAX_LOGITS) and the Stage-1 gather choice belong
-// to the assembly layer and are deliberately absent here.
 // ===========================================================================
 template <typename T, int D_QK_, int B_H_, int V_SPLIT_>
 struct MlaSparseDecode2StageTileTraits {
   static constexpr int D_QK = D_QK_;
-
-  // Query element resolved from the op's dtype, mirroring the fused MlaSparseXe. K/V
-  // are the Stage-1 gathered bf16 latent and the out / gathered_k param slices are
-  // bf16, so those stay bf16 (the QK DPAS is bf16; a non-bf16 query is converted on
-  // load). IS_FP8_QUERY is deduced from the element -- true only for an fp8 query,
-  // which the current codegen never instantiates (half/bf16 only), so it is false in
-  // practice; the fp8 dequant path stays compiled behind it for when it is wired up.
   using ElementType = typename SparseMlaToCutlassElementType<T>::type;
   using ElementQ = ElementType;
   using ElementKV = ElementType;
@@ -475,8 +349,7 @@ struct MlaSparseDecode2StageTileTraits {
   static constexpr int D_PE = 64;
   static constexpr int D_V = 512;
   // V-split factor: how many work-groups split the D_V output for one query tile.
-  // Decode and prefill pass different values (prefill's grid is already saturated by
-  // its s_q batch dim); see the knob comments just above.
+  // Decode and prefill pass different values
   static constexpr int V_SPLIT = V_SPLIT_;
   static_assert(V_SPLIT >= 1, "V_SPLIT must be >= 1");
   static_assert(D_V % V_SPLIT == 0, "D_V must be divisible by V_SPLIT");

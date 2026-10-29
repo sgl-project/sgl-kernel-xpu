@@ -1,3 +1,5 @@
+import argparse
+
 import pandas as pd
 import torch
 import triton
@@ -120,6 +122,25 @@ def benchmark(b_s, seq_len, hidden_size, provider):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=list(dict.fromkeys(c[0] for c in configs)),
+        help="b_s values",
+    )
+    parser.add_argument("--seq-lens", nargs="+", type=int, default=[1])
+    parser.add_argument("--hidden-sizes", nargs="+", type=int, default=[4096, 7168])
+    args = parser.parse_args()
+    # hidden_size is the outer loop, matching the default config order
+    benchmark.benchmarks.x_vals = [
+        (b_s, seq_len, h)
+        for h in args.hidden_sizes
+        for b_s in args.batch_sizes
+        for seq_len in args.seq_lens
+    ]
+
     benchmark.run(print_data=False)
     print("Benchmark finished!")
 

@@ -11,11 +11,21 @@ ref_device = utils.get_reference_device()
 
 
 def swiglu_gpt_oss_sigmoid_alpha_ref(x, gemm1_alpha, gemm1_limit):
-    """Reference implementation using native PyTorch"""
-    gate, up = x[..., ::2], x[..., 1::2]
+    """Reference implementation using native PyTorch.
+
+    Compute in fp32 and cast back at the end to mirror the kernel, which
+    upcasts to float, does all math in fp32, and rounds to the input dtype
+    only at the store. Running the whole chain in fp16 on CPU accumulates
+    per-op rounding (sigmoid + two multiplies), which for tail values of
+    ``gate`` (unbounded below) can exceed the 0.1 tolerance on large shapes.
+    """
+    orig_dtype = x.dtype
+    xf = x.to(torch.float32)
+    gate, up = xf[..., ::2], xf[..., 1::2]
     gate = gate.clamp(min=None, max=gemm1_limit)
     up = up.clamp(min=-gemm1_limit, max=gemm1_limit)
-    return gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+    out = gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1)
+    return out.to(orig_dtype)
 
 
 def swiglu_gpt_oss_sigmoid_alpha_ref_fp32(x, gemm1_alpha, gemm1_limit):
@@ -55,12 +65,12 @@ TIGHT_TOL = {
     list(
         itertools.product(
             [1, 16, 128, 512, 1024],  # batch_size
-            # hidden_size is the 2H dim (must be even). The powers of two here
-            # all make B*H a multiple of the kernel's vector width, so they
-            # never reach the tail path -- see test_swiglu_vector_tail.
-            [64, 128, 256, 512, 1024, 2048, 4096],  # hidden_size
-            [0.5, 1.0, 2.0],  # alpha
-            [1.0, 5.0, 10.0],  # limit
+            # hidden_size is the 2H dim (must be even). The values here all make
+            # B*H a multiple of the kernel's vector width, so they never reach
+            # the tail path -- see test_swiglu_vector_tail.
+            [64, 128, 256, 512, 1024, 2048, 4096, 5120, 8192],  # hidden_size
+            [0.5, 1.0, 1.702, 2.0],  # alpha
+            [1.0, 5.0, 7.0, 10.0],  # limit
             [torch.float32, torch.bfloat16, torch.float16],  # dtype
         )
     ),

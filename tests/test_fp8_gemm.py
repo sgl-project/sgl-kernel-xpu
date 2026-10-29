@@ -41,12 +41,27 @@ def _test_accuracy_once(M, N, K, with_bias, out_dtype, device):
     print(f"M={M}, N={N}, K={K}, with_bias={with_bias}, out_dtype={out_dtype}: OK")
 
 
-@pytest.mark.parametrize("M", [1, 128, 512, 1024, 4096])
-@pytest.mark.parametrize("N", [16, 128, 512, 1024, 4096])
-@pytest.mark.parametrize("K", [512, 1024, 4096, 8192, 16384])
+M_LIST = [1, 128, 512, 1024, 4096]
+K_LIST = [512, 1024, 2048, 4096, 5120, 8192, 16384]
+
+
+@pytest.mark.parametrize("M", M_LIST)
+@pytest.mark.parametrize("N", [16, 128, 512, 768, 1024, 2048, 4096, 5120, 8192])
+@pytest.mark.parametrize("K", K_LIST)
 @pytest.mark.parametrize("with_bias", [True, False])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 def test_accuracy(M, N, K, with_bias, out_dtype):
+    _test_accuracy_once(M, N, K, with_bias, out_dtype, device)
+
+
+# The fp32 reference matmul at N=28672, K=16384 needs ~6 GB of device memory.
+@utils.cri_only_large_shapes
+@pytest.mark.parametrize("M", M_LIST)
+@pytest.mark.parametrize("N", [25600, 28672])
+@pytest.mark.parametrize("K", K_LIST)
+@pytest.mark.parametrize("with_bias", [True, False])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_large_accuracy(M, N, K, with_bias, out_dtype):
     _test_accuracy_once(M, N, K, with_bias, out_dtype, device)
 
 

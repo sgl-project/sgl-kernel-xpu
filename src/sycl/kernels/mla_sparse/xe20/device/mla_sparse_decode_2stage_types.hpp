@@ -30,43 +30,7 @@
  **************************************************************************************************/
 /*!
   \file
-  \brief Two-stage sparse MLA decode Stage-2 config + host orchestrator for DeepSeek V4.
-
-  Config struct and op-facing run hierarchy for the two-stage sparse MLA decode path,
-  layered like the fused path's mla_sparse_decode_types.hpp (config MlaSparseXe + the
-  run* orchestration in one types header):
-
-    - MlaSparseDecode2StageXe<T, D_QK, HAS_ATTN_SINK, B_H, GatherKernel, V_SPLIT>:
-        the DPAS/tile config struct that assembles the collectives + tile scheduler +
-        dense kernel wrapper + Stage-1 gather kernel + device::MLASparse runner
-        (analog of MlaSparseXe, and of MlaXe wiring its split-KV attention and
-        reduction kernels into device::MLA). T is the op's query dtype, resolved to
-        ElementQ via SparseMlaToCutlassElementType (IS_FP8_QUERY is deduced from it).
-    - args_from_options_2stage<Config>: adapts our tensor arguments to the runner's
-        two-stage Arguments ({dense, gather}); no allocation, no launch.
-    - runMlaSparse2StageImpl<Element, D_QK, B_H, HAS_ATTN_SINK>: resolves the Stage-2
-        Config from the template params, allocates the dense gathered-KV + valid-mask HBM
-        workspaces (batch-chunked to bound peak memory) and runs the launch loop against
-        Config::Fmla.
-    - runMlaSparse2Stage<Element, D_QK, B_H, HAS_ATTN_SINK>: op-facing entry.
-        Validates inputs and forwards the dispatched head dim + head-block size +
-        attn_sink flag to the Impl (which resolves the Config). Its signature matches the
-        generated instantiation stub (mla_sparse_decode_2stage_kernel.cpp.in).
-
-  runMlaSparse2StageImpl / runMlaSparse2Stage are templated on the config-keying params
-  (head dim D_QK + head-block size B_H + attn_sink); the Impl resolves the Stage-2
-  Config from them, so the heavy Config::Fmla instantiation is keyed by (D_QK, B_H)
-  exactly the way the fused decode path is keyed by page size. Each generated launcher
-  launch_mla_sparse_decode_2stage_<ELEM>_<D_QK>_<B_H>_<HAS_ATTN_SINK> (from
-  mla_sparse_decode_2stage_kernel.cpp.in) instantiates a single (D_QK, B_H, sink) variant
-  in its own TU, so the CUTLASS codegen for one variant lands in a separate object file
-  (build OOM guard preserved -- one variant per file). The op (mla_sparse_decode.cpp)
-  dispatches dtype, then D_QK, then B_H, then the runtime attn_sink flag, mirroring the
-  fused path's dtype-then-page-size dispatch. Decode is always D_QK == 512.
-
-  This is an ALTERNATIVE to the fused sparse MLA decode path in
-  kernels/mla_sparse/{collective,kernel,device}/. It is selected at compile time via
-  the SGLANG_USE_SPARSE_MLA_2STAGE macro (see mla_sparse_decode.cpp) and is decode-only.
+  \brief Two-stage sparse MLA decode Stage-2 config + host orchestrator.
 */
 
 #pragma once
@@ -88,55 +52,17 @@
 #include "../../../../Utils.h"  // CUTLASS_CHECK (used by mla_sparse_runner.hpp)
 #include "cutlass/bfloat16.h"
 #include "cutlass/float8.h"
-// The collective headers pull in the full cute/cutlass sycl-tla stack (defining
-// cute::intel, etc.) that mla_sparse_runner.hpp -> comm/common.h references. They
-// sort under collective/ (before device/), so the runner always sees cute::intel
-// even after include re-alphabetization. (Matches the fused path, which likewise
-// includes its collectives before the runner.)
 #include "sycl/kernels/mla_sparse/xe20/collective/xe_mla_sparse_2stage_epilogue.hpp"
 #include "sycl/kernels/mla_sparse/xe20/collective/xe_mla_sparse_2stage_mainloop.hpp"
+#include "sycl/kernels/mla_sparse/xe20/device/mla_sparse_decode_dispatch.hpp"
 #include "sycl/kernels/mla_sparse/xe20/device/mla_sparse_runner.hpp"
-// The two stages' kernels, included as peers: the config struct below resolves one of
-// each (GatherKernel / DenseKernel) and hands both to the runner, which launches them
-// in order. The dense kernel transitively includes the common prologue (the per-layer params blocks /
-// LOG_2_E / the V-split knobs / DISPATCH_BOOLEAN_FLAG), the tile scheduler, and both
-// collectives; the gather kernel is independent of it.
 #include "sycl/kernels/mla_sparse/xe20/kernel/xe_mla_sparse_2stage_dense_kernel.hpp"
 #include "sycl/kernels/mla_sparse/xe20/kernel/xe_mla_sparse_2stage_gather_kernel.hpp"
-// Optional third stage, instantiated only when the config's IS_SPLIT_KV is true.
 #include "sycl/kernels/mla_sparse/xe20/kernel/xe_mla_sparse_2stage_reduce_split_kv.hpp"
 
 namespace cutlass::flash_attention::kernel {
 
 //----------------- Stage-2 dense-decode Xe configuration --------------------//
-// Assembly layer: picks the tile geometry, the three collectives + kernel wrapper,
-// the Stage-1 gather companion, and the device::MLASparse runner, mirroring the fused
-// path's MlaSparseXe (and MlaXe on the dense side).
-//
-// The DPAS/tile geometry itself lives in MlaSparseDecode2StageTileTraits
-// (xe_mla_sparse_2stage_common.hpp, next to the params blocks the same collectives
-// read) and is what they receive as their `Traits`. That two-layer split is
-// deliberate: this struct used to pass
-// *itself* as the collectives' Traits, i.e. name itself as a template argument while
-// still incomplete, which worked only because every alias in the chain is lazy -- and
-// which let the collectives reach members that are none of their business (Fmla, the
-// runner that contains them; GatherKernel, the other stage). The traits type is
-// complete before any collective names it, so that cycle is gone. See the header
-// comment there for the full rationale.
-//
-// Both stage kernels keep Arguments == Params, so the device::MLASparse
-// Arguments->Params flow is a per-stage identity and the host adapter
-// (args_from_options_2stage) fills the params directly. GrfSize is 256: this
-// dense-decode kernel is fragment-heavy and would spill at the runner's default 128.
-// GatherKernelTmpl_ selects the Stage-1 companion (keyed on D_QK). Defaults to the
-// decode gather (packed fp8 -> bf16 dequant); the prefill path reuses this exact
-// config struct but supplies SparsePrefillGatherKernel (dense bf16 copy). All other
-// template args and the whole DPAS/tile/collective assembly are shared verbatim.
-//
-// T is the op's query element (sycl::half / sycl::ext::oneapi::bfloat16), forwarded to
-// the traits, which resolves it to a cutlass element via SparseMlaToCutlassElementType
-// exactly like the fused config MlaSparseXe. This lets the run* entry points
-// instantiate the config straight from the dispatched dtype instead of branching on it.
 template <
     typename T,
     int D_QK_,
@@ -147,26 +73,13 @@ template <
     bool HAS_MAX_LOGITS_ = false,
     bool IS_SPLIT_KV_ = false>
 struct MlaSparseDecode2StageXe {
-  // Stage-2 DPAS / tile geometry. Complete at this point, so it can be handed to the
-  // collectives below without the former self-reference.
   using TileTraits = MlaSparseDecode2StageTileTraits<T, D_QK_, B_H_, V_SPLIT_>;
-
   static constexpr int D_QK = D_QK_;
   static constexpr bool HAS_ATTN_SINK = HAS_ATTN_SINK_;
-  // Prefill returns the pre-sink row max (max_logits) alongside lse; decode does not.
-  // Threaded into the epilogue so the extra store is compiled out for decode.
   static constexpr bool HAS_MAX_LOGITS = HAS_MAX_LOGITS_;
-  // Re-exported for the host side: the Impl only allocates the split-K scratch and
-  // resolves num_kv_splits when this is true.
   static constexpr bool IS_SPLIT_KV = IS_SPLIT_KV_;
-
-  // Re-exported for the host side: the run* Impls TORCH_CHECK the op's d_qk / d_v
-  // against these, and D_QK also keys the gather kernel below.
   static constexpr int D_V = TileTraits::D_V;
   static constexpr bool IS_FP8_QUERY = TileTraits::IS_FP8_QUERY;
-
-  // Collective mainloop / epilogue + tile scheduler + kernel wrapper, parameterized on
-  // the tile geometry above.
   using CollectiveMainloop =
       cutlass::flash_attention::collective::XeMlaSparse2StageMainloop<D_QK, IS_FP8_QUERY, TileTraits>;
   using CollectiveEpilogue = cutlass::flash_attention::collective::
@@ -176,32 +89,15 @@ struct MlaSparseDecode2StageXe {
   using DenseKernel = cutlass::flash_attention::kernel::
       XeMlaSparse2StageDenseKernel<CollectiveMainloop, CollectiveEpilogue, TileScheduler>;
 
-  // Stage-3 split-K reduction companion, present only under IS_SPLIT_KV. It derives
-  // everything (geometry, element type, HAS_ATTN_SINK / HAS_MAX_LOGITS, kvMaxSplits) from
-  // DenseKernel and shares its Params type, so there is nothing to keep in sync here.
   using ReduceKernel = cute::conditional_t<
       IS_SPLIT_KV,
       cutlass::flash_attention::kernel::XeMlaSparse2StageReduceSplitKV<DenseKernel>,
       cutlass::flash_attention::device::detail::DummyReduceKernel>;
 
-  // Largest split factor the host heuristic may pick, re-exported from the kernel.
   static constexpr int kvMaxSplits = DenseKernel::kvMaxSplits;
 
-  // Stage-1 gather kernel: an independent kernel with its own Arguments/Params,
-  // selected here (decode dequant vs prefill dense copy). This config struct is the
-  // single place that knows about both stages; neither kernel references the other.
   using GatherKernel = GatherKernelTmpl_<D_QK>;
 
-  // Both stages wired into one runner, the way MlaXe wires the split-KV attention +
-  // reduction kernels into device::MLA: Fmla::run issues gather-then-dense on the
-  // in-order queue, and Fmla::Arguments carries one argument object per stage
-  // (.gather / .dense).
-  //
-  // Dense GrfSize is 256 (see note above); XE3P's 512-GRF mode from the prior manual
-  // launch is capped to 256 by the shared launch<> helper's {128,256} constraint. The
-  // gather's GRF mode is picked by the runner (MLASparse::kGatherGrfSize).
-  // The reduction companion is a no-op placeholder unless IS_SPLIT_KV, in which case
-  // Fmla::run issues gather -> dense -> reduce on the in-order queue.
   using Fmla = cutlass::flash_attention::device::MLASparse<DenseKernel, 256, GatherKernel, ReduceKernel>;
 };
 
@@ -242,15 +138,15 @@ template <typename T>
 inline typename T::Fmla::Arguments args_from_options_2stage(
     at::Tensor& out,                                     // [B, 1, H, head_dim_v]
     at::Tensor& lse_out,                                 // [B, H, 1] (contiguous [B,1,H])
-    const at::Tensor& q,                                 // [B, 1, H, D_qk=512]
-    const at::Tensor& k_cache,                           // [num_pages, page_size, 1, 584] fp8 packed
+    const at::Tensor& q,                                 // [B, 1, H, D_qk] (512 or 576)
+    const at::Tensor& k_cache,                           // [num_pages, page_size, 1, 584|656] fp8 packed
     const at::Tensor& indices,                           // [B, 1, topk]
     const std::optional<at::Tensor>& topk_length,        // [B] or nullopt
-    const std::optional<at::Tensor>& extra_k_cache,      // [num_ext_pg, ep, 1, 584] or nullopt
+    const std::optional<at::Tensor>& extra_k_cache,      // [num_ext_pg, ep, 1, 584|656] or nullopt
     const std::optional<at::Tensor>& extra_indices,      // [B, 1, extra_topk] or nullopt
     const std::optional<at::Tensor>& extra_topk_length,  // [B] or nullopt
     const std::optional<at::Tensor>& attn_sink,          // [H] or nullopt
-    const at::Tensor& gathered_k,                        // [chunk_b, 1, gathered_topk, 512] bf16 workspace
+    const at::Tensor& gathered_k,                        // [chunk_b, 1, gathered_topk, d_qk] bf16 workspace
     const at::Tensor& gathered_valid_mask,               // [chunk_b, 1, gathered_topk] int workspace
     double sm_scale,
     int64_t head_dim_v,
@@ -588,19 +484,34 @@ template <typename Element, int D_QK, int B_H, bool HAS_ATTN_SINK>
 inline void runMlaSparse2Stage(
     at::Tensor& out,                                     // [B, 1, H, head_dim_v]
     at::Tensor& lse_out,                                 // [B, H, 1] (contiguous [B,1,H])
-    const at::Tensor& q,                                 // [B, 1, H, D_qk=512]
-    const at::Tensor& k_cache,                           // [num_pages, page_size, 1, 584] fp8 packed
+    const at::Tensor& q,                                 // [B, 1, H, D_qk] (512 or 576)
+    const at::Tensor& k_cache,                           // [num_pages, page_size, 1, 584|656] fp8 packed
     const at::Tensor& indices,                           // [B, 1, topk]
     const std::optional<at::Tensor>& topk_length,        // [B] or nullopt
-    const std::optional<at::Tensor>& extra_k_cache,      // [num_ext_pg, ep, 1, 584] or nullopt
+    const std::optional<at::Tensor>& extra_k_cache,      // [num_ext_pg, ep, 1, 584|656] or nullopt
     const std::optional<at::Tensor>& extra_indices,      // [B, 1, extra_topk] or nullopt
     const std::optional<at::Tensor>& extra_topk_length,  // [B] or nullopt
     const std::optional<at::Tensor>& attn_sink,          // [H] or nullopt
     double sm_scale,
     int64_t head_dim_v,
     bool is_fp8_kvcache) {
+  namespace F = cutlass::flash_attention::kernel;
+  using KvLayout = F::SparseMlaFp8KvLayout<D_QK>;
+
+  static_assert(
+      KvLayout::HEAD_BYTES == mla_sparse_decode::sparse_mla_decode_fp8_head_bytes(D_QK),
+      "sparse_mla_decode_fp8_head_bytes (host mirror) disagrees with SparseMlaFp8KvLayout::HEAD_BYTES");
+
   TORCH_CHECK(is_fp8_kvcache, "2-stage sparse MLA decode requires the FP8 packed KV cache");
   TORCH_CHECK(q.size(3) == D_QK, "2-stage sparse MLA decode q head dim must match the dispatched D_QK");
+  TORCH_CHECK(
+      k_cache.size(3) == KvLayout::HEAD_BYTES,
+      "2-stage sparse MLA decode k_cache last_dim must be ",
+      KvLayout::HEAD_BYTES,
+      " for d_qk=",
+      D_QK,
+      ", got ",
+      k_cache.size(3));
   TORCH_CHECK(attn_sink.has_value() == HAS_ATTN_SINK, "attn_sink presence must match the dispatched HAS_ATTN_SINK");
 
   // Delegate to the Impl, forwarding the compile-time config-keying params

@@ -4,35 +4,17 @@
  **************************************************************************************************/
 /*!
   \file
-  \brief Two-stage sparse MLA shared device declarations for DeepSeek V4.
+  \brief Two-stage sparse MLA shared device declarations.
 
   Shared by BOTH two-stage paths (decode and prefill): the Stage-2 dense kernel,
   its collectives, and its tile geometry are path-agnostic, and the Stage-1 gather
   params keep their common base here with one child per path.
-
-  Contains:
-    - LOG_2_E / LOG_E_2 log-base constants + packed FP8 KV layout constants.
-    - SparseDecode2StageProblemShape: pure problem geometry.
-    - The per-layer param blocks (Kernel2StageParams / Mainloop2StageParams /
-      Epilogue2StageParams / TileScheduler2StageParams) bundled into the Stage-2
-      dense SparseAttn2StageParams, plus the independent Stage-1 Gather2StageParams
-      and its decode / prefill children.
-    - DISPATCH_BOOLEAN_FLAG: compile-time boolean dispatch.
-    - FLASH_MLA_PREFILL_V_SPLIT: dense-decode V-split knob.
-    - MlaSparseDecode2StageTileTraits: the Stage-2 DPAS / tile geometry (element
-      types, MMA atoms, tile shapes, subgroup layouts, sizes) that the collectives
-      and the dense kernel wrapper receive as their `Traits`. The *assembly* around
-      it (which collectives / gather kernel / runner) is MlaSparseDecode2StageXe in
-      device/mla_sparse_decode_2stage_types.hpp.
-
-  reference: tests/test_flash_mla_with_kvcache.py
-    _gather_and_dequant (Stage 1) + _sm120_sparse_decode_fwd (Stage 2).
 */
 
 #pragma once
 
 #ifndef SYCL_INTEL_TARGET
-#define SYCL_INTEL_TARGET 20
+#define SYCL_INTEL_TARGET 35
 #endif
 
 #include <cstdint>
@@ -83,17 +65,96 @@ struct SparseMlaToCutlassElementType<sycl::ext::oneapi::bfloat16> {
 };
 
 // ---------------------------------------------------------------------------
-// log-base constants + packed FP8 KV layout.
+// log-base constants.
 // ---------------------------------------------------------------------------
 static constexpr float LOG_2_E = 1.4426950408889634f;
 static constexpr float LOG_E_2 = 0.6931471805599453f;
 
-// specific for DeepSeek V4 packed fp8 sparse MLA decode KV cache layout.
-static constexpr int SPARSE_MLA_FP8_NOPE_BYTES = 448;
-static constexpr int SPARSE_MLA_FP8_ROPE_DIM = 64;
-static constexpr int SPARSE_MLA_FP8_DATA_BYTES_PER_TOKEN = 576;
-static constexpr int SPARSE_MLA_FP8_SCALE_BYTES_PER_TOKEN = 8;
-static constexpr int SPARSE_MLA_FP8_HEAD_BYTES = 584;
+// ---------------------------------------------------------------------------
+// Packed FP8 KV cache layout for sparse MLA decode, keyed by the QK head dim.
+//
+// Two production layouts exist and D_QK selects between them 1:1, so the Stage-1
+// gather reads its byte geometry from this trait rather than from free constants.
+// Both store NoPE as fp8_e4m3 and RoPE as bf16; they differ in how the NoPE dequant
+// scales are encoded and where they live.
+//
+//   D_QK = 512 -- DeepSeek V4 ("MODEL1"), 584 B/token. Page-internal *sections*:
+//     a data section of page_block_size records
+//         [448 B fp8 NoPE | 128 B bf16 RoPE]     (record stride 576 B)
+//     followed by a page-END scale section of page_block_size records
+//         [7 UE8M0 scale bytes | 1 pad]          (record stride 8 B, one scale per 64)
+//     k_cache is an as_strided view whose stride(1) == 584 is a metadata value, NOT
+//     physical token spacing; stride(0) carries the real (576-aligned) page stride.
+//
+//   D_QK = 576 -- DeepSeek V3.2 / GLM-DSA, 656 B/token. One contiguous, self-contained
+//     record per token, no page-end section:
+//         [512 B fp8 NoPE | 16 B = 4 fp32 scales | 128 B bf16 RoPE]
+//     one scale per 128 NoPE values, inline. The tensor is plain contiguous, so
+//     stride(1) == 656 IS real token spacing and the page stride is exactly
+//     page_block_size * 656.
+//     Reference: sglang python/sglang/kernels/ops/attention/dsa/{quant,dequant}_k_cache.py
+//     and mem_cache/kv_cache_configurator.py::calculate_mla_kv_cache_dim,
+//       kv_lora_rank + kv_lora_rank / quant_block_size * 4 + qk_rope_head_dim * 2
+//       = 512 + 4 * 4 + 64 * 2 = 656.
+//
+// Both specializations declare the same member set so the gather source policy reads
+// them unconditionally; only SCALES_INLINE / SCALES_ARE_FP32 branch behavior.
+// HEAD_BYTES is the k_cache last-dim the host validates against (mirrored host-side by
+// sparse_mla_decode_fp8_head_bytes in device/mla_sparse_decode_dispatch.hpp, which the
+// run* entry points static_assert against).
+// ---------------------------------------------------------------------------
+template <int D_QK>
+struct SparseMlaFp8KvLayout;
+
+template <>
+struct SparseMlaFp8KvLayout<512> {
+  static constexpr int NOPE_DIM = 448;  // fp8_e4m3 values, 1 byte each
+  static constexpr int ROPE_DIM = 64;   // bf16 values
+
+  static constexpr int QUANT_GROUP = 64;                     // NoPE values sharing one scale
+  static constexpr int NUM_SCALES = NOPE_DIM / QUANT_GROUP;  // 7
+  static constexpr int SCALE_BYTES = 8;                      // 7 UE8M0 bytes + 1 pad
+
+  // Spacing between consecutive token records inside the page's data section.
+  static constexpr int TOKEN_STRIDE_BYTES = NOPE_DIM + ROPE_DIM * 2;  // 576
+  static constexpr int ROPE_BYTE_OFFSET = NOPE_DIM;                   // 448, within the record
+  static constexpr int SCALE_BYTE_OFFSET = 0;                         // unused (page-end scales)
+
+  static constexpr bool SCALES_INLINE = false;    // separate page-end scale section
+  static constexpr bool SCALES_ARE_FP32 = false;  // UE8M0 exponent bytes
+
+  // Scales live outside the record, so the advertised per-token width adds them on.
+  static constexpr int HEAD_BYTES = TOKEN_STRIDE_BYTES + SCALE_BYTES;  // 584
+
+  static_assert(NOPE_DIM + ROPE_DIM == 512, "NoPE + RoPE must equal the D_QK this layout is keyed by");
+  static_assert(NOPE_DIM % QUANT_GROUP == 0, "NoPE must tile evenly over the quant group");
+  static_assert(NUM_SCALES == SCALE_BYTES - 1, "only the first seven scale bytes are valid for 448 NoPE values");
+};
+
+template <>
+struct SparseMlaFp8KvLayout<576> {
+  static constexpr int NOPE_DIM = 512;  // fp8_e4m3 values, 1 byte each
+  static constexpr int ROPE_DIM = 64;   // bf16 values
+
+  static constexpr int QUANT_GROUP = 128;                    // NoPE values sharing one scale
+  static constexpr int NUM_SCALES = NOPE_DIM / QUANT_GROUP;  // 4
+  static constexpr int SCALE_BYTES = NUM_SCALES * 4;         // 16, fp32 scales
+
+  // The whole record is contiguous and includes its own scales, so this is both the
+  // record width and the per-token width the host sees.
+  static constexpr int TOKEN_STRIDE_BYTES = NOPE_DIM + SCALE_BYTES + ROPE_DIM * 2;  // 656
+  static constexpr int SCALE_BYTE_OFFSET = NOPE_DIM;                                // 512
+  static constexpr int ROPE_BYTE_OFFSET = NOPE_DIM + SCALE_BYTES;                   // 528
+
+  static constexpr bool SCALES_INLINE = true;    // inline, immediately after NoPE
+  static constexpr bool SCALES_ARE_FP32 = true;  // fp32 ("arbitrary_fp32") scales
+
+  static constexpr int HEAD_BYTES = TOKEN_STRIDE_BYTES;  // 656
+
+  static_assert(NOPE_DIM + ROPE_DIM == 576, "NoPE + RoPE must equal the D_QK this layout is keyed by");
+  static_assert(NOPE_DIM % QUANT_GROUP == 0, "NoPE must tile evenly over the quant group");
+  static_assert(HEAD_BYTES == 656, "DeepSeek V3.2 / GLM-DSA packed fp8 KV cache is 656 bytes per token");
+};
 
 // ---------------------------------------------------------------------------
 // Problem shape for the two-stage sparse MLA decode. Structural analog of the
@@ -109,7 +170,7 @@ struct SparseDecode2StageProblemShape {
   int s_q = 0;                    // query seqlen (1 for decode; 1 per mapped row for prefill)
   int h_q = 0;                    // number of query heads
   int h_kv = 0;                   // number of KV heads (1 for MLA)
-  int d_qk = 0;                   // QK head dim (512 = 448 nope + 64 rope; prefill uses dense 512)
+  int d_qk = 0;                   // QK head dim: 512 (448 nope + 64 rope) or 576 (512 nope + 64 rope)
   int d_v = 0;                    // V head dim (512)
   int num_blocks = 0;             // primary KV cache pages
   int page_block_size = 0;        // primary KV cache page size

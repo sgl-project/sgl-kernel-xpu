@@ -1,3 +1,4 @@
+import argparse
 import gc
 import itertools
 import math
@@ -203,43 +204,54 @@ head_config_range = [
 is_neox_range = [True, False]
 dtype_range = ["fp16", "bf16", "fp8_e4m3fn"]
 
-configs = []
-for batch_size, seq_len, (nq, nk, nv, hd), is_neox, dtype in itertools.product(
-    batch_size_range, seq_len_range, head_config_range, is_neox_range, dtype_range
+
+def build_configs(
+    batch_size_range=batch_size_range,
+    seq_len_range=seq_len_range,
+    head_config_range=head_config_range,
+    is_neox_range=is_neox_range,
+    dtype_range=dtype_range,
 ):
-    configs.append((batch_size, seq_len, nq, nk, nv, hd, is_neox, dtype))
+    configs = []
+    for batch_size, seq_len, (nq, nk, nv, hd), is_neox, dtype in itertools.product(
+        batch_size_range, seq_len_range, head_config_range, is_neox_range, dtype_range
+    ):
+        configs.append((batch_size, seq_len, nq, nk, nv, hd, is_neox, dtype))
 
+    # Support running the benchmark in "chunked" mode by setting environment variables:
+    # - NUM_CHUNKS: total number of chunks
+    # - CHUNK_IDX: index of this chunk (0-based)
+    num_chunks = int(os.environ.get("NUM_CHUNKS", "1"))
+    chunk_idx = int(os.environ.get("CHUNK_IDX", "0"))
+    # Support selecting a single config via env var SINGLE_CONFIG with CSV:
+    # "batch_size,seq_len,nq,nk,nv,head_dim,is_neox,dtype"
+    single_cfg = os.environ.get("SINGLE_CONFIG", "")
+    if single_cfg:
+        parts = [p.strip() for p in single_cfg.split(",")]
+        if len(parts) != 8:
+            raise RuntimeError("SINGLE_CONFIG must have 8 comma-separated fields")
+        bsz = int(parts[0])
+        sl = int(parts[1])
+        nq = int(parts[2])
+        nk = int(parts[3])
+        nv = int(parts[4])
+        hd = int(parts[5])
+        is_neox_val = parts[6].lower() in ("1", "true", "yes")
+        dtype_val = parts[7]
+        configs = [(bsz, sl, nq, nk, nv, hd, is_neox_val, dtype_val)]
+        num_chunks = 1
+        chunk_idx = 0
+    if num_chunks > 1:
+        total = len(configs)
+        chunk_size = (total + num_chunks - 1) // num_chunks
+        start = chunk_idx * chunk_size
+        end = min(start + chunk_size, total)
+        configs = configs[start:end]
+    return configs
+
+
+configs = build_configs()
 all_results = []
-
-# Support running the benchmark in "chunked" mode by setting environment variables:
-# - NUM_CHUNKS: total number of chunks
-# - CHUNK_IDX: index of this chunk (0-based)
-num_chunks = int(os.environ.get("NUM_CHUNKS", "1"))
-chunk_idx = int(os.environ.get("CHUNK_IDX", "0"))
-# Support selecting a single config via env var SINGLE_CONFIG with CSV:
-# "batch_size,seq_len,nq,nk,nv,head_dim,is_neox,dtype"
-single_cfg = os.environ.get("SINGLE_CONFIG", "")
-if single_cfg:
-    parts = [p.strip() for p in single_cfg.split(",")]
-    if len(parts) != 8:
-        raise RuntimeError("SINGLE_CONFIG must have 8 comma-separated fields")
-    bsz = int(parts[0])
-    sl = int(parts[1])
-    nq = int(parts[2])
-    nk = int(parts[3])
-    nv = int(parts[4])
-    hd = int(parts[5])
-    is_neox_val = parts[6].lower() in ("1", "true", "yes")
-    dtype_val = parts[7]
-    configs = [(bsz, sl, nq, nk, nv, hd, is_neox_val, dtype_val)]
-    num_chunks = 1
-    chunk_idx = 0
-if num_chunks > 1:
-    total = len(configs)
-    chunk_size = (total + num_chunks - 1) // num_chunks
-    start = chunk_idx * chunk_size
-    end = min(start + chunk_size, total)
-    configs = configs[start:end]
 
 
 def calculate_flops(
@@ -524,8 +536,8 @@ def benchmark_cache(
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
+def _benchmark_config(configs):
+    return triton.testing.Benchmark(
         x_names=[
             "batch_size",
             "seq_len",
@@ -545,7 +557,9 @@ def benchmark_cache(
         plot_name="fused-qk-norm-rope-performance",
         args={},
     )
-)
+
+
+@triton.testing.perf_report(_benchmark_config(configs))
 def benchmark(
     batch_size,
     seq_len,
@@ -1129,9 +1143,9 @@ def benchmark_flashmla_k_shape(
     return rows
 
 
-def run_flashmla_k_benchmarks(dtype_name: str = "bf16"):
+def run_flashmla_k_benchmarks(dtype_name: str = "bf16", configs=FLASHMLA_K_CONFIGS):
     print("\n=== DeepSeek-V4 fused_k_norm_rope_flashmla shape benchmark ===")
-    for num_tokens, label in FLASHMLA_K_CONFIGS:
+    for num_tokens, label in configs:
         k_results.extend(benchmark_flashmla_k_shape(dtype_name, num_tokens, label))
 
     fieldnames = list(k_results[0].keys())
@@ -1140,14 +1154,84 @@ def run_flashmla_k_benchmarks(dtype_name: str = "bf16"):
         print("\t".join(str(row[column]) for column in fieldnames))
 
 
+def _parse_head_config(value):
+    nq, nk, nv, hd = (int(v) for v in value.split(","))
+    return nq, nk, nv, hd
+
+
+def _parse_bool(value):
+    if value.lower() not in ("1", "true", "yes", "0", "false", "no"):
+        raise argparse.ArgumentTypeError(f"expected a boolean, got {value!r}")
+    return value.lower() in ("1", "true", "yes")
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--batch-sizes",
+        nargs="+",
+        type=int,
+        default=batch_size_range,
+        help="Batch sizes to sweep",
+    )
+    parser.add_argument(
+        "--seq-lens",
+        nargs="+",
+        type=int,
+        default=seq_len_range,
+        help="Sequence lengths to sweep",
+    )
+    parser.add_argument(
+        "--head-configs",
+        nargs="+",
+        type=_parse_head_config,
+        default=head_config_range,
+        metavar="NQ,NK,NV,HEAD_DIM",
+        help="Head configs to sweep",
+    )
+    parser.add_argument(
+        "--is-neox",
+        nargs="+",
+        type=_parse_bool,
+        default=is_neox_range,
+        help="RoPE styles to sweep (true=neox, false=gptj)",
+    )
+    parser.add_argument(
+        "--dtypes",
+        nargs="+",
+        choices=list(DTYPE_MAP),
+        default=dtype_range,
+        help="Dtypes for the main fused_qk_norm_rope sweep",
+    )
+    parser.add_argument(
+        "--dsv4-dtype",
+        choices=list(DTYPE_MAP),
+        default=os.environ.get("DTYPE", "bf16"),
+        help="Dtype for the DSV4 q/k norm+rope benchmarks (env DTYPE)",
+    )
+    parser.add_argument(
+        "--k-num-tokens",
+        nargs="+",
+        type=int,
+        default=[num_tokens for num_tokens, _ in FLASHMLA_K_CONFIGS],
+        help="Token counts for the fused_k_norm_rope_flashmla benchmark",
+    )
+    args = parser.parse_args()
+
+    sweep = build_configs(
+        args.batch_sizes, args.seq_lens, args.head_configs, args.is_neox, args.dtypes
+    )
+    k_configs = [(n, f"dsv4_k_bz{n}") for n in args.k_num_tokens]
+
     print("Running benchmarks...")
-    benchmark.run(print_data=True)
+    triton.testing.perf_report(_benchmark_config(sweep))(benchmark.fn).run(
+        print_data=True
+    )
     benchmark_cache.run(print_data=True)
 
-    dtype_name = os.environ.get("DTYPE", "bf16")
+    dtype_name = args.dsv4_dtype
     run_qnorm_rope_benchmarks(dtype_name)
-    run_flashmla_k_benchmarks(dtype_name)
+    run_flashmla_k_benchmarks(dtype_name, k_configs)
 
     # Ensure results dir exists and write per-chunk CSV
     os.makedirs("benchmark/results", exist_ok=True)

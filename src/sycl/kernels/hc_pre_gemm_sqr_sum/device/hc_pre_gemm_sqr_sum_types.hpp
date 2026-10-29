@@ -96,7 +96,9 @@ class HcPreGemmSqrSum {
   }
 
   cutlass::Status initialize(
-      Arguments const& args, void* workspace = nullptr, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
+      Arguments const& args,
+      void* workspace = nullptr,
+      [[maybe_unused]] sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     params_ = Kernel::to_underlying_arguments(args, workspace);
     initialized_ = true;
     return cutlass::Status::kSuccess;
@@ -106,7 +108,8 @@ class HcPreGemmSqrSum {
     return initialize(args, workspace);
   }
 
-  static cutlass::Status run(Params& params, sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
+  static cutlass::Status
+  run(Params& params, [[maybe_unused]] sycl::queue& queue = c10::xpu::getCurrentXPUStream().queue()) {
     launch<Kernel, 256>(params);
     return cutlass::Status::kSuccess;
   }

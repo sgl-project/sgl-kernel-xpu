@@ -5,10 +5,10 @@ import torch
 from sgl_kernel import moe_sum_reduce
 
 
-@pytest.mark.parametrize("num_tokens", [5, 16, 128])
-@pytest.mark.parametrize("num_experts", [4, 8, 32])
+@pytest.mark.parametrize("num_tokens", [1, 5, 16, 128])
+@pytest.mark.parametrize("num_experts", [4, 8, 32, 128])
 @pytest.mark.parametrize("top_k", [2, 4, 8])
-@pytest.mark.parametrize("hidden_dims", [16, 32, 64])
+@pytest.mark.parametrize("hidden_dims", [16, 32, 64, 2048])
 def test_moe_sum_reduce(num_tokens, num_experts, top_k, hidden_dims):
     torch.manual_seed(41)
 

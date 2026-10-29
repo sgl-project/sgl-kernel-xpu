@@ -3,6 +3,7 @@ from itertools import product
 import torch
 import triton
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from sgl_kernel.utils import is_xe3_arch
 
 
 def flash_attn_baseline(
@@ -19,6 +20,7 @@ def flash_attn_baseline(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
+    q_descale=None,
     k_descale=None,
     v_descale=None,
     rel_bias=None,
@@ -27,7 +29,9 @@ def flash_attn_baseline(
     # LSE is supported alongside causal / local masking, but not with sink logits,
     # an fp8 KV cache, or the relative-attention path (no LSE kernel instantiation
     # exists for those).
-    return_lse = sinks is None and k_descale is None and rel_bias is None
+    return_lse = (
+        not is_xe3_arch() and sinks is None and k_descale is None and rel_bias is None
+    )
 
     if page_table is not None:
         result = flash_attn_with_kvcache(
@@ -42,6 +46,8 @@ def flash_attn_baseline(
             cache_seqlens=cache_seqlens,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
             rel_bias=rel_bias,
@@ -120,69 +126,99 @@ kv_seq_length_range = [4096]
 # page_size==1 variant, so this exercises the gather-and-varlen workaround;
 # page_size=128 -> native paged kernel path.
 page_size_range = [0, 1, 128]
-# KV cache element type: "bf16" (default) or fp8. FP8 has two formats,
-# e5m2 and e4m3; both are exercised ("fp8_e4m3" / "fp8_e5m2"), dequantized
-# in-kernel via per-tensor k_descale / v_descale. fp8 only runs on the paged
-# path.
-kv_dtype_range = ["bf16", "fp8_e4m3", "fp8_e5m2"]
+# "fp8_*" uses BF16 Q with FP8 KV; "qkv_fp8_*" uses FP8 Q, K, and V.
+# Both FP8 modes run only on the paged path.
+kv_dtype_range = ["bf16", "fp8_e4m3", "fp8_e5m2", "qkv_fp8_e4m3", "qkv_fp8_e5m2"]
 attention_mode_range = ["standard", "relative"]
-configs = list(
-    filter(
-        lambda cfg: (
-            # Condition 1: causal and local cannot both be True
-            not (cfg[0] and cfg[1])
-            # Condition 2: when q_seq_length=1, causal must be False
-            and (cfg[4] != 1 or not cfg[0])
-            # Condition 3: num_heads_q must be a multiple of num_heads_kv (GQA requirement)
-            and (cfg[6] % cfg[7] == 0)
-            # Condition 4: kv_seq_length >= page_size
-            and (cfg[8] >= cfg[9])
-            # Condition 5: no_page mode (page_size=0) and the page_size=1
-            # workaround both dispatch to the non-paged kernel, which does
-            # not support sink logits
-            and (cfg[9] not in (0, 1) or not cfg[2])
-            # Condition 6: sink is only supported for head_size == 64
-            and (not cfg[2] or cfg[5] == 64)
-            # Condition 7: fp8 KV cache requires the native paged kernel and is
-            # exercised without sinks / local masking (matches the supported
-            # fp8 path); page_size=1 falls back to the non-paged kernel so it
-            # is excluded like page_size=0
-            and (
-                cfg[10] == "bf16"
-                or (cfg[9] not in (0, 1) and not cfg[2] and not cfg[1])
-            )
-            and (
-                cfg[11] == "standard"
-                or (
-                    cfg[9] != 0
-                    and cfg[10] == "bf16"
-                    and cfg[5] == 128
-                    and cfg[4] > 1
-                    and not cfg[1]
-                    and not cfg[2]
+
+
+def build_configs(
+    batch_size=batch_size,
+    q_seq_length_range=q_seq_length_range,
+    head_dim_no_page=head_dim_no_page,
+    head_dim_paged=head_dim_paged,
+    num_heads_q=num_heads_q,
+    num_heads_kv=num_heads_kv,
+    kv_seq_length_range=kv_seq_length_range,
+    page_size_range=page_size_range,
+    kv_dtype_range=kv_dtype_range,
+    attention_mode_range=attention_mode_range,
+    xe3=None,
+):
+    if xe3 is None:
+        xe3 = torch.xpu.is_available() and is_xe3_arch()
+    return list(
+        filter(
+            lambda cfg: (
+                # Condition 1: causal and local cannot both be True
+                not (cfg[0] and cfg[1])
+                # Condition 2: when q_seq_length=1, causal must be False
+                and (cfg[4] != 1 or not cfg[0])
+                # Condition 3: num_heads_q must be a multiple of num_heads_kv (GQA requirement)
+                and (cfg[6] % cfg[7] == 0)
+                # Condition 4: kv_seq_length >= page_size
+                and (cfg[8] >= cfg[9])
+                # Condition 5: no_page mode (page_size=0) and the page_size=1
+                # workaround both dispatch to the non-paged kernel, which does
+                # not support sink logits
+                and (cfg[9] not in (0, 1) or not cfg[2])
+                # Condition 6: sink is only supported for head_size == 64
+                and (not cfg[2] or cfg[5] == 64)
+                # Condition 7: fp8 KV cache requires the native paged kernel and is
+                # exercised without sinks / local masking (matches the supported
+                # fp8 path); page_size=1 falls back to the non-paged kernel so it
+                # is excluded like page_size=0
+                and (
+                    cfg[10] == "bf16"
+                    or (cfg[9] not in (0, 1) and not cfg[2] and not cfg[1])
                 )
-            )
-        ),
-        [
-            cfg
-            for page_size in page_size_range
-            for cfg in product(
-                causal,
-                local,
-                use_sinks,
-                batch_size,
-                q_seq_length_range,
-                head_dim_no_page if page_size == 0 else head_dim_paged,
-                num_heads_q,
-                num_heads_kv,
-                kv_seq_length_range,
-                [page_size],
-                kv_dtype_range,
-                attention_mode_range,
-            )
-        ],
+                and (
+                    cfg[11] == "standard"
+                    or (
+                        cfg[9] != 0
+                        and cfg[10] == "bf16"
+                        and cfg[5] == 128
+                        and cfg[4] > 1
+                        and not cfg[1]
+                        and not cfg[2]
+                    )
+                )
+                and (
+                    not xe3
+                    or cfg[5] in ((64, 128) if cfg[9] in (0, 1) else (64, 128, 256))
+                )
+                and (not xe3 or cfg[9] not in (0, 1) or not cfg[0])
+                and (xe3 or not cfg[10].startswith("qkv_fp8"))
+                and (not xe3 or cfg[10] == "bf16" or cfg[10].startswith("qkv_fp8"))
+                and (not xe3 or cfg[11] == "standard")
+                and (
+                    not cfg[10].startswith("qkv_fp8")
+                    or (cfg[9] in (64, 128) and cfg[11] == "standard")
+                )
+            ),
+            [
+                cfg
+                for page_size in page_size_range
+                for cfg in product(
+                    causal,
+                    local,
+                    use_sinks,
+                    batch_size,
+                    q_seq_length_range,
+                    head_dim_no_page if page_size == 0 else head_dim_paged,
+                    num_heads_q,
+                    num_heads_kv,
+                    kv_seq_length_range,
+                    [page_size],
+                    kv_dtype_range,
+                    attention_mode_range,
+                )
+            ],
+        )
     )
-)
+
+
+configs = build_configs()
 all_results = []
 
 
@@ -232,15 +268,23 @@ def benchmark(
     # fp8 KV cache: store K/V as e4m3 or e5m2 and dequantize in-kernel via
     # per-tensor k_descale / v_descale. Q/O stay bf16. Only valid on the paged
     # path.
-    is_fp8 = kv_dtype.startswith("fp8")
-    fp8_dtype = torch.float8_e5m2 if kv_dtype == "fp8_e5m2" else torch.float8_e4m3fn
-    fp8_max = 57344.0 if kv_dtype == "fp8_e5m2" else 448.0
+    is_qkv_fp8 = kv_dtype.startswith("qkv_fp8")
+    is_fp8 = kv_dtype != "bf16"
+    fp8_dtype = torch.float8_e5m2 if kv_dtype.endswith("e5m2") else torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+    q_descale = None
     k_descale = None
     v_descale = None
     # Create input tensors
     q = torch.randn(
         (batch_size * q_seq_length, num_heads_q, head_dim), device=device, dtype=dtype
     )
+    if is_qkv_fp8:
+        q_descale = (q.abs().amax().float() / fp8_max).clamp_min(
+            torch.finfo(torch.float32).tiny
+        )
+        q = (q.float() / q_descale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+        q_descale = q_descale.cpu()
     if page_size > 0:
         num_pages = (batch_size * kv_seq_length + page_size - 1) // page_size
         k_cache = torch.randn(
@@ -250,16 +294,24 @@ def benchmark(
             (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
         )
         if is_fp8:
-            k_descale_val = k_cache.abs().max().item() / fp8_max
-            v_descale_val = v_cache.abs().max().item() / fp8_max
+            k_descale_val = max(
+                k_cache.abs().max().item() / fp8_max, torch.finfo(torch.float32).tiny
+            )
+            v_descale_val = max(
+                v_cache.abs().max().item() / fp8_max, torch.finfo(torch.float32).tiny
+            )
             k_cache = (k_cache / k_descale_val).to(fp8_dtype)
             v_cache = (v_cache / v_descale_val).to(fp8_dtype)
-            k_descale = torch.tensor(
-                k_descale_val, dtype=torch.float32, device=device
-            ).expand(batch_size, num_heads_kv)
-            v_descale = torch.tensor(
-                v_descale_val, dtype=torch.float32, device=device
-            ).expand(batch_size, num_heads_kv)
+            if is_qkv_fp8:
+                k_descale = torch.tensor(k_descale_val, dtype=torch.float32)
+                v_descale = torch.tensor(v_descale_val, dtype=torch.float32)
+            else:
+                k_descale = torch.tensor(
+                    k_descale_val, dtype=torch.float32, device=device
+                ).expand(batch_size, num_heads_kv)
+                v_descale = torch.tensor(
+                    v_descale_val, dtype=torch.float32, device=device
+                ).expand(batch_size, num_heads_kv)
         page_table = (
             torch.randperm(num_pages, device=device, dtype=torch.int32)
             .reshape(batch_size, -1)
@@ -332,6 +384,7 @@ def benchmark(
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
+                q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
                 rel_bias=rel_bias,
@@ -370,7 +423,7 @@ def benchmark(
         * kv_seq_length
         * head_dim
         * effective_attention_ratio
-        + q.element_size() * batch_size * num_heads_q * q_seq_length * head_dim
+        + dtype.itemsize * batch_size * num_heads_q * q_seq_length * head_dim
     )
     bandwidth = (memory_qk + memory_pv) * 1e-9 / (ms * 1e-3)
     all_results.append(
@@ -400,6 +453,68 @@ def benchmark(
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch-sizes", nargs="+", type=int, default=batch_size)
+    parser.add_argument(
+        "--q-seq-lengths", nargs="+", type=int, default=q_seq_length_range
+    )
+    parser.add_argument(
+        "--kv-seq-lengths", nargs="+", type=int, default=kv_seq_length_range
+    )
+    parser.add_argument(
+        "--head-dims-no-page",
+        nargs="+",
+        type=int,
+        default=head_dim_no_page,
+        help="Head dims for page_size=0",
+    )
+    parser.add_argument(
+        "--head-dims-paged",
+        nargs="+",
+        type=int,
+        default=head_dim_paged,
+        help="Head dims for page_size>0",
+    )
+    parser.add_argument("--num-heads-q", nargs="+", type=int, default=num_heads_q)
+    parser.add_argument("--num-heads-kv", nargs="+", type=int, default=num_heads_kv)
+    parser.add_argument(
+        "--page-sizes",
+        nargs="+",
+        type=int,
+        default=page_size_range,
+        help="0 = non-paged varlen path",
+    )
+    parser.add_argument(
+        "--kv-dtypes",
+        nargs="+",
+        choices=["bf16", "fp8_e4m3", "fp8_e5m2", "qkv_fp8_e4m3", "qkv_fp8_e5m2"],
+        default=kv_dtype_range,
+    )
+    parser.add_argument(
+        "--attention-modes",
+        nargs="+",
+        choices=["standard", "relative"],
+        default=attention_mode_range,
+    )
+    args = parser.parse_args()
+    benchmark.benchmarks.x_vals = [
+        list(c)
+        for c in build_configs(
+            batch_size=args.batch_sizes,
+            q_seq_length_range=args.q_seq_lengths,
+            head_dim_no_page=args.head_dims_no_page,
+            head_dim_paged=args.head_dims_paged,
+            num_heads_q=args.num_heads_q,
+            num_heads_kv=args.num_heads_kv,
+            kv_seq_length_range=args.kv_seq_lengths,
+            page_size_range=args.page_sizes,
+            kv_dtype_range=args.kv_dtypes,
+            attention_mode_range=args.attention_modes,
+        )
+    ]
+
     torch.manual_seed(42)
     if hasattr(torch.xpu, "manual_seed_all"):
         torch.xpu.manual_seed_all(42)

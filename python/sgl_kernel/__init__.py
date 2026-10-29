@@ -60,6 +60,7 @@ from sgl_kernel.compress_plan import (
     plan_compress_prefill,
     plan_compress_prefill_legacy,
 )
+from sgl_kernel.diffusion import fused_scale_residual_norm_scale_shift
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
     fused_add_rmsnorm,
@@ -69,11 +70,16 @@ from sgl_kernel.elementwise import (
     fused_qk_norm_rope,
     fused_qk_rope,
     fused_qk_rope_with_cos_sin_cache_inplace,
+    fused_sigmoid_mul,
     gelu_and_mul,
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
+    grouped_gemma_rmsnorm,
     multimodal_rotary_embedding,
+    qwen4_gate_reduce,
+    qwen4_gate_value,
+    qwen4_ngram_hash,
     rmsnorm,
     silu_and_mul,
     silu_and_mul_clamp,
@@ -92,7 +98,7 @@ except ImportError:
     # fp8_paged_mqa_logits_triton will simply be unavailable.
     fp8_paged_mqa_logits_triton = None
 from sgl_kernel.fused_norm_rope_v2 import compress_norm_rope_store
-from sgl_kernel.gdn_attn import gdn_attention
+from sgl_kernel.gdn_attn import gated_delta_rule, gated_delta_rule_verify, gdn_attention
 
 hadamard_transform = torch.ops.sgl_kernel.hadamard_transform
 fused_q_indexer_rope_hadamard_quant = (
@@ -162,13 +168,21 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_ph_lf,
 )
 from sgl_kernel.lora import (
+    chunked_sgmv_lora_expand_fwd,
+    chunked_sgmv_lora_shrink_fwd,
     embedding_lora_a_fwd,
     gate_up_lora_b_fwd,
     qkv_lora_b_fwd,
     sgemm_lora_a_fwd,
     sgemm_lora_b_fwd,
 )
-from sgl_kernel.mamba import causal_conv1d_fn_xpu, causal_conv1d_update_xpu
+from sgl_kernel.mamba import (
+    causal_conv1d_fn_xpu,
+    causal_conv1d_update_verify_xpu,
+    causal_conv1d_update_xpu,
+    qwen4_short_conv_state,
+    qwen4_verify_conv,
+)
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
     hc_post,
@@ -202,6 +216,15 @@ from sgl_kernel.moe import (
     topk_softmax,
 )
 from sgl_kernel.nsa import fp8_mqa_logits, fp8_paged_mqa_logits
+from sgl_kernel.qsa_prepare import (
+    qsa_index_k_compress_store,
+    qsa_index_q_norm_rope_store,
+)
+from sgl_kernel.qsa_sparse_attention import (
+    qsa_mqa_decode,
+    qsa_mqa_prefill,
+    qsa_sparse_attention,
+)
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_renorm_prob,
@@ -218,6 +241,7 @@ from sgl_kernel.sparse_flash_attn import (
 from sgl_kernel.speculative import (
     TreeMaskMode,
     build_tree_kernel_efficient,
+    reconstruct_indices_from_tree_mask,
     segment_packbits,
     tree_speculative_sampling_target_only,
     verify_tree_greedy,

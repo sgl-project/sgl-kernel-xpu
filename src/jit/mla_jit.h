@@ -13,11 +13,12 @@
 namespace sgl {
 namespace mla_jit {
 
-// Launch MLA decode for (query dtype, page size). Tensor args are at::Tensor*
-// passed as void*. Returns true on success; fills *err on failure.
+// Launch MLA decode for (query dtype, page size, Q tile). Tensor args are
+// at::Tensor* passed as void*. Returns true on success; fills *err on failure.
 bool mla_decode_launch(
     bool is_fp16,
     int page_size,
+    int q_tile,
     void* out,
     const void* lse,  // const std::optional<at::Tensor>*; nullopt = skip
     const void* q_nope,

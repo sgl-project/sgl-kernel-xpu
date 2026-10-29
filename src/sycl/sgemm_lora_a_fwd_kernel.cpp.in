@@ -30,6 +30,7 @@
  **************************************************************************************************/
 // Auto-generated from sgemm_lora_a_fwd_kernel.cpp.in
 // Template parameters: ELEM_TAG=@ELEM_TAG@, TILE_TAG=@TILE_TAG@
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
 #include <c10/xpu/XPUStream.h>

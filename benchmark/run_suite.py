@@ -108,6 +108,7 @@ suites = {
         BenchFile("bench_per_token_quant_fp8.py"),
         BenchFile("bench_per_token_group_quant_mxfp4_fusion.py"),
         BenchFile("bench_top_k_renorm_probs.py"),
+        BenchFile("bench_scale_residual_norm_scale_shift.py"),
         BenchFile("bench_top_k_top_p_sampling_from_probs.py"),
         BenchFile("bench_min_p_sampling_from_probs.py"),
         BenchFile("bench_biased_topk.py"),
@@ -126,6 +127,8 @@ suites = {
         BenchFile("bench_sgemm_lora_b_fwd.py"),
         BenchFile("bench_qkv_lora_b_fwd.py"),
         BenchFile("bench_gate_up_lora_b_fwd.py"),
+        BenchFile("bench_chunked_sgmv_lora_shrink_fwd.py"),
+        BenchFile("bench_chunked_sgmv_lora_expand_fwd.py"),
         # disabled temporialy due to env issue
         # --- JIT kernels (need icpx from the oneAPI toolchain) ---
         # BenchFile("bench_jit_rmsnorm.py"),
@@ -139,6 +142,15 @@ suites = {
         # BenchFile("bench_jit_moe_align_block_size.py"),
         # BenchFile("bench_jit_per_token_group_quant_8bit_v2.py"),
         # BenchFile("bench_jit_activation.py"),
+        # --- Qwen4 ops ---
+        BenchFile("bench_qsa_mqa.py"),
+        BenchFile("bench_qsa_prepare.py"),
+        BenchFile("bench_qsa_sparse_attention.py"),
+        BenchFile("bench_grouped_gemma_rmsnorm.py"),
+        BenchFile("bench_qwen4_ple_gate.py"),
+        BenchFile("bench_qwen4_ngram_hash.py"),
+        BenchFile("bench_qwen4_short_conv.py"),
+        BenchFile("bench_sigmoid_mul.py"),
     ],
 }
 

@@ -29,6 +29,28 @@ spec:
               value: "${SGL_GPTQ_PAGE_SIZE}"
             - name: SGL_GPTQ_CONTEXT_LENGTH
               value: "${SGL_GPTQ_CONTEXT_LENGTH}"
+            - name: SGL_GPTQ_SPEC
+              value: "${SGL_GPTQ_SPEC}"
+            - name: SGL_GPTQ_SPEC_STEPS
+              value: "${SGL_GPTQ_SPEC_STEPS}"
+            - name: SGL_GPTQ_SPEC_DRAFT_TOKENS
+              value: "${SGL_GPTQ_SPEC_DRAFT_TOKENS}"
+            - name: SGL_GPTQ_MAMBA_CACHE
+              value: "${SGL_GPTQ_MAMBA_CACHE}"
+            - name: SGL_GPTQ_PP
+              value: "${SGL_GPTQ_PP}"
+            - name: SGL_GPTQ_TG
+              value: "${SGL_GPTQ_TG}"
+            - name: SGL_GPTQ_BATCH
+              value: "${SGL_GPTQ_BATCH}"
+            - name: SGL_GPTQ_GRAPH_BS
+              value: "${SGL_GPTQ_GRAPH_BS}"
+            - name: SGL_GPTQ_BATCH_WIDTHS
+              value: "${SGL_GPTQ_BATCH_WIDTHS}"
+            - name: SGL_GPTQ_MAX_RUNNING
+              value: "${SGL_GPTQ_MAX_RUNNING}"
+            - name: SGL_GPTQ_MEM_FRACTION
+              value: "${SGL_GPTQ_MEM_FRACTION}"
             - name: MODEL_DIR
               value: "/tank/nas/models/Qwen3.8-27B-TURBO-DF735-882-NM-DAU-GPTQ-Int4-g128-tuned"
           resources:

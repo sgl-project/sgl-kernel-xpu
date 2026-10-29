@@ -29,7 +29,7 @@ import sys
 from pathlib import Path
 
 text = Path("deploy/k8s/test-job.yaml").read_text()
-for key in ("IMAGE", "TAG", "MODE", "STAGE", "BASELINE_TPS", "SGL_GPTQ_PROFILE", "MAX_NEW_TOKENS", "SGL_GPTQ_STEP", "SGL_GPTQ_PAGE_SIZE", "SGL_GPTQ_CONTEXT_LENGTH"):
+for key in ("IMAGE", "TAG", "MODE", "STAGE", "BASELINE_TPS", "SGL_GPTQ_PROFILE", "MAX_NEW_TOKENS", "SGL_GPTQ_STEP", "SGL_GPTQ_PAGE_SIZE", "SGL_GPTQ_CONTEXT_LENGTH", "SGL_GPTQ_SPEC", "SGL_GPTQ_SPEC_STEPS", "SGL_GPTQ_SPEC_DRAFT_TOKENS", "SGL_GPTQ_MAMBA_CACHE", "SGL_GPTQ_PP", "SGL_GPTQ_TG", "SGL_GPTQ_BATCH", "SGL_GPTQ_GRAPH_BS", "SGL_GPTQ_BATCH_WIDTHS", "SGL_GPTQ_MAX_RUNNING", "SGL_GPTQ_MEM_FRACTION"):
     text = text.replace("${" + key + "}", os.environ.get(key, ""))
 Path(sys.argv[1]).write_text(text)
 PY

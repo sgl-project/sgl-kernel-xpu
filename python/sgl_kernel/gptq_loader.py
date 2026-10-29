@@ -14,9 +14,17 @@ def _ensure() -> None:
     global _LOADED
     if _LOADED:
         return
-    if not hasattr(torch.ops.sgl_kernel, "gptq_gemm"):
+    # Also registers the GDN verify ops that the base wheel does not ship.
+    if os.path.exists(_LIB) and (
+        not hasattr(torch.ops.sgl_kernel, "gptq_gemm")
+        or not hasattr(torch.ops.sgl_kernel, "gated_delta_rule_verify")
+    ):
         torch.ops.load_library(_LIB)
     _LOADED = True
+
+
+if os.path.exists(_LIB):
+    _ensure()
 
 
 def gptq_entry_probe() -> None:

@@ -19,15 +19,16 @@ execute_process(
   RESULT_VARIABLE TORCH_PY_PREFIX_RESULT
 )
 
-if(NOT TORCH_PY_PREFIX_RESULT EQUAL 0 OR TORCH_PY_PREFIX STREQUAL "")
-  message(FATAL_ERROR
-    "Could not import torch with ${Python3_EXECUTABLE}. Build isolation hides "
-    "torch from the build environment; build with --no-build-isolation "
-    "(or --no-isolation for `python -m build`).")
+# Under pip build isolation `import torch` fails, but scikit-build-core still puts
+# the interpreter's site-packages on CMAKE_PREFIX_PATH, so find_package(Torch)
+# can locate it without the hint.
+if(TORCH_PY_PREFIX_RESULT EQUAL 0 AND NOT TORCH_PY_PREFIX STREQUAL "")
+  message(STATUS "Torch cmake prefix: ${TORCH_PY_PREFIX}")
+  list(APPEND CMAKE_PREFIX_PATH ${TORCH_PY_PREFIX}/Torch)
+else()
+  message(STATUS "Could not import torch with ${Python3_EXECUTABLE}; "
+                 "searching CMAKE_PREFIX_PATH for Torch instead")
 endif()
-
-message(STATUS ${TORCH_PY_PREFIX})
-list(APPEND CMAKE_PREFIX_PATH ${TORCH_PY_PREFIX}/Torch)
 find_package(Torch REQUIRED)
 
 

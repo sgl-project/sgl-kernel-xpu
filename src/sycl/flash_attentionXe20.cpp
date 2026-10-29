@@ -1569,8 +1569,9 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     TORCH_CHECK(k.scalar_type() == q.scalar_type(), "alibi_slopes does not support fp8 KV cache");
     TORCH_CHECK(
         softcap == 0.f && !return_softmax_lse && !sinks_.has_value() && !rel_bias_.has_value() &&
-            !bidirectional_block_ids_.has_value(),
-        "alibi_slopes does not support softcap, softmax LSE, sinks, rel_bias or bidirectional_block_ids");
+            !bidirectional_block_ids_.has_value() && window_size_left < 0 && window_size_right < 0,
+        "alibi_slopes does not support softcap, softmax LSE, sinks, rel_bias, bidirectional_block_ids or a sliding "
+        "window");
   }
   at::Tensor out = out_.has_value() ? *out_ : at::empty({q.size(0), q.size(1), v.size(-1)}, q.options());
   // k and v may be 3D (total_k, h_k, d) for non-paged or 4D (num_pages, page_size, h_k, d)

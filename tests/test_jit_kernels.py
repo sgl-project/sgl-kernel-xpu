@@ -115,8 +115,14 @@ def test_rmsnorm_jit_vs_aot():
 @pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
 @pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "num_tokens, num_qo_heads, num_kv_heads, head_dim",
+    [(2048, 8, 2, 128), (64, 16, 16, 512)],
+)
 @pytest.mark.parametrize("packed_qkv", [False, True])
-def test_qknorm_jit_vs_reference(dtype, packed_qkv):
+def test_qknorm_jit_vs_reference(
+    dtype, packed_qkv, num_tokens, num_qo_heads, num_kv_heads, head_dim
+):
     """Test QKNorm JIT accuracy vs PyTorch reference for head_dim=128.
 
     With ``packed_qkv`` the q/k inputs are slices of a fused QKV projection, so
@@ -124,8 +130,6 @@ def test_qknorm_jit_vs_reference(dtype, packed_qkv):
     kernel takes as a parameter. V must then stay untouched.
     """
     device = "xpu"
-    num_tokens = 2048
-    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
     eps = 1e-6
 
     qkv = torch.randn(

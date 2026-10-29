@@ -241,7 +241,7 @@ def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
         return False
 
 
-def fused_qk_norm(
+def fused_inplace_qknorm(
     q: torch.Tensor,
     k: torch.Tensor,
     q_weight: torch.Tensor,
@@ -288,7 +288,7 @@ def rmsnorm(
 
 
 __all__ = [
-    "fused_qk_norm",
+    "fused_inplace_qknorm",
     "rmsnorm",
     "can_use_fused_inplace_qknorm",
 ]

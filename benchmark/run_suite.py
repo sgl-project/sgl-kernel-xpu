@@ -50,7 +50,7 @@ suites = {
         # their logs. update_baseline_from_log.py parses flash.log and
         # fused_moe.log against baseline.json; dropping a config silently
         # removes the matching baseline keys instead of failing loudly. ---
-        BenchFile("bench_flash_attn.py", tee_log="flash.log", estimated_time=75),
+        BenchFile("bench_flash_attn.py", tee_log="flash.log", estimated_time=100),
         BenchFile("bench_fused_moe.py", tee_log="fused_moe.log", estimated_time=90),
         # --- attention / MLA ---
         BenchFile(

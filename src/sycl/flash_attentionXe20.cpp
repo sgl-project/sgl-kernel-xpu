@@ -1468,17 +1468,17 @@ void mha_fwd(
   auto seqlens_q = cu_seqlens_q.slice(0, 1, batch_size + 1).sub(cu_seqlens_q.slice(0, 0, batch_size));
   auto is_prefill = seqlens_q.gt(1).contiguous();  // true for prefill batches
 
-  // Forward every shared argument to a sub-kernel, overriding only the per-batch
+  // Forward every shared argument to a sub-kernel, overriding only the max query length and the per-batch
   // skip mask. Both launches write into the same caller-provided ``out`` and
   // ``softmax_lse`` buffers.
-  auto launch = [&](auto&& fn, std::optional<at::Tensor> skip_mask, auto&&... tail) {
+  auto launch = [&](auto&& fn, int launch_max_seqlen_q, std::optional<at::Tensor> skip_mask, auto&&... tail) {
     fn(q,
        k,
        v,
        q_v_,
        cu_seqlens_q,
        cu_seqlens_k,
-       max_seqlen_q,
+       launch_max_seqlen_q,
        max_seqlen_k,
        page_table,
        kv_batch_idx_,
@@ -1508,12 +1508,13 @@ void mha_fwd(
 
   // Launch 1: decode writes the decode rows of ``out`` (and, when requested, of
   // ``softmax_lse``) and skips prefill batches, leaving their rows untouched.
-  launch(decode::mha_fwd, is_prefill, std::nullopt, false);
+  // Every batch it keeps has seqlen_q == 1; the batch-wide max_seqlen_q would size its grids by the prefill length.
+  launch(decode::mha_fwd, 1, is_prefill, std::nullopt, false);
   // Launch 2: prefill writes the prefill rows into the same buffers and skips
   // decode batches. The two complementary skip masks partition every query token
   // across the launches, so the shared buffers end up fully written with no
   // stitching or extra copies needed.
-  launch(prefill::mha_fwd, is_prefill.logical_not(), std::nullopt, block_id_);
+  launch(prefill::mha_fwd, max_seqlen_q, is_prefill.logical_not(), std::nullopt, block_id_);
 }
 
 }  // namespace chunkprefill

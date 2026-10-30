@@ -571,6 +571,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_q_indexer_rope_hadamard_quant(Tensor q_input, Tensor(a!) q_fp8, Tensor weight, Tensor(b!) "
       "weights_out, float weight_scale, Tensor rope_cache, Tensor positions) -> ()");
   m.impl("fused_q_indexer_rope_hadamard_quant", torch::kXPU, &fused_q_indexer_rope_hadamard_quant);
+  m.def(
+      "fused_q_indexer_rope_hadamard_fp4_quant(Tensor q_input, Tensor(a!) q_fp4, Tensor(b!) q_scale, "
+      "Tensor weight, Tensor(c!) weights_out, float weight_scale, Tensor rope_cache, Tensor positions) -> ()");
+  m.impl("fused_q_indexer_rope_hadamard_fp4_quant", torch::kXPU, &fused_q_indexer_rope_hadamard_fp4_quant);
+  m.def(
+      "index_q_rope_pack_weights(Tensor input, Tensor freqs_cis, Tensor positions, Tensor head_weights, "
+      "float weight_scale) -> (Tensor, Tensor, Tensor)");
+  m.impl("index_q_rope_pack_weights", torch::kXPU, &index_q_rope_pack_weights);
+  m.def(
+      "index_k_norm_rope_pack_store(Tensor input, Tensor norm_weight, float eps, Tensor freqs_cis, "
+      "Tensor positions, Tensor loc, Tensor(a!) cache, int ratio) -> ()");
+  m.impl("index_k_norm_rope_pack_store", torch::kXPU, &index_k_norm_rope_pack_store);
 
   /*
    * From fused qk norm rope
@@ -704,6 +716,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
       "int max_seq_len, bool clean_logits) -> Tensor");
   m.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
+  m.def(
+      "fp4_paged_mqa_logits(Tensor q_fp4, Tensor q_scale, Tensor kv_cache, Tensor weights, "
+      "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, int max_seq_len, "
+      "bool clean_logits) -> Tensor");
+  m.impl("fp4_paged_mqa_logits", torch::kXPU, &fp4_paged_mqa_logits);
 #endif  // SYCL_INTEL_TARGET == 20
 
   /*

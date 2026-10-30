@@ -105,6 +105,9 @@ hadamard_transform = torch.ops.sgl_kernel.hadamard_transform
 fused_q_indexer_rope_hadamard_quant = (
     torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_quant
 )
+fused_q_indexer_rope_hadamard_fp4_quant = (
+    torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_fp4_quant
+)
 from sgl_kernel.gdn_attn import gdn_attention
 from sgl_kernel.gemm import (
     awq_dequantize,
@@ -131,6 +134,10 @@ from sgl_kernel.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
     transfer_cache_dsv4_mla,
+)
+from sgl_kernel.indexer_rope_pack import (
+    index_k_norm_rope_pack_store,
+    index_q_rope_pack_weights,
 )
 from sgl_kernel.inkling_attn_prologue import (
     compile_inkling_attn_prologue,
@@ -216,7 +223,7 @@ from sgl_kernel.moe import (
     topk_sigmoid,
     topk_softmax,
 )
-from sgl_kernel.nsa import fp8_mqa_logits, fp8_paged_mqa_logits
+from sgl_kernel.nsa import fp4_paged_mqa_logits, fp8_mqa_logits, fp8_paged_mqa_logits
 from sgl_kernel.qsa_prepare import (
     qsa_index_k_compress_store,
     qsa_index_q_norm_rope_store,

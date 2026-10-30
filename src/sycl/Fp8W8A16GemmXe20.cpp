@@ -110,6 +110,10 @@ SGL_KERNEL_EXPORT void fp8_w8a16_mm_xe20(
   CHECK_DEVICE(input);
   CHECK_DEVICE(weight);
   CHECK_DEVICE(weight_scale);
+  const auto device = input.device();
+  TORCH_CHECK(
+      output.device() == device && weight.device() == device && weight_scale.device() == device,
+      "all operands must be on the same device");
   TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be bfloat16");
   TORCH_CHECK(output.scalar_type() == at::kBFloat16, "output must be bfloat16");
   TORCH_CHECK(weight.scalar_type() == at::ScalarType::Float8_e4m3fn, "weight must be float8_e4m3fn");
@@ -125,9 +129,12 @@ SGL_KERNEL_EXPORT void fp8_w8a16_mm_xe20(
       "weight_scale must be [N/128, K/128]");
   // 2D block loads need 64B-aligned bases and 16B-aligned row pitches.
   TORCH_CHECK(input.stride(0) * 2 % 16 == 0 && output.stride(0) * 2 % 16 == 0 && weight.stride(0) % 16 == 0);
+  auto aligned_64 = [](const torch::Tensor& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % 64 == 0; };
+  TORCH_CHECK(
+      aligned_64(input) && aligned_64(weight) && aligned_64(output), "input, weight and output must be 64B aligned");
   if (M == 0) return;
 
-  auto q = at::xpu::getCurrentXPUStream().queue();
+  auto q = at::xpu::getCurrentXPUStream(device.index()).queue();
   const int k_groups = static_cast<int>(K / 128);
   int tile = static_cast<int>(config % 10);
   int k_slices = static_cast<int>(config / 10);

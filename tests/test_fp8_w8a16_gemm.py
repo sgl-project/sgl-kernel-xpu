@@ -10,6 +10,8 @@ import torch
 import utils
 from sgl_kernel import fp8_w8a16_mm
 
+pytestmark = pytest.mark.arch("xe20")
+
 device = utils.get_device()
 
 BLOCK = 128
@@ -68,6 +70,15 @@ def test_fp8_w8a16_mm_strided_input_and_output():
     fp8_w8a16_mm(x_big[:, :k], w, s, out=out_big[:, :n])
     assert_close_to_reference(out_big[:, :n], reference(x_full, w, s))
     assert out_big[:, n:].abs().max().item() == 0
+
+
+def test_fp8_w8a16_mm_rejects_misaligned_base():
+    m, n, k = 6, 256, 1024
+    x_full, w, s = make_problem(m, n, k)
+    x_big = torch.zeros(m, k + 128, device=device, dtype=torch.bfloat16)
+    # Row pitch stays 16B aligned; the base is 2 bytes past a 64B boundary.
+    with pytest.raises(RuntimeError, match="64B aligned"):
+        fp8_w8a16_mm(x_big[:, 1 : k + 1], w, s)
 
 
 if __name__ == "__main__":

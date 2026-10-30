@@ -20,6 +20,13 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 #include "sgl_kernel_torch_shim.h"
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def("convrot_rotate_quantize(Tensor input, int group_size=256) -> (Tensor, Tensor)");
+  m.impl("convrot_rotate_quantize", torch::kXPU, &convrot_rotate_quantize);
+  m.def(
+      "convrot_int8_linear_prequant(Tensor input, Tensor weight, Tensor input_scale, "
+      "Tensor weight_scale, Tensor? bias=None) -> Tensor");
+  m.impl("convrot_int8_linear_prequant", torch::kXPU, &convrot_int8_linear_prequant);
+
   m.def("weak_ref_tensor(Tensor(a) tensor) -> Tensor(a)");
   m.impl("weak_ref_tensor", torch::kXPU, &weak_ref_tensor);
 

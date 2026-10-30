@@ -48,6 +48,14 @@ using fptr_t = int64_t;
 // default visibility to remain exported and dynamically linkable.
 #pragma GCC visibility push(default)
 
+std::tuple<at::Tensor, at::Tensor> convrot_rotate_quantize(const at::Tensor& input, int64_t group_size);
+at::Tensor convrot_int8_linear_prequant(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& input_scale,
+    const at::Tensor& weight_scale,
+    const std::optional<at::Tensor>& bias);
+
 /*
  * From csrc/allreduce
  */

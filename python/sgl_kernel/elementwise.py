@@ -900,7 +900,9 @@ def fused_q_indexer_rope_hadamard_fp4_quant(
     Returns ``((q_fp4, q_sf), weights_out)``: int8 packed payload
     ``(B, H, 64)``, int32 packed scales ``(B, H)``, float32 ``(B, H, 1)``.
     """
-    q_fp4, q_sf, weights_out = torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_fp4_quant(
-        q_input, weight, float(weight_scale), freqs_cis, positions
+    q_fp4, q_sf, weights_out = (
+        torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_fp4_quant(
+            q_input, weight, float(weight_scale), freqs_cis, positions
+        )
     )
     return (q_fp4, q_sf), weights_out

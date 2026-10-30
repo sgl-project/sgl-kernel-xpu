@@ -32,14 +32,14 @@
   \file
   \brief Forward declarations of the generated per-(dtype, tile) launch
          functions for sgemm_lora_a_fwd. The definitions are produced by
-         sgemm_lora_a_fwd_kernel.cpp.in via SGEMMLoraAFwdXe20.cmake, each in
+         sgemm_lora_a_fwd_kernel.cpp.in via SGEMMLoraAFwd.cmake, each in
          its own translation unit for parallel compilation of the heavy CUTLASS
          template instantiation.
 
          Naming: launch_sgemm_lora_a_fwd_<ELEM_TAG>_<TILE_TAG>
          Parameters:
            ELEM_TAG in {half, bf16}       -- fp16/bf16.
-           TILE_TAG in {large}            -- extend via SGEMMLoraAFwdXe20.cmake
+           TILE_TAG in {large}            -- extend via SGEMMLoraAFwd.cmake
                                              + a new option tag/type in
                                              sgemm_lora_a_fwd_types.hpp.
 */

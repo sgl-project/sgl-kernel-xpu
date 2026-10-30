@@ -62,6 +62,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("fused_sigmoid_mul(Tensor! output, Tensor input, Tensor gate) -> ()");
   m.impl("fused_sigmoid_mul", torch::kXPU, &at::native::xpu::fused_sigmoid_mul);
 
+  m.def("qwen4_hc_silu(Tensor! output, Tensor input, int hc_count) -> ()");
+  m.impl("qwen4_hc_silu", torch::kXPU, &at::native::xpu::qwen4_hc_silu);
+
+  m.def("qwen4_hc_gate_mix(Tensor! output, Tensor input, Tensor gate, int hc_count) -> ()");
+  m.impl("qwen4_hc_gate_mix", torch::kXPU, &at::native::xpu::qwen4_hc_gate_mix);
+
+  m.def(
+      "qwen4_hc_combine(Tensor! output, Tensor residual, Tensor block_output, Tensor? injection, int hc_count) -> ()");
+  m.impl("qwen4_hc_combine", torch::kXPU, &at::native::xpu::qwen4_hc_combine);
+
+  m.def(
+      "qwen4_hc_combine_norm(Tensor! combined, Tensor! normalized, Tensor residual, Tensor block_output, "
+      "Tensor? injection, Tensor weight, float eps, int hc_count) -> ()");
+  m.impl("qwen4_hc_combine_norm", torch::kXPU, &at::native::xpu::qwen4_hc_combine_norm);
+
   m.def(
       "qwen4_ngram_hash(Tensor! output, Tensor contexts, Tensor multipliers, Tensor vocab_sizes, Tensor offsets, "
       "int eos_token_id) -> ()");
@@ -556,6 +571,18 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_q_indexer_rope_hadamard_quant(Tensor q_input, Tensor(a!) q_fp8, Tensor weight, Tensor(b!) "
       "weights_out, float weight_scale, Tensor rope_cache, Tensor positions) -> ()");
   m.impl("fused_q_indexer_rope_hadamard_quant", torch::kXPU, &fused_q_indexer_rope_hadamard_quant);
+  m.def(
+      "fused_q_indexer_rope_hadamard_fp4_quant(Tensor q_input, Tensor(a!) q_fp4, Tensor(b!) q_scale, "
+      "Tensor weight, Tensor(c!) weights_out, float weight_scale, Tensor rope_cache, Tensor positions) -> ()");
+  m.impl("fused_q_indexer_rope_hadamard_fp4_quant", torch::kXPU, &fused_q_indexer_rope_hadamard_fp4_quant);
+  m.def(
+      "index_q_rope_pack_weights(Tensor input, Tensor freqs_cis, Tensor positions, Tensor head_weights, "
+      "float weight_scale) -> (Tensor, Tensor, Tensor)");
+  m.impl("index_q_rope_pack_weights", torch::kXPU, &index_q_rope_pack_weights);
+  m.def(
+      "index_k_norm_rope_pack_store(Tensor input, Tensor norm_weight, float eps, Tensor freqs_cis, "
+      "Tensor positions, Tensor loc, Tensor(a!) cache, int ratio) -> ()");
+  m.impl("index_k_norm_rope_pack_store", torch::kXPU, &index_k_norm_rope_pack_store);
 
   /*
    * From fused qk norm rope
@@ -649,7 +676,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def(
       "embedding_lora_a_fwd(Tensor! output, Tensor input_ids, Tensor weights, int vocab_size, Tensor seg_indptr, "
       "Tensor weight_indices, "
-      "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens) -> ()");
+      "Tensor lora_ranks, Tensor? extra_embeddings, Tensor? seg_lens, int? max_len=None) -> ()");
   m.impl("embedding_lora_a_fwd", torch::kXPU, &embedding_lora_a_fwd);
   m.def(
       "sgemm_lora_a_fwd(Tensor! output, Tensor input_x, Tensor weights, int stack_num, Tensor seg_indptr, "
@@ -689,6 +716,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, "
       "int max_seq_len, bool clean_logits) -> Tensor");
   m.impl("fp8_paged_mqa_logits", torch::kXPU, &fp8_paged_mqa_logits);
+  m.def(
+      "fp4_paged_mqa_logits(Tensor q_fp4, Tensor q_scale, Tensor kv_cache, Tensor weights, "
+      "Tensor seq_lens, Tensor block_tables, Tensor? schedule_metadata, int max_seq_len, "
+      "bool clean_logits) -> Tensor");
+  m.impl("fp4_paged_mqa_logits", torch::kXPU, &fp4_paged_mqa_logits);
 #endif  // SYCL_INTEL_TARGET == 20
 
   /*

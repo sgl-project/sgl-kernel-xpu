@@ -30,41 +30,44 @@
  **************************************************************************************************/
 /*!
   \file
-  \brief Tile-configuration option tag for the chunked-SGMV LoRA "expand" GEMM.
+  \brief Tile-configuration option tags for the chunked-SGMV LoRA expand kernel.
 
-  This is the wide-N grouped-GEMM tile for the LoRA-B "expand" projection.
-  The generic n_slices + caller-supplied slice_offsets are just arguments to the
-  shared sliced grouped-GEMM core (GroupGemmTypes<> + group_gemm_lora_launcher.hpp);
-  only the tile axis lives here.
-
-  Adding another tile is a two-step change (mirrors the B-fwd convention):
+  Adding another tile is a two-step change (mirrors the prefill LoRA kernels):
     1) Define a new option tag here.
-    2) Register (tag name, C++ type) in ChunkedSgmvLoraExpandFwdXe20.cmake.
-  The dtype/tile dispatch in ChunkedSgmvLoraExpandFwd.cpp then picks a tag per call.
+    2) Register (tag name, C++ type) in ChunkedSgmvLoraExpandFwd.cmake.
+  The entrypoint (ChunkedSgmvLoraExpandFwd.cpp) then picks a tag per call.
 */
 
 #pragma once
 
-#include <cute/layout.hpp>
-
-#include "cutlass/layout/matrix.h"
-#include "sycl/kernels/lora/common/group_gemm_types.hpp"
+#include "sycl/kernels/lora/common/gather_scatter_group_gemm_types.hpp"
 
 namespace chunked_sgmv_lora_expand_fwd_impl {
 
-//----------------- Tile / thread / staging option tag -----------------------//
-// LayoutB is ColumnMajor: the LoRA weight tensor is [num_loras, N_total, K]
-// row-major, which is ColumnMajor when viewed as B in the A @ B^T grouped GEMM.
-//   TileShape 32 x 512 x 32, ThreadLayout 2 x 16 x 1 (32 subgroups / workgroup)
-struct ChunkedExpandTileTall {
-  using TileShape = cute::Shape<cute::_32, cute::_512, cute::_32>;
-  using ThreadLayout =
-      cute::Layout<cute::Shape<cute::_2, cute::_16, cute::_1>, cute::Stride<cute::_16, cute::_1, cute::_0>>;
-  using LayoutB = cutlass::layout::ColumnMajor;
-  static constexpr int PipelineStages = 2;
-
-  template <typename T>
-  using Types = at::native::xpu::GroupGemmTypes<T, TileShape, ThreadLayout, LayoutB, PipelineStages>;
+// Work-group tile = BM rows x (NSG_N * SG_N) columns of one slice, NSG_N sub-groups side by
+// side along N, rank in 16-wide k-blocks, no split-K. Measured on BMG (B580) over the decode
+// shapes in benchmark/bench_chunked_sgmv_lora_expand_fwd.py; the entrypoint picks a tag.
+// Types<T, BLOCK_B> is the assembled gather / scatter grouped-GEMM bundle (sycl-tla GemmUniversal
+// with the LoRA collectives).
+template <int BM, int SG_N, int NSG_N>
+struct ChunkedExpandTile {
+  template <typename T, bool BLOCK_B>
+  using Types = at::native::xpu::lora::GatherScatterGroupGemmTypes<
+      T,
+      BM,
+      SG_N,
+      /*BK=*/16,
+      NSG_N,
+      /*SGK=*/1,
+      cutlass::lora::collective::ScaleResidualScatterGroupEpilogue,
+      BLOCK_B>;
 };
+
+// Default: short, wide tiles (16 x 128 per sub-group, 8 sub-groups).
+struct ChunkedExpandTileWide : ChunkedExpandTile<16, 128, 8> {};
+
+// Taller tiles share each weight load across more rows: used when rank >= 64 with short
+// segments, and for weights that need the generic (non block-2D) B path.
+struct ChunkedExpandTileTall : ChunkedExpandTile<32, 64, 4> {};
 
 }  // namespace chunked_sgmv_lora_expand_fwd_impl

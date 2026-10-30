@@ -20,3 +20,10 @@ jobs:
 
       - name: Linting
         run: pre-commit run --all-files --show-diff-on-failure
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Test CI commands
+        run: node --test tests/ci/test_ci_commands.cjs

@@ -1,21 +1,53 @@
 name: PR Test (XPU)
+run-name: "PR Test (XPU) #${{ github.event.pull_request.number || inputs.pr_number }} @ ${{ github.event.pull_request.head.sha || inputs.head_sha }}"
 
 on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: PR number to test
+        required: true
+        type: string
+      head_sha:
+        description: Expected PR head SHA
+        required: true
+        type: string
 
 permissions:
   contents: write
   pull-requests: write
 
 concurrency:
-  group: pr-test-xpu-${{ github.ref }}
+  group: pr-test-xpu-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: true
 
 jobs:
-  build-and-test:
+  resolve-pr:
     if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      number: ${{ steps.pr.outputs.number }}
+      sha: ${{ steps.pr.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.ref }}
+          persist-credentials: false
+      - id: pr
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { resolvePr } = require('./.github/scripts/ci-commands.cjs');
+            await resolvePr({ github, context, core });
+
+  build-and-test:
+    needs: resolve-pr
     permissions:
       contents: write
       pull-requests: write
@@ -45,24 +77,26 @@ jobs:
           # current base (main) merged with this PR. Testing that ref
           # catches conflicts with anything that landed on main while
           # the PR was in flight.
-          PR_MERGE_REF: refs/pull/${{ github.event.pull_request.number }}/merge
+          PR_MERGE_REF: refs/pull/${{ needs.resolve-pr.outputs.number }}/merge
+          EXPECTED_HEAD_SHA: ${{ needs.resolve-pr.outputs.sha }}
         run: |
-          docker exec -e PR_MERGE_REF="${PR_MERGE_REF}" ci_sglkernel_xpu \
+          docker exec -e PR_MERGE_REF="${PR_MERGE_REF}" -e EXPECTED_HEAD_SHA="${EXPECTED_HEAD_SHA}" ci_sglkernel_xpu \
             /bin/bash -c '\
               set -exo pipefail && \
               . /miniforge3/bin/activate && \
               conda activate py3.12 && \
               cd /root/sglang/sgl-kernel-xpu && \
               git remote set-url origin https://github.com/sgl-project/sgl-kernel-xpu.git && \
-              git fetch --depth=1 origin "${PR_MERGE_REF}" && \
+              git fetch --depth=2 origin "${PR_MERGE_REF}" && \
               git checkout FETCH_HEAD && \
+              test "$(git rev-parse HEAD^2)" = "${EXPECTED_HEAD_SHA}" && \
               # Nuke the image-baked build/ tree so Ninja recompiles against
               # the freshly checked-out source. Without this, C++/SYCL PRs
               # get silently linked against the prebuilt .o files from the
               # nightly image and the wheel that ships to tests contains
               # the pre-PR kernel code.
               rm -rf build && \
-              pip uninstall -y sgl-kernel || true && \
+              (pip uninstall -y sgl-kernel || true) && \
               pip install --force-reinstall -v . && \
               python -c "import sgl_kernel; print(sgl_kernel.__file__)" \
             '

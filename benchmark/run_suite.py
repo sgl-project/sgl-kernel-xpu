@@ -115,6 +115,7 @@ suites = {
         BenchFile("bench_per_token_group_quant_mxfp4.py"),
         BenchFile("bench_per_token_group_quant_8bit_v2.py"),
         BenchFile("bench_per_token_quant_fp8.py"),
+        BenchFile("bench_per_token_quant_int8.py"),
         BenchFile("bench_per_token_group_quant_mxfp4_fusion.py"),
         BenchFile("bench_top_k_renorm_probs.py"),
         BenchFile("bench_scale_residual_norm_scale_shift.py"),

@@ -23,6 +23,7 @@ using KernelFn = void (*)(
     int,          // gemm_k
     const int*,   // num_rows_per_expert
     int,          // num_experts
+    int,          // total_rows
     int*,         // workspace
     float,        // gemm1_alpha
     float,        // gemm1_limit
@@ -106,6 +107,7 @@ bool grouped_gemm_launch(
     int gemm_k,
     const int* num_rows_per_expert,
     int num_experts,
+    int total_rows,
     int* workspace,
     float gemm1_alpha,
     float gemm1_limit,
@@ -129,6 +131,7 @@ bool grouped_gemm_launch(
      gemm_k,
      num_rows_per_expert,
      num_experts,
+     total_rows,
      workspace,
      gemm1_alpha,
      gemm1_limit,
@@ -277,7 +280,21 @@ bool w4a16_grouped_gemm_launch(
 namespace {
 
 using W8A16Fn = void (*)(
-    void*, const void*, const void*, const void*, const void*, void*, int, int, const int*, int, int*, int, int, bool);
+    void*,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    void*,
+    int,
+    int,
+    const int*,
+    int,
+    int,
+    int*,
+    int,
+    int,
+    bool);
 
 struct W8A16TileCfg {
   const char* tile;
@@ -361,6 +378,7 @@ bool w8a16_grouped_gemm_launch(
     int gemm_k,
     const int* rows_per_expert,
     int num_experts,
+    int total_rows,
     int* workspace,
     int ld_b,
     bool static_scheduler,
@@ -379,6 +397,7 @@ bool w8a16_grouped_gemm_launch(
      gemm_k,
      rows_per_expert,
      num_experts,
+     total_rows,
      workspace,
      ld_b,
      scale_mode,

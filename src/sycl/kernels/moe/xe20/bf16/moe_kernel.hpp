@@ -32,6 +32,7 @@
 #pragma once
 
 #include "../common/block_2d_copy_d.hpp"
+#include "../common/expert_locate.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/gemm.h"
@@ -104,6 +105,8 @@ class MoEGEMM {
     int32_t ld_b;
     float gemm1_alpha = 1.702f;
     float gemm1_limit = 7.0f;
+    // Set by the launcher only when no work-group can get a second tile; see run_single_tile.
+    bool one_tile_per_group = false;
   };
 
   auto make_B_tensors(ElementB* ptr_B, int N, int K, int ld_b) {
@@ -186,6 +189,69 @@ class MoEGEMM {
     }
   }
 
+  // One (m_coord, n_coord) tile of expert `expert_id`, whose M rows start at row `pre_rows`.
+  CUTLASS_DEVICE void
+  run_tile(Params const& params, int thr_id, int expert_id, int pre_rows, int M, int m_coord, int n_coord) {
+    auto N = params.N;
+    auto K = params.K;
+    auto mma = params.mma;
+    int ld_b = params.ld_b;
+    int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(N) * static_cast<int64_t>(ld_b);
+    ElementA* ptr_A_curr_batch = const_cast<ElementA*>(params.Activations) + pre_rows * K;
+    ElementB* ptr_B_curr_batch = const_cast<ElementB*>(params.Weights) + B_offset;
+    float* ptr_Bias_curr_batch = nullptr;
+    if constexpr (WithBias) {
+      ptr_Bias_curr_batch = const_cast<float*>(params.Bias) + expert_id * N;
+    }
+
+    auto A_tensor =
+        make_tensor(make_gmem_ptr<ElementA>(ptr_A_curr_batch), make_layout(make_shape(M, K), make_stride(K, _1{})));
+    auto B_tensor = make_B_tensors(ptr_B_curr_batch, N, K, ld_b);
+    auto D_tensor = make_D_tensors(params.Outputs, pre_rows, M, N);
+    auto Bias_tensor = make_Bias_tensors(ptr_Bias_curr_batch, N);
+
+    CollectiveMainloop mainloop;
+    // Fused gated activations use dual-GEMM mainloop
+    // Unfused or fused non-gated RELU2 use single-GEMM mainloop
+    constexpr bool is_fused_gated = FuseAct && (ActType != ActivationType::RELU2);
+    if constexpr (is_fused_gated) {
+      auto tile_coord = make_coord(m_coord, n_coord, n_coord);
+      mainloop(
+          A_tensor,
+          get<0>(B_tensor),
+          get<1>(B_tensor),
+          D_tensor,
+          tile_coord,
+          mma,
+          thr_id,
+          get<0>(Bias_tensor),
+          get<1>(Bias_tensor),
+          params.gemm1_alpha,
+          params.gemm1_limit);
+    } else {
+      auto tile_coord = make_coord(m_coord, n_coord, _, 0);
+      mainloop(A_tensor, get<0>(B_tensor), D_tensor, tile_coord, mma, thr_id, get<0>(Bias_tensor));
+    }
+  }
+
+  // Decode-sized launches give every work-group at most one tile; locate its expert in parallel
+  // instead of walking the experts serially (see moe_xe20::locate_m_tile).
+  CUTLASS_DEVICE void run_single_tile(Params const& params, sycl::nd_item<3> item, int group_id, int n_tiles) {
+    moe_xe20::TileExpert te;
+    const int m_tile = group_id / n_tiles;
+    if (moe_xe20::locate_m_tile<size<0>(TileShape{}), 16>(
+            item.get_sub_group(), params.M_per_group, params.num_experts, m_tile, te)) {
+      run_tile(
+          params,
+          int32_t(item.get_local_linear_id()),
+          te.expert_id,
+          te.rows_before,
+          te.rows,
+          m_tile - te.m_tiles_before,
+          group_id % n_tiles);
+    }
+  }
+
   void operator()(Params const& params, sycl::nd_item<3> item, int32_t* slm_mem) {
     auto N = params.N;
     auto K = params.K;
@@ -211,6 +277,11 @@ class MoEGEMM {
     int group_range = item.get_group_range(1);
     int32_t thr_id = int32_t(item.get_local_linear_id());
 
+    if (params.one_tile_per_group) {
+      run_single_tile(params, item, group_id, N_pad / wg_tile_n);
+      return;
+    }
+
     if (group_id == 0 && thr_id == 0) {
       auto atm = sycl::atomic_ref<
           int,
@@ -233,47 +304,11 @@ class MoEGEMM {
         continue;
       }
 
-      int expert_id = i;
-      int ld_b = params.ld_b;
-      int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(N) * static_cast<int64_t>(ld_b);
-      ElementA* ptr_A_curr_batch = const_cast<ElementA*>(params.Activations) + pre_rows * K;
-      ElementB* ptr_B_curr_batch = const_cast<ElementB*>(params.Weights) + B_offset;
-      float* ptr_Bias_curr_batch = nullptr;
-      if constexpr (WithBias) {
-        ptr_Bias_curr_batch = const_cast<float*>(params.Bias) + expert_id * N;
-      }
-
-      auto A_tensor =
-          make_tensor(make_gmem_ptr<ElementA>(ptr_A_curr_batch), make_layout(make_shape(M, K), make_stride(K, _1{})));
-      auto B_tensor = make_B_tensors(ptr_B_curr_batch, N, K, ld_b);
-      auto D_tensor = make_D_tensors(params.Outputs, pre_rows, M, N);
-      auto Bias_tensor = make_Bias_tensors(ptr_Bias_curr_batch, N);
-
       while (group_m_id < cumsum_tiles_for_experts) {
         int n_coord = (group_id * wg_tile_n) % N_pad / wg_tile_n;
         int m_coord = (group_m_id - pre_tiles);
 
-        CollectiveMainloop mainloop;
-        // Fused gated activations use dual-GEMM mainloop
-        // Unfused or fused non-gated RELU2 use single-GEMM mainloop
-        if constexpr (is_fused_gated) {
-          auto tile_coord = make_coord(m_coord, n_coord, n_coord);
-          mainloop(
-              A_tensor,
-              get<0>(B_tensor),
-              get<1>(B_tensor),
-              D_tensor,
-              tile_coord,
-              mma,
-              thr_id,
-              get<0>(Bias_tensor),
-              get<1>(Bias_tensor),
-              params.gemm1_alpha,
-              params.gemm1_limit);
-        } else {
-          auto tile_coord = make_coord(m_coord, n_coord, _, 0);
-          mainloop(A_tensor, get<0>(B_tensor), D_tensor, tile_coord, mma, thr_id, get<0>(Bias_tensor));
-        }
+        run_tile(params, thr_id, i, pre_rows, M, m_coord, n_coord);
         if (thr_id == 0) {
           slm_mem[0] = cutlass::atomicAdd(workspace, 1);
         }

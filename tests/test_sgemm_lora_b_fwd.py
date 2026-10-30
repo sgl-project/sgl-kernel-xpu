@@ -616,26 +616,31 @@ def _make_valid_kwargs():
             "weight_indices_out_of_range",
             "weight_indices values must be in",
             id="weight_indices_out_of_range",
+            marks=pytest.mark.debug_checks,
         ),
         pytest.param(
             "seg_indptr_start_nonzero",
             "seg_indptr\\[0\\] must be 0",
             id="seg_indptr_start_nonzero",
+            marks=pytest.mark.debug_checks,
         ),
         pytest.param(
             "seg_indptr_end_mismatch",
             "seg_indptr\\[-1\\] must equal num_tokens",
             id="seg_indptr_end_mismatch",
+            marks=pytest.mark.debug_checks,
         ),
         pytest.param(
             "seg_indptr_decreasing",
             "seg_indptr must be non-decreasing",
             id="seg_indptr_decreasing",
+            marks=pytest.mark.debug_checks,
         ),
         pytest.param(
             "lora_ranks_out_of_range",
             "lora_ranks must be within the range",
             id="lora_ranks_out_of_range",
+            marks=pytest.mark.debug_checks,
         ),
         pytest.param(
             "dtype_mismatch",

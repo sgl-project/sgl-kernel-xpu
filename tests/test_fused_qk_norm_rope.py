@@ -223,9 +223,9 @@ def fused_qk_norm_rope_with_cache_reference(
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 32, 128])
-@pytest.mark.parametrize("num_heads_q", [8, 32])
-@pytest.mark.parametrize("num_heads_k", [8])
-@pytest.mark.parametrize("num_heads_v", [8])
+@pytest.mark.parametrize("num_heads_q", [8, 32, 64])
+@pytest.mark.parametrize("num_heads_k", [4, 8])
+@pytest.mark.parametrize("num_heads_v", [4, 8])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("is_neox", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

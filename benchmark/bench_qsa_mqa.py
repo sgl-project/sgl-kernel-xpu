@@ -62,9 +62,7 @@ def get_benchmark(page_size: int, device: str = "xpu"):
             else:
 
                 def run_op():
-                    return torch.ops.sgl_kernel.qsa_mqa_prefill(
-                        q, k, starts, ends, None
-                    )
+                    return sgl_kernel.qsa_mqa_prefill(q, k, starts, ends, None)
 
         else:
             pages_per_row = (columns + page_size - 1) // page_size
@@ -86,7 +84,7 @@ def get_benchmark(page_size: int, device: str = "xpu"):
             else:
 
                 def run_op():
-                    return torch.ops.sgl_kernel.qsa_mqa_decode(
+                    return sgl_kernel.qsa_mqa_decode(
                         q, cache, pages, lengths, columns, None
                     )
 

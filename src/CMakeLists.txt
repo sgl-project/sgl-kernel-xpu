@@ -61,6 +61,15 @@ message(STATUS "USE_SYCL_JIT=${USE_SYCL_JIT}")
 if(USE_MOE)
     add_compile_definitions(USE_MOE)
 endif()
+# Value-level input checks (index ranges, monotonic seg_indptr, permutation
+# bijectivity, offset tables) each force a device -> host sync, which dominates
+# small decode ops, so they are compiled only into RelWithDebInfo builds:
+# SKBUILD_CMAKE_BUILD_TYPE=RelWithDebInfo pip install -e . --no-build-isolation -v
+# Shape / dtype checks are always on.
+if(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    add_compile_definitions(SGL_KERNEL_DEBUG_CHECKS)
+    message(STATUS "Value-level input checks: ON (${CMAKE_BUILD_TYPE})")
+endif()
 if(USE_FMHA)
     add_compile_definitions(USE_FMHA)
 endif()
@@ -156,12 +165,12 @@ foreach(file ${device_cpp})
 
 endforeach()
 
-include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraAFwdXe20.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraBFwdXe20.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/QKVLoraBFwdXe20.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/GateUpLoraBFwdXe20.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/ChunkedSgmvLoraShrinkFwdXe20.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/ChunkedSgmvLoraExpandFwdXe20.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraAFwd.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraBFwd.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/QKVLoraBFwd.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/GateUpLoraBFwd.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/ChunkedSgmvLoraShrinkFwd.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/ChunkedSgmvLoraExpandFwd.cmake)
 if(USE_FMHA)
     if(NOT USE_SYCL_JIT AND NOT DPCPP_SYCL_TARGET MATCHES "cri")
         include(FMHADecodeXe20.cmake)

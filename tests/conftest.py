@@ -1,3 +1,5 @@
+import os
+
 import pytest
 import torch
 from _xpu import KNOWN_ARCHS, current_arch
@@ -17,9 +19,32 @@ def pytest_configure(config):
         "is skipped unless the live device is one of them. No mark = "
         "arch-agnostic (runs on any device).",
     )
+    config.addinivalue_line(
+        "markers",
+        "debug_checks: exercises value-level input checks that exist only in "
+        "RelWithDebInfo builds. Skipped unless SGL_KERNEL_DEBUG_CHECKS=1 "
+        "(set it when testing such a build).",
+    )
+
+
+# Value-level input checks (index ranges, seg_indptr, offset tables) cost a
+# device -> host sync, so kernels compile them only into RelWithDebInfo builds.
+# A Release build (the default) does not validate those values; feeding it bad
+# ones is undefined.
+_DEBUG_CHECKS_BUILD = os.environ.get("SGL_KERNEL_DEBUG_CHECKS", "0").lower() in (
+    "1",
+    "on",
+    "true",
+    "yes",
+)
 
 
 def pytest_runtest_setup(item):
+    if item.get_closest_marker("debug_checks") is not None and not _DEBUG_CHECKS_BUILD:
+        pytest.skip(
+            "needs a RelWithDebInfo build; set SGL_KERNEL_DEBUG_CHECKS=1 to run"
+        )
+
     marker = item.get_closest_marker("arch")
     if marker is None:
         return  # arch-agnostic — runs everywhere

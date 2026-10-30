@@ -320,8 +320,6 @@ SGL_KERNEL_EXPORT void moe_align_block_size(
     torch::Tensor num_tokens_post_pad,
     torch::Tensor cumsum_buffer,
     bool pad_sorted_token_ids) {
-  auto q = sycl::queue();
-
   int threads = 1024;
   threads = ((threads + sub_group_size - 1) / sub_group_size) * sub_group_size;
 

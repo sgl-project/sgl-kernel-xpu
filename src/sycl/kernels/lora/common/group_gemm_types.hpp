@@ -72,25 +72,10 @@
 #include "cutlass/half.h"
 #include "cutlass/layout/matrix.h"
 #include "sycl/kernels/lora/collective/xe_lora_epilogue.hpp"
+#include "sycl/kernels/lora/common/lora_element_type.hpp"
 #include "sycl/kernels/lora/device/group_gemm_lora_launcher.hpp"
 
 namespace at::native::xpu {
-
-//----------------- torch dtype -> CUTLASS element type ----------------------//
-template <typename T>
-struct ToCutlassElementType {
-  using type = T;  // float -> float (identity)
-};
-
-template <>
-struct ToCutlassElementType<at::Half> {
-  using type = cutlass::half_t;
-};
-
-template <>
-struct ToCutlassElementType<at::BFloat16> {
-  using type = cutlass::bfloat16_t;
-};
 
 //----------------- Group problem shape (shared across all instantiations) ----//
 using GroupedProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;

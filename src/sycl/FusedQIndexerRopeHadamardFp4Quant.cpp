@@ -194,31 +194,25 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_q_indexer
 
   const uint32_t num_rows = static_cast<uint32_t>(batch * heads);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
-  // The dispatch macros `return` out of the enclosing callable, which must
-  // therefore be void; the tuple is returned outside it.
-  [&]() -> void {
-    SYCL_DISPATCH_FLOATING_TYPES(
-        at::kHalf, at::kBFloat16, q_input.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
-          using input_t = scalar_t;
-          AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
-            using position_t = index_t;
-            FusedQIndexerRopeHadamardFp4QuantKernel<input_t, position_t> kernel{
-                q_input.data_ptr<input_t>(),
-                q_fp4.data_ptr<int8_t>(),
-                q_scale.data_ptr<uint8_t>(),
-                weight.data_ptr<input_t>(),
-                weights_out.data_ptr<float>(),
-                rope_cache.data_ptr<float>(),
-                positions.data_ptr<position_t>(),
-                num_rows,
-                static_cast<uint32_t>(q_input.size(1)),
-                static_cast<float>(weight_scale)};
-            const sycl::range<1> global_range(
-                ((num_rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup) * kWorkgroupSize);
-            const sycl::range<1> local_range(kWorkgroupSize);
-            sycl_kernel_submit(global_range, local_range, queue, kernel);
-          });
-        });
-  }();
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(q_input.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
+    using input_t = scalar_t;
+    AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
+      using position_t = index_t;
+      FusedQIndexerRopeHadamardFp4QuantKernel<input_t, position_t> kernel{
+          q_input.data_ptr<input_t>(),
+          q_fp4.data_ptr<int8_t>(),
+          q_scale.data_ptr<uint8_t>(),
+          weight.data_ptr<input_t>(),
+          weights_out.data_ptr<float>(),
+          rope_cache.data_ptr<float>(),
+          positions.data_ptr<position_t>(),
+          num_rows,
+          static_cast<uint32_t>(q_input.size(1)),
+          static_cast<float>(weight_scale)};
+      const sycl::range<1> global_range(((num_rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup) * kWorkgroupSize);
+      const sycl::range<1> local_range(kWorkgroupSize);
+      sycl_kernel_submit(global_range, local_range, queue, kernel);
+    });
+  });
   return {q_fp4, q_sf, weights_out};
 }

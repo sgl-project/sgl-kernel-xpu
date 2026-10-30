@@ -4,6 +4,90 @@ import torch
 from sgl_kernel.utils import _get_cache_buf, get_xpu_stream
 
 
+def bf16_dense_gemm_xe20(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Compute BF16 ``input @ weight.T`` on Xe2 with FP32 accumulation.
+
+    Both tensors must be contiguous matrices on one XPU, with K divisible
+    by 32 and N divisible by 64. The kernel uses static dense tiles without
+    expert metadata or an atomic scheduler. Tile selection is fixed; callers
+    should retain their ordinary GEMM path for shapes that are faster there.
+    """
+    return torch.ops.sgl_kernel.bf16_dense_gemm_xe20.default(input, weight)
+
+
+if hasattr(torch.ops.sgl_kernel, "bf16_dense_gemm_xe20"):
+
+    @torch.library.register_fake("sgl_kernel::bf16_dense_gemm_xe20")
+    def _bf16_dense_gemm_xe20_fake(input, weight):
+        torch._check(input.ndim == 2 and weight.ndim == 2)
+        torch._check(input.shape[1] == weight.shape[1])
+        return input.new_empty((input.shape[0], weight.shape[0]))
+
+
+def bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(m: int, n: int, k: int) -> bool:
+    """Whether this native binary has an optimized fused prefill specialization.
+
+    This checks specialization availability only. Callers own device, dtype,
+    backend and tensor eligibility, and should query outside compiled/captured
+    forwards. Older binaries expose the tensor API without this specialization;
+    an absent predicate returns False so they can retain their ordinary GEMM.
+    """
+    if not hasattr(
+        torch.ops.sgl_kernel, "bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported"
+    ):
+        return False
+    return torch.ops.sgl_kernel.bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported.default(
+        m, n, k
+    )
+
+
+def bf16_dense_gelu_tanh_mul_lut_xe20(
+    input: torch.Tensor, weight: torch.Tensor, table: torch.Tensor
+) -> torch.Tensor:
+    """Fuse BF16 dense gate/up projection, native BF16 GELU(tanh), and multiply.
+
+    ``weight`` concatenates gate and up rows. Both FP32 GEMM accumulators
+    round to BF16 before activation. ``table`` has 65536 BF16 entries indexed
+    by the gate's BF16 bit pattern and must contain the exact activation
+    contract selected by the caller. For the native BF16 GELU contract, create
+    it outside graph capture with ``gelu_tanh_and_mul`` on every BF16 bit
+    pattern concatenated with ones. Keep the table alive for graph replay.
+
+    Matrices must be contiguous BF16 on one Xe2 XPU, with positive K divisible
+    by 32 and weight rows divisible by 64. Output has half the weight rows.
+    The 2D descriptor requires M, K*2 and the weight row count to fit in
+    24 bits. Misaligned contiguous input or weight bases are copied to aligned
+    storage on the current stream. Input, weight and output element offsets
+    must fit signed int32.
+    Static tiles favor selected shapes; callers should retain a fallback.
+    Query ``bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported`` before
+    selecting the optimized prefill path, since older binaries expose this
+    tensor API with the previous, slower large-M implementation.
+    """
+    return torch.ops.sgl_kernel.bf16_dense_gelu_tanh_mul_lut_xe20.default(
+        input, weight, table
+    )
+
+
+if hasattr(torch.ops.sgl_kernel, "bf16_dense_gelu_tanh_mul_lut_xe20"):
+
+    @torch.library.register_fake("sgl_kernel::bf16_dense_gelu_tanh_mul_lut_xe20")
+    def _bf16_dense_gelu_tanh_mul_lut_xe20_fake(input, weight, table):
+        torch._check(input.ndim == 2 and weight.ndim == 2)
+        torch._check(input.shape[1] == weight.shape[1])
+        torch._check(weight.shape[0] % 64 == 0)
+        torch._check(input.shape[1] > 0)
+        torch._check(input.shape[1] % 32 == 0)
+        torch._check(input.shape[0] <= 0xFFFFFF)
+        torch._check(input.shape[1] <= 0xFFFFFF // 2)
+        torch._check(weight.shape[0] <= 0xFFFFFF)
+        torch._check(input.numel() <= 0x7FFFFFFF)
+        torch._check(weight.numel() <= 0x7FFFFFFF)
+        torch._check(input.shape[0] * (weight.shape[0] // 2) <= 0x7FFFFFFF)
+        torch._check(table.ndim == 1 and table.shape[0] == 65536)
+        return input.new_empty((input.shape[0], weight.shape[0] // 2))
+
+
 def awq_dequantize(
     qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor
 ) -> torch.ByteTensor:

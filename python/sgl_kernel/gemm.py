@@ -50,7 +50,7 @@ def _bmm_fp8_internal(
     A_scale: torch.Tensor,
     B_scale: torch.Tensor,
 ) -> None:
-    cublas_handle = torch.cuda.current_blas_handle()
+    # cublas_handle = torch.cuda.current_blas_handle()
     torch.ops.sgl_kernel.bmm_fp8.default(
         A,
         B,
@@ -58,7 +58,7 @@ def _bmm_fp8_internal(
         A_scale,
         B_scale,
         workspace_buffer,
-        cublas_handle,
+        0,
         get_xpu_stream(),
     )
 
@@ -79,6 +79,30 @@ def bmm_fp8(
         )
     workspace_buffer = _get_cache_buf("bmm_fp8_workspace", 32 * 1024 * 1024, A.device)
     _bmm_fp8_internal(workspace_buffer, A, B, out, A_scale, B_scale)
+    return out
+
+
+def bmm_bf16(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Batched matmul of 16-bit float inputs (no scaling).
+
+    A (L,M,K) and B (L,K,N) must share the same dtype: either ``torch.bfloat16``
+    or ``torch.float16``. Output D (L,M,N) may be either bf16 or fp16; defaults
+    to the input dtype when ``dtype``/``out`` are not supplied.
+    """
+    if out is None:
+        if dtype is None:
+            dtype = A.dtype
+        out = torch.empty(
+            (A.shape[0], A.shape[1], B.shape[2]),
+            device=A.device,
+            dtype=dtype,
+        )
+    torch.ops.sgl_kernel.bmm_bf16.default(A, B, out)
     return out
 
 

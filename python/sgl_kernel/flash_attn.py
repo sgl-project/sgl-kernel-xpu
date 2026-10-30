@@ -171,6 +171,7 @@ def flash_attn_with_kvcache(
     bidirectional_block_ids=None,  # Optional per-token block id (-1 = none): keys sharing a
     # query's non-negative id attend bidirectionally, causal otherwise. Prefill
     # only; pair with causal=False.
+    alibi_slopes=None,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -267,6 +268,8 @@ def flash_attn_with_kvcache(
             emits the sheared relative-bias surface. The surface's final
             dimension must be the decode padded width (a multiple of page size);
             this avoids the compatibility shear dispatch.
+        alibi_slopes [optional]: fp32 ``(nheads,)``. Adds ``-slope * |i + seqlen_k - seqlen_q - j|``
+            to the scores. Supported for paged KV attention with head dimension 128.
 
     Return:
         out: (total_q, nheads, headdim_v), where total_q = batch_size * seqlen (non-varlen)
@@ -297,6 +300,8 @@ def flash_attn_with_kvcache(
             raise NotImplementedError(
                 "bidirectional_block_ids (bidirectional-block mask) requires page_size > 1"
             )
+        if alibi_slopes is not None:
+            raise NotImplementedError("alibi_slopes requires page_size > 1")
         return _flash_attn_with_kvcache_page_size_1(
             q=q,
             k_cache=k_cache,
@@ -387,6 +392,7 @@ def flash_attn_with_kvcache(
         rel_bias,
         rel_bias_is_sheared,
         bidirectional_block_ids,
+        alibi_slopes,
     )
     return (out, softmax_lse) if return_softmax_lse else out
 

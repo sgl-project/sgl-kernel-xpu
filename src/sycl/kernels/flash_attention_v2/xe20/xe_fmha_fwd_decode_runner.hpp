@@ -250,6 +250,7 @@ struct Arguments {
   void* skip_batch_mask_ptr = nullptr;
 
   torch::TensorOptions tensor_opts;
+  const float* __restrict__ alibi_slopes_ptr = nullptr;  // [h] fp32 ALiBi slopes
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -443,7 +444,8 @@ struct DecodeRunner {
          static_cast<const ElementQ*>(params.rel_bias_ptr),
          params.rel_bias_token_stride,
          params.rel_bias_head_stride,
-         params.rel_bias_extent},
+         params.rel_bias_extent,
+         params.alibi_slopes_ptr},
         {},
         hw_info};
 
@@ -621,7 +623,8 @@ struct SplitDecodeKernelRunner {
          params.window_size_right,
          static_cast<const ElementQ*>(params.rel_bias_ptr),
          params.rel_bias_head_stride,
-         params.rel_bias_extent},
+         params.rel_bias_extent,
+         params.alibi_slopes_ptr},
         {},
         hw_info,
         params.num_kv_splits};

@@ -55,6 +55,7 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
   TORCH_CHECK(
       params.softmax_sink_ptr == nullptr,
       "No-page attention does not support sink logits (softmax_sink_ptr must be null)");
+  TORCH_CHECK(params.alibi_slopes_ptr == nullptr, "ALiBi requires paged KV cache");
   constexpr auto kTile = sgl::fmha::prefill_nopage_tile(@HEAD_DIM@);
   using TileShapeQK = cute::Shape<cute::Int<kTile.tiled_q>, cute::Int<kTile.tiled_kv>, cute::_32>;
   using TileShapePV = cute::Shape<cute::Int<kTile.tiled_q>, cute::_32, cute::Int<kTile.tiled_kv>>;

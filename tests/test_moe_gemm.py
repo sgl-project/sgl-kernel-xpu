@@ -303,7 +303,7 @@ def test_moe_gemm_gemma4_tp4_shapes(num_tokens):
     )
 
 
-def _decode_rows(num_experts, pattern):
+def _decode_rows(num_experts, pattern, tile_m):
     rows = torch.zeros(num_experts, dtype=torch.int32)
     if pattern == "round_edges":
         # One row each for experts at the ends of the 128-expert rounds and of the range.
@@ -320,8 +320,8 @@ def _decode_rows(num_experts, pattern):
             rows[min(e, num_experts - 1)] += 1
     elif pattern == "one_expert":
         rows[num_experts - 3] = 8
-    else:  # "multi_tile": 2 tokens; one expert spans two 8-row m-tiles
-        rows[1], rows[num_experts // 3], rows[num_experts - 1] = 9, 2, 5
+    else:  # "multi_tile": one expert spans two m-tiles
+        rows[1], rows[num_experts // 3], rows[num_experts - 1] = tile_m + 1, 2, 5
     return rows
 
 
@@ -334,8 +334,12 @@ def test_moe_grouped_mm_decode_routing(num_experts, pattern, kind):
     expert with more than one m-tile."""
     torch.manual_seed(0)
     k = 128
-    n = {"bf16_fused": 384, "bf16": 2048, "fp8_block": 1024}[kind]
-    rows = _decode_rows(num_experts, pattern)
+    # Small N keeps (m-tile bound) x (n-tiles) within the launch grid, the parallel-locate
+    # condition, also on GPUs with 20 Xe cores.
+    n = {"bf16_fused": 384, "bf16": 256, "fp8_block": 256}[kind]
+    # Decode sizes select 8-row bf16 tiles and 16-row FP8 tiles.
+    tile_m = 16 if kind == "fp8_block" else 8
+    rows = _decode_rows(num_experts, pattern, tile_m)
     total = int(rows.sum())
     a = torch.randn(total, k, dtype=torch.bfloat16, device=device)
     w = torch.randn(num_experts, n, k, device=device) / k**0.5

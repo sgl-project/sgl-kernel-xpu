@@ -644,14 +644,11 @@ void fused_q_indexer_rope_hadamard_quant(
     double weight_scale,
     const at::Tensor& rope_cache,
     const at::Tensor& positions);
-void fused_q_indexer_rope_hadamard_fp4_quant(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_q_indexer_rope_hadamard_fp4_quant(
     const at::Tensor& q_input,
-    at::Tensor& q_fp4,
-    at::Tensor& q_scale,
     const at::Tensor& weight,
-    at::Tensor& weights_out,
     double weight_scale,
-    const at::Tensor& rope_cache,
+    const at::Tensor& freqs_cis,
     const at::Tensor& positions);
 std::tuple<at::Tensor, at::Tensor, at::Tensor> index_q_rope_pack_weights(
     const at::Tensor& input,

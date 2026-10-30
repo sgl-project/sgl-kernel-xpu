@@ -151,80 +151,68 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
 
 }  // namespace
 
-SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_fp4_quant(
+SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_q_indexer_rope_hadamard_fp4_quant(
     const at::Tensor& q_input,
-    at::Tensor& q_fp4,
-    at::Tensor& q_scale,
     const at::Tensor& weight,
-    at::Tensor& weights_out,
     double weight_scale,
-    const at::Tensor& rope_cache,
+    const at::Tensor& freqs_cis,
     const at::Tensor& positions) {
+  // Same interface as the CUDA op in sglang.kernels.ops.attention.dsv4:
+  // outputs are allocated here, freqs_cis may be the complex64 cache
+  // [max_pos, 32] or its real float32 view [max_pos, 64], and the four
+  // ue8m0 scale bytes per head are returned packed as one int32.
+  const at::Tensor rope_cache =
+      freqs_cis.is_complex() ? at::view_as_real(freqs_cis).flatten(-2).contiguous() : freqs_cis;
   CHECK_INPUT(q_input);
-  CHECK_INPUT(q_fp4);
-  CHECK_INPUT(q_scale);
   CHECK_INPUT(weight);
-  CHECK_INPUT(weights_out);
   CHECK_INPUT(rope_cache);
   CHECK_INPUT(positions);
   CHECK_DIM(3, q_input);
-  CHECK_DIM(3, q_fp4);
-  CHECK_DIM(3, q_scale);
   CHECK_DIM(2, weight);
-  CHECK_DIM(3, weights_out);
   CHECK_DIM(2, rope_cache);
   CHECK_DIM(1, positions);
   TORCH_CHECK(q_input.size(2) == kHeadDim, "q_input head_dim must be 128");
-  TORCH_CHECK(
-      q_fp4.size(0) == q_input.size(0) && q_fp4.size(1) == q_input.size(1) && q_fp4.size(2) == kBlockSize,
-      "q_fp4 must be [B, H, 64]");
-  TORCH_CHECK(
-      q_scale.size(0) == q_input.size(0) && q_scale.size(1) == q_input.size(1) && q_scale.size(2) == kNumGroups,
-      "q_scale must be [B, H, 4]");
   TORCH_CHECK(weight.size(0) == q_input.size(0) && weight.size(1) == q_input.size(1), "weight must be [B, H]");
-  TORCH_CHECK(
-      weights_out.size(0) == q_input.size(0) && weights_out.size(1) == q_input.size(1) && weights_out.size(2) == 1,
-      "weights_out must be [B, H, 1]");
   TORCH_CHECK(
       rope_cache.size(1) == kRopeDim && positions.size(0) == q_input.size(0), "invalid rope_cache or positions shape");
   TORCH_CHECK(
       q_input.scalar_type() == at::kBFloat16 || q_input.scalar_type() == at::kHalf, "q_input must be bf16 or fp16");
   TORCH_CHECK(weight.scalar_type() == q_input.scalar_type(), "weight dtype must match q_input");
-  TORCH_CHECK(
-      q_fp4.scalar_type() == at::kChar && q_scale.scalar_type() == at::kByte,
-      "q_fp4 must be int8 and q_scale must be uint8");
-  TORCH_CHECK(
-      weights_out.scalar_type() == at::kFloat && rope_cache.scalar_type() == at::kFloat,
-      "weights_out and rope_cache must be float32");
+  TORCH_CHECK(rope_cache.scalar_type() == at::kFloat, "rope_cache must be float32 (or complex64 freqs_cis)");
   TORCH_CHECK(
       positions.scalar_type() == at::kInt || positions.scalar_type() == at::kLong, "positions must be int32 or int64");
-  TORCH_CHECK(
-      q_input.is_contiguous() && q_fp4.is_contiguous() && q_scale.is_contiguous() && weight.is_contiguous() &&
-          weights_out.is_contiguous() && rope_cache.is_contiguous() && positions.is_contiguous(),
-      "inputs and outputs must be contiguous");
-  if (q_input.numel() == 0) return;
 
-  const uint32_t num_rows = static_cast<uint32_t>(q_input.size(0) * q_input.size(1));
+  const int64_t batch = q_input.size(0);
+  const int64_t heads = q_input.size(1);
+  at::Tensor q_fp4 = at::empty({batch, heads, kBlockSize}, q_input.options().dtype(at::kChar));
+  // One packed int32 per head; the kernel writes its four ue8m0 exponent
+  // bytes through this zero-copy uint8 view.
+  at::Tensor q_sf = at::empty({batch, heads}, q_input.options().dtype(at::kInt));
+  at::Tensor q_scale = q_sf.view(at::kByte).view({batch, heads, kNumGroups});
+  at::Tensor weights_out = at::empty({batch, heads, 1}, q_input.options().dtype(at::kFloat));
+  if (q_input.numel() == 0) return {q_fp4, q_sf, weights_out};
+
+  const uint32_t num_rows = static_cast<uint32_t>(batch * heads);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
-  SYCL_DISPATCH_FLOATING_TYPES(
-      at::kHalf, at::kBFloat16, q_input.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
-        using input_t = scalar_t;
-        AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
-          using position_t = index_t;
-          FusedQIndexerRopeHadamardFp4QuantKernel<input_t, position_t> kernel{
-              q_input.data_ptr<input_t>(),
-              q_fp4.data_ptr<int8_t>(),
-              q_scale.data_ptr<uint8_t>(),
-              weight.data_ptr<input_t>(),
-              weights_out.data_ptr<float>(),
-              rope_cache.data_ptr<float>(),
-              positions.data_ptr<position_t>(),
-              num_rows,
-              static_cast<uint32_t>(q_input.size(1)),
-              static_cast<float>(weight_scale)};
-          const sycl::range<1> global_range(((num_rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup) * kWorkgroupSize);
-          const sycl::range<1> local_range(kWorkgroupSize);
-          sycl_kernel_submit(global_range, local_range, queue, kernel);
-        });
-      });
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(q_input.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
+    using input_t = scalar_t;
+    AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
+      using position_t = index_t;
+      FusedQIndexerRopeHadamardFp4QuantKernel<input_t, position_t> kernel{
+          q_input.data_ptr<input_t>(),
+          q_fp4.data_ptr<int8_t>(),
+          q_scale.data_ptr<uint8_t>(),
+          weight.data_ptr<input_t>(),
+          weights_out.data_ptr<float>(),
+          rope_cache.data_ptr<float>(),
+          positions.data_ptr<position_t>(),
+          num_rows,
+          static_cast<uint32_t>(q_input.size(1)),
+          static_cast<float>(weight_scale)};
+      const sycl::range<1> global_range(((num_rows + kRowsPerWorkgroup - 1) / kRowsPerWorkgroup) * kWorkgroupSize);
+      const sycl::range<1> local_range(kWorkgroupSize);
+      sycl_kernel_submit(global_range, local_range, queue, kernel);
+    });
+  });
+  return {q_fp4, q_sf, weights_out};
 }

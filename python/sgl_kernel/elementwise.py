@@ -880,3 +880,65 @@ def fused_k_norm_rope_flashmla(
     torch.ops.sgl_kernel.fused_k_norm_rope_flashmla(
         kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, page_size
     )
+
+
+def fused_q_indexer_rope_hadamard_fp4_quant(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    r"""Fused Q-indexer RoPE + Hadamard + MXFP4 quant for DeepSeek-V4.
+
+    Mirrors the CUDA ``fused_q_indexer_rope_hadamard_fp4_quant`` in
+    ``sglang.kernels.ops.attention.dsv4.norm_rope``: same signature, same
+    return layout, so callers need no backend-specific code.
+
+    Parameters
+    ----------
+    q_input: torch.Tensor
+        Shape ``(B, H, 128)``, bf16/fp16, contiguous.
+    weight: torch.Tensor
+        Shape ``(B, H)``, same dtype as ``q_input``.
+    weight_scale: float
+        Multiplier fused into ``weights_out``.
+    freqs_cis: torch.Tensor
+        Complex64 ``(max_pos, 32)``, or its real float32 view ``(max_pos, 64)``
+        interleaved ``[re0, im0, ...]``.
+    positions: torch.Tensor
+        Shape ``(B,)``, int32 or int64.
+
+    Returns
+    -------
+    ``((q_fp4, q_sf), weights_out)`` — int8 packed payload ``(B, H, 64)``,
+    one packed int32 ue8m0 scale per head ``(B, H)``, and float32
+    ``(B, H, 1)`` fused weights.
+    """
+    freqs_real = (
+        torch.view_as_real(freqs_cis).flatten(-2)
+        if freqs_cis.is_complex()
+        else freqs_cis
+    )
+    q_fp4 = torch.empty(
+        (*q_input.shape[:-1], q_input.shape[-1] // 2),
+        dtype=torch.int8,
+        device=q_input.device,
+    )
+    q_sf = torch.empty(q_input.shape[:-1], dtype=torch.int32, device=q_input.device)
+    weights_out = torch.empty(
+        (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
+    )
+    torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_fp4_quant(
+        q_input,
+        q_fp4,
+        # The SYCL op takes the four ue8m0 exponent bytes per head unpacked;
+        # viewing the int32 buffer is zero-copy, so q_sf is filled in place.
+        q_sf.view(torch.uint8).view(*q_input.shape[:-1], q_input.shape[-1] // 32),
+        weight,
+        weights_out,
+        float(weight_scale),
+        freqs_real,
+        positions,
+    )
+    return (q_fp4, q_sf), weights_out

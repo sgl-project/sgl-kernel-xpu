@@ -2,6 +2,9 @@ import pytest
 import torch
 from sgl_kernel import fused_q_indexer_rope_hadamard_fp4_quant
 
+# The raw out-parameter op, for tests that drive hand-built buffers.
+_raw_fp4_quant_op = torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_fp4_quant
+
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available(), reason="XPU not available"
 )
@@ -72,7 +75,7 @@ def test_fp4_fused_q_midpoint_rounding(midpoint, expected_code):
     payload = torch.empty(1, 1, FP4_DIM, device=device, dtype=torch.int8)
     scales = torch.empty(1, 1, SCALE_GROUPS, device=device, dtype=torch.uint8)
     weights_out = torch.empty(1, 1, 1, device=device)
-    fused_q_indexer_rope_hadamard_fp4_quant(
+    _raw_fp4_quant_op(
         q, payload, scales, weight, weights_out, 1.0, rope_cache, positions
     )
     indices = torch.arange(HEAD_DIM, device=device)
@@ -119,30 +122,17 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int, input_scale: f
     q_input.mul_(input_scale)
     weight = torch.randn(batch_size, num_heads, device=device, dtype=torch.bfloat16)
     positions = (torch.arange(batch_size, device=device, dtype=torch.int32) * 7) % 63
-    rope_cache = torch.view_as_real(_make_freqs_cis(64, device)).flatten(-2)
-    q_fp4 = torch.empty(
-        (batch_size, num_heads, FP4_DIM), device=device, dtype=torch.int8
-    )
-    q_scale = torch.empty(
-        (batch_size, num_heads, SCALE_GROUPS), device=device, dtype=torch.uint8
-    )
-    weights_out = torch.empty(
-        (batch_size, num_heads, 1), device=device, dtype=torch.float32
-    )
+    freqs_cis = _make_freqs_cis(64, device)
+    rope_cache = torch.view_as_real(freqs_cis).flatten(-2)
 
-    fused_q_indexer_rope_hadamard_fp4_quant(
-        q_input,
-        q_fp4,
-        q_scale,
-        weight,
-        weights_out,
-        weight_scale,
-        rope_cache,
-        positions,
+    # The CUDA-parity wrapper allocates the outputs and packs the scales.
+    (q_fp4, q_sf), weights_out = fused_q_indexer_rope_hadamard_fp4_quant(
+        q_input, weight, weight_scale, freqs_cis, positions
     )
     torch.xpu.synchronize()
 
     assert q_fp4.dtype == torch.int8
+    assert q_sf.dtype == torch.int32 and q_sf.shape == (batch_size, num_heads)
     reference = q_input.float()
     frequency = rope_cache[positions].view(batch_size, 1, 32, 2)
     rope = reference[..., -64:].view(batch_size, num_heads, 32, 2)
@@ -163,14 +153,10 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int, input_scale: f
     reference = (_fwht128(reference) * (HEAD_DIM**-0.5)).to(q_input.dtype).float()
     ref_fp4, ref_scale = _ref_quantize_fp4_indexer(reference)
     ref_fp4 = ref_fp4.view(batch_size, num_heads, FP4_DIM)
-    ref_scale = (
-        ref_scale.view(batch_size, num_heads)
-        .view(torch.uint8)
-        .view(batch_size, num_heads, SCALE_GROUPS)
-    )
+    ref_scale = ref_scale.view(batch_size, num_heads)
 
     torch.testing.assert_close(q_fp4.cpu(), ref_fp4.cpu())
-    torch.testing.assert_close(q_scale.cpu(), ref_scale.cpu())
+    torch.testing.assert_close(q_sf.cpu(), ref_scale.cpu())
     torch.testing.assert_close(
         weights_out.cpu(), weight.cpu().float().unsqueeze(-1) * weight_scale
     )

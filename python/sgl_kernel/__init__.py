@@ -117,6 +117,7 @@ from sgl_kernel.gemm import (
     dsv3_router_gemm,
     fp8_blockwise_scaled_mm,
     fp8_scaled_mm,
+    fp8_w8a16_mm,
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,
     qserve_w4a8_per_group_gemm,

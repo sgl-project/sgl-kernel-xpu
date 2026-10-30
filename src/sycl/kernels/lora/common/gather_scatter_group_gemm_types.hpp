@@ -58,20 +58,10 @@
 #include "sycl/kernels/lora/collective/xe_scatter_group_epilogue.hpp"
 #include "sycl/kernels/lora/collective/xe_segment_problem_shape.hpp"
 #include "sycl/kernels/lora/collective/xe_segment_tile_scheduler.hpp"
+#include "sycl/kernels/lora/common/lora_element_type.hpp"
 #include "sycl/kernels/lora/device/group_gemm_lora_launcher.hpp"
 
 namespace at::native::xpu::lora {
-
-template <typename T>
-struct ToCuteElementType;
-template <>
-struct ToCuteElementType<at::BFloat16> {
-  using type = cute::bfloat16_t;
-};
-template <>
-struct ToCuteElementType<at::Half> {
-  using type = cute::half_t;
-};
 
 // BM x (SG_N * NSG_N) x BK work-group tile; NSG_N sub-groups along N share the TiledMma and
 // SGK copies of it split K.
@@ -86,7 +76,7 @@ template <
     class Epilogue_,
     bool BLOCK_B>
 struct GatherScatterGroupGemmTypes {
-  using Element = typename ToCuteElementType<TensorDType>::type;
+  using Element = typename at::native::xpu::ToCutlassElementType<TensorDType>::type;
   using TileShape = cute::Shape<cute::Int<BM>, cute::Int<SG_N * NSG_N>, cute::Int<BK>>;
   using ThreadLayout = cute::Layout<cute::Shape<cute::_1, cute::Int<NSG_N>, cute::_1>>;
   using MmaAtom = cute::XE_DPAS_TT<8, float, Element>;

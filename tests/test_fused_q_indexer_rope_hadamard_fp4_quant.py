@@ -2,9 +2,6 @@ import pytest
 import torch
 from sgl_kernel import fused_q_indexer_rope_hadamard_fp4_quant
 
-# The raw out-parameter op, for tests that drive hand-built buffers.
-_raw_fp4_quant_op = torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_fp4_quant
-
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available(), reason="XPU not available"
 )
@@ -72,12 +69,10 @@ def test_fp4_fused_q_midpoint_rounding(midpoint, expected_code):
     rope_cache[0, 2] = (4 - midpoint) / (2 * scale)
     positions = torch.zeros(1, device=device, dtype=torch.int32)
     weight = torch.ones(1, 1, device=device, dtype=torch.bfloat16)
-    payload = torch.empty(1, 1, FP4_DIM, device=device, dtype=torch.int8)
-    scales = torch.empty(1, 1, SCALE_GROUPS, device=device, dtype=torch.uint8)
-    weights_out = torch.empty(1, 1, 1, device=device)
-    _raw_fp4_quant_op(
-        q, payload, scales, weight, weights_out, 1.0, rope_cache, positions
+    (payload, q_sf), _ = fused_q_indexer_rope_hadamard_fp4_quant(
+        q, weight, 1.0, rope_cache, positions
     )
+    scales = q_sf.view(torch.uint8).view(1, 1, SCALE_GROUPS)
     indices = torch.arange(HEAD_DIM, device=device)
     codes = torch.where((indices & 2) == 0, 6, expected_code)
     codes = (codes | torch.where((indices & 64) != 0, 8, 0)).to(torch.uint8)
@@ -125,7 +120,7 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int, input_scale: f
     freqs_cis = _make_freqs_cis(64, device)
     rope_cache = torch.view_as_real(freqs_cis).flatten(-2)
 
-    # The CUDA-parity wrapper allocates the outputs and packs the scales.
+    # The op allocates the outputs itself and packs the scales (CUDA parity).
     (q_fp4, q_sf), weights_out = fused_q_indexer_rope_hadamard_fp4_quant(
         q_input, weight, weight_scale, freqs_cis, positions
     )

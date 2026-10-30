@@ -160,6 +160,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "qsa_mqa_decode(Tensor q, Tensor k_cache, Tensor page_table, Tensor context_lens, "
       "int max_model_len, float? score_scale=None) -> Tensor");
   m.impl("qsa_mqa_decode", torch::kXPU, &qsa_mqa_decode);
+#endif
+
+#ifdef USE_QSA_PREPARE
   m.def(
       "qsa_index_q_norm_rope_store(Tensor qk, Tensor positions, Tensor cos_sin_cache, Tensor axis_map, "
       "Tensor weight, Tensor cache_loc, Tensor(a!) key_state_buffer, Tensor(b!) rope_position_buffer, "

@@ -1,4 +1,4 @@
-"""Benchmark fused Xe2 QSA preparation against equivalent Torch eager operations."""
+"""Benchmark fused QSA preparation against equivalent Torch eager operations."""
 
 import argparse
 import itertools

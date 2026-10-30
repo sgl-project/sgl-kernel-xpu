@@ -322,6 +322,25 @@ def sgl_per_token_quant_fp8(
     torch.ops.sgl_kernel.sgl_per_token_quant_fp8.default(input, output_q, output_s)
 
 
+def sgl_per_token_quant_int8(
+    x: torch.Tensor,
+    scale_dtype: torch.dtype = torch.float32,
+    cal_sum: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    assert x.ndim >= 1 and x.shape[-1] > 0, "x must have a nonempty last dimension"
+    x_q = torch.empty_like(x, device=x.device, dtype=torch.int8)
+    scales = torch.empty(x.shape[:-1] + (1,), device=x.device, dtype=scale_dtype)
+    if cal_sum:
+        x_sum = torch.empty(x.shape[:-1], device=x.device, dtype=x.dtype)
+    else:
+        x_sum = None
+    torch.ops.sgl_kernel.sgl_per_token_quant_int8.default(x, x_q, scales, x_sum)
+    if cal_sum:
+        return x_q, scales, x_sum
+    else:
+        return x_q, scales
+
+
 def cutlass_scaled_fp4_mm(
     a: torch.Tensor,
     b: torch.Tensor,

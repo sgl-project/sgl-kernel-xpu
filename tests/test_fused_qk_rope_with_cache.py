@@ -62,7 +62,7 @@ def fused_qk_rope_with_cache(
 # ---------------------------------------------------------------------------
 
 BS_LIST = [1, 128, 2048]
-NUM_KV_HEADS_LIST = [1, 4]
+NUM_KV_HEADS_LIST = [1, 4, 8]
 GQA_RATIO = [1, 8]
 ROPE_DIM_LIST = [64, 128, 256, 512]
 IS_NEOX_LIST = [False, True]

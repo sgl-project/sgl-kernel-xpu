@@ -149,6 +149,7 @@ suites = {
         BenchFile("bench_grouped_gemma_rmsnorm.py"),
         BenchFile("bench_qwen4_ple_gate.py"),
         BenchFile("bench_qwen4_ngram_hash.py"),
+        BenchFile("bench_qwen4_short_conv.py"),
         BenchFile("bench_sigmoid_mul.py"),
     ],
 }

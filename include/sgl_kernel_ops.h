@@ -182,7 +182,8 @@ void fused_inplace_qknorm_rope(
     bool is_neox,
     double eps,
     int64_t head_dim,
-    int64_t rope_dim);
+    int64_t rope_dim,
+    bool round_norm_before_rope);
 void topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gating_output, bool renormalize);
 void topk_sigmoid(
     at::Tensor& topk_weights,

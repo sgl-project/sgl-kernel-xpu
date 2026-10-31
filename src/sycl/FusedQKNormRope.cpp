@@ -813,6 +813,238 @@ void launchFusedQKNormRopeCacheVecImpl(
   sycl_kernel_submit(sycl::range<1>(gridSize * blockSize), sycl::range<1>(blockSize), queue, kernel);
 }
 
+// round_norm_before_rope: reproduce PyTorch eager `nn.RMSNorm` followed by
+// RoPE in the activation dtype, bit for bit on XPU. The norm output is rounded
+// to scalar_t before RoPE, and each RoPE product and the sum are rounded, as
+// eager rounds every op. The sum of squares follows torch-xpu's RMSNorm order
+// for head_dim 64 and 128: head_dim / 4 "torch lanes" of 4 consecutive elements
+// accumulated left to right, then a pairwise tree (lane i + lane i + half, ...).
+// With 16-lane sub-groups each SYCL lane holds head_dim / 64 such partials.
+template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename IdType, int64_t kVecSize>
+struct FusedQKNormRopeCacheEagerKernel {
+  static constexpr uint32_t kElemsPerThread = static_cast<uint32_t>(kHeadDim / NUM_REDUCE_STAGES);
+  static constexpr uint32_t kTorchLaneElems = 4;
+  static constexpr uint32_t kPartials = kElemsPerThread / kTorchLaneElems;
+  static_assert(kElemsPerThread % kTorchLaneElems == 0, "lane must hold whole torch-xpu reduction lanes");
+  static_assert(kElemsPerThread % 2 == 0, "interleaved pairs must stay within a lane");
+  static_assert(kElemsPerThread % kVecSize == 0, "kVecSize must evenly divide kElemsPerThread");
+  static constexpr uint32_t kNumChunks = kElemsPerThread / kVecSize;
+
+  scalar_t* q_ptr;
+  scalar_t* k_ptr;
+  const scalar_t* q_weight_ptr;
+  const scalar_t* k_weight_ptr;
+  const float* cos_sin_cache_ptr;  // [max_position, rope_dim]
+  const IdType* positions;         // [num_tokens]
+  int64_t rope_dim;
+  int64_t q_token_stride;
+  int64_t k_token_stride;
+  int64_t q_head_stride;
+  int64_t k_head_stride;
+  uint32_t num_qo_heads;
+  uint32_t num_kv_heads;
+  uint32_t num_tokens;
+  float eps;
+
+  static inline float roundToScalar(float v) {
+    return static_cast<float>(static_cast<scalar_t>(v));
+  }
+
+  [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item) const {
+    // every product and sum must round separately, as the eager ops do
+#pragma clang fp contract(off)
+    auto sg = item.get_sub_group();
+    const uint32_t lane_id = static_cast<uint32_t>(item.get_local_id(0) % NUM_REDUCE_STAGES);
+    const uint32_t warp_id = static_cast<uint32_t>(item.get_local_id(0) / NUM_REDUCE_STAGES);
+    const uint32_t warps_per_block = static_cast<uint32_t>(item.get_local_range(0) / NUM_REDUCE_STAGES);
+    const uint32_t start_worker_id = static_cast<uint32_t>(item.get_group(0)) * warps_per_block + warp_id;
+    const uint32_t num_workers = static_cast<uint32_t>(item.get_group_range(0)) * warps_per_block;
+    const uint32_t num_qk_heads = num_qo_heads + num_kv_heads;
+    const uint32_t num_works = num_qk_heads * num_tokens;
+
+    // NeoX pairs dim d with d +/- rope_dim / 2, which the launcher aligns to whole lanes
+    const int64_t half_rotary_lanes = rope_dim / 2 / kElemsPerThread;
+    const bool first_half = static_cast<int64_t>(lane_id) < half_rotary_lanes;
+    const bool neox_rotary_lane = static_cast<int64_t>(lane_id) < 2 * half_rotary_lanes;
+    uint32_t partner_lane = lane_id;
+    if (kIsNeox && neox_rotary_lane) {
+      partner_lane = static_cast<uint32_t>(first_half ? lane_id + half_rotary_lanes : lane_id - half_rotary_lanes);
+    }
+
+    for (uint32_t idx = start_worker_id; idx < num_works; idx += num_workers) {
+      const uint32_t token_id = idx / num_qk_heads;
+      const uint32_t head_id = idx % num_qk_heads;
+      const bool load_q = head_id < num_qo_heads;
+      scalar_t* row_ptr;
+      const scalar_t* weight_ptr;
+      if (load_q) {
+        row_ptr =
+            rowPtr(q_ptr, static_cast<int64_t>(token_id), static_cast<int64_t>(head_id), q_token_stride, q_head_stride);
+        weight_ptr = q_weight_ptr;
+      } else {
+        row_ptr = rowPtr(
+            k_ptr,
+            static_cast<int64_t>(token_id),
+            static_cast<int64_t>(head_id - num_qo_heads),
+            k_token_stride,
+            k_head_stride);
+        weight_ptr = k_weight_ptr;
+      }
+
+      using VecT = aligned_vector_loop<scalar_t, kVecSize>;
+      float elems[kElemsPerThread];
+#pragma unroll
+      for (uint32_t c = 0; c < kNumChunks; ++c) {
+        const VecT in_vec = *reinterpret_cast<const VecT*>(row_ptr + lane_id * kElemsPerThread + c * kVecSize);
+#pragma unroll
+        for (uint32_t v = 0; v < kVecSize; ++v) {
+          elems[c * kVecSize + v] = static_cast<float>(in_vec[v]);
+        }
+      }
+
+      float partial[kPartials];
+#pragma unroll
+      for (uint32_t p = 0; p < kPartials; ++p) {
+        const float* x = elems + p * kTorchLaneElems;
+        float s = x[0] * x[0];
+#pragma unroll
+        for (uint32_t e = 1; e < kTorchLaneElems; ++e) {
+          const float sq = x[e] * x[e];
+          s = s + sq;
+        }
+        partial[p] = s;
+      }
+#pragma unroll
+      for (int mask = NUM_REDUCE_STAGES / 2; mask >= 1; mask >>= 1) {
+#pragma unroll
+        for (uint32_t p = 0; p < kPartials; ++p) {
+          partial[p] = partial[p] + sycl::permute_group_by_xor(sg, partial[p], mask);
+        }
+      }
+      float sum_of_squares = partial[0];
+#pragma unroll
+      for (uint32_t p = 1; p < kPartials; ++p) {
+        sum_of_squares = sum_of_squares + partial[p];
+      }
+      const float rstd = sycl::rsqrt(sum_of_squares / static_cast<float>(kHeadDim) + eps);
+
+#pragma unroll
+      for (uint32_t c = 0; c < kNumChunks; ++c) {
+        const VecT w_vec = *reinterpret_cast<const VecT*>(weight_ptr + lane_id * kElemsPerThread + c * kVecSize);
+#pragma unroll
+        for (uint32_t v = 0; v < kVecSize; ++v) {
+          const float normed = elems[c * kVecSize + v] * rstd;
+          elems[c * kVecSize + v] = roundToScalar(normed * static_cast<float>(w_vec[v]));
+        }
+      }
+
+      const int64_t pos = static_cast<int64_t>(positions[token_id]);
+      const float* cos_ptr = cos_sin_cache_ptr + pos * rope_dim;
+      const float* sin_ptr = cos_ptr + rope_dim / 2;
+      if constexpr (kIsNeox) {
+        float partner[kElemsPerThread];
+#pragma unroll
+        for (uint32_t i = 0; i < kElemsPerThread; ++i) {
+          partner[i] = sycl::select_from_group(sg, elems[i], partner_lane);
+        }
+        if (neox_rotary_lane) {
+          const int64_t half_offset = first_half ? 0 : rope_dim / 2;
+#pragma unroll
+          for (uint32_t i = 0; i < kElemsPerThread; ++i) {
+            const int64_t half_idx = static_cast<int64_t>(lane_id * kElemsPerThread + i) - half_offset;
+            const float lhs = roundToScalar(elems[i] * cos_ptr[half_idx]);
+            const float rhs = roundToScalar(partner[i] * sin_ptr[half_idx]);
+            elems[i] = first_half ? lhs - rhs : lhs + rhs;
+          }
+        }
+      } else {
+#pragma unroll
+        for (uint32_t i = 0; i < kElemsPerThread; i += 2) {
+          const int64_t dim = static_cast<int64_t>(lane_id * kElemsPerThread + i);
+          if (dim < rope_dim) {
+            const float cos = cos_ptr[dim / 2];
+            const float sin = sin_ptr[dim / 2];
+            const float re = elems[i];
+            const float im = elems[i + 1];
+            elems[i] = roundToScalar(re * cos) - roundToScalar(im * sin);
+            elems[i + 1] = roundToScalar(re * sin) + roundToScalar(im * cos);
+          }
+        }
+      }
+
+#pragma unroll
+      for (uint32_t c = 0; c < kNumChunks; ++c) {
+        VecT out_vec;
+#pragma unroll
+        for (uint32_t v = 0; v < kVecSize; ++v) {
+          out_vec[v] = static_cast<scalar_t>(elems[c * kVecSize + v]);
+        }
+        *reinterpret_cast<VecT*>(row_ptr + lane_id * kElemsPerThread + c * kVecSize) = out_vec;
+      }
+    }
+  }
+};
+
+template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename IdType>
+void launchFusedQKNormRopeCacheEagerImpl(
+    scalar_t* q_ptr,
+    scalar_t* k_ptr,
+    const scalar_t* q_weight_ptr,
+    const scalar_t* k_weight_ptr,
+    const float* cos_sin_cache_ptr,
+    const IdType* positions_ptr,
+    int64_t q_token_stride,
+    int64_t k_token_stride,
+    int64_t q_head_stride,
+    int64_t k_head_stride,
+    int64_t num_tokens,
+    int64_t num_qo_heads,
+    int64_t num_kv_heads,
+    int64_t rope_dim,
+    float eps,
+    sycl::queue& queue) {
+  constexpr int64_t kElemsPerThread = kHeadDim / NUM_REDUCE_STAGES;
+  TORCH_CHECK(rope_dim > 0 && rope_dim <= kHeadDim, "Invalid rope_dim: ", rope_dim);
+  if constexpr (kIsNeox) {
+    TORCH_CHECK(
+        rope_dim % (2 * kElemsPerThread) == 0,
+        "round_norm_before_rope with NeoX RoPE needs each rotary half to cover whole lanes (rope_dim % ",
+        2 * kElemsPerThread,
+        " == 0), got ",
+        rope_dim);
+  }
+  const auto launch_cfg = computePersistentLaunchConfig(num_tokens * (num_qo_heads + num_kv_heads), NUM_REDUCE_STAGES);
+  const int64_t vec_size = pickVecSizeForRow(
+      sizeof(scalar_t),
+      {q_ptr, k_ptr, q_weight_ptr, k_weight_ptr},
+      kElemsPerThread,
+      {q_token_stride, k_token_stride, q_head_stride, k_head_stride});
+  dispatchFusedQKNormRopeVecSize<kElemsPerThread>(vec_size, [&](auto vec_size_tag) {
+    constexpr int64_t kVecSize = decltype(vec_size_tag)::value;
+    FusedQKNormRopeCacheEagerKernel<kHeadDim, kIsNeox, scalar_t, IdType, kVecSize> kernel{
+        q_ptr,
+        k_ptr,
+        q_weight_ptr,
+        k_weight_ptr,
+        cos_sin_cache_ptr,
+        positions_ptr,
+        rope_dim,
+        q_token_stride,
+        k_token_stride,
+        q_head_stride,
+        k_head_stride,
+        static_cast<uint32_t>(num_qo_heads),
+        static_cast<uint32_t>(num_kv_heads),
+        static_cast<uint32_t>(num_tokens),
+        eps};
+    sycl_kernel_submit(
+        sycl::range<1>(launch_cfg.gridSize * launch_cfg.blockSize),
+        sycl::range<1>(launch_cfg.blockSize),
+        queue,
+        kernel);
+  });
+}
+
 template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename IdType>
 void launchFusedQKNormRopeCacheImpl(
     scalar_t* q_ptr,
@@ -830,7 +1062,33 @@ void launchFusedQKNormRopeCacheImpl(
     int64_t num_kv_heads,
     int64_t rope_dim,
     float eps,
+    bool round_norm_before_rope,
     sycl::queue& queue) {
+  if (round_norm_before_rope) {
+    // the torch-xpu RMSNorm summation order is only reproduced for these head dims
+    if constexpr (kHeadDim == 64 || kHeadDim == 128) {
+      launchFusedQKNormRopeCacheEagerImpl<kHeadDim, kIsNeox, scalar_t, IdType>(
+          q_ptr,
+          k_ptr,
+          q_weight_ptr,
+          k_weight_ptr,
+          cos_sin_cache_ptr,
+          positions_ptr,
+          q_token_stride,
+          k_token_stride,
+          q_head_stride,
+          k_head_stride,
+          num_tokens,
+          num_qo_heads,
+          num_kv_heads,
+          rope_dim,
+          eps,
+          queue);
+      return;
+    } else {
+      TORCH_CHECK(false, "round_norm_before_rope supports head_dim 64 and 128, got ", kHeadDim);
+    }
+  }
   const int64_t totalWork = num_tokens * (num_qo_heads + num_kv_heads);
   const auto launch_cfg = computePersistentLaunchConfig(totalWork, NUM_REDUCE_STAGES);
 
@@ -1788,13 +2046,19 @@ SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
     bool is_neox,
     double eps,
     int64_t head_dim,
-    int64_t rope_dim) {
+    int64_t rope_dim,
+    bool round_norm_before_rope) {
   TORCH_CHECK(q.dim() == k.dim(), "q and k must have the same rank, got q:", q.dim(), " k:", k.dim());
   TORCH_CHECK(q.dim() == 3 || q.dim() == 4, "q/k must be 3D or 4D tensors, got q:", q.dim());
   TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q and k must have the same dtype");
   TORCH_CHECK(q_weight.scalar_type() == q.scalar_type(), "q_weight dtype must match q dtype");
   TORCH_CHECK(k_weight.scalar_type() == k.scalar_type(), "k_weight dtype must match k dtype");
   TORCH_CHECK(cos_sin_cache.scalar_type() == at::ScalarType::Float, "cos_sin_cache must be float32");
+  // fp16 needs a fold-proof per-op rounding and fp32's summation order is unverified
+  TORCH_CHECK(
+      !round_norm_before_rope || q.scalar_type() == at::ScalarType::BFloat16,
+      "round_norm_before_rope supports bfloat16 only, got ",
+      q.scalar_type());
 
   CHECK_DEVICE(q);
   // Only the last dimension (head_dim) needs to be contiguous; q/k may be
@@ -1896,6 +2160,7 @@ SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
               num_kv_heads,
               rope_dim,
               static_cast<float>(eps),
+              round_norm_before_rope,
               queue);
         } else {
           launchFusedQKNormRopeCacheImpl<kHeadDimConst, false, scalar_t, IdType>(
@@ -1914,6 +2179,7 @@ SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
               num_kv_heads,
               rope_dim,
               static_cast<float>(eps),
+              round_norm_before_rope,
               queue);
         }
       });

@@ -62,6 +62,7 @@ jobs:
         run: |
           docker pull "$IMAGE"
           docker run -dt --device /dev/dri/ --name "$CONTAINER" \
+            -e UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD=1 \
             -e HF_TOKEN="$(cat ~/huggingface_token.txt)" "$IMAGE"
 
       - name: Replace image-baked sgl-kernel with ${{ inputs.ref }} source

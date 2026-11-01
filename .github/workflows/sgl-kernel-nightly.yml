@@ -111,13 +111,11 @@ jobs:
         timeout-minutes: 20
         run: |
           # huggingface_hub reads HF_TOKEN from the env; `hf auth login` hits a rate-limited whoami call.
-          docker exec "${CONTAINER}" /miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
-          docker exec "${CONTAINER}" /miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
-          docker exec "${CONTAINER}" /bin/bash -c "ln -sf /miniforge3/envs/py3.12/bin/python3 /usr/bin/python3"
+          docker exec "${CONTAINER}" uv pip install pytest expecttest ray huggingface_hub tabulate
 
       - name: Verify pre-installed sgl-kernel wheel
         run: |
-          docker exec "${CONTAINER}" /miniforge3/envs/py3.12/bin/python3 -c \
+          docker exec "${CONTAINER}" python3 -c \
             "import sgl_kernel; print('sgl_kernel loaded from', sgl_kernel.__file__)"
 
       - name: Verify JIT wheel and icpx
@@ -125,7 +123,7 @@ jobs:
         if: matrix.variant == 'jit'
         run: |
           docker exec "${CONTAINER}" icpx --version
-          docker exec "${CONTAINER}" /miniforge3/envs/py3.12/bin/python3 -c \
+          docker exec "${CONTAINER}" python3 -c \
             "import os, sgl_kernel; d = os.path.join(os.path.dirname(sgl_kernel.__file__), 'include', 'sgl_src'); assert os.path.isdir(d), 'not a JIT wheel, missing ' + d; print('JIT wheel OK:', d)"
 
       # Suites keep going past failures (continue-on-error); the last step turns the job red.
@@ -135,7 +133,7 @@ jobs:
         continue-on-error: true
         run: |
           docker exec -w /root/sglang/sgl-kernel-xpu/tests "${CONTAINER}" \
-            /miniforge3/envs/py3.12/bin/python3 run_nightly_suite.py \
+            python3 run_nightly_suite.py \
               --suite sgl-kernel-test \
               --variant ${{ matrix.variant }} \
               --timeout-per-file 7200
@@ -146,7 +144,7 @@ jobs:
         continue-on-error: true
         run: |
           docker exec -w /root/sglang/sgl-kernel-xpu/tests "${CONTAINER}" \
-            /miniforge3/envs/py3.12/bin/python3 run_nightly_suite.py \
+            python3 run_nightly_suite.py \
               --suite sgl-kernel-benchmark \
               --variant ${{ matrix.variant }} \
               --timeout-per-file 1800

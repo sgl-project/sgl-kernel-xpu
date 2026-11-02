@@ -8,9 +8,18 @@ name: sgl-kernel Nightly (XPU)
 
 on:
   schedule:
-    # A few hours after the nightly image publish (12:00 UTC).
-    - cron: '0 16 * * *'
+    # Images build at 12:00 UTC (17:30 UTC+05:30). AOT and JIT run at different times
+    # so they do not compete for sglang-bmg runners. Keep in sync with `select`.
+    - cron: '30 18 * * *'   # AOT, 00:00 UTC+05:30
+    - cron: '30 22 * * *'   # JIT, 04:00 UTC+05:30
   workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Which wheel to test'
+        required: false
+        type: choice
+        options: [both, aot, jit]
+        default: both
   workflow_call:
     inputs:
       ref:
@@ -18,29 +27,56 @@ on:
         required: false
         type: string
         default: ""
+      variant:
+        description: "Which wheel to test: both, aot or jit"
+        required: false
+        type: string
+        default: both
 
 concurrency:
-  group: sgl-kernel-nightly-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
+  # The schedule string keeps the AOT and JIT crons from cancelling each other.
+  group: sgl-kernel-nightly-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}-${{ github.event.schedule }}
   cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  sgl-kernel-nightly:
+  select:
     if: github.repository == 'sgl-project/sgl-kernel-xpu'
+    runs-on: ubuntu-latest
+    outputs:
+      variants: ${{ steps.pick.outputs.variants }}
+    steps:
+      - name: Pick AOT/JIT for this trigger
+        id: pick
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+          VARIANT: ${{ inputs.variant }}
+        run: |
+          case "${SCHEDULE}" in
+            '30 18 * * *') v='["aot"]' ;;
+            '30 22 * * *') v='["jit"]' ;;
+            *)
+              case "${VARIANT}" in
+                aot) v='["aot"]' ;;
+                jit) v='["jit"]' ;;
+                *)   v='["aot","jit"]' ;;
+              esac ;;
+          esac
+          echo "schedule='${SCHEDULE}' variant='${VARIANT}' -> ${v}"
+          echo "variants=${v}" >> "$GITHUB_OUTPUT"
+
+  sgl-kernel-nightly:
+    needs: select
     runs-on: sglang-bmg
     strategy:
       # Same suites for both wheels; one variant failing must not cancel the other.
       fail-fast: false
       matrix:
-        include:
-          - variant: aot
-            image: intel/sgl-kernel-xpu-dev:latest
-          - variant: jit
-            image: intel/sgl-kernel-xpu-dev:latest-jit
+        variant: ${{ fromJSON(needs.select.outputs.variants) }}
     name: sgl-kernel-nightly (${{ matrix.variant }})
     env:
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
       DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
-      IMAGE: ${{ matrix.image }}
+      IMAGE: intel/sgl-kernel-xpu-dev:${{ matrix.variant == 'jit' && 'latest-jit' || 'latest' }}
       CONTAINER: sgl_kernel_nightly_${{ matrix.variant }}
     steps:
       - name: Checkout code

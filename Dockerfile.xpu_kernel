@@ -18,6 +18,8 @@ ARG SG_LANG_BRANCH=main
 
 ARG SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git
 ARG SG_LANG_KERNEL_BRANCH=main
+# ON builds the runtime-JIT wheel (FMHA/MLA/MoE/GDN compiled on first use).
+ARG USE_SYCL_JIT=OFF
 
 # Pin the compute UMD + IGC. The kobuk-team PPA is rolling; an untested build
 # mismatched the host xe KMD and faulted libze_intel_gpu.so on the B580 runner.
@@ -84,7 +86,7 @@ RUN --mount=type=secret,id=github_token \
     echo "cloning ${SG_LANG_KERNEL_REPO} from ${SG_LANG_KERNEL_BRANCH}" && \
     git clone --branch ${SG_LANG_KERNEL_BRANCH} --single-branch ${SG_LANG_KERNEL_REPO} && \
     cd sgl-kernel-xpu && \
-    pip install -v . &&\
+    USE_SYCL_JIT=${USE_SYCL_JIT} pip install -v . &&\
     # Install required packages for sglang workloads
     pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops matplotlib pandas --root-user-action=ignore aiohttp && \
     conda install libsqlite=3.48.0 -y && \

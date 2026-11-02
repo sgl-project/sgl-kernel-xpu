@@ -13,6 +13,20 @@ jobs:
     if: github.repository == 'sgl-project/sgl-kernel-xpu'
     runs-on: sglang-bmg
     environment: 'prod'
+    strategy:
+      # A JIT build failure must not block the AOT image the PR CI depends on.
+      fail-fast: false
+      matrix:
+        include:
+          - variant: aot
+            use_sycl_jit: 'OFF'
+            tag_prefix: nightly-dev-xpu-bmg
+            latest_tag: latest
+          - variant: jit
+            use_sycl_jit: 'ON'
+            tag_prefix: nightly-dev-xpu-bmg-jit
+            latest_tag: latest-jit
+    name: publish (${{ matrix.variant }})
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,7 +44,7 @@ jobs:
             echo "::error::Could not resolve commit hash"
             exit 1
           fi
-          image_tag="nightly-dev-xpu-bmg-${date_tag}-${commit_hash}"
+          image_tag="${{ matrix.tag_prefix }}-${date_tag}-${commit_hash}"
           echo "DATE=${date_tag}" >> $GITHUB_ENV
           echo "commit_hash=${commit_hash}" >> $GITHUB_OUTPUT
           echo "IMAGE_TAG=${image_tag}" >> $GITHUB_ENV
@@ -47,14 +61,15 @@ jobs:
 
       - name: Build intel/sgl-kernel-xpu-dev
         run: |
-          echo "Building intel/sgl-kernel-xpu-dev:${{ env.IMAGE_TAG }}"
+          echo "Building intel/sgl-kernel-xpu-dev:${{ env.IMAGE_TAG }} (USE_SYCL_JIT=${{ matrix.use_sycl_jit }})"
           docker build sgl-kernel-xpu-nightly-build \
             -f sgl-kernel-xpu-nightly-build/Dockerfile.xpu_kernel \
             --build-arg SG_LANG_KERNEL_REPO=https://github.com/sgl-project/sgl-kernel-xpu.git \
             --build-arg SG_LANG_KERNEL_BRANCH=main \
+            --build-arg USE_SYCL_JIT=${{ matrix.use_sycl_jit }} \
             --no-cache --progress=plain \
             -t "intel/sgl-kernel-xpu-dev:${{ env.IMAGE_TAG }}" \
-            -t "intel/sgl-kernel-xpu-dev:latest"
+            -t "intel/sgl-kernel-xpu-dev:${{ matrix.latest_tag }}"
 
       - name: Push intel/sgl-kernel-xpu-dev
         run: |
@@ -67,4 +82,4 @@ jobs:
             return 1
           }
           push_with_retry "intel/sgl-kernel-xpu-dev:${{ env.IMAGE_TAG }}"
-          push_with_retry "intel/sgl-kernel-xpu-dev:latest"
+          push_with_retry "intel/sgl-kernel-xpu-dev:${{ matrix.latest_tag }}"

@@ -2,8 +2,9 @@ name: sgl-kernel Nightly (XPU)
 
 # Fully independent of pr-test-xpu.yml. Runs the nightly-only kernel
 # and benchmark suites defined in tests/run_nightly_suite.py against the
-# published intel/sgl-kernel-xpu-dev:latest wheel (built by
-# release-docker-xpu-kernel-nightly.yml).
+# published AOT (intel/sgl-kernel-xpu-dev:latest) and JIT
+# (intel/sgl-kernel-xpu-dev:latest-jit, USE_SYCL_JIT=ON) wheels, both built
+# by release-docker-xpu-kernel-nightly.yml.
 
 on:
   schedule:
@@ -37,9 +38,21 @@ jobs:
   sgl-kernel-nightly:
     if: github.repository == 'sgl-project/sgl-kernel-xpu'
     runs-on: sglang-bmg
+    strategy:
+      # Same suites for both wheels; one variant failing must not cancel the other.
+      fail-fast: false
+      matrix:
+        include:
+          - variant: aot
+            image: intel/sgl-kernel-xpu-dev:latest
+          - variant: jit
+            image: intel/sgl-kernel-xpu-dev:latest-jit
+    name: sgl-kernel-nightly (${{ matrix.variant }})
     env:
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
       DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
+      IMAGE: ${{ matrix.image }}
+      CONTAINER: sgl_kernel_nightly_${{ matrix.variant }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -49,15 +62,15 @@ jobs:
 
       - name: Pull nightly Docker image
         run: |
-          docker pull intel/sgl-kernel-xpu-dev:latest
+          docker pull "${IMAGE}"
 
       - name: Run container
         run: |
           docker run -dt \
             --device /dev/dri/ \
-            --name sgl_kernel_nightly \
+            --name "${CONTAINER}" \
             -e HF_TOKEN=$(cat ~/huggingface_token.txt) \
-            intel/sgl-kernel-xpu-dev:latest
+            "${IMAGE}"
 
       - name: Sync tests/ and benchmark/ from checkout into container
         # The nightly image bakes tests/ and benchmark/ at build time, so any
@@ -66,26 +79,34 @@ jobs:
         # always exercises the current source-of-truth harness against the
         # shipped wheel.
         run: |
-          docker cp ./tests/. sgl_kernel_nightly:/root/sglang/sgl-kernel-xpu/tests/
-          docker cp ./benchmark/. sgl_kernel_nightly:/root/sglang/sgl-kernel-xpu/benchmark/
+          docker cp ./tests/. "${CONTAINER}":/root/sglang/sgl-kernel-xpu/tests/
+          docker cp ./benchmark/. "${CONTAINER}":/root/sglang/sgl-kernel-xpu/benchmark/
 
       - name: Install runner extras
         timeout-minutes: 20
         run: |
           # huggingface_hub reads HF_TOKEN from the env; `hf auth login` hits a rate-limited whoami call.
-          docker exec sgl_kernel_nightly /miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
-          docker exec sgl_kernel_nightly /miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
-          docker exec sgl_kernel_nightly /bin/bash -c "ln -sf /miniforge3/envs/py3.12/bin/python3 /usr/bin/python3"
+          docker exec "${CONTAINER}" /miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
+          docker exec "${CONTAINER}" /miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate
+          docker exec "${CONTAINER}" /bin/bash -c "ln -sf /miniforge3/envs/py3.12/bin/python3 /usr/bin/python3"
 
       - name: Verify pre-installed sgl-kernel wheel
         run: |
-          docker exec sgl_kernel_nightly /miniforge3/envs/py3.12/bin/python3 -c \
+          docker exec "${CONTAINER}" /miniforge3/envs/py3.12/bin/python3 -c \
             "import sgl_kernel; print('sgl_kernel loaded from', sgl_kernel.__file__)"
+
+      - name: Verify JIT wheel and icpx
+        # sgl_src/ is only packaged by USE_SYCL_JIT=ON; JIT kernels compile with icpx on first use.
+        if: matrix.variant == 'jit'
+        run: |
+          docker exec "${CONTAINER}" icpx --version
+          docker exec "${CONTAINER}" /miniforge3/envs/py3.12/bin/python3 -c \
+            "import os, sgl_kernel; d = os.path.join(os.path.dirname(sgl_kernel.__file__), 'include', 'sgl_src'); assert os.path.isdir(d), 'not a JIT wheel, missing ' + d; print('JIT wheel OK:', d)"
 
       - name: sgl-kernel-test (nightly kernel suite)
         timeout-minutes: 240
         run: |
-          docker exec -w /root/sglang/sgl-kernel-xpu/tests sgl_kernel_nightly \
+          docker exec -w /root/sglang/sgl-kernel-xpu/tests "${CONTAINER}" \
             /miniforge3/envs/py3.12/bin/python3 run_nightly_suite.py \
               --suite sgl-kernel-test \
               --timeout-per-file 7200 \
@@ -96,7 +117,7 @@ jobs:
       - name: sgl-kernel-benchmark (nightly benchmark suite)
         timeout-minutes: 60
         run: |
-          docker exec -w /root/sglang/sgl-kernel-xpu/tests sgl_kernel_nightly \
+          docker exec -w /root/sglang/sgl-kernel-xpu/tests "${CONTAINER}" \
             /miniforge3/envs/py3.12/bin/python3 run_nightly_suite.py \
               --suite sgl-kernel-benchmark \
               --timeout-per-file 1800 \
@@ -107,7 +128,7 @@ jobs:
       - name: Cleanup container
         if: always()
         run: |
-          docker rm -f sgl_kernel_nightly || true
+          docker rm -f "${CONTAINER}" || true
 
   check-all-jobs:
     if: always() && (github.repository == 'sgl-project/sgl-kernel-xpu' || github.event_name == 'workflow_dispatch')

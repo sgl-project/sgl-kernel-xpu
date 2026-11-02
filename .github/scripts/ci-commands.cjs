@@ -41,7 +41,7 @@ module.exports = async function handleCommand({ github, context, core }) {
     });
     const candidates = runs.filter((run) => run.head_sha === pr.head.sha &&
       (run.pull_requests.some((pull) => pull.number === pr.number) ||
-       (run.head_branch === pr.head.ref &&
+       (run.pull_requests.length === 0 && run.head_branch === pr.head.ref &&
         run.head_repository.full_name === pr.head.repo.full_name)));
     if (workflow === "pr-test-xpu.yml") {
       const dispatched = await github.paginate(github.rest.actions.listWorkflowRuns, {
@@ -51,11 +51,12 @@ module.exports = async function handleCommand({ github, context, core }) {
       const title = `PR Test (XPU) #${pr.number} @ ${pr.head.sha}`;
       candidates.push(...dispatched.filter((run) => run.display_title === title));
     }
-    const latest = candidates.sort((left, right) => right.id - left.id)[0];
-    if (latest && latest.status !== "completed") {
-      messages.push(`${workflow}: already active: ${latest.html_url}`);
+    const active = candidates.find((run) => run.status !== "completed");
+    if (active) {
+      messages.push(`${workflow}: already active: ${active.html_url}`);
       continue;
     }
+    const latest = candidates.sort((left, right) => right.id - left.id)[0];
 
     if (command === "/rerun-failed-ci") {
       if (latest && failedConclusions.has(latest.conclusion)) {

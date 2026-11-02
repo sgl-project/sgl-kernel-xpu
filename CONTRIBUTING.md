@@ -34,9 +34,12 @@ an open PR targeting `main` after adding the `run-ci` label:
 	the current head. Successful and skipped runs are left alone.
 
 Post the command by itself in a new PR comment. Active runs are not duplicated,
-and the bot reports its actions in a reply. XPU manual dispatch also accepts a
-PR number and its expected head SHA. Dispatched runs execute tests and benchmarks;
-automatic performance-baseline PR creation remains limited to normal PR events.
+including retries of older matching runs, and the bot reports its actions in a
+reply. Runs explicitly associated with another PR are not retried, even when
+the branch and head SHA match. XPU manual dispatch also accepts a PR number and
+its expected head SHA. Dispatched runs execute tests and benchmarks;
+host-side benchmark processing and container tests use the PR merge ref.
+Automatic performance-baseline PR creation remains limited to normal PR events.
 The commands become available after the bot workflow is merged into `main`.
 
 ### Extra Requirements:

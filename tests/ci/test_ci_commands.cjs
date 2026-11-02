@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const { readFileSync } = require("node:fs");
 const test = require("node:test");
 const handleCommand = require("../../.github/scripts/ci-commands.cjs");
 
@@ -177,8 +178,66 @@ test("matches a fork run even when GitHub omits pull_requests", async () => {
   assert.equal(fixture.calls.find((call) => call.method === "failed").run_id, 100);
 });
 
+for (const command of ["/rerun-ci", "/rerun-failed-ci"]) {
+  test(`${command} respects another PR's explicit association on the same branch`, async () => {
+    const fixture = harness({ command, runs: [run({
+      workflow: "lint.yml", pull_requests: [{ number: 999 }],
+      head_branch: "feature", head_repository: { full_name: "author/kernel" },
+    })] });
+    await handleCommand(fixture);
+    assert.equal(fixture.calls.filter((call) => call.method === "rerun" ||
+      call.method === "failed").length, 0);
+    assert.equal(fixture.calls.filter((call) => call.method === "dispatch").length,
+      command === "/rerun-ci" ? 1 : 0);
+  });
+
+  for (const workflow of ["pr-test-xpu.yml", "lint.yml"]) {
+    for (const status of ["queued", "in_progress"]) {
+      test(`${command} preserves an older ${status} retry of ${workflow}`, async () => {
+        const fixture = harness({ command, runs: [
+          run({ workflow, id: 100, status, conclusion: null }),
+          run({ workflow, id: 101 }),
+        ] });
+        await handleCommand(fixture);
+        assert.equal(fixture.calls.filter((call) => call.method === "rerun" ||
+          call.method === "failed").length, 0);
+        assert.equal(fixture.calls.filter((call) => call.method === "dispatch").length,
+          workflow === "lint.yml" && command === "/rerun-ci" ? 1 : 0);
+        assert.match(fixture.calls.find((call) => call.method === "comment").body,
+          new RegExp(`${workflow}: already active:`));
+      });
+    }
+  }
+
+  test(`${command} preserves an older active XPU dispatch`, async () => {
+    const fixture = harness({ command, runs: [
+      run({
+        id: 99, event: "workflow_dispatch", status: "in_progress", conclusion: null,
+        display_title: "PR Test (XPU) #532 @ current",
+      }),
+      run({ id: 101 }),
+    ] });
+    await handleCommand(fixture);
+    assert.deepEqual(fixture.calls.map((call) => call.method), ["comment"]);
+    assert.match(fixture.calls[0].body, /pr-test-xpu.yml: already active:/);
+  });
+}
+
 test("skipped runs are not failed-only rerun candidates", async () => {
   const fixture = harness({ command: "/rerun-failed-ci", runs: [run({ conclusion: "skipped" })] });
   await handleCommand(fixture);
   assert.deepEqual(fixture.calls.map((call) => call.method), ["comment"]);
+});
+
+test("lint limits the workflow token to read-only contents", () => {
+  const workflow = readFileSync(`${__dirname}/../../.github/workflows/lint.yml`, "utf8");
+  assert.match(workflow, /^permissions:\n  contents: read\n/m);
+});
+
+test("host benchmark processing checks out the same PR merge ref as the container", () => {
+  const workflow = readFileSync(`${__dirname}/../../.github/workflows/pr-test-xpu.yml`, "utf8");
+  const checkout = workflow.match(/      - name: Checkout code\n([\s\S]*?)(?=\n      - name:)/)[1];
+  assert.match(checkout, /ref: refs\/pull\/\$\{\{ needs\.resolve-pr\.outputs\.number \}\}\/merge/);
+  assert.match(checkout, /persist-credentials: false/);
+  assert.match(workflow, /PR_MERGE_REF: refs\/pull\/\$\{\{ needs\.resolve-pr\.outputs\.number \}\}\/merge/);
 });

@@ -1,4 +1,4 @@
-from itertools import accumulate, product
+from itertools import product
 
 import torch
 import triton
@@ -452,197 +452,6 @@ def benchmark(
     return 1000 * ms, 1000 * max_ms, 1000 * min_ms
 
 
-# Mixed batches: one prefill chunk next to 1-token decode rows, as a chunked-prefill
-# server sends them. Uneven paged batches take the chunkprefill two-launch path,
-# which the uniform configs above never reach.
-mixed_prefill_q = 2048
-mixed_prefill_prefix_range = [0, 4096, 6144]
-mixed_num_decode_range = [1, 8, 32]
-mixed_decode_kv_range = [512, 8192]
-mixed_num_heads_kv = [2, 8]
-# "causal": plain causal; "local_sinks": 128-token sliding window with sink logits
-# (gpt-oss style), only supported at head_dim 64.
-mixed_variant_range = ["causal", "local_sinks"]
-
-
-def build_mixed_configs(
-    head_dim_paged=head_dim_paged,
-    num_heads_q=num_heads_q,
-    kv_dtype_range=("bf16", "fp8_e4m3"),
-    page_size_range=(128,),
-    xe3=None,
-):
-    # Narrowed by the same CLI filters as build_configs; the sweep runs at page_size 128 only.
-    if 128 not in page_size_range:
-        return []
-    if xe3 is None:
-        xe3 = torch.xpu.is_available() and is_xe3_arch()
-    return [
-        cfg
-        for cfg in product(
-            mixed_prefill_prefix_range,
-            mixed_num_decode_range,
-            mixed_decode_kv_range,
-            head_dim_paged,
-            num_heads_q,
-            mixed_num_heads_kv,
-            [d for d in ("bf16", "fp8_e4m3") if d in kv_dtype_range],
-            mixed_variant_range,
-        )
-        # fp8 KV runs without sinks / local masking, at head_dim 128 only to bound the sweep.
-        if (cfg[6] == "bf16" or (cfg[3] == 128 and cfg[7] == "causal"))
-        and (cfg[7] == "causal" or (cfg[3] == 64 and cfg[6] == "bf16"))
-        # Xe3 paged attention: head_dim 64 / 128 / 256 and no bf16-Q + fp8-KV (see build_configs).
-        and (not xe3 or (cfg[3] in (64, 128, 256) and cfg[6] == "bf16"))
-    ]
-
-
-mixed_configs = build_mixed_configs()
-mixed_results = []
-
-
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=[
-            "prefill_prefix",
-            "num_decode",
-            "decode_kv",
-            "head_dim",
-            "num_heads_q",
-            "num_heads_kv",
-            "kv_dtype",
-            "variant",
-        ],
-        x_vals=[list(c) for c in mixed_configs],
-        line_arg="provider",
-        line_vals=["flash_attn"],
-        line_names=["Flash Attention"],
-        styles=[("blue", "-")],
-        ylabel="us",
-        plot_name="flash-attention-mixed-batch-performance",
-        args={},
-    )
-)
-def benchmark_mixed(
-    prefill_prefix,
-    num_decode,
-    decode_kv,
-    head_dim,
-    num_heads_q,
-    num_heads_kv,
-    kv_dtype,
-    variant,
-    provider,
-):
-    dtype = torch.bfloat16
-    device = torch.device("xpu")
-    page_size = 128
-    q_lens = [mixed_prefill_q] + [1] * num_decode
-    kv_lens = [prefill_prefix + mixed_prefill_q] + [decode_kv] * num_decode
-    batch_size = len(q_lens)
-    pages_per_seq = [(n + page_size - 1) // page_size for n in kv_lens]
-    num_pages = sum(pages_per_seq)
-    k_cache = torch.randn(
-        (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
-    )
-    v_cache = torch.randn(
-        (num_pages, page_size, num_heads_kv, head_dim), device=device, dtype=dtype
-    )
-    k_descale = None
-    v_descale = None
-    if kv_dtype == "fp8_e4m3":
-        k_descale_val = k_cache.abs().max().item() / 448.0
-        v_descale_val = v_cache.abs().max().item() / 448.0
-        k_cache = (k_cache / k_descale_val).to(torch.float8_e4m3fn)
-        v_cache = (v_cache / v_descale_val).to(torch.float8_e4m3fn)
-        k_descale = torch.tensor(
-            k_descale_val, dtype=torch.float32, device=device
-        ).expand(batch_size, num_heads_kv)
-        v_descale = torch.tensor(
-            v_descale_val, dtype=torch.float32, device=device
-        ).expand(batch_size, num_heads_kv)
-    page_ids = torch.randperm(num_pages, dtype=torch.int32)
-    page_table = torch.zeros((batch_size, max(pages_per_seq)), dtype=torch.int32)
-    start = 0
-    for i, n in enumerate(pages_per_seq):
-        page_table[i, :n] = page_ids[start : start + n]
-        start += n
-    page_table = page_table.to(device)
-    q = torch.randn((sum(q_lens), num_heads_q, head_dim), device=device, dtype=dtype)
-    cache_seqlens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
-    cu_seqlens_q = torch.tensor(
-        [0, *accumulate(q_lens)], dtype=torch.int32, device=device
-    )
-    causal = variant == "causal"
-    window_size = (-1, -1) if causal else (128, 0)
-    sinks = (
-        torch.randn(num_heads_q, device=device, dtype=dtype)
-        if variant == "local_sinks"
-        else None
-    )
-    softmax_scale = 1.0 / (head_dim**0.5)
-    quantiles = [0.5, 0.2, 0.8]
-    if provider == "flash_attn":
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: flash_attn_baseline(
-                q,
-                k_cache,
-                v_cache,
-                causal=causal,
-                window_size=window_size,
-                softmax_scale=softmax_scale,
-                sinks=sinks,
-                cache_seqlens=cache_seqlens,
-                page_table=page_table,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=None,
-                max_seqlen_q=mixed_prefill_q,
-                max_seqlen_k=max(kv_lens),
-                k_descale=k_descale,
-                v_descale=v_descale,
-            ),
-            quantiles=quantiles,
-        )
-
-    # Effective (unmasked) query-key pairs and the K/V rows they read, per sequence.
-    attention_pairs = 0
-    kv_rows_read = 0
-    for q_len, kv_len in zip(q_lens, kv_lens):
-        attention_pairs += get_effective_attention_pairs(
-            q_seq_length=q_len,
-            kv_seq_length=kv_len,
-            causal=causal,
-            window_size=window_size,
-        )
-        first_visible = (
-            0 if window_size[0] < 0 else max(0, kv_len - q_len - window_size[0])
-        )
-        kv_rows_read += kv_len - first_visible
-    flops = 4 * num_heads_q * head_dim * attention_pairs
-    memory = (
-        2 * kv_rows_read * num_heads_kv * head_dim * k_cache.element_size()
-        + 2 * q.numel() * q.element_size()
-    )
-    mixed_results.append(
-        {
-            "prefill_prefix": prefill_prefix,
-            "num_decode": num_decode,
-            "decode_kv": decode_kv,
-            "num_heads_q": num_heads_q,
-            "num_heads_kv": num_heads_kv,
-            "head_dim": head_dim,
-            "page_size": page_size,
-            "kv_dtype": kv_dtype,
-            "variant": variant,
-            "provider": provider,
-            "tflops": flops * 1e-12 / (ms * 1e-3),
-            "bandwidth": memory * 1e-9 / (ms * 1e-3),
-            "us": 1000 * ms,
-        }
-    )
-    return 1000 * ms, 1000 * max_ms, 1000 * min_ms
-
-
 if __name__ == "__main__":
     import argparse
 
@@ -705,29 +514,14 @@ if __name__ == "__main__":
             attention_mode_range=args.attention_modes,
         )
     ]
-    benchmark_mixed.benchmarks.x_vals = [
-        list(c)
-        for c in build_mixed_configs(
-            head_dim_paged=args.head_dims_paged,
-            num_heads_q=args.num_heads_q,
-            kv_dtype_range=args.kv_dtypes,
-            page_size_range=args.page_sizes,
-        )
-    ]
 
     torch.manual_seed(42)
     if hasattr(torch.xpu, "manual_seed_all"):
         torch.xpu.manual_seed_all(42)
     benchmark.run(print_data=False)
-    benchmark_mixed.run(print_data=False)
+    print("Benchmark finished!")
 
     import pandas as pd
-
-    # Printed before "Benchmark finished!": update_baseline_from_log.py parses only
-    # the uniform table that follows that line.
-    print("Mixed prefill + decode batches:")
-    print(pd.DataFrame(mixed_results).to_markdown())
-    print("Benchmark finished!")
 
     df = pd.DataFrame(all_results)
     print(df.to_markdown())

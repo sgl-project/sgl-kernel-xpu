@@ -137,6 +137,7 @@ jobs:
           docker exec -w /root/sglang/sgl-kernel-xpu/tests "${CONTAINER}" \
             /miniforge3/envs/py3.12/bin/python3 run_nightly_suite.py \
               --suite sgl-kernel-test \
+              --variant ${{ matrix.variant }} \
               --timeout-per-file 7200
 
       - name: Kernel benchmarks (per-commit suite)
@@ -147,6 +148,7 @@ jobs:
           docker exec -w /root/sglang/sgl-kernel-xpu/tests "${CONTAINER}" \
             /miniforge3/envs/py3.12/bin/python3 run_nightly_suite.py \
               --suite sgl-kernel-benchmark \
+              --variant ${{ matrix.variant }} \
               --timeout-per-file 1800
 
       - name: Fail if any suite failed

@@ -9,8 +9,11 @@ Two suites:
   * sgl-kernel-test       -- tests/run_suite.py per-commit list
   * sgl-kernel-benchmark  -- benchmark/run_suite.py per-commit list
 
+--variant aot|jit appends the matching *_ONLY_* list below to the per-commit
+list. Those extras run only in that nightly, never in PR CI.
+
 Both are invoked as:
-    python3 run_nightly_suite.py --suite <name>
+    python3 run_nightly_suite.py --suite <name> --variant <aot|jit>
 """
 
 import argparse
@@ -39,11 +42,65 @@ def _load_bench_suite():
 
 
 bench_suite = _load_bench_suite()
+TestFile = test_suite.TestFile
+BenchFile = bench_suite.BenchFile
+
+# ---------------------------------------------------------------------------
+# Nightly-only extras, added on top of the per-commit lists.
+# To run something in PR CI and both nightlies, add it to the per-commit list
+# in tests/run_suite.py or benchmark/run_suite.py instead.
+# ---------------------------------------------------------------------------
+
+# Tests that run only in the JIT nightly (USE_SYCL_JIT=ON wheel). Example:
+#   JIT_ONLY_TESTS = [
+#       TestFile("test_my_jit_kernel.py"),
+#       TestFile("test_my_slow_jit_case.py", estimated_time=300),
+#   ]
+JIT_ONLY_TESTS = []
+
+# Tests that run only in the AOT nightly. Example:
+#   AOT_ONLY_TESTS = [
+#       TestFile("test_my_aot_kernel.py"),
+#   ]
+AOT_ONLY_TESTS = []
+
+# Benchmarks that run only in the JIT nightly; tee_log/args are optional. Example:
+#   JIT_ONLY_BENCHMARKS = [
+#       BenchFile("bench_my_jit_kernel.py"),
+#       BenchFile("bench_my_jit_sweep.py", tee_log="my_jit.log", args=["--quick"]),
+#   ]
+JIT_ONLY_BENCHMARKS = []
+
+# Benchmarks that run only in the AOT nightly. Example:
+#   AOT_ONLY_BENCHMARKS = [
+#       BenchFile("bench_my_aot_kernel.py"),
+#   ]
+AOT_ONLY_BENCHMARKS = []
 
 SUITES = {
     "sgl-kernel-test": ("test", TESTS_DIR, test_suite.suites["per-commit"]),
     "sgl-kernel-benchmark": ("bench", BENCH_DIR, bench_suite.suites["per-commit"]),
 }
+
+EXTRAS = {
+    ("sgl-kernel-test", "jit"): JIT_ONLY_TESTS,
+    ("sgl-kernel-test", "aot"): AOT_ONLY_TESTS,
+    ("sgl-kernel-benchmark", "jit"): JIT_ONLY_BENCHMARKS,
+    ("sgl-kernel-benchmark", "aot"): AOT_ONLY_BENCHMARKS,
+}
+
+
+def select_entries(suite: str, variant):
+    """Per-commit list plus the extras for ``variant``, skipping duplicates."""
+    entries = list(SUITES[suite][2])
+    names = {e.name for e in entries}
+    for extra in EXTRAS.get((suite, variant), []):
+        if extra.name in names:
+            print(f"[skip] {extra.name} is already in the per-commit list")
+            continue
+        entries.append(extra)
+        names.add(extra.name)
+    return entries
 
 
 def run_tests(files, workdir: str, timeout_per_file: int) -> int:
@@ -91,6 +148,12 @@ if __name__ == "__main__":
         help="Time limit per test/benchmark in seconds.",
     )
     parser.add_argument(
+        "--variant",
+        choices=["aot", "jit"],
+        default=None,
+        help="Append that variant's *_ONLY_* list (default: per-commit only).",
+    )
+    parser.add_argument(
         "--range-begin",
         type=int,
         default=0,
@@ -114,7 +177,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    kind, workdir, entries = SUITES[args.suite]
+    kind, workdir, _ = SUITES[args.suite]
+    entries = select_entries(args.suite, args.variant)
 
     if args.auto_partition_size:
         entries = test_suite.auto_partition(
@@ -123,7 +187,10 @@ if __name__ == "__main__":
     else:
         entries = entries[args.range_begin : args.range_end]
 
-    print(f"Suite: {args.suite} ({kind}); {len(entries)} entries; workdir: {workdir}")
+    print(
+        f"Suite: {args.suite} ({kind}), variant: {args.variant}; "
+        f"{len(entries)} entries; workdir: {workdir}"
+    )
     print("Selected entries:", [e.name for e in entries])
 
     if kind == "test":

@@ -311,9 +311,11 @@ jobs:
           icc=$(echo __INTEL_LLVM_COMPILER | icpx -E -x c++ - | tail -n1 | tr -dc 0-9)
 
           # DPCPP_SYCL_TARGET must be explicit, or auto-detect builds Xe2 on a BMG host.
+          # USE_FMHA=OFF: Xe35 FMHA needs a non-public sycl-tla and grf_size<512>; re-enable once public.
           cmake -GNinja -S . -B build-cri \
             -DCMAKE_BUILD_TYPE=Release \
             -DDPCPP_SYCL_TARGET=cri \
+            -DUSE_FMHA=OFF \
             -DSKBUILD_SABI_COMPONENT=Development.SABIModule \
             -DSKBUILD_SABI_VERSION="${sabi}" \
             -D__INTEL_LLVM_COMPILER="${icc}" \
@@ -332,6 +334,7 @@ jobs:
           check "log reports target cri"      'grep -qF "DPCPP_SYCL_TARGET set to: cri" cri_build.log'
           check "log reports AOT for cri"     'grep -qF "Compile Intel GPU AOT Targets for cri" cri_build.log'
           check "CMakeCache target is cri"    '[ "$(sed -n "s/^DPCPP_SYCL_TARGET:[A-Z]*=//p" build-cri/CMakeCache.txt)" = cri ]'
+          check "Xe35 FMHA excluded (USE_FMHA=OFF)" 'grep -qF -- "-- USE_FMHA=OFF" cri_build.log'
           check "kernel libraries were built" '[ -n "$(find build-cri -name "*.so" -print -quit)" ]'
           check "no wheel was produced"       '[ -z "$(find . -name "*.whl" -print -quit)" ]'
           exit "${fail}"

@@ -190,6 +190,11 @@ if __name__ == "__main__":
         type=int,
         help="Use auto load balancing. The number of parts.",
     )
+    arg_parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Run every file even after a failure; still exit non-zero if any failed.",
+    )
     args = arg_parser.parse_args()
     print(f"{args=}")
 
@@ -205,6 +210,8 @@ if __name__ == "__main__":
 
     print("The running tests are ", [f.name for f in files])
 
-    exit_code = run_unittest_files(files, args.timeout_per_file)
+    exit_code = run_unittest_files(
+        files, args.timeout_per_file, continue_on_error=args.continue_on_error
+    )
 
     exit(exit_code)

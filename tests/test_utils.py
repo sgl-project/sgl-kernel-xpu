@@ -82,9 +82,12 @@ def run_with_timeout(
     return ret_value[0]
 
 
-def run_unittest_files(files: List[TestFile], timeout_per_file: float):
+def run_unittest_files(
+    files: List[TestFile], timeout_per_file: float, continue_on_error: bool = False
+):
     tic = time.perf_counter()
     success = True
+    failed = []
 
     for i, file in enumerate(files):
         filename, estimated_time = file.name, file.estimated_time
@@ -169,7 +172,12 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
 
         if crashed:
             success = False
-            break
+            failed.append(filename)
+            if not continue_on_error:
+                break
+            # Let a wedged device reset before the next file.
+            _recover_xpu(wait=_XPU_TIMEOUT_RECOVER_WAIT)
+            continue
 
         try:
             assert (
@@ -178,11 +186,15 @@ def run_unittest_files(files: List[TestFile], timeout_per_file: float):
         except AssertionError as e:
             print(f"\n{e}\n", flush=True)
             success = False
-            break
+            failed.append(filename)
+            if not continue_on_error:
+                break
 
     if success:
         print(f"Success. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
     else:
+        if continue_on_error:
+            print(f"\n{len(failed)} test file(s) failed: {failed}", flush=True)
         print(f"Fail. Time elapsed: {time.perf_counter() - tic:.2f}s", flush=True)
 
     return 0 if success else -1

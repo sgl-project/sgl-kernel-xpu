@@ -1,22 +1,16 @@
 name: sgl-kernel Nightly (XPU)
 
-# Fully independent of pr-test-xpu.yml. Runs the nightly-only kernel
-# and benchmark suites defined in tests/run_nightly_suite.py against the
-# published AOT (intel/sgl-kernel-xpu-dev:latest) and JIT
-# (intel/sgl-kernel-xpu-dev:latest-jit, USE_SYCL_JIT=ON) wheels, both built
-# by release-docker-xpu-kernel-nightly.yml.
+# Runs the same per-commit suites as pr-test-xpu.yml (tests/run_suite.py and
+# benchmark/run_suite.py, --suite per-commit) against the published AOT
+# (intel/sgl-kernel-xpu-dev:latest) and JIT (:latest-jit, USE_SYCL_JIT=ON)
+# wheels built by release-docker-xpu-kernel-nightly.yml. Every suite runs to
+# completion; the job fails if any test or benchmark failed.
 
 on:
   schedule:
     # A few hours after the nightly image publish (12:00 UTC).
     - cron: '0 16 * * *'
   workflow_dispatch:
-    inputs:
-      continue_on_error:
-        description: 'Continue on error (do not fail the workflow on test failures)'
-        required: false
-        type: boolean
-        default: true
   workflow_call:
     inputs:
       ref:
@@ -24,11 +18,6 @@ on:
         required: false
         type: string
         default: ""
-      continue_on_error:
-        description: 'Continue on error (do not fail the workflow on test failures)'
-        required: false
-        type: boolean
-        default: true
 
 concurrency:
   group: sgl-kernel-nightly-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
@@ -103,27 +92,45 @@ jobs:
           docker exec "${CONTAINER}" /miniforge3/envs/py3.12/bin/python3 -c \
             "import os, sgl_kernel; d = os.path.join(os.path.dirname(sgl_kernel.__file__), 'include', 'sgl_src'); assert os.path.isdir(d), 'not a JIT wheel, missing ' + d; print('JIT wheel OK:', d)"
 
-      - name: sgl-kernel-test (nightly kernel suite)
+      # Suites keep going past failures (continue-on-error); the last step turns the job red.
+      - name: Kernel tests (per-commit suite)
+        id: tests
         timeout-minutes: 240
+        continue-on-error: true
         run: |
           docker exec -w /root/sglang/sgl-kernel-xpu/tests "${CONTAINER}" \
-            /miniforge3/envs/py3.12/bin/python3 run_nightly_suite.py \
-              --suite sgl-kernel-test \
+            /miniforge3/envs/py3.12/bin/python3 run_suite.py \
+              --suite per-commit \
               --timeout-per-file 7200 \
-            || TEST_EXIT_CODE=$?
-          exit ${TEST_EXIT_CODE:-0}
-        continue-on-error: ${{ github.event_name == 'schedule' || inputs.continue_on_error == true }}
+              --continue-on-error
 
-      - name: sgl-kernel-benchmark (nightly benchmark suite)
+      - name: Kernel benchmarks (per-commit suite)
+        id: bench
         timeout-minutes: 60
+        continue-on-error: true
         run: |
-          docker exec -w /root/sglang/sgl-kernel-xpu/tests "${CONTAINER}" \
-            /miniforge3/envs/py3.12/bin/python3 run_nightly_suite.py \
-              --suite sgl-kernel-benchmark \
-              --timeout-per-file 1800 \
-            || BENCH_EXIT_CODE=$?
-          exit ${BENCH_EXIT_CODE:-0}
-        continue-on-error: ${{ github.event_name == 'schedule' || inputs.continue_on_error == true }}
+          docker exec -w /root/sglang/sgl-kernel-xpu/benchmark "${CONTAINER}" \
+            /miniforge3/envs/py3.12/bin/python3 run_suite.py \
+              --suite per-commit \
+              --timeout-per-file 1800
+
+      - name: Fail if any suite failed
+        if: always()
+        env:
+          TESTS: ${{ steps.tests.outcome }}
+          BENCH: ${{ steps.bench.outcome }}
+        run: |
+          {
+            echo "### sgl-kernel nightly (${{ matrix.variant }})"
+            echo "| suite | outcome |"
+            echo "|---|---|"
+            echo "| tests (per-commit) | ${TESTS} |"
+            echo "| benchmarks (per-commit) | ${BENCH} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${TESTS}" != "success" ] || [ "${BENCH}" != "success" ]; then
+            echo "::error::Nightly ${{ matrix.variant }}: tests=${TESTS} benchmarks=${BENCH}"
+            exit 1
+          fi
 
       - name: Cleanup container
         if: always()

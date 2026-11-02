@@ -1,7 +1,7 @@
 name: sgl-kernel Nightly (XPU)
 
-# Runs the same per-commit suites as pr-test-xpu.yml (tests/run_suite.py and
-# benchmark/run_suite.py, --suite per-commit) against the published AOT
+# Runs tests/run_nightly_suite.py, which uses the same per-commit lists as
+# pr-test-xpu.yml (tests/ and benchmark/ run_suite.py), against the published AOT
 # (intel/sgl-kernel-xpu-dev:latest) and JIT (:latest-jit, USE_SYCL_JIT=ON)
 # wheels built by release-docker-xpu-kernel-nightly.yml. Every suite runs to
 # completion; the job fails if any test or benchmark failed.
@@ -99,19 +99,18 @@ jobs:
         continue-on-error: true
         run: |
           docker exec -w /root/sglang/sgl-kernel-xpu/tests "${CONTAINER}" \
-            /miniforge3/envs/py3.12/bin/python3 run_suite.py \
-              --suite per-commit \
-              --timeout-per-file 7200 \
-              --continue-on-error
+            /miniforge3/envs/py3.12/bin/python3 run_nightly_suite.py \
+              --suite sgl-kernel-test \
+              --timeout-per-file 7200
 
       - name: Kernel benchmarks (per-commit suite)
         id: bench
         timeout-minutes: 60
         continue-on-error: true
         run: |
-          docker exec -w /root/sglang/sgl-kernel-xpu/benchmark "${CONTAINER}" \
-            /miniforge3/envs/py3.12/bin/python3 run_suite.py \
-              --suite per-commit \
+          docker exec -w /root/sglang/sgl-kernel-xpu/tests "${CONTAINER}" \
+            /miniforge3/envs/py3.12/bin/python3 run_nightly_suite.py \
+              --suite sgl-kernel-benchmark \
               --timeout-per-file 1800
 
       - name: Fail if any suite failed

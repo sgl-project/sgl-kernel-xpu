@@ -79,6 +79,8 @@ PARTIAL_ROTARY_FACTOR = [0.25]
 IS_NEOX_LIST = [False, True]
 MROPE_IS_INTERLEAVED = [False, True]
 DTYPE_LIST = [torch.bfloat16, torch.float16]
+# None: cache in the query dtype.
+CACHE_DTYPE_LIST = [None, torch.float32]
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
@@ -89,6 +91,7 @@ DTYPE_LIST = [torch.bfloat16, torch.float16]
 @pytest.mark.parametrize("mrope_is_interleaved", MROPE_IS_INTERLEAVED)
 @pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
 @pytest.mark.parametrize("dtype", DTYPE_LIST)
+@pytest.mark.parametrize("cache_dtype", CACHE_DTYPE_LIST)
 def test_multimodal_rotary_embedding(
     batch_size: int,
     gqa_ratio: int,
@@ -98,6 +101,7 @@ def test_multimodal_rotary_embedding(
     mrope_is_interleaved: bool,
     is_neox: bool,
     dtype: torch.dtype,
+    cache_dtype,
 ):
 
     torch.manual_seed(1234)
@@ -111,13 +115,14 @@ def test_multimodal_rotary_embedding(
     )
     mrope_section = split_3(rotary_dim // 2)
 
-    cos_sin_cache = create_cos_sin_cache(rotary_dim).to(dtype)
+    cos_sin_cache = create_cos_sin_cache(rotary_dim).to(cache_dtype or dtype)
 
+    # The kernel computes in fp32 for all cache dtypes.
     q_ker, k_ker = q.clone(), k.clone()
     q_na, k_na = torch_impl_mrope(
-        q,
-        k,
-        cos_sin_cache,
+        q.float(),
+        k.float(),
+        cos_sin_cache.float(),
         positions,
         mrope_section,
         head_size,
@@ -140,9 +145,31 @@ def test_multimodal_rotary_embedding(
         None,
     )
 
+    q_na, k_na = q_na.to(dtype), k_na.to(dtype)
     atol = rtol = 1e-2
     triton.testing.assert_close(q_na, q_ker, atol=atol, rtol=rtol)
     triton.testing.assert_close(k_na, k_ker, atol=atol, rtol=rtol)
+
+
+def test_multimodal_rotary_embedding_rejects_mismatched_cache():
+    q = torch.randn(4, 4 * 128, device=DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(4, 128, device=DEVICE, dtype=torch.bfloat16)
+    positions = torch.zeros(3, 4, device=DEVICE, dtype=torch.int64)
+    cos_sin_cache = create_cos_sin_cache(32).to(torch.float16)
+    with pytest.raises(RuntimeError, match="cos_sin_cache must be float32"):
+        multimodal_rotary_embedding(
+            q,
+            k,
+            cos_sin_cache,
+            positions,
+            split_3(16),
+            128,
+            32,
+            False,
+            False,
+            True,
+            None,
+        )
 
 
 if __name__ == "__main__":

@@ -193,6 +193,9 @@ def get_benchmark(device="xpu", configs=None, dtype=torch.bfloat16):
                 "q_heads": q_heads,
                 "kv_heads": kv_heads,
                 "rotary_dim": rotary_dim,
+                "head_dim": head_dim,
+                "partial_rotary_factor": partial_rotary_factor,
+                "max_position_embeddings": max_position_embeddings,
                 "dtype": dtype,
                 "cache_dtype": cache_dtype,
                 "provider": provider,
@@ -263,7 +266,15 @@ if __name__ == "__main__":
     print(df.to_markdown())
 
     # fp32-cache vs q-dtype-cache, per problem size
-    keys = ["num_tokens", "q_heads", "kv_heads", "rotary_dim"]
+    keys = [
+        "num_tokens",
+        "q_heads",
+        "kv_heads",
+        "head_dim",
+        "partial_rotary_factor",
+        "rotary_dim",
+        "max_position_embeddings",
+    ]
     ms = df.pivot_table(index=keys, columns="provider", values="ms")
     ms["fp32/q-dtype"] = ms["cache_fp32"] / ms["cache_q_dtype"]
     print("\nfp32 cache vs q-dtype cache (ms; ratio > 1 means fp32 cache is slower)")

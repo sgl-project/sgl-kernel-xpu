@@ -1,3 +1,4 @@
+#include <ATen/OpMathType.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
@@ -25,6 +26,8 @@ struct MRoPEKernel {
   // Grid  : nd_range<2>( {num_tokens, global_rotary_dim}, {1, local_rotary_dim} )
   //   dim 0: token   (1 work-group row per token)
   //   dim 1: rot lane (local_rotary_dim lanes per work-group)
+
+  using opmath_t = at::opmath_type<scalar_t>;
 
   [[sycl::reqd_sub_group_size(sg_size)]]
   void operator()(sycl::nd_item<2> item) const {
@@ -54,8 +57,8 @@ struct MRoPEKernel {
     const int64_t chosen_pos = h_mask ? h_pos : (w_mask ? w_pos : t_pos);
     const int64_t cache_base = chosen_pos * rotary_dim_;
 
-    const float cos_v = static_cast<float>(cos_sin_cache_[cache_base + rot]);
-    const float sin_v = static_cast<float>(cos_sin_cache_[cache_base + rot + half_rotary_dim_]);
+    const opmath_t cos_v = static_cast<opmath_t>(cos_sin_cache_[cache_base + rot]);
+    const opmath_t sin_v = static_cast<opmath_t>(cos_sin_cache_[cache_base + rot + half_rotary_dim_]);
 
     const int64_t max_heads = (num_q_heads_ > num_k_heads_) ? num_q_heads_ : num_k_heads_;
 
@@ -64,15 +67,15 @@ struct MRoPEKernel {
         scalar_t* q_head = query_ + token_id * q_stride_ + head_id * head_size_;
 
         if constexpr (is_neox) {
-          const float x = static_cast<float>(q_head[rot]);
-          const float y = static_cast<float>(q_head[rot + half_rotary_dim_]);
+          const opmath_t x = static_cast<opmath_t>(q_head[rot]);
+          const opmath_t y = static_cast<opmath_t>(q_head[rot + half_rotary_dim_]);
           q_head[rot] = static_cast<scalar_t>(x * cos_v - y * sin_v);
           q_head[rot + half_rotary_dim_] = static_cast<scalar_t>(y * cos_v + x * sin_v);
         } else {
           const int64_t x_idx = 2 * rot;
           const int64_t y_idx = x_idx + 1;
-          const float x = static_cast<float>(q_head[x_idx]);
-          const float y = static_cast<float>(q_head[y_idx]);
+          const opmath_t x = static_cast<opmath_t>(q_head[x_idx]);
+          const opmath_t y = static_cast<opmath_t>(q_head[y_idx]);
           q_head[x_idx] = static_cast<scalar_t>(x * cos_v - y * sin_v);
           q_head[y_idx] = static_cast<scalar_t>(y * cos_v + x * sin_v);
         }
@@ -81,15 +84,15 @@ struct MRoPEKernel {
         scalar_t* k_head = key_ + token_id * k_stride_ + head_id * head_size_;
 
         if constexpr (is_neox) {
-          const float x = static_cast<float>(k_head[rot]);
-          const float y = static_cast<float>(k_head[rot + half_rotary_dim_]);
+          const opmath_t x = static_cast<opmath_t>(k_head[rot]);
+          const opmath_t y = static_cast<opmath_t>(k_head[rot + half_rotary_dim_]);
           k_head[rot] = static_cast<scalar_t>(x * cos_v - y * sin_v);
           k_head[rot + half_rotary_dim_] = static_cast<scalar_t>(y * cos_v + x * sin_v);
         } else {
           const int64_t x_idx = 2 * rot;
           const int64_t y_idx = x_idx + 1;
-          const float x = static_cast<float>(k_head[x_idx]);
-          const float y = static_cast<float>(k_head[y_idx]);
+          const opmath_t x = static_cast<opmath_t>(k_head[x_idx]);
+          const opmath_t y = static_cast<opmath_t>(k_head[y_idx]);
           k_head[x_idx] = static_cast<scalar_t>(x * cos_v - y * sin_v);
           k_head[y_idx] = static_cast<scalar_t>(y * cos_v + x * sin_v);
         }

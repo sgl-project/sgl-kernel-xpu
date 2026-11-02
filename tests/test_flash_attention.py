@@ -2810,6 +2810,9 @@ def test_flash_attn_kvcache_mixed_prefill_decode(
 ):
     from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
+    if is_cri_device() and return_lse:
+        pytest.skip("Xe35 does not support softmax LSE")
+
     seqlens_q, seqlens_k = shape
     nheads, nheads_kv = heads
     torch.manual_seed(23)

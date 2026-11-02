@@ -463,25 +463,41 @@ mixed_num_heads_kv = [2, 8]
 # "causal": plain causal; "local_sinks": 128-token sliding window with sink logits
 # (gpt-oss style), only supported at head_dim 64.
 mixed_variant_range = ["causal", "local_sinks"]
-mixed_xe3 = torch.xpu.is_available() and is_xe3_arch()
-mixed_configs = [
-    cfg
-    for cfg in product(
-        mixed_prefill_prefix_range,
-        mixed_num_decode_range,
-        mixed_decode_kv_range,
-        head_dim_paged,
-        num_heads_q,
-        mixed_num_heads_kv,
-        ["bf16", "fp8_e4m3"],
-        mixed_variant_range,
-    )
-    # fp8 KV runs without sinks / local masking, at head_dim 128 only to bound the sweep.
-    if (cfg[6] == "bf16" or (cfg[3] == 128 and cfg[7] == "causal"))
-    and (cfg[7] == "causal" or (cfg[3] == 64 and cfg[6] == "bf16"))
-    # Xe3 paged attention: head_dim 64 / 128 / 256 and no bf16-Q + fp8-KV (see build_configs).
-    and (not mixed_xe3 or (cfg[3] in (64, 128, 256) and cfg[6] == "bf16"))
-]
+
+
+def build_mixed_configs(
+    head_dim_paged=head_dim_paged,
+    num_heads_q=num_heads_q,
+    kv_dtype_range=("bf16", "fp8_e4m3"),
+    page_size_range=(128,),
+    xe3=None,
+):
+    # Narrowed by the same CLI filters as build_configs; the sweep runs at page_size 128 only.
+    if 128 not in page_size_range:
+        return []
+    if xe3 is None:
+        xe3 = torch.xpu.is_available() and is_xe3_arch()
+    return [
+        cfg
+        for cfg in product(
+            mixed_prefill_prefix_range,
+            mixed_num_decode_range,
+            mixed_decode_kv_range,
+            head_dim_paged,
+            num_heads_q,
+            mixed_num_heads_kv,
+            [d for d in ("bf16", "fp8_e4m3") if d in kv_dtype_range],
+            mixed_variant_range,
+        )
+        # fp8 KV runs without sinks / local masking, at head_dim 128 only to bound the sweep.
+        if (cfg[6] == "bf16" or (cfg[3] == 128 and cfg[7] == "causal"))
+        and (cfg[7] == "causal" or (cfg[3] == 64 and cfg[6] == "bf16"))
+        # Xe3 paged attention: head_dim 64 / 128 / 256 and no bf16-Q + fp8-KV (see build_configs).
+        and (not xe3 or (cfg[3] in (64, 128, 256) and cfg[6] == "bf16"))
+    ]
+
+
+mixed_configs = build_mixed_configs()
 mixed_results = []
 
 
@@ -687,6 +703,15 @@ if __name__ == "__main__":
             page_size_range=args.page_sizes,
             kv_dtype_range=args.kv_dtypes,
             attention_mode_range=args.attention_modes,
+        )
+    ]
+    benchmark_mixed.benchmarks.x_vals = [
+        list(c)
+        for c in build_mixed_configs(
+            head_dim_paged=args.head_dims_paged,
+            num_heads_q=args.num_heads_q,
+            kv_dtype_range=args.kv_dtypes,
+            page_size_range=args.page_sizes,
         )
     ]
 

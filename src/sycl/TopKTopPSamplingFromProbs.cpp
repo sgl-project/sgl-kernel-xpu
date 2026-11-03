@@ -245,7 +245,7 @@ void launch_top_k_top_p_sampling(
   const uint32_t vec_size = std::gcd(16 / sizeof(float), static_cast<uint32_t>(vocab_size));
 
   DISPATCH_TOPKTOPP_VEC_SIZE(vec_size, VEC_SIZE, {
-    AT_DISPATCH_BOOL_NO_RETURN(deterministic, DETERMINISTIC, {
+    SGL_DISPATCH_BOOL(deterministic, DETERMINISTIC, [&] {
       auto kernel = TopKTopPSamplingKernel<VEC_SIZE, DETERMINISTIC>(
           probs,
           output,

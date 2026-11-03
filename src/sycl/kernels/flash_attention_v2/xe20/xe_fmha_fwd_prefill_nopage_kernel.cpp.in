@@ -92,7 +92,7 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
           Element>::run_nopaged(params);
       });
     } else {
-      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      SGL_DISPATCH_BOOL(params.is_local, LocalMask, [&] {
         dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;
         FMHAConfig<
@@ -120,10 +120,9 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
   }
 
   // No sink support for no_page path; always use Sink=false
-  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-    AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-      using Element = @ELEM_TYPE@;
-      dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+  SGL_DISPATCH_BOOL2(params.is_local, LocalMask, params.is_causal, Causal, [&] {
+    using Element = @ELEM_TYPE@;
+    dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;
       FMHAConfig<
           Causal,
@@ -143,7 +142,6 @@ __attribute__((visibility("default"))) void FmhaPrefillNpRunner<@HEAD_DIM@, @ELE
           Element,
           Element,
           Element>::run_nopaged(params);
-      });
     });
   });
 }

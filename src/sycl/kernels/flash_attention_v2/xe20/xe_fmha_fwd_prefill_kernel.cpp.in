@@ -91,7 +91,7 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
           Element>::run_paged(params);
       });
     } else {
-      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      SGL_DISPATCH_BOOL(params.is_local, LocalMask, [&] {
         dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;
         FMHAConfig<
@@ -119,33 +119,28 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
   }
 
 #if @HEAD_DIM@ == 64
-  AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
-    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-
-          using Element = @ELEM_TYPE@;
-          dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+  SGL_DISPATCH_BOOL3(use_sink, Sink, params.is_local, LocalMask, params.is_causal, Causal, [&] {
+    using Element = @ELEM_TYPE@;
+    dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;
-          FMHAConfig<
-              Causal,
-              LocalMask,
-              Sink,
-              Softcap,
-              /*LSE=*/false,
-              TileShapeQK,
-              TileShapePV,
-              TileShapeOutput,
-              SubgroupLayoutQK,
-              void,
-              false,
-              2,
-              false,
-              Element,
-              Element,
-              Element,
-                Element>::run_paged(params);
-          });
-      });
+      FMHAConfig<
+          Causal,
+          LocalMask,
+          Sink,
+          Softcap,
+          /*LSE=*/false,
+          TileShapeQK,
+          TileShapePV,
+          TileShapeOutput,
+          SubgroupLayoutQK,
+          void,
+          false,
+          2,
+          false,
+          Element,
+          Element,
+          Element,
+          Element>::run_paged(params);
     });
   });
 #else
@@ -166,45 +161,63 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
     using RelTileShapeOutput = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<128>>;
     using RelSubgroupLayoutQK =
         cute::Layout<cute::Shape<cute::Int<16>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
-    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-        using Element = @ELEM_TYPE@;
-        // softcap+rel_bias is host-rejected (runner TORCH_CHECK); Softcap=false only.
-        constexpr bool Softcap = false;
-        FMHAConfig<
-            Causal,
-            LocalMask,
-            false,
-            Softcap,
-            /*LSE=*/false,
-            RelTileShapeQK,
-            RelTileShapePV,
-            RelTileShapeOutput,
-            RelSubgroupLayoutQK,
-            void,
-            true,
-            2,
-            false,
-            Element,
-            Element,
-            Element,
-            Element>::run_paged(params);
-      });
+    SGL_DISPATCH_BOOL2(params.is_local, LocalMask, params.is_causal, Causal, [&] {
+      using Element = @ELEM_TYPE@;
+      // softcap+rel_bias is host-rejected (runner TORCH_CHECK); Softcap=false only.
+      constexpr bool Softcap = false;
+      FMHAConfig<
+          Causal,
+          LocalMask,
+          false,
+          Softcap,
+          /*LSE=*/false,
+          RelTileShapeQK,
+          RelTileShapePV,
+          RelTileShapeOutput,
+          RelSubgroupLayoutQK,
+          void,
+          true,
+          2,
+          false,
+          Element,
+          Element,
+          Element,
+          Element>::run_paged(params);
     });
     return;
   }
 #else
   TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention is only compiled for head_dim == 128");
 #endif
-  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-    AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
-      using Element = @ELEM_TYPE@;
-      dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
-        constexpr bool Softcap = decltype(softcap_tag)::value;
-        if constexpr (Causal || LocalMask) {
-          // bidirectional_block_ids requires is_causal=false and no sliding
-          // window, so the causal/local paths never carry the mask; skip those
-          // instantiations (host-side checks enforce the precondition).
+  SGL_DISPATCH_BOOL2(params.is_local, LocalMask, params.is_causal, Causal, [&] {
+    using Element = @ELEM_TYPE@;
+    dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
+      if constexpr (Causal || LocalMask) {
+        // bidirectional_block_ids requires is_causal=false and no sliding
+        // window, so the causal/local paths never carry the mask; skip those
+        // instantiations (host-side checks enforce the precondition).
+        FMHAConfig<
+            Causal,
+            LocalMask,
+            false,
+            Softcap,
+            /*LSE=*/false,
+            TileShapeQK,
+            TileShapePV,
+            TileShapeOutput,
+            SubgroupLayoutQK,
+            void,
+            false,
+            2,
+            false,
+            Element,
+            Element,
+            Element,
+            Element,
+            /*HasBidirectionalBlock=*/false>::run_paged(params);
+      } else {
+        SGL_DISPATCH_BOOL(params.block_id_ptr != nullptr, HasBidirectionalBlock, [&] {
           FMHAConfig<
               Causal,
               LocalMask,
@@ -223,31 +236,9 @@ __attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_
               Element,
               Element,
               Element,
-              /*HasBidirectionalBlock=*/false>::run_paged(params);
-        } else {
-          AT_DISPATCH_BOOL_NO_RETURN(params.block_id_ptr != nullptr, HasBidirectionalBlock, {
-            FMHAConfig<
-                Causal,
-                LocalMask,
-                false,
-                Softcap,
-                /*LSE=*/false,
-                TileShapeQK,
-                TileShapePV,
-                TileShapeOutput,
-                SubgroupLayoutQK,
-                void,
-                false,
-                2,
-                false,
-                Element,
-                Element,
-                Element,
-                Element,
-                HasBidirectionalBlock>::run_paged(params);
-          });
-        }
-      });
+              HasBidirectionalBlock>::run_paged(params);
+        });
+      }
     });
   });
 #endif

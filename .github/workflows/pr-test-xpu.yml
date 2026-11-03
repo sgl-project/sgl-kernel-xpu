@@ -50,8 +50,6 @@ jobs:
           docker exec -e PR_MERGE_REF="${PR_MERGE_REF}" ci_sglkernel_xpu \
             /bin/bash -c '\
               set -exo pipefail && \
-              . /miniforge3/bin/activate && \
-              conda activate py3.12 && \
               cd /root/sglang/sgl-kernel-xpu && \
               git remote set-url origin https://github.com/sgl-project/sgl-kernel-xpu.git && \
               git fetch --depth=1 origin "${PR_MERGE_REF}" && \
@@ -62,8 +60,7 @@ jobs:
               # nightly image and the wheel that ships to tests contains
               # the pre-PR kernel code.
               rm -rf build && \
-              pip uninstall -y sgl-kernel || true && \
-              pip install --force-reinstall -v . && \
+              uv pip install -v --no-build-isolation --reinstall-package sglang-kernel-xpu . && \
               python -c "import sgl_kernel; print(sgl_kernel.__file__)" \
             '
 
@@ -71,9 +68,7 @@ jobs:
         timeout-minutes: 20
         run: |
           # huggingface_hub reads HF_TOKEN from the env; `hf auth login` hits a rate-limited whoami call.
-          docker exec ci_sglkernel_xpu /miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
-          docker exec ci_sglkernel_xpu /miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub
-          docker exec ci_sglkernel_xpu /bin/bash -c "ln -sf /miniforge3/envs/py3.12/bin/python3 /usr/bin/python3"
+          docker exec ci_sglkernel_xpu uv pip install pytest expecttest ray huggingface_hub
 
       - name: Run Sglang Kernel Cases
         timeout-minutes: 70
@@ -90,7 +85,7 @@ jobs:
           docker exec -w /root/sglang ci_sglkernel_xpu \
             /bin/bash -c "\
                set -exo pipefail && \
-               /miniforge3/envs/py3.12/bin/python3 -m pip install tabulate && \
+               uv pip install tabulate && \
                cd /root/sglang/sgl-kernel-xpu/benchmark && \
                python3 run_suite.py --suite per-commit "
 

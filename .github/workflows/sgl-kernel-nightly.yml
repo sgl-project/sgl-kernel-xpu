@@ -55,6 +55,7 @@ jobs:
         run: |
           docker run -dt \
             --device /dev/dri/ \
+            -e UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD=1 \
             --name sgl_kernel_nightly \
             -e HF_TOKEN=$(cat ~/huggingface_token.txt) \
             intel/sgl-kernel-xpu-dev:latest

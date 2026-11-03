@@ -206,7 +206,7 @@ void launch_min_p_sampling(
   const uint32_t vec_size = std::gcd(preferred_vec_size, vocab_size);
 
   DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE, {
-    AT_DISPATCH_BOOL_NO_RETURN(deterministic, DETERMINISTIC, {
+    SGL_DISPATCH_BOOL(deterministic, DETERMINISTIC, [&] {
       auto kernel = MinPSamplingKernel<KernelDType, VEC_SIZE, DETERMINISTIC>(
           probs_ptr,
           output,

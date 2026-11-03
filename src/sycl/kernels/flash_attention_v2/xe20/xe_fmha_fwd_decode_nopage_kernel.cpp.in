@@ -72,7 +72,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   // non-causal, so only the local axis fans out here (this path has no sink
   // support at all -- checked above).
   if (params.return_softmax_lse) {
-    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+    SGL_DISPATCH_BOOL(params.is_local, LocalMask, [&] {
       using Element = @ELEM_TYPE@;
       dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;
@@ -98,7 +98,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
     return;
   }
   // No sink support for no_page path; always use Sink=false
-  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+  SGL_DISPATCH_BOOL(params.is_local, LocalMask, [&] {
     using Element = @ELEM_TYPE@;
     dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;

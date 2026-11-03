@@ -40,6 +40,26 @@
 
 #define DISPATCH_FLOAT_TYPES(TYPE, NAME, ...) AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOAT_TYPES(__VA_ARGS__))
 
+#define SGL_DISPATCH_BOOL(BOOL_V, BOOL_NAME, ...)        \
+  [&]() -> decltype(auto) {                              \
+    if (BOOL_V) {                                        \
+      [[maybe_unused]] constexpr bool BOOL_NAME = true;  \
+      return (__VA_ARGS__)();                            \
+    } else {                                             \
+      [[maybe_unused]] constexpr bool BOOL_NAME = false; \
+      return (__VA_ARGS__)();                            \
+    }                                                    \
+  }()
+
+#define SGL_DISPATCH_BOOL2(BOOL_V1, BOOL_NAME1, BOOL_V2, BOOL_NAME2, ...) \
+  SGL_DISPATCH_BOOL(                                                      \
+      BOOL_V1, BOOL_NAME1, [&]() -> decltype(auto) { return SGL_DISPATCH_BOOL(BOOL_V2, BOOL_NAME2, __VA_ARGS__); })
+
+#define SGL_DISPATCH_BOOL3(BOOL_V1, BOOL_NAME1, BOOL_V2, BOOL_NAME2, BOOL_V3, BOOL_NAME3, ...) \
+  SGL_DISPATCH_BOOL(BOOL_V1, BOOL_NAME1, [&]() -> decltype(auto) {                             \
+    return SGL_DISPATCH_BOOL2(BOOL_V2, BOOL_NAME2, BOOL_V3, BOOL_NAME3, __VA_ARGS__);          \
+  })
+
 #define CUTLASS_CHECK(status)                                                       \
   {                                                                                 \
     cutlass::Status error = status;                                                 \

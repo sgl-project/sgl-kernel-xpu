@@ -38,7 +38,7 @@ __attribute__((visibility("default"))) void FmhaDecodeFp8Runner<@QG_SZ@, @HEAD_D
   // of leaving the caller's softmax_lse buffer unwritten.
   TORCH_CHECK(
       !params.return_softmax_lse, "return_softmax_lse is not supported with an fp8 KV cache (decode)");
-  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+  SGL_DISPATCH_BOOL(params.is_local, LocalMask, [&] {
     using QElement = @ELEM_TYPE@;
     dispatch_softcap<@HEAD_DIM@, true>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;

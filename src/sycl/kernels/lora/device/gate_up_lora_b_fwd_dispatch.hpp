@@ -32,14 +32,14 @@
   \file
   \brief Forward declarations of the generated per-dtype launch functions for
          gate_up_lora_b_fwd. The definitions are produced by
-         gate_up_lora_b_fwd_kernel.cpp.in via GateUpLoraBFwdXe20.cmake, each in
+         gate_up_lora_b_fwd_kernel.cpp.in via GateUpLoraBFwd.cmake, each in
          its own translation unit for parallel compilation of the heavy CUTLASS
          template instantiation.
 
          Naming: launch_gate_up_lora_b_fwd_<ELEM_TAG>_<TILE_TAG>
          Parameters:
            ELEM_TAG in {half, bf16}       -- fp16/bf16.
-           TILE_TAG in {tall}             -- extend via GateUpLoraBFwdXe20.cmake
+           TILE_TAG in {tall}             -- extend via GateUpLoraBFwd.cmake
                                              + a new option tag/type in
                                              gate_up_lora_b_fwd_types.hpp.
 */

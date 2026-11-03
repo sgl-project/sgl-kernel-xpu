@@ -771,7 +771,7 @@ def multimodal_rotary_embedding(
     key: torch.Tensor
         Key tensor updated in-place.
     cos_sin_cache: torch.Tensor
-        Precomputed RoPE cos/sin cache.
+        Precomputed RoPE cos/sin cache, float32 or the query dtype.
     positions: torch.Tensor
         Position indices used to index the cache.
     mrope_section: List[int]
@@ -880,3 +880,29 @@ def fused_k_norm_rope_flashmla(
     torch.ops.sgl_kernel.fused_k_norm_rope_flashmla(
         kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, page_size
     )
+
+
+def fused_q_indexer_rope_hadamard_fp4_quant(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+    r"""Fused Q-indexer RoPE + Hadamard + MXFP4 quant for DeepSeek-V4.
+
+    Same interface as the CUDA op in
+    ``sglang.kernels.ops.attention.dsv4.norm_rope``. The C++ op allocates the
+    outputs, accepts the complex64 ``freqs_cis`` cache (or its real float32
+    view), and packs the four ue8m0 scale bytes per head into one int32;
+    this shim only nests the returned tensors the way the CUDA op does.
+
+    Returns ``((q_fp4, q_sf), weights_out)``: int8 packed payload
+    ``(B, H, 64)``, int32 packed scales ``(B, H)``, float32 ``(B, H, 1)``.
+    """
+    q_fp4, q_sf, weights_out = (
+        torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_fp4_quant(
+            q_input, weight, float(weight_scale), freqs_cis, positions
+        )
+    )
+    return (q_fp4, q_sf), weights_out

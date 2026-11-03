@@ -1,234 +1,136 @@
 """Nightly runner for sgl-kernel-xpu.
 
-Independent of tests/run_suite.py (which owns per-commit CI). Edit the two
-suites below freely to add or drop nightly coverage without touching CI.
+Runs the same per-commit lists as PR CI, taken from tests/run_suite.py and
+benchmark/run_suite.py, so nightly coverage cannot drift from CI. Unlike PR
+CI, every file runs even after a failure; all failures are reported at the
+end and the exit code is non-zero if any file failed.
 
 Two suites:
-  * sgl-kernel-test       -- pytest-style tests under tests/
-  * sgl-kernel-benchmark  -- __main__-style benchmark scripts under benchmark/
+  * sgl-kernel-test       -- tests/run_suite.py per-commit list
+  * sgl-kernel-benchmark  -- benchmark/run_suite.py per-commit list
+
+--variant aot|jit appends the matching *_ONLY_* list below to the per-commit
+list. Those extras run only in that nightly, never in PR CI.
 
 Both are invoked as:
-    python3 run_nightly_suite.py --suite <name>
+    python3 run_nightly_suite.py --suite <name> --variant <aot|jit>
 """
 
 import argparse
+import importlib.util
 import os
-import subprocess
 import sys
-from dataclasses import dataclass, field
-from typing import List
+import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS_DIR = os.path.join(REPO_ROOT, "tests")
 BENCH_DIR = os.path.join(REPO_ROOT, "benchmark")
 
-
-@dataclass
-class Entry:
-    name: str
-    estimated_time: float = 60
-    tee_log: str = ""
+sys.path.insert(0, TESTS_DIR)
+import run_suite as test_suite  # noqa: E402
+from test_utils import _recover_xpu, run_unittest_files  # noqa: E402
 
 
-NIGHTLY_TESTS: List[Entry] = [
-    Entry("test_awq_dequant.py"),
-    Entry("test_topk_sigmoid.py"),
-    Entry("test_topk_softmax.py"),
-    Entry("test_flash_attention.py"),
-    Entry("test_flash_attn_sparse.py"),
-    Entry("test_flash_mla_decode.py"),
-    Entry("test_flash_mla_prefill.py"),
-    Entry("test_flash_mla_with_kvcache.py"),
-    Entry("test_moe_align.py"),
-    Entry("test_moe_gemm.py"),
-    Entry("test_moe_sum_reduce.py"),
-    Entry("test_moe_prepare_input.py"),
-    Entry("test_swiglu_with_alpha_limit.py"),
-    Entry("test_per_token_group_quant_8bit.py"),
-    Entry("test_per_token_group_quant_mxfp4.py"),
-    Entry("test_moe_fused_gate.py"),
-    Entry("test_mrope.py"),
-    Entry("test_per_tensor_quant_fp8.py"),
-    Entry("test_per_token_quant_fp8.py"),
-    Entry("test_fused_qk_norm_rope.py"),
-    Entry("test_fused_qk_rope_with_cache.py"),
-    Entry("test_merge_state.py"),
-    Entry("test_merge_state_v2.py"),
-    Entry("test_norm.py"),
-    Entry("test_per_token_group_quant_8bit_v2.py"),
-    Entry("test_activation.py"),
-    Entry("test_scatter_tokens_to_experts.py"),
-    Entry("test_sampling.py"),
-    Entry("test_hc_split_sinkhorn.py"),
-    Entry("test_hc_pre_fuse.py"),
-    Entry("test_fused_experts_mxfp4_dsv4_shapes.py"),
-    Entry("test_store_cache_xpu.py"),
-    Entry("test_hc_pre_gemm_sqr_sum.py"),
-    Entry("test_mhc_pre.py"),
-    Entry("test_per_token_group_quant_mxfp4_fused.py"),
-    Entry("test_silu_and_mul_clamp.py"),
-    Entry("test_hadamard.py"),
-    Entry("test_fp8_paged_mqa_logits.py"),
-    Entry("test_c128_v2.py"),
-    Entry("test_c4_v2.py"),
-    Entry("test_fused_q_indexer_rope_hadamard_quant.py"),
-    Entry("test_fused_norm_rope_v2.py"),
-    Entry("test_hc_post.py"),
-    Entry("test_jit_kernels.py"),
-    Entry("test_embedding_lora_a_fwd.py"),
-    Entry("test_sgemm_lora_a_fwd.py"),
-    Entry("test_fused_q_norm_rope.py"),
-    Entry("test_qsa_mqa_nightly.py", estimated_time=180),
-    Entry("test_qsa_sparse_attention_nightly.py", estimated_time=180),
-]
+def _load_bench_suite():
+    # Both runners are named run_suite.py; load the benchmark one under its own name.
+    path = os.path.join(BENCH_DIR, "run_suite.py")
+    spec = importlib.util.spec_from_file_location("bench_run_suite", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
-NIGHTLY_BENCHMARKS: List[Entry] = [
-    Entry("bench_flash_attn.py", tee_log="flash.log"),
-    Entry("bench_flash_mla_decode.py", tee_log="mla.log"),
-    Entry("bench_flash_mla_with_kvcache.py", tee_log="mla_with_kvcache.log"),
-    Entry("bench_moe_topk_sigmoid.py", tee_log="moe_topk_sigmoid.log"),
-    Entry("bench_moe_topk_softmax.py", tee_log="moe.log"),
-    Entry("bench_fused_moe.py", tee_log="fused_moe.log"),
-    Entry("bench_moe_sum_reduce.py", tee_log="moe_sum_reduce.log"),
-    Entry("bench_moe_fused_gate.py", tee_log="moe_fused_gate.py.log"),
-    Entry("bench_merge_states_v2.py", tee_log="merge_states.py.log"),
-    Entry("bench_mrope.py", tee_log="mrope.py.log"),
-    Entry("bench_swiglu_alpha_limit.py", tee_log="swiglu_alpha_limit.py.log"),
-    Entry("bench_fused_qk_norm_rope.py", tee_log="fused_qk_norm_rope.py.log"),
-    Entry(
-        "bench_fused_qk_rope_with_cache.py",
-        tee_log="bench_fused_qk_rope_with_cache.py.log",
-    ),
-    Entry(
-        "bench_per_token_group_quant_mxfp4.py",
-        tee_log="per_token_group_quant_mxfp4.py.log",
-    ),
-    Entry(
-        "bench_per_token_group_quant_8bit_v2.py",
-        tee_log="bench_per_token_group_quant_8bit_v2.py.log",
-    ),
-    Entry("bench_per_token_quant_fp8.py", tee_log="bench_per_token_quant_fp8.py.log"),
-    Entry(
-        "bench_per_token_group_quant_mxfp4_fusion.py",
-        tee_log="bench_per_token_group_quant_mxfp4_fusion.py.log",
-    ),
-    Entry(
-        "bench_scatter_tokens_to_experts.py",
-        tee_log="bench_scatter_tokens_to_experts.py.log",
-    ),
-    Entry("bench_top_k_renorm_probs.py", tee_log="bench_top_k_renorm_probs.py.log"),
-    Entry(
-        "bench_scale_residual_norm_scale_shift.py",
-        tee_log="bench_scale_residual_norm_scale_shift.py.log",
-    ),
-    Entry("bench_hc_split_sinkhorn.py", tee_log="bench_hc_split_sinkhorn.py.log"),
-    Entry("bench_hc_pre_fuse.py", tee_log="bench_hc_pre_fuse.py.log"),
-    Entry("bench_embedding_lora_a_fwd.py", tee_log="bench_embedding_lora_a_fwd.py.log"),
-    Entry("bench_moe_mxfp4_w4a16_gemm.py", tee_log="bench_moe_mxfp4_w4a16_gemm.py.log"),
-    Entry("bench_fused_experts_mxfp4.py", tee_log="bench_fused_experts_mxfp4.py.log"),
-    Entry("bench_hc_pre_gemm_sqr_sum.py", tee_log="bench_hc_pre_gemm_sqr_sum.py.log"),
-    Entry("bench_mhc_pre.py", tee_log="bench_mhc_pre.py.log"),
-    Entry("bench_silu_and_mul_clamp.py", tee_log="bench_silu_and_mul_clamp.log"),
-    Entry("bench_jit_rmsnorm.py", tee_log="bench_jit_rmsnorm.py.log"),
-    Entry("bench_jit_qknorm.py", tee_log="bench_jit_qknorm.py.log"),
-    Entry("bench_jit_rope.py", tee_log="bench_jit_rope.py.log"),
-    Entry(
-        "bench_jit_timestep_embedding.py", tee_log="bench_jit_timestep_embedding.py.log"
-    ),
-    Entry(
-        "bench_jit_per_tensor_quant_fp8.py",
-        tee_log="bench_jit_per_tensor_quant_fp8.py.log",
-    ),
-    Entry(
-        "bench_jit_moe_align_block_size.py",
-        tee_log="bench_jit_moe_align_block_size.py.log",
-    ),
-    Entry(
-        "bench_jit_per_token_group_quant_8bit_v2.py",
-        tee_log="bench_jit_per_token_group_quant_8bit_v2.py.log",
-    ),
-    Entry("bench_jit_activation.py", tee_log="bench_jit_activation.py.log"),
-    Entry("bench_hc_post.py", tee_log="bench_hc_post.py.log"),
-    Entry("bench_sgemm_lora_a_fwd.py", tee_log="bench_sgemm_lora_a_fwd.py.log"),
-    Entry("bench_minimax_decode_topk.py", tee_log="bench_minimax_decode_topk.py.log"),
-]
+bench_suite = _load_bench_suite()
+TestFile = test_suite.TestFile
+BenchFile = bench_suite.BenchFile
 
+# ---------------------------------------------------------------------------
+# Nightly-only extras, added on top of the per-commit lists.
+# To run something in PR CI and both nightlies, add it to the per-commit list
+# in tests/run_suite.py or benchmark/run_suite.py instead.
+# ---------------------------------------------------------------------------
+
+# Tests that run only in the JIT nightly (USE_SYCL_JIT=ON wheel). Example:
+#   JIT_ONLY_TESTS = [
+#       TestFile("test_my_jit_kernel.py"),
+#       TestFile("test_my_slow_jit_case.py", estimated_time=300),
+#   ]
+JIT_ONLY_TESTS = []
+
+# Tests that run only in the AOT nightly. Example:
+#   AOT_ONLY_TESTS = [
+#       TestFile("test_my_aot_kernel.py"),
+#   ]
+AOT_ONLY_TESTS = []
+
+# Benchmarks that run only in the JIT nightly; tee_log/args are optional. Example:
+#   JIT_ONLY_BENCHMARKS = [
+#       BenchFile("bench_my_jit_kernel.py"),
+#       BenchFile("bench_my_jit_sweep.py", tee_log="my_jit.log", args=["--quick"]),
+#   ]
+JIT_ONLY_BENCHMARKS = []
+
+# Benchmarks that run only in the AOT nightly. Example:
+#   AOT_ONLY_BENCHMARKS = [
+#       BenchFile("bench_my_aot_kernel.py"),
+#   ]
+AOT_ONLY_BENCHMARKS = []
 
 SUITES = {
-    "sgl-kernel-test": ("test", TESTS_DIR, NIGHTLY_TESTS),
-    "sgl-kernel-benchmark": ("bench", BENCH_DIR, NIGHTLY_BENCHMARKS),
+    "sgl-kernel-test": ("test", TESTS_DIR, test_suite.suites["per-commit"]),
+    "sgl-kernel-benchmark": ("bench", BENCH_DIR, bench_suite.suites["per-commit"]),
+}
+
+EXTRAS = {
+    ("sgl-kernel-test", "jit"): JIT_ONLY_TESTS,
+    ("sgl-kernel-test", "aot"): AOT_ONLY_TESTS,
+    ("sgl-kernel-benchmark", "jit"): JIT_ONLY_BENCHMARKS,
+    ("sgl-kernel-benchmark", "aot"): AOT_ONLY_BENCHMARKS,
 }
 
 
-def auto_partition(files, rank, size):
-    """Balance ``files`` into ``size`` partitions by ``estimated_time`` and
-    return the ``rank``-th partition. Mirrors tests/run_suite.py.
-    """
-    weights = [f.estimated_time for f in files]
-    if not weights or size <= 0 or size > len(weights):
-        return []
-
-    indexed_weights = [(w, -i) for i, w in enumerate(weights)]
-    indexed_weights = sorted(indexed_weights, reverse=True)
-    indexed_weights = [(w, -i) for w, i in indexed_weights]
-
-    partitions = [[] for _ in range(size)]
-    sums = [0.0] * size
-    for weight, idx in indexed_weights:
-        min_sum_idx = sums.index(min(sums))
-        partitions[min_sum_idx].append(idx)
-        sums[min_sum_idx] += weight
-
-    return [files[i] for i in partitions[rank]]
+def select_entries(suite: str, variant):
+    """Per-commit list plus the extras for ``variant``, skipping duplicates."""
+    entries = list(SUITES[suite][2])
+    names = {e.name for e in entries}
+    for extra in EXTRAS.get((suite, variant), []):
+        if extra.name in names:
+            print(f"[skip] {extra.name} is already in the per-commit list")
+            continue
+        entries.append(extra)
+        names.add(extra.name)
+    return entries
 
 
-def run_tests(files: List[Entry], workdir: str, timeout_per_file: int) -> int:
-    # Reuse tests/test_utils.run_unittest_files so nightly test execution matches
-    # the harness per-commit CI uses.
-    sys.path.insert(0, workdir)
-    from run_suite import TestFile  # noqa: E402
-    from test_utils import run_unittest_files  # noqa: E402
-
-    return run_unittest_files(
-        [TestFile(f.name, f.estimated_time) for f in files],
-        timeout_per_file,
-    )
-
-
-def run_benchmarks(files: List[Entry], workdir: str, timeout_per_file: int) -> int:
+def run_tests(files, workdir: str, timeout_per_file: int) -> int:
+    # run_unittest_files resolves file names against the cwd.
+    os.chdir(workdir)
+    tic = time.perf_counter()
     failed = []
-    for entry in files:
-        script = os.path.join(workdir, entry.name)
-        log_path = os.path.join(workdir, entry.tee_log or f"{entry.name}.log")
-        print(
-            f"\n=== Running {entry.name} (log: {entry.tee_log or entry.name + '.log'}) ==="
-        )
-        try:
-            with open(log_path, "wb") as log_f:
-                proc = subprocess.run(
-                    [sys.executable, script],
-                    cwd=workdir,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    timeout=timeout_per_file,
-                )
-                log_f.write(proc.stdout)
-                sys.stdout.buffer.write(proc.stdout)
-            if proc.returncode != 0:
-                print(f"FAILED: {entry.name} (exit {proc.returncode})")
-                failed.append(entry.name)
-        except subprocess.TimeoutExpired:
-            print(f"TIMEOUT: {entry.name} exceeded {timeout_per_file}s")
-            failed.append(entry.name)
-        except FileNotFoundError:
-            print(f"MISSING: {entry.name} not found under {workdir}")
-            failed.append(entry.name)
+    for i, f in enumerate(files):
+        print(f"\n===== [{i + 1}/{len(files)}] {f.name} =====", flush=True)
+        # One file per call keeps run_unittest_files' timeout/retry handling
+        # but stops its stop-at-first-failure from skipping the rest.
+        if run_unittest_files([f], timeout_per_file) != 0:
+            failed.append(f.name)
+            # Give a crashed or wedged device time to reset before the next file.
+            _recover_xpu()
 
+    total = time.perf_counter() - tic
+    print(f"\n===== nightly tests: {len(files)} files, {total / 60:.1f} min =====")
     if failed:
-        print(f"\nBenchmark failures: {failed}")
+        print(f"Fail. {len(failed)} test file(s) failed:", flush=True)
+        for name in failed:
+            print(f"  {name}", flush=True)
         return 1
+    print("Success. All test files passed.", flush=True)
     return 0
+
+
+def run_benchmarks(files, workdir: str, timeout_per_file: int) -> int:
+    # benchmark/run_suite.py already runs every benchmark and reports failures at the end.
+    return bench_suite.run_benchmark_files(files, timeout_per_file)
 
 
 if __name__ == "__main__":
@@ -244,6 +146,12 @@ if __name__ == "__main__":
         type=int,
         default=1800,
         help="Time limit per test/benchmark in seconds.",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=["aot", "jit"],
+        default=None,
+        help="Append that variant's *_ONLY_* list (default: per-commit only).",
     )
     parser.add_argument(
         "--range-begin",
@@ -269,16 +177,20 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    kind, workdir, entries = SUITES[args.suite]
+    kind, workdir, _ = SUITES[args.suite]
+    entries = select_entries(args.suite, args.variant)
 
     if args.auto_partition_size:
-        entries = auto_partition(
+        entries = test_suite.auto_partition(
             entries, args.auto_partition_id, args.auto_partition_size
         )
     else:
         entries = entries[args.range_begin : args.range_end]
 
-    print(f"Suite: {args.suite} ({kind}); {len(entries)} entries; workdir: {workdir}")
+    print(
+        f"Suite: {args.suite} ({kind}), variant: {args.variant}; "
+        f"{len(entries)} entries; workdir: {workdir}"
+    )
     print("Selected entries:", [e.name for e in entries])
 
     if kind == "test":

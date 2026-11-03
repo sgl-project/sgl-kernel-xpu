@@ -2,7 +2,7 @@
 # Each (ELEM_TAG, TILE_TAG) combination is compiled as a separate translation
 # unit so the heavy CUTLASS template instantiation parallelizes across the
 # build, matching the convention used by the other Xe20 grouped-GEMM kernels
-# (see QKVLoraBFwdXe20.cmake).
+# (see QKVLoraBFwd.cmake).
 #
 # To add a new tile, register both a tag name in GATE_UP_LORA_B_FWD_TILE_TAGS and
 # the matching C++ option-tag type in GATE_UP_LORA_B_FWD_TILE_TYPES here, define

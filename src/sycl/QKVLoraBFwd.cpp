@@ -46,12 +46,12 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
-#include <algorithm>
 #include <sycl/sycl.hpp>
 
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "kernels/lora/common/lora_debug_checks.hpp"
 #include "kernels/lora/device/qkv_lora_b_fwd_dispatch.hpp"
 #include "sgl_kernel_export.h"
 
@@ -61,7 +61,7 @@ namespace {
 // QKV LoRA-B is a K-thin (rank 16..64), memory-bandwidth-bound grouped GEMM.
 // After trying different shapes, a single tall/thin 32x512 workgroup tile is
 // fastest across the shape space, so tile selection currently has a single option (tall).
-// Add tiles to DISPATCH_QKV_LORA_B_FWD_TILE (and to QKVLoraBFwdXe20.cmake +
+// Add tiles to DISPATCH_QKV_LORA_B_FWD_TILE (and to QKVLoraBFwd.cmake +
 // qkv_lora_b_fwd_dispatch.hpp + qkv_lora_b_fwd_types.hpp) with a runtime
 // heuristic picking the tag.
 #define DISPATCH_QKV_LORA_B_FWD_TILE(ELEM, ...)                            \
@@ -134,12 +134,7 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
       num_tokens_i64 == 0 || seg_indptr.numel() >= 2, "seg_indptr must have at least 2 elements when num_tokens > 0");
   const int64_t num_segments_i64 = seg_indptr.numel() - 1;
   TORCH_CHECK(weight_indices.numel() == num_segments_i64, "weight_indices.numel() must equal seg_indptr.numel() - 1");
-  if (num_segments_i64 > 0) {
-    auto [min_wi, max_wi] = torch::aminmax(weight_indices);
-    TORCH_CHECK(
-        min_wi.item<int64_t>() >= 0 && max_wi.item<int64_t>() < num_loras_i64,
-        "weight_indices values must be in [0, qkv_lora_b.size(0))");
-  }
+  lora_debug_checks::check_weight_indices(weight_indices, num_loras_i64, "qkv_lora_b");
   // Validate output tensor size and dtype.
   TORCH_CHECK(
       output.size(0) == num_tokens_i64 && output.size(1) == n_total_i64,
@@ -157,19 +152,18 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
   }
 
   // output_offset defines the q/k/v output-column bands: [0, N_Q, N_Q + N_KV,
-  // N_Q + 2 * N_KV]. Validate the boundaries frame the full output and are
-  // non-decreasing, and that max_qkv_out_dim matches the widest projection.
+  // N_Q + 2 * N_KV]. Its values (frame the full output, non-decreasing, widest band
+  // == max_qkv_out_dim) are checked in debug-check builds only: reading them needs
+  // a device -> host copy.
   auto output_offset_i32 =
       output_offset.scalar_type() == torch::kInt32 ? output_offset : output_offset.to(torch::kInt32);
-  auto oo_cpu = output_offset_i32.cpu();
-  const int32_t* oo = oo_cpu.data_ptr<int32_t>();
-  TORCH_CHECK(oo[0] == 0, "output_offset[0] must be 0");
-  TORCH_CHECK(oo[3] == n_total_i64, "output_offset[-1] must equal qkv_lora_b.size(1) (N_Q + 2 * N_KV)");
-  TORCH_CHECK(oo[0] <= oo[1] && oo[1] <= oo[2] && oo[2] <= oo[3], "output_offset must be non-decreasing");
-  const int64_t widest = std::max({oo[1] - oo[0], oo[2] - oo[1], oo[3] - oo[2]});
-  TORCH_CHECK(
-      max_qkv_out_dim == widest,
-      "max_qkv_out_dim must equal max(output_q_dim, output_kv_dim) implied by output_offset");
+  lora_debug_checks::check_column_offsets(
+      output_offset_i32,
+      n_total_i64,
+      max_qkv_out_dim,
+      "output_offset",
+      "qkv_lora_b.size(1) (N_Q + 2 * N_KV)",
+      "max_qkv_out_dim");
 
   if (num_tokens_i64 == 0) {
     return;
@@ -186,21 +180,12 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
     return;
   }
 
-  TORCH_CHECK(seg_indptr[0].item<int64_t>() == 0, "seg_indptr[0] must be 0");
-  TORCH_CHECK(
-      seg_indptr[seg_indptr.numel() - 1].item<int64_t>() == num_tokens_i64, "seg_indptr[-1] must equal num_tokens");
-  auto seg_len_tensor = seg_indptr.slice(0, 1) - seg_indptr.slice(0, 0, seg_indptr.size(0) - 1);
-  auto [seg_len_min, seg_len_max] = torch::aminmax(seg_len_tensor);
-  TORCH_CHECK(seg_len_min.item<int>() >= 0, "seg_indptr must be non-decreasing");
-  (void)seg_len_max;  // not needed: grouped GEMM handles variable M per group
+  lora_debug_checks::check_seg_indptr(seg_indptr, num_tokens_i64);
 
   // lora_ranks is only range-validated here; it does NOT shrink the per-segment
   // GEMM (every group computes the full K = max_rank reduction). The caller must
   // pre-zero weight columns beyond each adapter's rank R_l.
-  auto [min_lr, max_lr] = torch::aminmax(lora_ranks);
-  TORCH_CHECK(
-      min_lr.item<int64_t>() >= 0 && max_lr.item<int>() <= max_rank_i64,
-      "All values in lora_ranks must be within the range [0, max_rank]");
+  lora_debug_checks::check_lora_ranks(lora_ranks, max_rank_i64);
 
   // Cast index tensors to int32 for the device-side metadata build; the per-group
   // alpha buffer is derived from fp32 scalings.
@@ -214,7 +199,7 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
 
   const int n_total = static_cast<int>(n_total_i64);
   const int num_segments = static_cast<int>(num_segments_i64);
-  (void)max_qkv_out_dim;  // validated above; per-group N comes from output_offset
+  (void)max_qkv_out_dim;  // debug-checked above; per-group N comes from output_offset
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // Grouped GEMM: (num_tokens, K) @ (K, N_total) -> (num_tokens, N_total). K == max_rank per group.
@@ -229,7 +214,7 @@ SGL_KERNEL_EXPORT void qkv_lora_b_fwd(
 #endif
 
   // Dispatch on dtype. Each launch symbol is defined in a separate generated
-  // translation unit (see QKVLoraBFwdXe20.cmake).
+  // translation unit (see QKVLoraBFwd.cmake).
   DISPATCH_QKV_LORA_B_FWD_DTYPE(
       input_x,
       qkv_lora_b,

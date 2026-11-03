@@ -50,7 +50,7 @@
 
   Adding a new tile is a two-step change:
     1) Define a new option tag here.
-    2) Register (tag name, C++ type) in QKVLoraBFwdXe20.cmake.
+    2) Register (tag name, C++ type) in QKVLoraBFwd.cmake.
   The dtype dispatch in QKVLoraBFwd.cpp then picks a tag per call.
 */
 

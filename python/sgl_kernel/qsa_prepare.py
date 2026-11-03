@@ -1,4 +1,4 @@
-"""Xe2 QSA preparation operators."""
+"""QSA preparation operators (Xe2 and Xe3)."""
 
 from typing import Optional
 
@@ -28,7 +28,7 @@ def qsa_index_q_norm_rope_store(
     """
     if out_dtype not in (None, torch.bfloat16, torch.float8_e4m3fn):
         raise NotImplementedError(
-            "Xe2 QSA preparation supports BF16 or float8_e4m3fn output only"
+            "QSA preparation supports BF16 or float8_e4m3fn output only"
         )
     return torch.ops.sgl_kernel.qsa_index_q_norm_rope_store(
         qk,

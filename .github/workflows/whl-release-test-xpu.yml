@@ -2,7 +2,7 @@ name: Wheel Release Test (XPU)
 run-name: Wheel Release Test PY ${{ inputs.python_version }} (XPU) @ ${{ inputs.ref }}
 
 # Run the per-commit kernel tests + benchmarks of a given ref against a prebuilt
-# wheel, in a fresh conda env of the requested Python. Nothing is built from source.
+# wheel, in a fresh uv venv of the requested Python. Nothing is built from source.
 
 on:
   workflow_dispatch:
@@ -28,7 +28,7 @@ on:
         type: string
         default: '2.13.0'
       image:
-        description: 'Base image (provides driver, oneAPI, conda)'
+        description: 'Base image (provides driver, oneAPI, uv)'
         required: false
         type: string
         default: 'intel/sgl-kernel-xpu-dev:latest'
@@ -88,7 +88,7 @@ jobs:
         run: |
           docker exec "$CONTAINER" /bin/bash -c '
             set -ex
-            /miniforge3/envs/py3.12/bin/python3 -m pip uninstall -y sglang-kernel-xpu sgl-kernel || true
+            uv pip uninstall sglang-kernel-xpu sgl-kernel || true
             rm -rf /root/sglang/sgl-kernel-xpu
             mkdir -p /root/sglang/sgl-kernel-xpu
           '
@@ -107,30 +107,26 @@ jobs:
         run: |
           docker exec -e PY -e TORCH -e PY_ENV -e WHEEL_FILE "$CONTAINER" /bin/bash -c '
             set -exo pipefail
-            . /miniforge3/bin/activate
-            conda create -y -n "$PY_ENV" python="$PY"
-            conda activate "$PY_ENV"
-            pip install --upgrade pip
-            pip install --timeout 300 --retries 10 "torch==$TORCH" torchvision triton-xpu \
+            uv venv --python "$PY" --seed "/opt/$PY_ENV"
+            . "/opt/$PY_ENV/bin/activate"
+            uv pip install "torch==$TORCH" torchvision triton-xpu \
               --index-url https://download.pytorch.org/whl/xpu
-            pip install --no-deps --force-reinstall "/tmp/whl/$WHEEL_FILE"
-            pip install pytest expecttest ray huggingface_hub scipy tabulate pandas matplotlib einops numpy
+            uv pip install --no-deps --reinstall "/tmp/whl/$WHEEL_FILE"
+            uv pip install pytest expecttest ray huggingface_hub scipy tabulate pandas matplotlib einops numpy
             # Same extras as the pr-test-xpu.yml image (benchmark/utils.py needs transformers);
             # torch pinned so the resolver cannot swap it.
-            pip install "torch==$TORCH" transformers msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser aiohttp
+            uv pip install "torch==$TORCH" transformers msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser aiohttp
             hf auth login --token "$HF_TOKEN"
-            # tests/test_utils.py spawns bare "python3".
-            ln -sf "/miniforge3/envs/$PY_ENV/bin/python3" /usr/bin/python3
-            pip show sglang-kernel-xpu
+            uv pip show sglang-kernel-xpu
           '
 
       - name: Verify sgl_kernel comes from the given wheel
         run: |
           docker exec -i -w /root/sglang/sgl-kernel-xpu/tests -e PY_ENV -e WHEEL_FILE "$CONTAINER" \
-            "/miniforge3/envs/$PY_ENV/bin/python3" - <<'EOF' | tee kernel_info.txt
+            "/opt/$PY_ENV/bin/python3" - <<'EOF' | tee kernel_info.txt
           import os, sys, importlib.metadata as md
           import torch, sgl_kernel
-          env_prefix = f"/miniforge3/envs/{os.environ['PY_ENV']}/"
+          env_prefix = f"/opt/{os.environ['PY_ENV']}/"
           whl_ver = os.environ["WHEEL_FILE"].split("-")[1]
           dist_ver = md.version("sglang-kernel-xpu")
           print("python     :", sys.version.split()[0])
@@ -152,7 +148,7 @@ jobs:
           set -uo pipefail
           dir=$1; label=$2
           mapfile -t names < <(docker exec -w "$KERNEL_DIR/$dir" "$CONTAINER" \
-            "/miniforge3/envs/$PY_ENV/bin/python3" -c \
+            "/opt/$PY_ENV/bin/python3" -c \
             'import run_suite as r; print("\n".join(f.name for f in r.suites["per-commit"]))')
           if [ ${#names[@]} -eq 0 ]; then echo "::error::no $label files found"; exit 1; fi
           failed=0
@@ -161,7 +157,7 @@ jobs:
             echo "::group::[$((i + 1))/${#names[@]}] $label: ${names[$i]}"
             start=$(date +%s)
             if docker exec -w "$KERNEL_DIR/$dir" "$CONTAINER" /bin/bash -c \
-                ". /miniforge3/bin/activate $PY_ENV && python3 run_suite.py --suite per-commit --range-begin $i --range-end $((i + 1))" </dev/null; then
+                ". /opt/$PY_ENV/bin/activate && python3 run_suite.py --suite per-commit --range-begin $i --range-end $((i + 1))" </dev/null; then
               status=pass
             else
               status=fail; failed=$((failed + 1))

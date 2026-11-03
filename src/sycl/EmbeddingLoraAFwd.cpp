@@ -2,11 +2,13 @@
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
+#include <algorithm>
 #include <sycl/sycl.hpp>
 
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "kernels/lora/common/lora_debug_checks.hpp"
 #include "sgl_kernel_export.h"
 
 // ============================================================
@@ -227,7 +229,8 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
     const torch::Tensor& lora_ranks,                       // [num_loras,]
     const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
     [[maybe_unused]] const std::optional<torch::Tensor>&
-        seg_lens  // [num_segments,] optional; currently unused, reserved for future per-segment optimizations
+        seg_lens,  // [num_segments,] optional; currently unused, reserved for future per-segment optimizations
+    std::optional<int64_t> max_len_opt  // upper bound on segment length; default: longest segment (one sync)
 ) {
   CHECK_INPUT(input_ids);
   CHECK_INPUT(weights);
@@ -257,12 +260,7 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
       num_tokens_i64 == 0 || seg_indptr.numel() >= 2, "seg_indptr must have at least 2 elements when num_tokens > 0");
   const int64_t num_segments_i64 = seg_indptr.numel() - 1;
   TORCH_CHECK(weight_indices.numel() == num_segments_i64, "weight_indices.numel() must equal seg_indptr.numel() - 1");
-  if (num_segments_i64 > 0) {
-    auto [min_wi, max_wi] = torch::aminmax(weight_indices);
-    TORCH_CHECK(
-        min_wi.item<int64_t>() >= 0 && max_wi.item<int64_t>() < num_loras_i64,
-        "weight_indices values must be in [0, weights.size(0))");
-  }
+  lora_debug_checks::check_weight_indices(weight_indices, num_loras_i64, "weights");
   // Validate output tensor size and dtype
   TORCH_CHECK(
       output.size(0) == num_tokens_i64 && output.size(1) == max_rank_i64,
@@ -273,14 +271,21 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
     return;
   }
 
-  TORCH_CHECK(seg_indptr[0].item<int64_t>() == 0, "seg_indptr[0] must be 0");
-  TORCH_CHECK(
-      seg_indptr[seg_indptr.numel() - 1].item<int64_t>() == num_tokens_i64, "seg_indptr[-1] must equal num_tokens");
-  auto seg_len_tensor = seg_indptr.slice(0, 1) - seg_indptr.slice(0, 0, seg_indptr.size(0) - 1);
-  auto [seg_len_min, seg_len_max] = torch::aminmax(seg_len_tensor);
-  TORCH_CHECK(seg_len_min.item<int>() >= 0, "seg_indptr must be non-decreasing");
-  const int max_len =
-      static_cast<int>(seg_len_max.item<int64_t>());  // max_len = maximum segment length of all segments
+  lora_debug_checks::check_seg_indptr(seg_indptr, num_tokens_i64);
+  // max_len sizes the launch grid (token blocks per segment); rows of a segment longer than
+  // max_len are skipped. Without a caller bound, the longest segment is read from the device
+  // (one device -> host sync): defaulting to num_tokens would launch num_segments * num_tokens
+  // token slots, which overflows the SYCL range for many short segments.
+  int64_t max_len = 0;
+  if (max_len_opt.has_value()) {
+    max_len = max_len_opt.value();
+    TORCH_CHECK(max_len >= 0 && max_len <= num_tokens_i64, "max_len must be in [0, num_tokens]");
+    lora_debug_checks::check_max_seg_len(seg_indptr, max_len);
+  } else {
+    const auto seg_lens_dev = seg_indptr.slice(0, 1) - seg_indptr.slice(0, 0, -1);
+    // Clamped so an invalid seg_indptr cannot size an oversized grid.
+    max_len = std::clamp<int64_t>(seg_lens_dev.max().item<int64_t>(), 0, num_tokens_i64);
+  }
 
   if (extra_embeddings.has_value()) {
     TORCH_CHECK(extra_embeddings->dim() == 3, "extra_embeddings must be a 3D tensor");
@@ -290,10 +295,7 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
     TORCH_CHECK(
         extra_embeddings->scalar_type() == weights.scalar_type(), "extra_embeddings dtype must match weights dtype");
   }
-  auto [min_lr, max_lr] = torch::aminmax(lora_ranks);
-  TORCH_CHECK(
-      min_lr.item<int64_t>() >= 0 && max_lr.item<int>() <= max_rank_i64,
-      "All values in lora_ranks must be within the range [0, max_rank]");
+  lora_debug_checks::check_lora_ranks(lora_ranks, max_rank_i64);
 
   // Cast to int32 and validate the bounds
   auto seg_indptr_i32 = seg_indptr.scalar_type() == torch::kInt32 ? seg_indptr : seg_indptr.to(torch::kInt32);
@@ -334,7 +336,7 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
         max_rank,
         num_segments,
         num_extra_tokens,
-        max_len,
+        static_cast<int>(max_len),
         queue);
   } else if (weights.scalar_type() == torch::kHalf) {
     launch_embedding_lora_a_fwd<at::Half>(
@@ -350,7 +352,7 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
         max_rank,
         num_segments,
         num_extra_tokens,
-        max_len,
+        static_cast<int>(max_len),
         queue);
   } else if (weights.scalar_type() == torch::kBFloat16) {
     launch_embedding_lora_a_fwd<at::BFloat16>(
@@ -366,7 +368,7 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
         max_rank,
         num_segments,
         num_extra_tokens,
-        max_len,
+        static_cast<int>(max_len),
         queue);
   } else {
     TORCH_CHECK(false, "Unsupported data type for weights");

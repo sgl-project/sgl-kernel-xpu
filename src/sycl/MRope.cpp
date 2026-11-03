@@ -1,3 +1,4 @@
+#include <ATen/OpMathType.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
@@ -20,11 +21,13 @@ static constexpr int sg_size = 32;
 // Adapted from triton implementation in sglang "_triton_mrope_forward_fused":
 // https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/rotary_embedding/triton_kernels.py
 
-template <typename scalar_t, bool is_neox, bool is_interleaved>
+template <typename scalar_t, typename cache_t, bool is_neox, bool is_interleaved>
 struct MRoPEKernel {
   // Grid  : nd_range<2>( {num_tokens, global_rotary_dim}, {1, local_rotary_dim} )
   //   dim 0: token   (1 work-group row per token)
   //   dim 1: rot lane (local_rotary_dim lanes per work-group)
+
+  using opmath_t = at::opmath_type<scalar_t>;
 
   [[sycl::reqd_sub_group_size(sg_size)]]
   void operator()(sycl::nd_item<2> item) const {
@@ -54,8 +57,8 @@ struct MRoPEKernel {
     const int64_t chosen_pos = h_mask ? h_pos : (w_mask ? w_pos : t_pos);
     const int64_t cache_base = chosen_pos * rotary_dim_;
 
-    const scalar_t cos_v = cos_sin_cache_[cache_base + rot];
-    const scalar_t sin_v = cos_sin_cache_[cache_base + rot + half_rotary_dim_];
+    const opmath_t cos_v = static_cast<opmath_t>(cos_sin_cache_[cache_base + rot]);
+    const opmath_t sin_v = static_cast<opmath_t>(cos_sin_cache_[cache_base + rot + half_rotary_dim_]);
 
     const int64_t max_heads = (num_q_heads_ > num_k_heads_) ? num_q_heads_ : num_k_heads_;
 
@@ -64,34 +67,34 @@ struct MRoPEKernel {
         scalar_t* q_head = query_ + token_id * q_stride_ + head_id * head_size_;
 
         if constexpr (is_neox) {
-          const scalar_t x = q_head[rot];
-          const scalar_t y = q_head[rot + half_rotary_dim_];
-          q_head[rot] = x * cos_v - y * sin_v;
-          q_head[rot + half_rotary_dim_] = y * cos_v + x * sin_v;
+          const opmath_t x = static_cast<opmath_t>(q_head[rot]);
+          const opmath_t y = static_cast<opmath_t>(q_head[rot + half_rotary_dim_]);
+          q_head[rot] = static_cast<scalar_t>(x * cos_v - y * sin_v);
+          q_head[rot + half_rotary_dim_] = static_cast<scalar_t>(y * cos_v + x * sin_v);
         } else {
           const int64_t x_idx = 2 * rot;
           const int64_t y_idx = x_idx + 1;
-          const scalar_t x = q_head[x_idx];
-          const scalar_t y = q_head[y_idx];
-          q_head[x_idx] = x * cos_v - y * sin_v;
-          q_head[y_idx] = y * cos_v + x * sin_v;
+          const opmath_t x = static_cast<opmath_t>(q_head[x_idx]);
+          const opmath_t y = static_cast<opmath_t>(q_head[y_idx]);
+          q_head[x_idx] = static_cast<scalar_t>(x * cos_v - y * sin_v);
+          q_head[y_idx] = static_cast<scalar_t>(y * cos_v + x * sin_v);
         }
       }
       if (head_id < num_k_heads_) {
         scalar_t* k_head = key_ + token_id * k_stride_ + head_id * head_size_;
 
         if constexpr (is_neox) {
-          const scalar_t x = k_head[rot];
-          const scalar_t y = k_head[rot + half_rotary_dim_];
-          k_head[rot] = x * cos_v - y * sin_v;
-          k_head[rot + half_rotary_dim_] = y * cos_v + x * sin_v;
+          const opmath_t x = static_cast<opmath_t>(k_head[rot]);
+          const opmath_t y = static_cast<opmath_t>(k_head[rot + half_rotary_dim_]);
+          k_head[rot] = static_cast<scalar_t>(x * cos_v - y * sin_v);
+          k_head[rot + half_rotary_dim_] = static_cast<scalar_t>(y * cos_v + x * sin_v);
         } else {
           const int64_t x_idx = 2 * rot;
           const int64_t y_idx = x_idx + 1;
-          const scalar_t x = k_head[x_idx];
-          const scalar_t y = k_head[y_idx];
-          k_head[x_idx] = x * cos_v - y * sin_v;
-          k_head[y_idx] = y * cos_v + x * sin_v;
+          const opmath_t x = static_cast<opmath_t>(k_head[x_idx]);
+          const opmath_t y = static_cast<opmath_t>(k_head[y_idx]);
+          k_head[x_idx] = static_cast<scalar_t>(x * cos_v - y * sin_v);
+          k_head[y_idx] = static_cast<scalar_t>(y * cos_v + x * sin_v);
         }
       }
     }
@@ -100,7 +103,7 @@ struct MRoPEKernel {
   // Pointers
   scalar_t* query_;
   scalar_t* key_;
-  const scalar_t* cos_sin_cache_;
+  const cache_t* cos_sin_cache_;
   const int64_t* positions_;
 
   // Strides
@@ -122,7 +125,7 @@ struct MRoPEKernel {
   int64_t section_w_;
 };
 
-template <typename scalar_t, bool is_neox, bool is_interleaved>
+template <typename scalar_t, typename cache_t, bool is_neox, bool is_interleaved>
 void launch_mrope(
     at::Tensor& query,
     at::Tensor& key,
@@ -142,10 +145,10 @@ void launch_mrope(
   const int64_t local_rotary_dim = RoundUp(half_rotary_dim, static_cast<int64_t>(sg_size));
   const int64_t global_rotary_dim = RoundUp(half_rotary_dim, local_rotary_dim);
 
-  MRoPEKernel<scalar_t, is_neox, is_interleaved> kernel{
+  MRoPEKernel<scalar_t, cache_t, is_neox, is_interleaved> kernel{
       query.data_ptr<scalar_t>(),
       key.data_ptr<scalar_t>(),
-      cos_sin_cache.data_ptr<scalar_t>(),
+      cos_sin_cache.data_ptr<cache_t>(),
       positions.data_ptr<int64_t>(),
       static_cast<int64_t>(query.stride(0)),
       static_cast<int64_t>(key.stride(0)),
@@ -199,6 +202,11 @@ SGL_KERNEL_EXPORT void multimodal_rotary_embedding(
   const int64_t num_tokens = query.size(0);
   TORCH_CHECK(positions.size(1) == num_tokens, "positions second dimension must equal num_tokens");
   TORCH_CHECK(mrope_interleaved_glm == false, "glm style rope is not supported");
+  TORCH_CHECK(key.scalar_type() == query.scalar_type(), "query and key must have the same dtype");
+  const bool fp32_cache = cos_sin_cache.scalar_type() == at::kFloat;
+  TORCH_CHECK(
+      fp32_cache || cos_sin_cache.scalar_type() == query.scalar_type(),
+      "cos_sin_cache must be float32 or have the query dtype");
 
   const int64_t num_q_heads = query.size(1) / head_size;
   const int64_t num_k_heads = key.size(1) / head_size;
@@ -224,18 +232,33 @@ SGL_KERNEL_EXPORT void multimodal_rotary_embedding(
 
 #define LAUNCH_MROPE_KERNEL(IS_NEOX, IS_INTERLEAVED)                                                                 \
   SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, query.scalar_type(), "multimodal_rotary_embedding", [&]() { \
-    launch_mrope<scalar_t, IS_NEOX, IS_INTERLEAVED>(                                                                 \
-        query,                                                                                                       \
-        key,                                                                                                         \
-        cos_sin_cache,                                                                                               \
-        positions,                                                                                                   \
-        num_q_heads,                                                                                                 \
-        num_k_heads,                                                                                                 \
-        head_size,                                                                                                   \
-        rotary_dim,                                                                                                  \
-        section_t,                                                                                                   \
-        section_h,                                                                                                   \
-        section_w);                                                                                                  \
+    if (fp32_cache) {                                                                                                \
+      launch_mrope<scalar_t, float, IS_NEOX, IS_INTERLEAVED>(                                                        \
+          query,                                                                                                     \
+          key,                                                                                                       \
+          cos_sin_cache,                                                                                             \
+          positions,                                                                                                 \
+          num_q_heads,                                                                                               \
+          num_k_heads,                                                                                               \
+          head_size,                                                                                                 \
+          rotary_dim,                                                                                                \
+          section_t,                                                                                                 \
+          section_h,                                                                                                 \
+          section_w);                                                                                                \
+    } else {                                                                                                         \
+      launch_mrope<scalar_t, scalar_t, IS_NEOX, IS_INTERLEAVED>(                                                     \
+          query,                                                                                                     \
+          key,                                                                                                       \
+          cos_sin_cache,                                                                                             \
+          positions,                                                                                                 \
+          num_q_heads,                                                                                               \
+          num_k_heads,                                                                                               \
+          head_size,                                                                                                 \
+          rotary_dim,                                                                                                \
+          section_t,                                                                                                 \
+          section_h,                                                                                                 \
+          section_w);                                                                                                \
+    }                                                                                                                \
   });
 
   if (is_neox_style) {

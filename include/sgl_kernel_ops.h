@@ -644,14 +644,11 @@ void fused_q_indexer_rope_hadamard_quant(
     double weight_scale,
     const at::Tensor& rope_cache,
     const at::Tensor& positions);
-void fused_q_indexer_rope_hadamard_fp4_quant(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_q_indexer_rope_hadamard_fp4_quant(
     const at::Tensor& q_input,
-    at::Tensor& q_fp4,
-    at::Tensor& q_scale,
     const at::Tensor& weight,
-    at::Tensor& weights_out,
     double weight_scale,
-    const at::Tensor& rope_cache,
+    const at::Tensor& freqs_cis,
     const at::Tensor& positions);
 std::tuple<at::Tensor, at::Tensor, at::Tensor> index_q_rope_pack_weights(
     const at::Tensor& input,
@@ -1382,7 +1379,8 @@ void embedding_lora_a_fwd(
     const torch::Tensor& weight_indices,                   // [num_segments,]
     const torch::Tensor& lora_ranks,                       // [num_loras,]
     const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
-    const std::optional<torch::Tensor>& seg_lens           // [num_segments,]
+    const std::optional<torch::Tensor>& seg_lens,          // [num_segments,]
+    std::optional<int64_t> max_len                         // upper bound on segment length; default num_tokens
 );
 
 void sgemm_lora_a_fwd(

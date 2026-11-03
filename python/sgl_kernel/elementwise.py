@@ -771,7 +771,7 @@ def multimodal_rotary_embedding(
     key: torch.Tensor
         Key tensor updated in-place.
     cos_sin_cache: torch.Tensor
-        Precomputed RoPE cos/sin cache.
+        Precomputed RoPE cos/sin cache, float32 or the query dtype.
     positions: torch.Tensor
         Position indices used to index the cache.
     mrope_section: List[int]

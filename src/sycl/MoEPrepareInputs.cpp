@@ -232,6 +232,11 @@ struct compute_arg_sorts_sycl_K_T {
     if (i >= topk_length_) return;
 
     T expert = topk_ids_[i];
+    // Expert-parallel callers mark non-local experts with -1: drop them.
+    if (expert < 0) {
+      output_permutation_[i] = -1;
+      return;
+    }
 
     sycl::atomic_ref<
         T,
@@ -286,7 +291,7 @@ struct compute_arg_sorts_count_sycl_K_T : public __SYCL_KER_CONFIG_CONVENTION__ 
     sycl::group_barrier(item.get_group());
 
     // ===== Phase 2: Accumulate into SLM histogram, store per-element local offset =====
-    if (gid < (int)topk_length_) {
+    if (gid < (int)topk_length_ && topk_ids_[gid] >= 0) {
       T expert = topk_ids_[gid];
       sycl::atomic_ref<
           T,
@@ -321,7 +326,7 @@ struct compute_arg_sorts_count_sycl_K_T : public __SYCL_KER_CONFIG_CONVENTION__ 
 
     // ===== Phase 4: Fix per-element offset to be global =====
     // local_offsets[gid] += this WG's base for that expert
-    if (gid < (int)topk_length_) {
+    if (gid < (int)topk_length_ && topk_ids_[gid] >= 0) {
       T expert = topk_ids_[gid];
       local_offsets_[gid] += slm_[expert];
     }
@@ -361,6 +366,10 @@ struct compute_arg_sorts_scatter_sycl_K_T {
 
     if (gid < (int)topk_length_) {
       T expert = topk_ids_[gid];
+      if (expert < 0) {
+        output_permutation_[gid] = -1;
+        return;
+      }
       // Final position = expert's base (from prefix-sum) + this element's global offset
       T pos = expert_base_offsets_[expert] + local_offsets_[gid];
 
@@ -811,6 +820,7 @@ struct ScatterTokensToExperts {
         using vec_t = sycl::vec<storage_t, ElemsPerItem>;
         vec_t data = *(reinterpret_cast<const vec_t*>(reinterpret_cast<const storage_t*>(src_base + loop * Stride)));
         for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
+          if (dst_rows[k] < 0) continue;
           T* dst = output_ + dst_rows[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
           *(reinterpret_cast<vec_t*>(reinterpret_cast<storage_t*>(dst))) = data;
         }
@@ -930,6 +940,7 @@ struct ApplyShuffleMulSum {
           acc[j] = 0.0f;
 
         for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
+          if (src_indices[k] < 0) continue;
           const T* src = input_ + src_indices[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
           using vec_t = sycl::vec<T, ElemsPerItem>;
           vec_t reg = *(reinterpret_cast<const vec_t*>(src));

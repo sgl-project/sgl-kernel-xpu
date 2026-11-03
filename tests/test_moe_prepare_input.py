@@ -257,5 +257,82 @@ def test_prepare_input_moe(
     torch.testing.assert_allclose(input_merge_xpu.to("cpu"), expected)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 37, 300])
+@pytest.mark.parametrize("routing", ["local_shard", "all_dropped"])
+def test_prepare_moe_input_drops_negative_ids(num_tokens, routing):
+    # Expert-parallel callers mark experts owned by other ranks with -1.
+    # 8 * 300 routes exceed the single-kernel limit and use the two-kernel path.
+    num_local_experts, num_global_experts, top_k, hidden_dim = 16, 64, 8, 128
+    torch.manual_seed(41)
+    noise = torch.rand(num_tokens, num_global_experts)
+    topk_ids = torch.argsort(noise, dim=1)[:, :top_k].to(torch.int32).contiguous()
+    if routing == "all_dropped":
+        topk_ids.fill_(-1)
+    else:
+        topk_ids[topk_ids >= num_local_experts] = -1
+
+    flat_ids = topk_ids.flatten()
+    valid = flat_ids >= 0
+    num_valid = int(valid.sum())
+    expected_counts = torch.bincount(
+        flat_ids[valid].to(torch.int64), minlength=num_local_experts
+    ).to(torch.int32)
+
+    device = "xpu"
+    expert_offsets = torch.zeros(num_local_experts, dtype=torch.int32, device=device)
+    problem_sizes1 = torch.zeros(
+        num_local_experts * 3, dtype=torch.int32, device=device
+    )
+    problem_sizes2 = torch.zeros(
+        num_local_experts * 3, dtype=torch.int32, device=device
+    )
+    input_permutation = torch.empty(flat_ids.numel(), dtype=torch.int32, device=device)
+    output_permutation = torch.empty(flat_ids.numel(), dtype=torch.int32, device=device)
+    prepare_moe_input(
+        topk_ids.to(device),
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        input_permutation,
+        output_permutation,
+        num_local_experts,
+        hidden_dim,
+        top_k,
+    )
+    torch.xpu.synchronize()
+
+    torch.testing.assert_close(expert_offsets.cpu(), expected_counts)
+    perm = output_permutation.cpu()
+    assert torch.equal(perm[~valid], torch.full_like(perm[~valid], -1))
+
+    # Valid routes map one-to-one onto rows grouped by ascending expert id.
+    dst = perm[valid].to(torch.int64)
+    assert torch.equal(torch.sort(dst).values, torch.arange(num_valid))
+    expert_ends = torch.cumsum(expected_counts, 0).to(torch.int64)
+    expert_starts = expert_ends - expected_counts
+    ids = flat_ids[valid].to(torch.int64)
+    assert bool(((dst >= expert_starts[ids]) & (dst < expert_ends[ids])).all())
+
+    # Dropped routes neither write rows nor contribute to the combined output.
+    input_tensor = torch.randn(num_tokens, hidden_dim, dtype=torch.bfloat16)
+    scattered = torch.zeros(
+        num_tokens * top_k, hidden_dim, dtype=torch.bfloat16, device=device
+    )
+    scatter_tokens_to_experts(input_tensor.to(device), output_permutation, scattered)
+    route_tokens = torch.arange(flat_ids.numel())[valid] // top_k
+    torch.testing.assert_close(
+        scattered.cpu()[dst], input_tensor[route_tokens], rtol=0, atol=0
+    )
+
+    combined = torch.empty(num_tokens, hidden_dim, dtype=torch.bfloat16, device=device)
+    factors = torch.full(
+        (flat_ids.numel(),), 1 / top_k, dtype=torch.float32, device=device
+    )
+    apply_shuffle_mul_sum(scattered, combined, output_permutation, factors)
+    valid_per_token = valid.view(num_tokens, top_k).sum(dim=1, keepdim=True)
+    expected = (input_tensor.float() * valid_per_token / top_k).to(torch.bfloat16)
+    torch.testing.assert_close(combined.cpu(), expected)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

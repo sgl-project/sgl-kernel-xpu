@@ -585,11 +585,19 @@ struct PrepareMoeInputSmall : public __SYCL_KER_CONFIG_CONVENTION__ {
           }
           order[insert_at] = current;
         }
-        for (int destination = 0; destination < topk_; ++destination) {
-          int32_t route = order[destination];
-          ++expert_counts_[static_cast<int32_t>(topk_ids_[route])];
+        int32_t destination = 0;
+        for (int rank = 0; rank < topk_; ++rank) {
+          int32_t route = order[rank];
+          int32_t expert = static_cast<int32_t>(topk_ids_[route]);
+          if (expert < 0) {
+            route_positions_[route] = -1;
+            output_permutation_[route] = -1;
+            continue;
+          }
+          ++expert_counts_[expert];
           route_positions_[route] = destination;
           output_permutation_[route] = destination;
+          ++destination;
         }
       }
       sycl::group_barrier(item.get_group());
@@ -601,12 +609,14 @@ struct PrepareMoeInputSmall : public __SYCL_KER_CONFIG_CONVENTION__ {
       for (int vector_id = local_id; vector_id < vector_count; vector_id += WGSize) {
         Vector value = input_vectors[vector_id];
         for (int route = 0; route < topk_; ++route) {
+          if (route_positions_[route] < 0) continue;
           output_vectors[route_positions_[route] * vector_count + vector_id] = value;
         }
       }
       for (int column = vector_count * ElementsPerVector + local_id; column < hidden_dim_; column += WGSize) {
         ScalarT value = input_[column];
         for (int route = 0; route < topk_; ++route) {
+          if (route_positions_[route] < 0) continue;
           output_[route_positions_[route] * hidden_dim_ + column] = value;
         }
       }
@@ -614,7 +624,8 @@ struct PrepareMoeInputSmall : public __SYCL_KER_CONFIG_CONVENTION__ {
     }
 
     int route_count = topk_ * input_rows_;
-    if (local_id < route_count) {
+    // Expert-parallel callers mark non-local experts with -1: drop them.
+    if (local_id < route_count && topk_ids_[local_id] >= 0) {
       int32_t expert = static_cast<int32_t>(topk_ids_[local_id]);
       sycl::atomic_ref<
           int32_t,
@@ -639,9 +650,12 @@ struct PrepareMoeInputSmall : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     if (local_id < route_count) {
       int32_t expert = static_cast<int32_t>(topk_ids_[local_id]);
-      int32_t destination = local_counts_[expert];
-      for (int route = 0; route < local_id; ++route) {
-        destination += static_cast<int32_t>(topk_ids_[route]) == expert;
+      int32_t destination = -1;
+      if (expert >= 0) {
+        destination = local_counts_[expert];
+        for (int route = 0; route < local_id; ++route) {
+          destination += static_cast<int32_t>(topk_ids_[route]) == expert;
+        }
       }
       route_positions_[local_id] = destination;
       output_permutation_[local_id] = destination;
@@ -656,6 +670,7 @@ struct PrepareMoeInputSmall : public __SYCL_KER_CONFIG_CONVENTION__ {
     for (int task = local_id; task < vector_tasks; task += WGSize) {
       int route = task / vector_count;
       int vector_id = task % vector_count;
+      if (route_positions_[route] < 0) continue;
       int source_row = route / topk_;
       output_vectors[route_positions_[route] * vector_count + vector_id] =
           input_vectors[source_row * vector_count + vector_id];
@@ -666,6 +681,7 @@ struct PrepareMoeInputSmall : public __SYCL_KER_CONFIG_CONVENTION__ {
     for (int task = local_id; task < tail_tasks; task += WGSize) {
       int route = task / tail_size;
       int column = tail_start + task % tail_size;
+      if (route_positions_[route] < 0) continue;
       int source_row = route / topk_;
       output_[route_positions_[route] * hidden_dim_ + column] = input_[source_row * hidden_dim_ + column];
     }

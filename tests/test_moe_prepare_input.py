@@ -87,6 +87,69 @@ def test_prepare_moe_input_small(num_tokens, top_k, hidden_dim, index_dtype, rou
 
 
 @pytest.mark.parametrize(
+    "num_tokens,top_k",
+    [(1, 1), (1, 8), (1, 16), (3, 3), (8, 8), (4, 16)],
+)
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("routing", ["local_shard", "all_dropped"])
+def test_prepare_moe_input_small_drops_negative_ids(
+    num_tokens, top_k, index_dtype, routing
+):
+    # Expert-parallel callers mark experts owned by other ranks with -1.
+    num_local_experts, num_global_experts, hidden_dim = 16, 64, 33
+    torch.manual_seed(41)
+    noise = torch.rand(num_tokens, num_global_experts)
+    topk_ids = torch.argsort(noise, dim=1)[:, :top_k]
+    if routing == "all_dropped":
+        topk_ids.fill_(-1)
+    else:
+        topk_ids[topk_ids >= num_local_experts] = -1
+    # Keep one local route so the single-route local_shard case is not all dropped.
+    if routing == "local_shard" and top_k == 1:
+        topk_ids[0, 0] = 3
+
+    input_tensor = torch.randn(
+        num_tokens, hidden_dim, dtype=torch.bfloat16, device="xpu"
+    )
+    expert_counts = torch.full(
+        (num_local_experts,), 123, dtype=torch.int32, device="xpu"
+    )
+    output_permutation = torch.full(
+        (num_tokens * top_k,), 123, dtype=torch.int32, device="xpu"
+    )
+    output = torch.zeros(
+        num_tokens * top_k, hidden_dim, dtype=torch.bfloat16, device="xpu"
+    )
+    torch.ops.sgl_kernel.prepare_moe_input_small.default(
+        input_tensor,
+        topk_ids.to(device="xpu", dtype=index_dtype),
+        expert_counts,
+        output_permutation,
+        output,
+    )
+
+    flat_ids = topk_ids.flatten()
+    valid = flat_ids >= 0
+    num_valid = int(valid.sum())
+    # The kernel is stable: routes of one expert keep their original order.
+    order = torch.argsort(flat_ids[valid], stable=True)
+    valid_routes = torch.arange(flat_ids.numel())[valid]
+    expected_permutation = torch.full((flat_ids.numel(),), -1, dtype=torch.int32)
+    expected_permutation[valid_routes[order]] = torch.arange(
+        num_valid, dtype=torch.int32
+    )
+    expected_counts = torch.bincount(flat_ids[valid], minlength=num_local_experts).to(
+        torch.int32
+    )
+    expected_output = torch.zeros(num_tokens * top_k, hidden_dim, dtype=torch.bfloat16)
+    expected_output[:num_valid] = input_tensor.cpu()[valid_routes[order] // top_k]
+
+    torch.testing.assert_close(expert_counts.cpu(), expected_counts)
+    torch.testing.assert_close(output_permutation.cpu(), expected_permutation)
+    torch.testing.assert_close(output.cpu(), expected_output, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
     "num_tokens,top_k,error",
     [(1, 17, "topk must be in"), (13, 5, "routed rows must be")],
 )

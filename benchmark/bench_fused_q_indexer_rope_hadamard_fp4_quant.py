@@ -5,8 +5,6 @@ import triton
 from sgl_kernel import fused_q_indexer_rope_hadamard_fp4_quant
 
 HEAD_DIM = 128
-PACKED_DIM = HEAD_DIM // 2
-GROUPS = HEAD_DIM // 32
 CONFIGS = list(product([1, 5, 17], [8]))
 
 
@@ -39,22 +37,17 @@ def benchmark(batch: int, heads: int, provider: str):
     weight = torch.randn(batch, heads, device=device, dtype=torch.bfloat16)
     positions = torch.randint(0, 512, (batch,), device=device, dtype=torch.int32)
     rope_cache = _make_rope_cache(512, device)
-    q_fp4 = torch.empty(batch, heads, PACKED_DIM, device=device, dtype=torch.int8)
-    q_scale = torch.empty(batch, heads, GROUPS, device=device, dtype=torch.uint8)
-    weights_out = torch.empty(batch, heads, 1, device=device, dtype=torch.float32)
 
     def fn():
         fused_q_indexer_rope_hadamard_fp4_quant(
             q_input,
-            q_fp4,
-            q_scale,
             weight,
-            weights_out,
             HEAD_DIM**-0.5 * heads**-0.5,
             rope_cache,
             positions,
         )
 
+    # Time the public API, including output allocation.
     return triton.testing.do_bench(fn, warmup=10, rep=100) * 1000.0
 
 

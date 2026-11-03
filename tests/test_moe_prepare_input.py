@@ -92,11 +92,12 @@ def test_prepare_moe_input_small(num_tokens, top_k, hidden_dim, index_dtype, rou
 )
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("routing", ["local_shard", "all_dropped"])
+@pytest.mark.parametrize("hidden_dim", [32, 33])
 def test_prepare_moe_input_small_drops_negative_ids(
-    num_tokens, top_k, index_dtype, routing
+    num_tokens, top_k, index_dtype, routing, hidden_dim
 ):
     # Expert-parallel callers mark experts owned by other ranks with -1.
-    num_local_experts, num_global_experts, hidden_dim = 16, 64, 33
+    num_local_experts, num_global_experts = 16, 64
     torch.manual_seed(41)
     noise = torch.rand(num_tokens, num_global_experts)
     topk_ids = torch.argsort(noise, dim=1)[:, :top_k]

@@ -33,6 +33,9 @@ on:
         type: string
         default: both
 
+permissions:
+  contents: read
+
 concurrency:
   # The schedule string keeps the AOT and JIT crons from cancelling each other.
   group: sgl-kernel-nightly-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}-${{ github.event.schedule }}

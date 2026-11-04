@@ -26,6 +26,20 @@ void check_tensor(const at::Tensor& tensor, const at::Device& device, at::Scalar
   TORCH_CHECK(tensor.is_contiguous(), name, " must be contiguous");
 }
 
+// CuTe block-2D loads require 64-byte-aligned base addresses, which contiguous offset views may violate.
+at::Tensor align_gemm_operand(const at::Tensor& tensor, const char* name) {
+  constexpr uintptr_t alignment = 64;
+  if (reinterpret_cast<uintptr_t>(tensor.data_ptr()) % alignment == 0) {
+    return tensor;
+  }
+  auto aligned = tensor.clone(at::MemoryFormat::Contiguous);
+  TORCH_CHECK(
+      reinterpret_cast<uintptr_t>(aligned.data_ptr()) % alignment == 0,
+      name,
+      " could not be copied into 64-byte-aligned storage");
+  return aligned;
+}
+
 template <int FixedK, int Threads>
 struct ConvRotQuantKernel {
   const at::BFloat16* input;
@@ -39,12 +53,14 @@ struct ConvRotQuantKernel {
     const int tid = item.get_local_id(0);
     const int64_t row = item.get_group(0);
     // Fuse input loading with the first H4 stage, avoiding an SLM round trip.
+    // Apply the 1/16 normalization before any butterfly addition so finite rows with representable
+    // results cannot overflow in intermediate stages. Power-of-two scaling is exact for normal FP32.
     for (int b = tid; b < k / 4; b += Threads) {
       const int base = b * 4;
-      const float a = static_cast<float>(input[row * k + base]);
-      const float b1 = static_cast<float>(input[row * k + base + 1]);
-      const float c = static_cast<float>(input[row * k + base + 2]);
-      const float d = static_cast<float>(input[row * k + base + 3]);
+      const float a = 0.0625f * static_cast<float>(input[row * k + base]);
+      const float b1 = 0.0625f * static_cast<float>(input[row * k + base + 1]);
+      const float c = 0.0625f * static_cast<float>(input[row * k + base + 2]);
+      const float d = 0.0625f * static_cast<float>(input[row * k + base + 3]);
       values[base] = ((a + b1) + c) - d;
       values[base + 1] = ((a + b1) - c) + d;
       values[base + 2] = ((a - b1) + c) + d;
@@ -80,7 +96,7 @@ struct ConvRotQuantKernel {
       const float final_values[4] = {((a + b1) + c) - d, ((a + b1) - c) + d, ((a - b1) + c) + d, ((-a + b1) + c) + d};
 #pragma unroll
       for (int i = 0; i < 4; ++i) {
-        const float rotated = static_cast<float>(static_cast<at::BFloat16>(final_values[i] * 0.0625f));
+        const float rotated = static_cast<float>(static_cast<at::BFloat16>(final_values[i]));
         if constexpr (FixedK) {
           rounded_values[(b - tid) / Threads][i] = static_cast<at::BFloat16>(rotated);
         } else {
@@ -337,6 +353,8 @@ SGL_KERNEL_EXPORT at::Tensor convrot_int8_linear_prequant(
   if (m == 0) {
     return output;
   }
+  const auto aligned_input = align_gemm_operand(input, "input");
+  const auto aligned_weight = align_gemm_operand(weight, "weight");
   Callbacks::Arguments thread{
       {},
       {input_scale.data_ptr<float>(), 0.0f, {_1{}, _0{}, 0}},
@@ -347,7 +365,7 @@ SGL_KERNEL_EXPORT at::Tensor convrot_int8_linear_prequant(
     typename DeviceGemm::Arguments args{
         cutlass::gemm::GemmUniversalMode::kGemm,
         {static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), 1},
-        {input.data_ptr<int8_t>(), {k, _1{}, 0}, weight.data_ptr<int8_t>(), {k, _1{}, 0}},
+        {aligned_input.data_ptr<int8_t>(), {k, _1{}, 0}, aligned_weight.data_ptr<int8_t>(), {k, _1{}, 0}},
         {thread, nullptr, {n, _1{}, 0}, reinterpret_cast<Output*>(output.data_ptr()), {n, _1{}, 0}}};
     DeviceGemm gemm;
     auto status = gemm.can_implement(args);

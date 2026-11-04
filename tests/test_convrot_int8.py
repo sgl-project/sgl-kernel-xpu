@@ -61,7 +61,9 @@ def test_rotate_quantize(m, k):
     torch.testing.assert_close(q, expected_q, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("kind", ["zero", "constant", "basis", "ties", "small"])
+@pytest.mark.parametrize(
+    "kind", ["zero", "constant", "basis", "ties", "small", "subnormal", "large"]
+)
 def test_rotation_and_quantization_edges(kind):
     x = torch.zeros(256, 512, device="xpu", dtype=torch.bfloat16)
     if kind == "constant":
@@ -72,17 +74,35 @@ def test_rotation_and_quantization_edges(kind):
         x.copy_(torch.arange(512, device="xpu") % 19 - 9)
     elif kind == "small":
         x.fill_(1e-30)
+    elif kind == "subnormal":
+        x.copy_((torch.arange(512, device="xpu") % 7 - 3) * 1e-39)
+    elif kind == "large":
+        x.fill_(2.0**124)
     expected_q, expected_scale = reference_rotate_quantize(x)
     q, scale = convrot_rotate_quantize(x)
     torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
     torch.testing.assert_close(q, expected_q, rtol=0, atol=0)
 
 
+def test_large_finite_input_does_not_overflow():
+    # Constant rows are eigenvectors of normalized regular H256, so the result stays 2**124.
+    x = torch.full((1, 256), 2.0**124, device="xpu", dtype=torch.bfloat16)
+    q, scale = convrot_rotate_quantize(x)
+    expected_q, expected_scale = reference_rotate_quantize(x)
+    assert torch.isfinite(scale).all()
+    torch.testing.assert_close(
+        scale.cpu(), torch.tensor([2.0**124 / 127]), rtol=1e-6, atol=0
+    )
+    torch.testing.assert_close(scale, expected_scale, rtol=0, atol=0)
+    torch.testing.assert_close(q, expected_q, rtol=0, atol=0)
+    assert q.abs().min().item() >= 126
+
+
 @pytest.mark.parametrize("k", range(256, 8193, 256))
 def test_rotation_butterfly_order(k):
     torch.manual_seed(131 + k)
     x = torch.randn(17, k, dtype=torch.bfloat16)
-    values = x.float()
+    values = x.float() * 0.0625
     for stride in (1, 4, 16, 64):
         blocks = values.reshape(17, k // (4 * stride), 4, stride)
         a, b, c, d = blocks.unbind(2)
@@ -95,7 +115,7 @@ def test_rotation_butterfly_order(k):
             ),
             dim=2,
         ).reshape_as(values)
-    rotated = (values * 0.0625).bfloat16()
+    rotated = values.bfloat16()
     scale = (rotated.abs().amax(-1).float() * (1.0 / 127.0)).clamp_min(1e-30)
     quotient = (rotated.float() / scale.bfloat16()[:, None].float()).bfloat16()
     expected_q = quotient.float().round().clamp(-128, 127).to(torch.int8)
@@ -130,6 +150,32 @@ def test_prequant_linear(m, n, k, with_bias):
         expected = reference_linear(q, weight, scale, weight_scale, bias)
         torch.testing.assert_close(out, expected, rtol=0, atol=0)
     assert out.shape == (m, n) and out.dtype == torch.bfloat16
+
+
+def storage_offset_view(tensor, offset):
+    storage = torch.empty(
+        tensor.numel() + offset, device=tensor.device, dtype=tensor.dtype
+    )
+    view = storage[offset:].view_as(tensor)
+    view.copy_(tensor)
+    assert view.is_contiguous() and view.data_ptr() % 64 == offset % 64
+    return view
+
+
+@pytest.mark.parametrize("offset", [1, 16, 63])
+@pytest.mark.parametrize("operand", ["input", "weight", "both"])
+def test_prequant_linear_unaligned_storage_offset(operand, offset):
+    torch.manual_seed(97)
+    m, n, k = 17, 32, 256
+    q = torch.randint(-128, 128, (m, k), device="xpu", dtype=torch.int8)
+    weight = torch.randint(-128, 128, (n, k), device="xpu", dtype=torch.int8)
+    scale = torch.rand(m, device="xpu") / 128
+    weight_scale = torch.rand(n, device="xpu") / 128
+    expected = reference_linear(q, weight, scale, weight_scale)
+    q_view = storage_offset_view(q, offset) if operand != "weight" else q
+    weight_view = storage_offset_view(weight, offset) if operand != "input" else weight
+    out = convrot_int8_linear_prequant(q_view, weight_view, scale, weight_scale)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("device", range(4))

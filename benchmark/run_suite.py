@@ -101,6 +101,9 @@ suites = {
         # --- norm / rope / quant ---
         BenchFile("bench_merge_states_v2.py", tee_log="merge_states.py.log"),
         BenchFile("bench_mrope.py", tee_log="mrope.py.log"),
+        BenchFile("bench_indexer_rope_pack.py"),
+        BenchFile("bench_fused_q_indexer_rope_hadamard_fp4_quant.py"),
+        BenchFile("bench_fp4_paged_mqa_logits.py"),
         BenchFile("bench_swiglu_alpha_limit.py", tee_log="swiglu_alpha_limit.py.log"),
         BenchFile("bench_fused_qk_rope_with_cache.py"),
         BenchFile("bench_per_token_group_quant_mxfp4.py"),
@@ -142,6 +145,16 @@ suites = {
         # BenchFile("bench_jit_moe_align_block_size.py"),
         # BenchFile("bench_jit_per_token_group_quant_8bit_v2.py"),
         # BenchFile("bench_jit_activation.py"),
+        # --- Qwen4 ops ---
+        BenchFile("bench_qsa_mqa.py"),
+        BenchFile("bench_qsa_prepare.py"),
+        BenchFile("bench_qsa_sparse_attention.py"),
+        BenchFile("bench_grouped_gemma_rmsnorm.py"),
+        BenchFile("bench_qwen4_ple_gate.py"),
+        BenchFile("bench_qwen4_ngram_hash.py"),
+        BenchFile("bench_qwen4_short_conv.py"),
+        BenchFile("bench_qwen4_hyperconnection.py"),
+        BenchFile("bench_sigmoid_mul.py"),
     ],
 }
 

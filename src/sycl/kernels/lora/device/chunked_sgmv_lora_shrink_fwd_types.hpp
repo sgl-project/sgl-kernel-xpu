@@ -30,44 +30,36 @@
  **************************************************************************************************/
 /*!
   \file
-  \brief Tile-configuration option tag for the chunked-SGMV LoRA "shrink" GEMM.
+  \brief Tile-configuration option tags for the chunked-SGMV LoRA shrink kernel.
 
-  This is a dedicated, small-N grouped-GEMM tile for the LoRA-A "shrink"
-  projection. It reuses the shared grouped-GEMM core (GroupGemmTypes<> +
-  group_gemm_lora_launcher.hpp).
-
-  Adding another tile is a two-step change (mirrors the A-fwd convention):
+  Adding another tile is a two-step change (mirrors the prefill LoRA kernels):
     1) Define a new option tag here.
-    2) Register (tag name, C++ type) in ChunkedSgmvLoraShrinkFwdXe20.cmake.
-  The dtype/tile dispatch in ChunkedSgmvLoraShrinkFwd.cpp then picks a tag per call.
+    2) Register (tag name, C++ type) in ChunkedSgmvLoraShrinkFwd.cmake.
+  The entrypoint (ChunkedSgmvLoraShrinkFwd.cpp) then picks a tag per call.
 */
 
 #pragma once
 
-#include <cute/layout.hpp>
-
-#include "cutlass/layout/matrix.h"
-#include "sycl/kernels/lora/common/group_gemm_types.hpp"
+#include "sycl/kernels/lora/common/gather_scatter_group_gemm_types.hpp"
 
 namespace chunked_sgmv_lora_shrink_fwd_impl {
 
-//----------------- Tile / thread / staging option tag -----------------------//
-// LayoutB is ColumnMajor: the LoRA weight tensor is [num_loras, N, K] row-major,
-// which is ColumnMajor when viewed as B in the A @ B^T grouped GEMM (the
-// auto-selected copy atom free-transposes it) -- identical to the A-fwd contract.
-//
-//   TileShape       = 128 x 64 x 32   (small N + short M for the skinny shrink)
-//   ThreadLayout    = 8 x 4 x 1        (32 subgroups / workgroup; validated)
-//   PipelineStages  = 2
-struct ChunkedShrinkTileSmall {
-  using TileShape = cute::Shape<cute::_128, cute::_64, cute::_32>;
-  using ThreadLayout =
-      cute::Layout<cute::Shape<cute::_8, cute::_4, cute::_1>, cute::Stride<cute::_4, cute::_1, cute::_0>>;
-  using LayoutB = cutlass::layout::ColumnMajor;
-  static constexpr int PipelineStages = 2;
-
-  template <typename T>
-  using Types = at::native::xpu::GroupGemmTypes<T, TileShape, ThreadLayout, LayoutB, PipelineStages>;
+// Sub-group tile 16 x 32, k-blocks of 32, 8 sub-groups splitting K inside one work-group (the
+// split-K epilogue reduces them through SLM). BM = 16 keeps the kernel at 128 GRF (twice the
+// hardware threads of a 32-row tile). Measured on BMG (B580) over the decode shapes in
+// benchmark/bench_chunked_sgmv_lora_shrink_fwd.py. Types<T, BLOCK_B> is the assembled gather /
+// scatter grouped-GEMM bundle (sycl-tla GemmUniversal with the LoRA collectives).
+struct ChunkedShrinkTileSplitK {
+  template <typename T, bool BLOCK_B>
+  using Types = at::native::xpu::lora::GatherScatterGroupGemmTypes<
+      T,
+      /*BM=*/16,
+      /*SG_N=*/32,
+      /*BK=*/32,
+      /*NSG_N=*/1,
+      /*SGK=*/8,
+      cutlass::lora::collective::SplitKScatterGroupEpilogue,
+      BLOCK_B>;
 };
 
 }  // namespace chunked_sgmv_lora_shrink_fwd_impl

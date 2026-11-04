@@ -81,6 +81,7 @@ def calculate_bandwidth(
     rotary_dim: int,
     time_ms: float,
     dtype: torch.dtype,
+    cache_dtype: Optional[torch.dtype] = None,
 ) -> float:
     """
     Calculate the effective memory bandwidth of the MRoPE kernel in GB/s.
@@ -95,6 +96,7 @@ def calculate_bandwidth(
         rotary_dim: Number of elements per head that are rotated (head_size * partial_rotary_factor).
         time_ms:    Kernel elapsed time in milliseconds (e.g. from triton.testing.do_bench).
         dtype:      Torch dtype of q and k tensors (used to get element size in bytes).
+        cache_dtype: Torch dtype of cos_sin_cache; defaults to ``dtype``.
 
     Returns:
         Bandwidth in GB/s.
@@ -103,12 +105,14 @@ def calculate_bandwidth(
         torch.finfo(dtype).bits // 8
     )  # e.g. 2 for bfloat16/float16, 4 for float32
 
+    cache_elem_bytes = torch.finfo(cache_dtype or dtype).bits // 8
+
     # Q and K are read then written in-place → multiply by 2
     bytes_q = num_tokens * q_heads * rotary_dim * elem_bytes * 2
     bytes_k = num_tokens * kv_heads * rotary_dim * elem_bytes * 2
 
     # cos_sin_cache: one effective row of `rotary_dim` elements read per token
-    bytes_cos_sin = 3 * num_tokens * rotary_dim * elem_bytes
+    bytes_cos_sin = 3 * num_tokens * rotary_dim * cache_elem_bytes
 
     # positions: 3 int64 values per token (t, h, w) — small but included for correctness
     bytes_positions = num_tokens * 3 * torch.iinfo(torch.int64).bits // 8
@@ -134,8 +138,8 @@ def get_benchmark(device="xpu", configs=None, dtype=torch.bfloat16):
             ],
             x_vals=configs,
             line_arg="provider",
-            line_vals=["sglang"],
-            line_names=["Sglang"],
+            line_vals=["cache_q_dtype", "cache_fp32"],
+            line_names=["Sglang (cache = q dtype)", "Sglang (fp32 cache)"],
             styles=[("blue", "-"), ("green", "-")],
             ylabel="Latency (us)",
             plot_name="mrope-performance",
@@ -154,33 +158,33 @@ def get_benchmark(device="xpu", configs=None, dtype=torch.bfloat16):
         q = torch.randn((num_tokens, q_heads * head_dim), device=device, dtype=dtype)
         k = torch.randn((num_tokens, kv_heads * head_dim), device=device, dtype=dtype)
         rotary_dim = int(head_dim * partial_rotary_factor)
+        cache_dtype = torch.float32 if provider == "cache_fp32" else dtype
         cos_sin_cache = torch.randn(
-            (max_position_embeddings, rotary_dim), dtype=dtype, device=device
+            (max_position_embeddings, rotary_dim), dtype=cache_dtype, device=device
         )
         positions = torch.randint(
             0, max_position_embeddings, (3, num_tokens), device=device
         )
         mrope_section = [11, 11, 10]
 
-        if provider == "sglang":
-            fn = lambda: mrope_sglang(
-                q,
-                k,
-                cos_sin_cache,
-                positions,
-                mrope_section,
-                head_dim,
-                rotary_dim,
-                True,
-                False,
-                True,
-                None,
-            )
+        fn = lambda: mrope_sglang(
+            q,
+            k,
+            cos_sin_cache,
+            positions,
+            mrope_section,
+            head_dim,
+            rotary_dim,
+            True,
+            False,
+            True,
+            None,
+        )
 
         quantiles = [0.5, 0.2, 0.8]
         ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
         bandwidth = calculate_bandwidth(
-            num_tokens, q_heads, kv_heads, rotary_dim, ms, dtype
+            num_tokens, q_heads, kv_heads, rotary_dim, ms, dtype, cache_dtype
         )
 
         all_results.append(
@@ -189,7 +193,11 @@ def get_benchmark(device="xpu", configs=None, dtype=torch.bfloat16):
                 "q_heads": q_heads,
                 "kv_heads": kv_heads,
                 "rotary_dim": rotary_dim,
+                "head_dim": head_dim,
+                "partial_rotary_factor": partial_rotary_factor,
+                "max_position_embeddings": max_position_embeddings,
                 "dtype": dtype,
+                "cache_dtype": cache_dtype,
                 "provider": provider,
                 "bandwidth": bandwidth,
                 "ms": ms,
@@ -256,3 +264,18 @@ if __name__ == "__main__":
 
     df = pd.DataFrame(all_results)
     print(df.to_markdown())
+
+    # fp32-cache vs q-dtype-cache, per problem size
+    keys = [
+        "num_tokens",
+        "q_heads",
+        "kv_heads",
+        "head_dim",
+        "partial_rotary_factor",
+        "rotary_dim",
+        "max_position_embeddings",
+    ]
+    ms = df.pivot_table(index=keys, columns="provider", values="ms")
+    ms["fp32/q-dtype"] = ms["cache_fp32"] / ms["cache_q_dtype"]
+    print("\nfp32 cache vs q-dtype cache (ms; ratio > 1 means fp32 cache is slower)")
+    print(ms.to_markdown())

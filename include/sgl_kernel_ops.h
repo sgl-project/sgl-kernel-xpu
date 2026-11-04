@@ -130,6 +130,35 @@ void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight,
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double eps);
+void grouped_gemma_rmsnorm(
+    torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps, int64_t group_size);
+void qwen4_gate_value(torch::Tensor& output, torch::Tensor& gate, torch::Tensor& value);
+void qwen4_gate_reduce(torch::Tensor& output, torch::Tensor& key, torch::Tensor& query, torch::Tensor& value);
+void fused_sigmoid_mul(torch::Tensor& output, torch::Tensor& input, torch::Tensor& gate);
+void qwen4_hc_silu(torch::Tensor& output, const torch::Tensor& input, int64_t hc_count);
+void qwen4_hc_gate_mix(torch::Tensor& output, const torch::Tensor& input, const torch::Tensor& gate, int64_t hc_count);
+void qwen4_hc_combine(
+    torch::Tensor& output,
+    const torch::Tensor& residual,
+    const torch::Tensor& block_output,
+    const std::optional<torch::Tensor>& injection,
+    int64_t hc_count);
+void qwen4_hc_combine_norm(
+    torch::Tensor& combined,
+    torch::Tensor& normalized,
+    const torch::Tensor& residual,
+    const torch::Tensor& block_output,
+    const std::optional<torch::Tensor>& injection,
+    const torch::Tensor& weight,
+    double eps,
+    int64_t hc_count);
+void qwen4_ngram_hash(
+    torch::Tensor& output,
+    torch::Tensor& contexts,
+    torch::Tensor& multipliers,
+    torch::Tensor& vocab_sizes,
+    torch::Tensor& offsets,
+    int64_t eos_token_id);
 std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_norm_scale_shift(
     const torch::Tensor& residual,
     const torch::Tensor& x,
@@ -623,6 +652,27 @@ void fused_q_indexer_rope_hadamard_quant(
     double weight_scale,
     const at::Tensor& rope_cache,
     const at::Tensor& positions);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_q_indexer_rope_hadamard_fp4_quant(
+    const at::Tensor& q_input,
+    const at::Tensor& weight,
+    double weight_scale,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> index_q_rope_pack_weights(
+    const at::Tensor& input,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    const at::Tensor& head_weights,
+    double weight_scale);
+void index_k_norm_rope_pack_store(
+    const at::Tensor& input,
+    const at::Tensor& norm_weight,
+    double eps,
+    const at::Tensor& freqs_cis,
+    const at::Tensor& positions,
+    const at::Tensor& loc,
+    at::Tensor& cache,
+    int64_t ratio);
 void bmm_fp8(
     at::Tensor A,
     at::Tensor B,
@@ -640,6 +690,16 @@ void bmm_fp8(
 
 torch::Tensor fp8_paged_mqa_logits(
     const torch::Tensor& q_fp8,
+    const torch::Tensor& kv_cache,
+    const torch::Tensor& weights,
+    const torch::Tensor& seq_lens,
+    const torch::Tensor& block_tables,
+    const std::optional<torch::Tensor>& schedule_metadata,
+    int64_t max_seq_len,
+    bool clean_logits);
+torch::Tensor fp4_paged_mqa_logits(
+    const torch::Tensor& q_fp4,
+    const torch::Tensor& q_scale,
     const torch::Tensor& kv_cache,
     const torch::Tensor& weights,
     const torch::Tensor& seq_lens,
@@ -1077,6 +1137,36 @@ at::Tensor qsa_mqa_decode(
     int64_t max_model_len,
     std::optional<double> score_scale);
 
+at::Tensor qsa_index_q_norm_rope_store(
+    const at::Tensor& qk,
+    const at::Tensor& positions,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& axis_map,
+    const at::Tensor& weight,
+    const at::Tensor& cache_loc,
+    at::Tensor key_state_buffer,
+    at::Tensor rope_position_buffer,
+    int64_t num_q_heads,
+    int64_t rotary_dim,
+    double eps,
+    bool is_neox_style,
+    std::optional<int64_t> q_heads_padded,
+    std::optional<at::ScalarType> out_dtype);
+
+void qsa_index_k_compress_store(
+    const at::Tensor& key_state_buffer,
+    const at::Tensor& group_locs,
+    const at::Tensor& rope_position_buffer,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& axis_map,
+    const at::Tensor& weight,
+    const at::Tensor& write_locs,
+    at::Tensor compressed_k_buffer,
+    int64_t compress_ratio,
+    int64_t rotary_dim,
+    double eps,
+    bool is_neox_style);
+
 at::Tensor fast_topk_transform_fused(
     const at::Tensor& score,
     const at::Tensor& lengths,
@@ -1297,7 +1387,8 @@ void embedding_lora_a_fwd(
     const torch::Tensor& weight_indices,                   // [num_segments,]
     const torch::Tensor& lora_ranks,                       // [num_loras,]
     const std::optional<torch::Tensor>& extra_embeddings,  // [num_loras, num_extra_tokens, max_rank]
-    const std::optional<torch::Tensor>& seg_lens           // [num_segments,]
+    const std::optional<torch::Tensor>& seg_lens,          // [num_segments,]
+    std::optional<int64_t> max_len                         // upper bound on segment length; default num_tokens
 );
 
 void sgemm_lora_a_fwd(
@@ -1510,6 +1601,23 @@ at::Tensor causal_conv1d_update_verify(
     const std::optional<at::Tensor>& retrieve_next_sibling,
     const std::optional<at::Tensor>& retrieve_parent_token,
     int64_t pad_slot_id);
+
+// Qwen3.8-Flash-Next PLE short convolution.
+namespace at::native::xpu {
+void qwen4_short_conv_state(
+    torch::Tensor& conv_input, torch::Tensor& state, torch::Tensor& state_indices, torch::Tensor& x);
+void qwen4_verify_conv(
+    torch::Tensor& output,
+    const std::optional<torch::Tensor>& intermediate,
+    torch::Tensor& x,
+    torch::Tensor& residual,
+    torch::Tensor& weight,
+    torch::Tensor& state,
+    torch::Tensor& state_indices,
+    torch::Tensor& valid,
+    int64_t width,
+    int64_t dilation);
+}  // namespace at::native::xpu
 
 // Xe35 only kernels
 #if SYCL_INTEL_TARGET == 35

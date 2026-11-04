@@ -6,6 +6,7 @@
 #include <sycl/sycl.hpp>
 
 #include "Compress.h"
+#include "Fp4Utils.h"
 #include "QuantUtils.h"
 #include "SGLKernelPerf.h"
 #include "Utils.h"
@@ -17,6 +18,8 @@ using cutlass::float_e4m3_t;
 namespace at::native::xpu {
 
 namespace {
+
+namespace fp4_utils = at::native::xpu::fp4;
 
 constexpr uint32_t kSubGroupSize = 16;
 constexpr int64_t kRopeDim = 64;
@@ -49,22 +52,6 @@ inline int64_t log2_i64(int64_t v) {
     ++bits;
   }
   return bits;
-}
-
-inline uint8_t quant_fp4_e2m1(float x) {
-  const float ax = sycl::fmin(sycl::fabs(x), 6.0f);
-  uint8_t idx = 0;
-  idx += ax > 0.25f;
-  idx += ax > 0.75f;
-  idx += ax > 1.25f;
-  idx += ax > 1.75f;
-  idx += ax > 2.5f;
-  idx += ax > 3.5f;
-  idx += ax > 5.0f;
-  if (x < 0.0f && idx != 0) {
-    idx |= 0x8;
-  }
-  return idx;
 }
 
 inline uint8_t cvt_float_to_fp8_e4m3(float x) {
@@ -333,8 +320,8 @@ struct FusedNormRopeIndexerKernel {
     const int64_t i1 = i0 + 1;
     const int64_t g0 = i0 / static_cast<int64_t>(kFp4GroupDim);
     const int64_t g1 = i1 / static_cast<int64_t>(kFp4GroupDim);
-    const uint8_t q0 = quant_fp4_e2m1(data[i0] * group_inv[g0]);
-    const uint8_t q1 = quant_fp4_e2m1(data[i1] * group_inv[g1]);
+    const uint8_t q0 = fp4_utils::encode_e2m1_ties_to_zero(data[i0] * group_inv[g0]);
+    const uint8_t q1 = fp4_utils::encode_e2m1_ties_to_zero(data[i1] * group_inv[g1]);
     kvcache[value_base + i] = static_cast<uint8_t>((q0 & 0x0F) | ((q1 & 0x0F) << 4));
 
     if (lid < kFp4Groups) {

@@ -5,7 +5,7 @@
 // use via the generic JIT engine, and caches the resolved kernel entry in an
 // O(1) front cache so the launch hot path is a single lookup + indirect call.
 //
-// This layer is torch-free: the caller (flash_attention.cpp) builds the POD
+// This layer is torch-free: the caller (flash_attentionXe20.cpp) builds the POD
 // `decode::Arguments` and passes its address as an opaque `const void*`; the
 // JIT-compiled module casts it back (both sides share the runner header, so the
 // struct layout is identical).

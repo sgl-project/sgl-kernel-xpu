@@ -18,7 +18,6 @@ template <typename T>
 struct FusedTopkSigmoid {
   static constexpr int sub_group_size = 32;
   static constexpr int max_group_size = 1024;
-  static constexpr int malloc_per_item = 8;
   static constexpr float kNegInfinity = -std::numeric_limits<float>::infinity();
 
   FusedTopkSigmoid(
@@ -61,7 +60,6 @@ struct FusedTopkSigmoid {
     int group_id = item.get_group_linear_id();
     int local_range = item.get_local_range(2);
     int sub_groups_per_group = local_range / sub_group_size;
-    int calc_per_item = (experts + sub_group_size - 1) / sub_group_size;
 
     sycl::sub_group sg = item.get_sub_group();
     int sg_id = sg.get_group_id();
@@ -70,110 +68,60 @@ struct FusedTopkSigmoid {
     int tid = group_id * sub_groups_per_group + sg_id;
     if (tid >= tokens) return;
 
-    // Keep ranking scores in float so bf16/fp16 inputs do not perturb top-k order.
-    float local_elems[malloc_per_item];
-    int local_idx[malloc_per_item];
-
-    int start_offset = sg_local_id * calc_per_item;
-    int local_num = calc_per_item;
-    if (start_offset + local_num >= experts) local_num = experts - start_offset;
-    if (local_num < 0) local_num = 0;
-
-    for (int e = 0; e < calc_per_item; ++e) {
-      local_elems[e] = kNegInfinity;
-      local_idx[e] = -1;
-    }
-
-    for (int e = 0; e < local_num; ++e) {
-      int expert_id = start_offset + e;
-      float logit = static_cast<float>(gating_output[tid * experts + expert_id]);
-
-      // sigmoid activation
-      float sig = 1.0f / (1.0f + sycl::native::exp(-logit));
-
-      local_idx[e] = expert_id;
-
-      // add bias for ranking purposes only
-      if (correction_bias != nullptr) sig += correction_bias[expert_id];
-
-      local_elems[e] = sig;
-    }
-
-    // Top-K selection
-    float topk_weights_local[malloc_per_item];
-    int topk_ids_local[malloc_per_item];
-
+    const int row_offset = tid * experts;
+    const int output_offset = tid * top_k;
     const int routed_topk = top_k - num_fused_shared_experts;
     float row_sum_for_renormalize = 0.0f;
 
     for (int k = 0; k < routed_topk; ++k) {
-      float k_max = kNegInfinity;
-      int k_max_idx = -1;
-      int remove_ix = -1;
-
-      for (int e = 0; e < calc_per_item; ++e) {
-        float my_val = local_elems[e];
-        int my_idx = local_idx[e];
-
-        // butterfly argmax across sub-group — same as softmax
-        for (int offset = sub_group_size / 2; offset > 0; offset /= 2) {
-          float other_val = sycl::permute_group_by_xor(sg, my_val, offset);
-          int other_idx = sycl::permute_group_by_xor(sg, my_idx, offset);
-          if (other_val > my_val || (other_val == my_val && other_idx < my_idx)) {
-            my_val = other_val;
-            my_idx = other_idx;
+      float max_score = kNegInfinity;
+      int max_expert = experts;
+      for (int expert = sg_local_id; expert < experts; expert += sub_group_size) {
+        bool selected = false;
+        for (int prior_k = 0; prior_k < k; ++prior_k) {
+          selected |= topk_ids[output_offset + prior_k] == expert;
+        }
+        if (!selected) {
+          float logit = static_cast<float>(gating_output[row_offset + expert]);
+          float score = 1.0f / (1.0f + sycl::native::exp(-logit));
+          if (correction_bias != nullptr) score += correction_bias[expert];
+          if (score > max_score || (score == max_score && expert < max_expert)) {
+            max_score = score;
+            max_expert = expert;
           }
         }
+      }
 
-        if (my_val > k_max || (my_val == k_max && my_idx < k_max_idx)) {
-          k_max = my_val;
-          k_max_idx = my_idx;
-          remove_ix = (k_max_idx == local_idx[e]) ? e : -1;
+      for (int offset = sub_group_size / 2; offset > 0; offset /= 2) {
+        float other_score = sycl::permute_group_by_xor(sg, max_score, offset);
+        int other_expert = sycl::permute_group_by_xor(sg, max_expert, offset);
+        if (other_score > max_score || (other_score == max_score && other_expert < max_expert)) {
+          max_score = other_score;
+          max_expert = other_expert;
         }
       }
-      topk_weights_local[k] = k_max;
-      topk_ids_local[k] = k_max_idx;
 
-      // owner lane clears winning slot to prevent re-selection
-      if (remove_ix != -1) {
-        local_elems[remove_ix] = kNegInfinity;
-        local_idx[remove_ix] = -1;
+      if (sg_local_id == 0) {
+        float logit = static_cast<float>(gating_output[row_offset + max_expert]);
+        float weight = 1.0f / (1.0f + sycl::native::exp(-logit));
+        topk_weights[output_offset + k] = weight;
+        topk_ids[output_offset + k] = max_expert;
+        row_sum_for_renormalize += weight;
       }
+      sycl::group_barrier(sg);
     }
 
-    // Reuse the selected ranking scores. When bias participates in ranking,
-    // subtract it back out so outputs stay as raw sigmoid weights.
-    if (correction_bias != nullptr) {
-      for (int i = 0; i < routed_topk; ++i) {
-        int id = topk_ids_local[i];
-        topk_weights_local[i] -= correction_bias[id];
-      }
-    }
-
-    for (int i = 0; i < routed_topk; ++i) {
-      row_sum_for_renormalize += topk_weights_local[i];
-    }
-
-    // Write output
     if (sg_local_id == 0) {
-      int offset = tid * top_k;
-      for (int i = 0; i < routed_topk; ++i) {
-        topk_weights[offset + i] = topk_weights_local[i];
-        topk_ids[offset + i] = (topk_ids_local[i] >= 0) ? topk_ids_local[i] : 0;
-      }
-
       if (num_fused_shared_experts > 0) {
-        const int shared_idx = offset + routed_topk;
+        const int shared_idx = output_offset + routed_topk;
         topk_ids[shared_idx] = experts;
         topk_weights[shared_idx] = renormalize ? 1.0f : row_sum_for_renormalize / routed_scaling_factor;
       }
 
       if (renormalize) {
-        // Keep this tiny denominator guard aligned with CUDA
-        // Ref: https://github.com/sgl-project/sglang/blob/main/python/sglang/jit_kernel/csrc/moe/moe_topk_sigmoid.cuh
         const float scale = routed_scaling_factor / (row_sum_for_renormalize + 1e-20f);
         for (int i = 0; i < routed_topk; ++i) {
-          topk_weights[offset + i] *= scale;
+          topk_weights[output_offset + i] *= scale;
         }
       }
     }
@@ -577,6 +525,9 @@ void fused_topk_sigmoid(
     case 256:
       LAUNCH_GATING_SIGMOID(T, 256, WARPS_PER_TB);
       break;
+    case 512:
+      LAUNCH_GATING_SIGMOID(T, 512, WARPS_PER_TB);
+      break;
     default:
       launch_fused_topk_sigmoid(
           queue,
@@ -616,14 +567,11 @@ SGL_KERNEL_EXPORT void topk_sigmoid(
   TORCH_CHECK(shape.size() == 2, "gating_output must be 2D");
   int64_t n_tokens = shape[0];
   int64_t n_experts = shape[1];
-  TORCH_CHECK(n_experts <= 256, "n_experts only support up to 256, got ", n_experts);
+  TORCH_CHECK(n_experts <= 512, "n_experts only support up to 512, got ", n_experts);
   TORCH_CHECK(topk_weights.scalar_type() == at::kFloat, "topk_weights should be Float");
   TORCH_CHECK(topk_indices.scalar_type() == at::kInt, "topk_indices should be Int");
 
   int64_t n_topk = topk_weights.size(1);
-  // The max topk value is 8, which is constrained by 'malloc_per_item'.
-  auto max_topk = n_experts < 8 ? n_experts : 8;
-  TORCH_CHECK(0 < n_topk && n_topk <= max_topk, "topk must be less than or equal to num_experts and 8");
   TORCH_CHECK(
       num_fused_shared_experts >= 0 && num_fused_shared_experts <= 1, "num_fused_shared_experts must be in [0, 1]");
   TORCH_CHECK(
@@ -632,6 +580,13 @@ SGL_KERNEL_EXPORT void topk_sigmoid(
       n_topk,
       ", num_fused_shared_experts = ",
       num_fused_shared_experts);
+  const int64_t routed_topk = n_topk - num_fused_shared_experts;
+  TORCH_CHECK(
+      routed_topk <= n_experts,
+      "routed topk must be less than or equal to num_experts, got routed_topk = ",
+      routed_topk,
+      ", num_experts = ",
+      n_experts);
   TORCH_CHECK(
       !(num_fused_shared_experts > 0 && !renormalize && routed_scaling_factor == 0.0),
       "routed_scaling_factor must be non-zero when num_fused_shared_experts > 0 and renormalize is false");

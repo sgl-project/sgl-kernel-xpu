@@ -146,7 +146,7 @@ def fused_qk_rope_reference(
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 32, 128])
-@pytest.mark.parametrize("num_heads_q", [8, 32])
+@pytest.mark.parametrize("num_heads_q", [8, 32, 64])
 @pytest.mark.parametrize("num_heads_k", [8])
 @pytest.mark.parametrize("num_heads_v", [8])
 @pytest.mark.parametrize("head_dim", [64, 128])

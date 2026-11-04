@@ -254,13 +254,9 @@ def flash_attn_with_kvcache(
             with sink logits (``sinks``), an fp8 KV cache, or relative attention
             (``rel_bias``) -- no LSE kernel instantiation exists for those; requesting
             it there raises a ``RuntimeError``.
-        out [optional]: preallocated output buffer of shape (total_q, nheads, headdim_v),
-            dtype matching q, on the same XPU device as q, with a contiguous last dimension
-            (stride(-1) == 1). When provided, the kernel writes results directly into this
-            buffer and the returned tensor aliases it. Useful for XPU graph / torch.compile
-            capture to avoid allocating a new output tensor each step. Requires
-            ``page_table`` to be provided (paged KV cache); passing ``out`` without a
-            page table raises a ``RuntimeError``.
+        out [optional]: a preallocated output buffer. When provided, the native
+            operator writes into and returns this buffer; otherwise it allocates
+            the output tensor.
         rel_bias [optional]: device-resident Inkling relative logits with shape
             ``(total_q, nheads, extent)``. The kernel shears this source on the
             current XPU stream for its fixed 256x32 relative-attention tiles. Its
@@ -274,8 +270,7 @@ def flash_attn_with_kvcache(
 
     Return:
         out: (total_q, nheads, headdim_v), where total_q = batch_size * seqlen (non-varlen)
-            or the sum of actual sequence lengths (varlen). The tensor aliases the provided
-            ``out`` buffer when one is supplied.
+            or the sum of actual sequence lengths (varlen).
         softmax_lse [optional, if return_softmax_lse=True]: (nheads, total_q). The
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
@@ -358,21 +353,7 @@ def flash_attn_with_kvcache(
         assert cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0)
         cu_seqlens_k = cache_seqlens
 
-    # Pre-construct the output buffers and let the kernel write into them in
-    # place (passed by reference); nothing is returned by the op. Whether the
-    # logsumexp is computed is signalled by passing ``softmax_lse``: a real
-    # tensor requests it, ``None`` skips the LSE computation.
-    total_q = q.size(0)
-    num_heads = q.size(-2)
-    head_size_v = v_cache.size(-1)
-    if out is None:
-        out = q.new_empty(total_q, num_heads, head_size_v)
-    softmax_lse = (
-        q.new_empty(num_heads, total_q, dtype=torch.float32)
-        if return_softmax_lse
-        else None
-    )
-    torch.ops.sgl_kernel.fwd.default(
+    out, softmax_lse = torch.ops.sgl_kernel.fwd.default(
         q,
         k_cache,
         v_cache,
@@ -402,7 +383,7 @@ def flash_attn_with_kvcache(
         pack_gqa,
         sm_margin,
         out,
-        softmax_lse,
+        return_softmax_lse,
         rel_bias,
         rel_bias_is_sheared,
         bidirectional_block_ids,
@@ -513,12 +494,10 @@ def _flash_attn_with_kvcache_page_size_1(
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
         return_softmax_lse=return_softmax_lse,
+        out=out,
     )
-    result_out, softmax_lse = result if return_softmax_lse else (result, None)
-    if out is not None:
-        out.copy_(result_out)
-        result_out = out
-    return (result_out, softmax_lse) if return_softmax_lse else result_out
+    out, softmax_lse = result if return_softmax_lse else (result, None)
+    return (out, softmax_lse) if return_softmax_lse else out
 
 
 def flash_attn_varlen_func(
@@ -544,6 +523,7 @@ def flash_attn_varlen_func(
     pack_gqa=None,
     sm_margin=0,
     return_softmax_lse=False,
+    out=None,
 ):
     if not is_fa3_supported():
         raise NotImplementedError(
@@ -561,20 +541,7 @@ def flash_attn_varlen_func(
         max_seqlen_q = q.size(1)
         q = q.view(-1, q.size(-2), q.size(-1)).contiguous()
 
-    # Pre-construct the output buffers and let the kernel write into them in
-    # place (passed by reference); nothing is returned by the op. Whether the
-    # logsumexp is computed is signalled by passing ``softmax_lse``: a real
-    # tensor requests it, ``None`` skips the LSE computation.
-    total_q = q.size(0)
-    num_heads = q.size(-2)
-    head_size_v = v.size(-1)
-    out = q.new_empty(total_q, num_heads, head_size_v)
-    softmax_lse = (
-        q.new_empty(num_heads, total_q, dtype=torch.float32)
-        if return_softmax_lse
-        else None
-    )
-    torch.ops.sgl_kernel.fwd.default(
+    out, softmax_lse = torch.ops.sgl_kernel.fwd.default(
         q,
         k,
         v,
@@ -604,7 +571,7 @@ def flash_attn_varlen_func(
         pack_gqa,
         sm_margin,
         out,
-        softmax_lse,
+        return_softmax_lse,
     )
 
     return (out, softmax_lse) if return_softmax_lse else out

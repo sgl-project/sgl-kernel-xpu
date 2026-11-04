@@ -30,6 +30,14 @@ def _find_segment(token_pos: int, seg_indptr_cpu: torch.Tensor) -> int:
     return seg_indptr_cpu.numel() - 2
 
 
+def _max_seg_len(seg_indptr: torch.Tensor) -> int:
+    """Longest segment, as the caller (the LoRA batch info) supplies it to the op."""
+    indptr = seg_indptr.reshape(-1).cpu()
+    if indptr.numel() < 2:
+        return 0
+    return max(int((indptr[1:] - indptr[:-1]).max()), 0)
+
+
 def _reference_embedding_lora_a_fwd(
     input_ids: torch.Tensor,
     weights: torch.Tensor,
@@ -218,6 +226,52 @@ def test_embedding_lora_a_fwd_zero_rank_all_zero_output():
     )
 
     assert torch.count_nonzero(out).item() == 0
+
+
+def test_embedding_lora_a_fwd_max_len_is_optional_and_backward_compatible():
+    # max_len is an optional, keyword-only trailing bound: legacy positional calls
+    # (no max_len), an omitted max_len (longest segment read on the host) and a tight
+    # max_len must all give the same result.
+    torch.manual_seed(16)
+    vocab_size, max_rank = 128, 4
+    input_ids = torch.randint(0, vocab_size, (37,), dtype=torch.int64, device="xpu")
+    seg_indptr = torch.tensor([0, 3, 4, 20, 37], dtype=torch.int32, device="xpu")
+    weight_indices = torch.tensor([2, 1, 0, 1], dtype=torch.int32, device="xpu")
+    lora_ranks = torch.tensor([4, 2, 3], dtype=torch.int32, device="xpu")
+    weights = torch.randn(3, max_rank, vocab_size, dtype=torch.float32, device="xpu")
+
+    legacy_positional = embedding_lora_a_fwd(
+        input_ids,
+        weights,
+        vocab_size,
+        seg_indptr,
+        weight_indices,
+        lora_ranks,
+        None,
+        None,
+    )
+    default_bound = embedding_lora_a_fwd(
+        input_ids=input_ids,
+        weights=weights,
+        vocab_size=vocab_size,
+        seg_indptr=seg_indptr,
+        weight_indices=weight_indices,
+        lora_ranks=lora_ranks,
+    )
+    tight_bound = embedding_lora_a_fwd(
+        input_ids=input_ids,
+        weights=weights,
+        vocab_size=vocab_size,
+        seg_indptr=seg_indptr,
+        weight_indices=weight_indices,
+        lora_ranks=lora_ranks,
+        max_len=_max_seg_len(seg_indptr),
+    )
+    ref = _reference_embedding_lora_a_fwd(
+        input_ids, weights, vocab_size, seg_indptr, weight_indices, lora_ranks, None
+    ).to("xpu")
+    for out in (legacy_positional, default_bound, tight_bound):
+        torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
 
 
 def test_embedding_lora_a_fwd_segment_boundaries_precise_routing():

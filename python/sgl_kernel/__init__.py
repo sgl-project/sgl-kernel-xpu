@@ -71,11 +71,16 @@ from sgl_kernel.elementwise import (
     fused_qk_norm_rope,
     fused_qk_rope,
     fused_qk_rope_with_cos_sin_cache_inplace,
+    fused_sigmoid_mul,
     gelu_and_mul,
     gelu_tanh_and_mul,
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
+    grouped_gemma_rmsnorm,
     multimodal_rotary_embedding,
+    qwen4_gate_reduce,
+    qwen4_gate_value,
+    qwen4_ngram_hash,
     rmsnorm,
     silu_and_mul,
     silu_and_mul_clamp,
@@ -86,6 +91,7 @@ from sgl_kernel.flash_compress_128 import (
     flash_compress128_decode,
     flash_compress128_prefill,
 )
+from sgl_kernel.hc import hc_combine, hc_combine_norm, hc_gate_mix, hc_silu
 
 try:
     from sgl_kernel.fp8_paged_mqa_logits import fp8_paged_mqa_logits_triton
@@ -100,6 +106,7 @@ hadamard_transform = torch.ops.sgl_kernel.hadamard_transform
 fused_q_indexer_rope_hadamard_quant = (
     torch.ops.sgl_kernel.fused_q_indexer_rope_hadamard_quant
 )
+from sgl_kernel.elementwise import fused_q_indexer_rope_hadamard_fp4_quant
 from sgl_kernel.gdn_attn import gdn_attention
 from sgl_kernel.gemm import (
     awq_dequantize,
@@ -126,6 +133,10 @@ from sgl_kernel.hisparse import (
     load_cache_to_device_buffer_dsv4_mla,
     load_cache_to_device_buffer_mla,
     transfer_cache_dsv4_mla,
+)
+from sgl_kernel.indexer_rope_pack import (
+    index_k_norm_rope_pack_store,
+    index_q_rope_pack_weights,
 )
 from sgl_kernel.inkling_attn_prologue import (
     compile_inkling_attn_prologue,
@@ -176,6 +187,8 @@ from sgl_kernel.mamba import (
     causal_conv1d_fn_xpu,
     causal_conv1d_update_verify_xpu,
     causal_conv1d_update_xpu,
+    qwen4_short_conv_state,
+    qwen4_verify_conv,
 )
 from sgl_kernel.memory import weak_ref_tensor
 from sgl_kernel.mhc import (
@@ -209,8 +222,16 @@ from sgl_kernel.moe import (
     topk_sigmoid,
     topk_softmax,
 )
-from sgl_kernel.nsa import fp8_mqa_logits, fp8_paged_mqa_logits
-from sgl_kernel.qsa_sparse_attention import qsa_sparse_attention
+from sgl_kernel.nsa import fp4_paged_mqa_logits, fp8_mqa_logits, fp8_paged_mqa_logits
+from sgl_kernel.qsa_prepare import (
+    qsa_index_k_compress_store,
+    qsa_index_q_norm_rope_store,
+)
+from sgl_kernel.qsa_sparse_attention import (
+    qsa_mqa_decode,
+    qsa_mqa_prefill,
+    qsa_sparse_attention,
+)
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_renorm_prob,

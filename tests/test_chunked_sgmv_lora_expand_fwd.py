@@ -147,6 +147,14 @@ def _build_logical_segments(row_adapters: List[int], permutation_mode: str = "so
 # ----------------------------------------------------------------------------
 
 
+def _misalign(t: torch.Tensor) -> torch.Tensor:
+    """Contiguous copy of ``t`` whose data pointer is 1 element past a 16-byte boundary."""
+    buf = torch.empty(t.numel() + 1, dtype=t.dtype, device=t.device)
+    out = buf[1:].view(t.shape)
+    out.copy_(t)
+    return out
+
+
 def _run_and_compare_chunked(
     *,
     dtype: torch.dtype,
@@ -158,6 +166,7 @@ def _run_and_compare_chunked(
     scalings: torch.Tensor,
     permutation_mode: str = "sorted",
     with_base_output: bool = False,
+    misaligned: bool = False,
 ) -> None:
     torch.manual_seed(0)
     num_tokens = len(row_adapters)
@@ -182,6 +191,10 @@ def _run_and_compare_chunked(
         if with_base_output
         else None
     )
+    if misaligned:
+        input_x, weights = _misalign(input_x), _misalign(weights)
+        if base_output is not None:
+            base_output = _misalign(base_output)
 
     out = chunked_sgmv_lora_expand_fwd(
         input_x=input_x,
@@ -240,6 +253,7 @@ _DEFAULT_SCENARIO = {
     "scalings": None,
     "permutation_mode": "sorted",
     "with_base_output": False,
+    "misaligned": False,
 }
 
 _MANY_ADAPTERS = torch.randint(
@@ -314,6 +328,39 @@ _SCENARIOS = [
         },
         id="permutation-none",
     ),
+    # Arbitrary shapes: rank tails (aligned and unaligned rows), unaligned slice
+    # starts, odd N_total, unaligned base pointers.
+    pytest.param(
+        {"max_rank": 24, "slice_sizes": [256, 128], "lora_ranks": [24, 8]},
+        id="rank-tail-aligned",
+    ),
+    pytest.param(
+        {"max_rank": 12, "slice_sizes": [256], "lora_ranks": [12, 5]},
+        id="rank-tail-unaligned-rows",
+    ),
+    pytest.param(
+        {"max_rank": 5, "slice_sizes": [101, 30, 7], "lora_ranks": [5, 3]},
+        id="odd-rank-odd-slices",
+    ),
+    pytest.param(
+        {
+            "max_rank": 16,
+            "slice_sizes": [100, 28],
+            "lora_ranks": [16, 8],
+            "with_base_output": True,
+        },
+        id="unaligned-slice-starts",
+    ),
+    pytest.param(
+        {
+            "max_rank": 16,
+            "slice_sizes": [256, 256],
+            "lora_ranks": [16, 8],
+            "with_base_output": True,
+            "misaligned": True,
+        },
+        id="misaligned-ptrs",
+    ),
     # Identity permutation drives the gather/scatter path as a no-op remap.
     pytest.param(
         {
@@ -353,6 +400,7 @@ def test_chunked_expand(dtype, scenario):
         scalings=scalings,
         permutation_mode=cfg["permutation_mode"],
         with_base_output=cfg["with_base_output"],
+        misaligned=cfg["misaligned"],
     )
 
 

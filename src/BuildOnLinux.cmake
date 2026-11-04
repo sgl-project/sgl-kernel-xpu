@@ -17,7 +17,7 @@ endif()
 
 # Runtime-JIT engine (pure host C++, depends only on libdl). Linked into the
 # SYCL libraries whose dispatch renders/compiles the *.cpp.in templates on
-# demand (flash_attention for FMHA, GroupGemmXe20 for MoE grouped GEMM).
+# demand (flash_attentionXe20 for FMHA, GroupGemmXe20 for MoE grouped GEMM).
 if(USE_SYCL_JIT)
   add_library(sgl_jit STATIC
     ${SGL_OPS_XPU_ROOT}/src/jit/sycl_template_jit.cpp
@@ -104,8 +104,8 @@ if(USE_GDN
 endif()
 
 # Dispatchers that call the runtime-JIT engine link the static JIT library.
-if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-flash_attention)
-  target_link_libraries(sgl-ops-sycl-flash_attention PRIVATE sgl_jit)
+if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-flash_attentionXe20)
+  target_link_libraries(sgl-ops-sycl-flash_attentionXe20 PRIVATE sgl_jit)
 endif()
 if(USE_MLA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-mla_decode)
   target_link_libraries(sgl-ops-sycl-mla_decode PRIVATE sgl_jit)

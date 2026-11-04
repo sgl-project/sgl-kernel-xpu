@@ -132,10 +132,11 @@ def merge_state_triton(
 @pytest.mark.parametrize("seq_len", [2048])
 @pytest.mark.parametrize("num_heads", [32])
 @pytest.mark.parametrize("head_dim", [128])
-def test_merge_state(seq_len, num_heads, head_dim):
-    va = torch.randn(seq_len, num_heads, head_dim).half().to(f"{device}:0")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_merge_state(seq_len, num_heads, head_dim, dtype):
+    va = torch.randn(seq_len, num_heads, head_dim, dtype=dtype).to(f"{device}:0")
     sa = torch.randn(seq_len, num_heads, dtype=torch.float32).to(f"{device}:0")
-    vb = torch.randn(seq_len, num_heads, head_dim).half().to(f"{device}:0")
+    vb = torch.randn(seq_len, num_heads, head_dim, dtype=dtype).to(f"{device}:0")
     sb = torch.randn(seq_len, num_heads, dtype=torch.float32).to(f"{device}:0")
     v_merged, s_merged = merge_state_triton(va, sa, vb, sb)
     v_merged_std, s_merged_std = merge_state(va, sa, vb, sb)

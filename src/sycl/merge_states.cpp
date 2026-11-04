@@ -303,19 +303,6 @@ void merge_state_sycl(
   });
 }
 
-#define SYCL_DISPATCH_BY_SCALAR_DTYPE(scalar_dtype, fn)                                     \
-  {                                                                                         \
-    if (scalar_dtype == at::ScalarType::Float) {                                            \
-      fn(float);                                                                            \
-    } else if (scalar_dtype == at::ScalarType::Half) {                                      \
-      fn(sycl::half);                                                                       \
-    } else if (scalar_dtype == at::ScalarType::BFloat16) {                                  \
-      fn(sycl::ext::oneapi::bfloat16);                                                      \
-    } else {                                                                                \
-      TORCH_CHECK(false, "Unsupported dtype for SYCL merge_state_v2_sycl: ", scalar_dtype); \
-    }                                                                                       \
-  }
-
 template <typename scalar_t>
 void merge_attn_states_launcher_sycl(
     const at::Tensor& prefix_output,
@@ -342,9 +329,6 @@ void merge_attn_states_launcher_sycl(
       head_size);
 }
 
-#define CALL_MERGE_ATTN_STATES_LAUNCHER_SYCL(scalar_t) \
-  { merge_attn_states_launcher_sycl<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); }
-
 SGL_KERNEL_EXPORT void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
   CHECK_INPUT(v_a);
@@ -364,7 +348,9 @@ SGL_KERNEL_EXPORT void merge_state_v2(
   CHECK_EQ(v_a.size(0), s_a.size(0));
   CHECK_EQ(v_a.size(1), s_b.size(1));
 
-  SYCL_DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER_SYCL);
+  SYCL_DISPATCH_FLOATING_TYPES_V2(v_merged.scalar_type(), "merge_state_v2", [&] {
+    merge_attn_states_launcher_sycl<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged);
+  });
 }
 
 template <typename scalar_t>
@@ -392,9 +378,6 @@ void merge_state_launcher_sycl(
       num_heads,
       head_size);
 }
-
-#define CALL_MERGE_STATE_LAUNCHER_SYCL(scalar_t) \
-  { merge_state_launcher_sycl<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); }
 
 SGL_KERNEL_EXPORT void
 merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
@@ -425,5 +408,7 @@ merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::
   TORCH_CHECK(s_b.scalar_type() == at::ScalarType::Float, "s_b must be float32");
   TORCH_CHECK(s_merged.scalar_type() == at::ScalarType::Float, "s_merged must be float32");
 
-  SYCL_DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_STATE_LAUNCHER_SYCL);
+  SYCL_DISPATCH_FLOATING_TYPES_V2(v_merged.scalar_type(), "merge_state", [&] {
+    merge_state_launcher_sycl<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged);
+  });
 }

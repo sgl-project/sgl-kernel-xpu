@@ -366,13 +366,17 @@ SGL_KERNEL_EXPORT void fused_qk_rope(
       position_ids.data_ptr<int>(), static_cast<float>(factor), static_cast<float>(low), static_cast<float>(high), \
       static_cast<float>(attention_factor), static_cast<int>(rotary_dim), queue
 
-#define LAUNCH_QK_ROPE_KERNEL(HEAD_DIM, INTERLEAVE)                                                                \
-  AT_DISPATCH_SWITCH(                                                                                              \
-      qkv.scalar_type(), "fused_qk_rope", DISPATCH_CASE_FLOAT_TYPES(([&] {                                         \
-        launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, scalar_t>(FUSED_QK_ROPE_LAUNCH_ARGS);                          \
-      })) AT_DISPATCH_CASE(at::ScalarType::Float8_e4m3fn, ([&] {                                                   \
-                             launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, float_e4m3_t>(FUSED_QK_ROPE_LAUNCH_ARGS); \
-                           })))
+// FP8 uses CUTLASS storage; FP32/FP16/BF16 use ATen types.
+#define LAUNCH_QK_ROPE_KERNEL(HEAD_DIM, INTERLEAVE)                                         \
+  do {                                                                                      \
+    if (qkv.scalar_type() == at::ScalarType::Float8_e4m3fn) {                               \
+      launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, float_e4m3_t>(FUSED_QK_ROPE_LAUNCH_ARGS); \
+    } else {                                                                                \
+      AT_DISPATCH_FLOATING_TYPES_V2(qkv.scalar_type(), "fused_qk_rope", [&] {               \
+        launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, scalar_t>(FUSED_QK_ROPE_LAUNCH_ARGS);   \
+      });                                                                                   \
+    }                                                                                       \
+  } while (0)
 
   switch (head_dim) {
     case 64:
@@ -613,7 +617,7 @@ SGL_KERNEL_EXPORT void fused_qk_rope_with_cos_sin_cache_inplace(
     DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(false, POS_T); \
   }
 
-  SYCL_DISPATCH_FLOATING_TYPES(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
       query.scalar_type(),

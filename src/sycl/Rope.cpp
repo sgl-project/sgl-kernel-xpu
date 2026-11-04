@@ -352,7 +352,7 @@ void rotary_embedding_2D_kernel_impl(
     group_size = std::min<int64_t>(std::min<int64_t>(num_heads * rot_dim / 2, 512), max_wg_size);
   }
 
-  SYCL_DISPATCH_FLOATING_TYPES(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "rotary_embedding_2D_kernel_impl", [=]() {
         auto cgf = DPCPP_Q_CGF(cgh) {
           if (is_neox) {

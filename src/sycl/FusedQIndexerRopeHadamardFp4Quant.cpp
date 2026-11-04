@@ -206,7 +206,7 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_fp4_quant(
 
   const uint32_t num_rows = static_cast<uint32_t>(q_input.size(0) * q_input.size(1));
   auto queue = c10::xpu::getCurrentXPUStream().queue();
-  SYCL_DISPATCH_FLOATING_TYPES(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
       at::kHalf, at::kBFloat16, q_input.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {
         using input_t = scalar_t;
         AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_fp4_quant", [&]() {

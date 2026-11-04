@@ -432,12 +432,16 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_
   auto& queue = stream.queue();
   SYCL_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::BFloat16, at::ScalarType::Half, x.scalar_type(), "fused_scale_residual_norm_scale_shift", [&]() {
-        SYCL_DISPATCH_WEIGHT_TYPES(
+        using input_t = scalar_t;
+        AT_DISPATCH_FLOATING_TYPES_AND2(
             at::ScalarType::Half,
             at::ScalarType::BFloat16,
             param_dtype,
             "fused_scale_residual_norm_scale_shift",
-            [&]() { launch<scalar_t, srnss_sycl_t<weight_t>>(queue, args); });
+            [&]() {
+              using weight_t = scalar_t;
+              launch<input_t, srnss_sycl_t<weight_t>>(queue, args);
+            });
       });
 
   return {out, residual_output};

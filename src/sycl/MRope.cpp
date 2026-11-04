@@ -222,21 +222,22 @@ SGL_KERNEL_EXPORT void multimodal_rotary_embedding(
   SGL_KERNEL_PERF_SCOPE("multimodal_rotary_embedding", profiling_queue, bytes, flops);
 #endif
 
-#define LAUNCH_MROPE_KERNEL(IS_NEOX, IS_INTERLEAVED)                                                                 \
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, query.scalar_type(), "multimodal_rotary_embedding", [&]() { \
-    launch_mrope<scalar_t, IS_NEOX, IS_INTERLEAVED>(                                                                 \
-        query,                                                                                                       \
-        key,                                                                                                         \
-        cos_sin_cache,                                                                                               \
-        positions,                                                                                                   \
-        num_q_heads,                                                                                                 \
-        num_k_heads,                                                                                                 \
-        head_size,                                                                                                   \
-        rotary_dim,                                                                                                  \
-        section_t,                                                                                                   \
-        section_h,                                                                                                   \
-        section_w);                                                                                                  \
-  });
+#define LAUNCH_MROPE_KERNEL(IS_NEOX, IS_INTERLEAVED)                                        \
+  AT_DISPATCH_FLOATING_TYPES_AND2(                                                          \
+      at::kHalf, at::kBFloat16, query.scalar_type(), "multimodal_rotary_embedding", [&]() { \
+        launch_mrope<scalar_t, IS_NEOX, IS_INTERLEAVED>(                                    \
+            query,                                                                          \
+            key,                                                                            \
+            cos_sin_cache,                                                                  \
+            positions,                                                                      \
+            num_q_heads,                                                                    \
+            num_k_heads,                                                                    \
+            head_size,                                                                      \
+            rotary_dim,                                                                     \
+            section_t,                                                                      \
+            section_h,                                                                      \
+            section_w);                                                                     \
+      });
 
   if (is_neox_style) {
     if (mrope_interleaved) {

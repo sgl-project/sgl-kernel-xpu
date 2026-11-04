@@ -264,11 +264,10 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_quant(
   SGL_KERNEL_PERF_SCOPE("fused_q_indexer_rope_hadamard_quant", profiling_queue, bytes, flops);
 #endif
 
-  SYCL_DISPATCH_FLOATING_TYPES_AND2(
-      at::kBFloat16, at::kHalf, q_input.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
-        AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
-          launch_fused_q_indexer_rope_hadamard_quant<scalar_t, index_t>(
-              q_input, q_fp8, weight, weights_out, weight_scale, rope_cache, positions);
-        });
-      });
+  SYCL_DISPATCH_FLOATING_TYPES_V3(q_input.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
+    AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_q_indexer_rope_hadamard_quant", [&]() {
+      launch_fused_q_indexer_rope_hadamard_quant<scalar_t, index_t>(
+          q_input, q_fp8, weight, weights_out, weight_scale, rope_cache, positions);
+    });
+  });
 }

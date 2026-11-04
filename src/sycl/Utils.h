@@ -30,6 +30,33 @@
 #define AT_DISPATCH_FLOATING_TYPES_V2(TYPE, NAME, ...) \
   AT_DISPATCH_V2(TYPE, NAME, AT_WRAP(__VA_ARGS__), at::kFloat, at::kHalf, at::kBFloat16)
 
+template <typename T>
+using sycl_type_t = std::conditional_t<
+    std::is_same_v<T, at::Half>,
+    sycl::half,
+    std::conditional_t<std::is_same_v<T, at::BFloat16>, sycl::ext::oneapi::bfloat16, T>>;
+
+#define SYCL_DISPATCH_BODY(...)                  \
+  AT_WRAP([&] {                                  \
+    using sycl_scalar_t = sycl_type_t<scalar_t>; \
+    return [&] {                                 \
+      using scalar_t = sycl_scalar_t;            \
+      return (__VA_ARGS__)();                    \
+    }();                                         \
+  })
+
+// FP16/BF16.
+#define SYCL_DISPATCH_FLOATING_TYPES_V1(TYPE, NAME, ...) \
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(TYPE, NAME, SYCL_DISPATCH_BODY(__VA_ARGS__))
+
+// FP32/FP16/BF16.
+#define SYCL_DISPATCH_FLOATING_TYPES_V2(TYPE, NAME, ...) \
+  AT_DISPATCH_FLOATING_TYPES_V2(TYPE, NAME, SYCL_DISPATCH_BODY(__VA_ARGS__))
+
+// FP64/FP32/FP16/BF16.
+#define SYCL_DISPATCH_FLOATING_TYPES_V3(TYPE, NAME, ...) \
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, TYPE, NAME, SYCL_DISPATCH_BODY(__VA_ARGS__))
+
 #define SGL_DISPATCH_BOOL(BOOL_V, BOOL_NAME, ...)        \
   [&]() -> decltype(auto) {                              \
     if (BOOL_V) {                                        \
@@ -299,52 +326,6 @@ inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_
   TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
 
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
-
-#define PRIVATE_CASE_TYPE_OUTPLACE(enum_type, type, ...) \
-  case enum_type: {                                      \
-    using scalar_t = type;                               \
-    __VA_ARGS__();                                       \
-    break;                                               \
-  }
-
-#define SYCL_DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)    \
-  {                                                                                     \
-    const auto& the_type = TYPE;                                                        \
-    at::ScalarType _st = ::detail::scalar_type(the_type);                               \
-    switch (_st) {                                                                      \
-      PRIVATE_CASE_TYPE_OUTPLACE(at::ScalarType::Double, double, __VA_ARGS__)           \
-      PRIVATE_CASE_TYPE_OUTPLACE(at::ScalarType::Float, float, __VA_ARGS__)             \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE1, sycl::ext::oneapi::bfloat16, __VA_ARGS__) \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE2, sycl::half, __VA_ARGS__)                  \
-      default:                                                                          \
-        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                 \
-    }                                                                                   \
-  }
-
-#define SYCL_DISPATCH_ONLY_FLOATING16_TYPES(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)  \
-  {                                                                                     \
-    const auto& the_type = TYPE;                                                        \
-    at::ScalarType _st = ::detail::scalar_type(the_type);                               \
-    switch (_st) {                                                                      \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE1, sycl::ext::oneapi::bfloat16, __VA_ARGS__) \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE2, sycl::half, __VA_ARGS__)                  \
-      default:                                                                          \
-        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                 \
-    }                                                                                   \
-  }
-
-#define SYCL_DISPATCH_FLOATING_TYPES_AND3(SCALARTYPE1, SCALARTYPE2, SCALARTYPE3, TYPE, NAME, ...) \
-  {                                                                                               \
-    const auto& the_type = TYPE;                                                                  \
-    at::ScalarType _st = ::detail::scalar_type(the_type);                                         \
-    switch (_st) {                                                                                \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE1, float, __VA_ARGS__)                                 \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE2, sycl::ext::oneapi::bfloat16, __VA_ARGS__)           \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE3, sycl::half, __VA_ARGS__)                            \
-      default:                                                                                    \
-        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                           \
-    }                                                                                             \
-  }
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {

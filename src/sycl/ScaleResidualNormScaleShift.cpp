@@ -20,14 +20,6 @@ namespace at::native::xpu {
 
 namespace {
 
-// FLOATING_TYPES_AND2 binds scalar_t to the SYCL types but WEIGHT_TYPES binds weight_t
-// to the c10 ones; map them so T and P convert identically inside the kernel.
-template <typename T>
-using srnss_sycl_t = std::conditional_t<
-    std::is_same_v<T, at::Half>,
-    ::sycl::half,
-    std::conditional_t<std::is_same_v<T, at::BFloat16>, ::sycl::ext::oneapi::bfloat16, T>>;
-
 // Global access is vectorized through vec_t, as in per_tensor_quant_fp8.cpp and
 // TopKRenormProbs.cpp, but by dereferencing a vec_t pointer rather than vec_t::load/store:
 // the member functions scalarize, measured 119 vs 392 GB/s for bf16 at S=32760 H=5120.
@@ -430,19 +422,14 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto& queue = stream.queue();
-  SYCL_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::BFloat16, at::ScalarType::Half, x.scalar_type(), "fused_scale_residual_norm_scale_shift", [&]() {
-        using input_t = scalar_t;
-        AT_DISPATCH_FLOATING_TYPES_AND2(
-            at::ScalarType::Half,
-            at::ScalarType::BFloat16,
-            param_dtype,
-            "fused_scale_residual_norm_scale_shift",
-            [&]() {
-              using weight_t = scalar_t;
-              launch<input_t, srnss_sycl_t<weight_t>>(queue, args);
-            });
-      });
+  SYCL_DISPATCH_FLOATING_TYPES_V3(x.scalar_type(), "fused_scale_residual_norm_scale_shift", [&]() {
+    using input_t = scalar_t;
+    AT_DISPATCH_FLOATING_TYPES_AND2(
+        at::ScalarType::Half, at::ScalarType::BFloat16, param_dtype, "fused_scale_residual_norm_scale_shift", [&]() {
+          using weight_t = scalar_t;
+          launch<input_t, sycl_type_t<weight_t>>(queue, args);
+        });
+  });
 
   return {out, residual_output};
 }

@@ -209,7 +209,6 @@ at::Tensor SGL_KERNEL_EXPORT fused_hc_head(
   TORCH_CHECK(D < std::numeric_limits<int>::max(), "hidden_size must fit in int32, got ", D);
 
   auto q = dpcppGetCurrentQueue();
-  at::Tensor y;
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // Head computation: hc_fn matmul (2 * T * hc_mult * (hc_mult * D)) + norm/scale/base (~4 * T * hc_mult * D).
@@ -226,11 +225,8 @@ at::Tensor SGL_KERNEL_EXPORT fused_hc_head(
   SGL_KERNEL_PERF_SCOPE("fused_hc_head", q, x_bytes + fn_bytes + y_bytes, flops);
 #endif
 
-  SYCL_DISPATCH_ONLY_FLOATING16_TYPES(
-      at::ScalarType::BFloat16, at::ScalarType::Half, x.scalar_type(), "fused_hc_head", [&]() {
-        y = launch_fused_hc_head<scalar_t>(
-            q, x, hc_fn, hc_scale, hc_base, T, D, static_cast<float>(norm_eps), static_cast<float>(hc_eps));
-      });
-
-  return y;
+  return SYCL_DISPATCH_FLOATING_TYPES_V1(x.scalar_type(), "fused_hc_head", [&]() {
+    return launch_fused_hc_head<scalar_t>(
+        q, x, hc_fn, hc_scale, hc_base, T, D, static_cast<float>(norm_eps), static_cast<float>(hc_eps));
+  });
 }

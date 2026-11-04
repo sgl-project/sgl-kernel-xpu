@@ -249,23 +249,17 @@ SGL_KERNEL_EXPORT at::Tensor hadamard_transform(const at::Tensor& input, double 
 
       auto& q = dpcppGetCurrentQueue();
 
-      SYCL_DISPATCH_FLOATING_TYPES_AND3(
-          at::ScalarType::Float,
-          at::ScalarType::BFloat16,
-          at::ScalarType::Half,
-          x_flat.scalar_type(),
-          "hadamard_transform",
-          [&]() {
-            hadamard_dispatch<scalar_t>(
-                q,
-                reinterpret_cast<const scalar_t*>(x_flat.data_ptr()),
-                reinterpret_cast<scalar_t*>(out_flat.data_ptr()),
-                batch,
-                x_batch_stride,
-                out_batch_stride,
-                log_N,
-                scale_f);
-          });
+      SYCL_DISPATCH_FLOATING_TYPES_V2(x_flat.scalar_type(), "hadamard_transform", [&]() {
+        hadamard_dispatch<scalar_t>(
+            q,
+            reinterpret_cast<const scalar_t*>(x_flat.data_ptr()),
+            reinterpret_cast<scalar_t*>(out_flat.data_ptr()),
+            batch,
+            x_batch_stride,
+            out_batch_stride,
+            log_N,
+            scale_f);
+      });
     }
   }  // scope destructs here — timing bracket closes before the reshape below
 

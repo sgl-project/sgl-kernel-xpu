@@ -323,10 +323,11 @@ def test_prepare_input_moe(
 
 @pytest.mark.parametrize("num_tokens", [1, 37, 300])
 @pytest.mark.parametrize("routing", ["local_shard", "all_dropped"])
-def test_prepare_moe_input_drops_negative_ids(num_tokens, routing):
+@pytest.mark.parametrize("hidden_dim", [128, 1536, 4096])
+def test_prepare_moe_input_drops_negative_ids(num_tokens, routing, hidden_dim):
     # Expert-parallel callers mark experts owned by other ranks with -1.
     # 8 * 300 routes exceed the single-kernel limit and use the two-kernel path.
-    num_local_experts, num_global_experts, top_k, hidden_dim = 16, 64, 8, 128
+    num_local_experts, num_global_experts, top_k = 16, 64, 8
     torch.manual_seed(41)
     noise = torch.rand(num_tokens, num_global_experts)
     topk_ids = torch.argsort(noise, dim=1)[:, :top_k].to(torch.int32).contiguous()

@@ -864,12 +864,9 @@ SGL_KERNEL_EXPORT void scatter_tokens_to_experts(
   if (input_tensor.scalar_type() == at::ScalarType::Float8_e4m3fn) {
     scatter_tokens_to_experts_impl<c10::Float8_e4m3fn>(input_tensor, src2dst_map, output_tensor);
   } else {
-    SYCL_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::BFloat16,
-        at::ScalarType::Half,
-        input_tensor.scalar_type(),
-        "scatter_tokens_to_experts_impl",
-        [&]() { scatter_tokens_to_experts_impl<scalar_t>(input_tensor, src2dst_map, output_tensor); });
+    SYCL_DISPATCH_FLOATING_TYPES_V3(input_tensor.scalar_type(), "scatter_tokens_to_experts_impl", [&]() {
+      scatter_tokens_to_experts_impl<scalar_t>(input_tensor, src2dst_map, output_tensor);
+    });
   }
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
@@ -1000,59 +997,57 @@ SGL_KERNEL_EXPORT void apply_shuffle_mul_sum(
   timer.start();
 #endif
 
-  SYCL_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "apply_shuffle_mul_sum", [&]() {
-        using input_t = scalar_t;
-        if (factors.has_value()) {
-          SYCL_DISPATCH_FLOATING_TYPES_AND2(
-              at::ScalarType::BFloat16, at::ScalarType::Half, factors.value().scalar_type(), "factors dispatch", [&]() {
-                using factors_t = scalar_t;
-                if (use_routed_scaling) {
-                  apply_shuffle_mul_sum_impl<input_t, factors_t, true>(
-                      reinterpret_cast<input_t*>(input.data_ptr()),
-                      reinterpret_cast<input_t*>(output.data_ptr()),
-                      reinterpret_cast<int32_t*>(permutation.data_ptr()),
-                      reinterpret_cast<factors_t*>(factors->data_ptr()),
-                      output.size(0),
-                      output.size(1),
-                      topk,
-                      routed_scaling_factor);
-                } else {
-                  apply_shuffle_mul_sum_impl<input_t, factors_t, false>(
-                      reinterpret_cast<input_t*>(input.data_ptr()),
-                      reinterpret_cast<input_t*>(output.data_ptr()),
-                      reinterpret_cast<int32_t*>(permutation.data_ptr()),
-                      reinterpret_cast<factors_t*>(factors->data_ptr()),
-                      output.size(0),
-                      output.size(1),
-                      topk,
-                      routed_scaling_factor);
-                }
-              });
+  SYCL_DISPATCH_FLOATING_TYPES_V3(input.scalar_type(), "apply_shuffle_mul_sum", [&]() {
+    using input_t = scalar_t;
+    if (factors.has_value()) {
+      SYCL_DISPATCH_FLOATING_TYPES_V3(factors.value().scalar_type(), "factors dispatch", [&]() {
+        using factors_t = scalar_t;
+        if (use_routed_scaling) {
+          apply_shuffle_mul_sum_impl<input_t, factors_t, true>(
+              reinterpret_cast<input_t*>(input.data_ptr()),
+              reinterpret_cast<input_t*>(output.data_ptr()),
+              reinterpret_cast<int32_t*>(permutation.data_ptr()),
+              reinterpret_cast<factors_t*>(factors->data_ptr()),
+              output.size(0),
+              output.size(1),
+              topk,
+              routed_scaling_factor);
         } else {
-          if (use_routed_scaling) {
-            apply_shuffle_mul_sum_impl<input_t, input_t, true>(
-                reinterpret_cast<input_t*>(input.data_ptr()),
-                reinterpret_cast<input_t*>(output.data_ptr()),
-                reinterpret_cast<int32_t*>(permutation.data_ptr()),
-                nullptr,
-                output.size(0),
-                output.size(1),
-                topk,
-                routed_scaling_factor);
-          } else {
-            apply_shuffle_mul_sum_impl<input_t, input_t, false>(
-                reinterpret_cast<input_t*>(input.data_ptr()),
-                reinterpret_cast<input_t*>(output.data_ptr()),
-                reinterpret_cast<int32_t*>(permutation.data_ptr()),
-                nullptr,
-                output.size(0),
-                output.size(1),
-                topk,
-                routed_scaling_factor);
-          }
+          apply_shuffle_mul_sum_impl<input_t, factors_t, false>(
+              reinterpret_cast<input_t*>(input.data_ptr()),
+              reinterpret_cast<input_t*>(output.data_ptr()),
+              reinterpret_cast<int32_t*>(permutation.data_ptr()),
+              reinterpret_cast<factors_t*>(factors->data_ptr()),
+              output.size(0),
+              output.size(1),
+              topk,
+              routed_scaling_factor);
         }
       });
+    } else {
+      if (use_routed_scaling) {
+        apply_shuffle_mul_sum_impl<input_t, input_t, true>(
+            reinterpret_cast<input_t*>(input.data_ptr()),
+            reinterpret_cast<input_t*>(output.data_ptr()),
+            reinterpret_cast<int32_t*>(permutation.data_ptr()),
+            nullptr,
+            output.size(0),
+            output.size(1),
+            topk,
+            routed_scaling_factor);
+      } else {
+        apply_shuffle_mul_sum_impl<input_t, input_t, false>(
+            reinterpret_cast<input_t*>(input.data_ptr()),
+            reinterpret_cast<input_t*>(output.data_ptr()),
+            reinterpret_cast<int32_t*>(permutation.data_ptr()),
+            nullptr,
+            output.size(0),
+            output.size(1),
+            topk,
+            routed_scaling_factor);
+      }
+    }
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // apply_shuffle_mul_sum: for each output row, weighted sum of topk source rows into hidden_dim.

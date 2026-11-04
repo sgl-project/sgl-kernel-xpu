@@ -9,7 +9,8 @@ from sgl_kernel import moe_sum_reduce
 @pytest.mark.parametrize("num_experts", [4, 8, 32, 128])
 @pytest.mark.parametrize("top_k", [2, 4, 8])
 @pytest.mark.parametrize("hidden_dims", [16, 32, 64, 2048])
-def test_moe_sum_reduce(num_tokens, num_experts, top_k, hidden_dims):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_moe_sum_reduce(num_tokens, num_experts, top_k, hidden_dims, dtype):
     torch.manual_seed(41)
 
     def moe_sum_reduce_reference(inp, scaling):
@@ -22,13 +23,13 @@ def test_moe_sum_reduce(num_tokens, num_experts, top_k, hidden_dims):
         return out
 
     # routing that generate unique tokens
-    inp = torch.randn((num_tokens, top_k, hidden_dims))
+    inp = torch.randn((num_tokens, top_k, hidden_dims), dtype=dtype)
     out = torch.empty((num_tokens, hidden_dims))
     scaling = 1.0 / float(top_k)
     expected = moe_sum_reduce_reference(inp, scaling)
 
     device = "xpu"
     inp_xpu = inp.clone().to(device)
-    output_xpu = torch.empty((num_tokens, hidden_dims), device=device)
+    output_xpu = torch.empty((num_tokens, hidden_dims), device=device, dtype=dtype)
     moe_sum_reduce(inp_xpu, output_xpu, scaling)
     torch.testing.assert_close(expected, output_xpu.to("cpu"))

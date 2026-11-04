@@ -30,6 +30,21 @@
 #define AT_DISPATCH_FLOATING_TYPES_V2(TYPE, NAME, ...) \
   AT_DISPATCH_V2(TYPE, NAME, AT_WRAP(__VA_ARGS__), at::kFloat, at::kHalf, at::kBFloat16)
 
+// INPUT_T is an ATen/c10 type; weight_t is INPUT_T or float, not an independent dtype dispatch.
+// Other weight dtypes throw. TYPE is evaluated once; callback returns stay inside this expression.
+#define AT_DISPATCH_WEIGHT_TYPES(INPUT_T, TYPE, NAME, ...)                                                            \
+  [&]() -> decltype(auto) {                                                                                           \
+    const auto _weight_type = TYPE;                                                                                   \
+    if (_weight_type == c10::CppTypeToScalarType<INPUT_T>::value) {                                                   \
+      using weight_t = INPUT_T;                                                                                       \
+      return (__VA_ARGS__)();                                                                                         \
+    }                                                                                                                 \
+    TORCH_CHECK(                                                                                                      \
+        _weight_type == at::kFloat, NAME, ": weight dtype must match input dtype or be float32, got ", _weight_type); \
+    using weight_t = float;                                                                                           \
+    return (__VA_ARGS__)();                                                                                           \
+  }()
+
 template <typename T>
 using sycl_type_t = std::conditional_t<
     std::is_same_v<T, at::Half>,

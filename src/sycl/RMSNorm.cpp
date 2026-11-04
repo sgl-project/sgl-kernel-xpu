@@ -779,27 +779,25 @@ SGL_KERNEL_EXPORT void rmsnorm(torch::Tensor& output, torch::Tensor& input, torc
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "RMSNormKernelImpl", [&]() {
         using input_t = scalar_t;
-        AT_DISPATCH_FLOATING_TYPES_AND2(
-            at::ScalarType::Half, at::ScalarType::BFloat16, weight_.scalar_type(), "RMSNormKernelImpl", [&]() {
-              using weight_t = scalar_t;
-              RMSNormKernelImplInternal<input_t, weight_t>(
-                  input,
-                  weight_,
-                  M,
-                  N,
-                  static_cast<acc_type<input_t>>(eps),
-                  output,
-                  in_strides.batch_stride,
-                  out_strides.batch_stride,
-                  in_strides.inner0_size,
-                  in_strides.inner0_stride,
-                  out_strides.inner0_size,
-                  out_strides.inner0_stride,
-                  in_strides.inner1_size,
-                  in_strides.inner1_stride,
-                  out_strides.inner1_size,
-                  out_strides.inner1_stride);
-            });
+        AT_DISPATCH_WEIGHT_TYPES(input_t, weight_.scalar_type(), "RMSNormKernelImpl", [&]() {
+          RMSNormKernelImplInternal<input_t, weight_t>(
+              input,
+              weight_,
+              M,
+              N,
+              static_cast<acc_type<input_t>>(eps),
+              output,
+              in_strides.batch_stride,
+              out_strides.batch_stride,
+              in_strides.inner0_size,
+              in_strides.inner0_stride,
+              out_strides.inner0_size,
+              out_strides.inner0_stride,
+              in_strides.inner1_size,
+              in_strides.inner1_stride,
+              out_strides.inner1_size,
+              out_strides.inner1_stride);
+        });
       });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
@@ -864,12 +862,10 @@ fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor wei
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
         using input_t = scalar_t;
-        AT_DISPATCH_FLOATING_TYPES_AND2(
-            at::ScalarType::Half, at::ScalarType::BFloat16, weight.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
-              using weight_t = scalar_t;
-              FusedAddRMSNormKernelImplInternal<input_t, weight_t>(
-                  input, weight, M, N, static_cast<acc_type<input_t>>(eps), residual);
-            });
+        AT_DISPATCH_WEIGHT_TYPES(input_t, weight.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
+          FusedAddRMSNormKernelImplInternal<input_t, weight_t>(
+              input, weight, M, N, static_cast<acc_type<input_t>>(eps), residual);
+        });
       });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
@@ -928,27 +924,25 @@ SGL_KERNEL_EXPORT void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
         using input_t = scalar_t;
-        AT_DISPATCH_FLOATING_TYPES_AND2(
-            at::ScalarType::Half, at::ScalarType::BFloat16, weight_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
-              using weight_t = scalar_t;
-              GemmaRMSNormKernelImplInternal<input_t, weight_t>(
-                  input,
-                  weight_,
-                  M,
-                  N,
-                  static_cast<acc_type<input_t>>(eps),
-                  output,
-                  in_strides.batch_stride,
-                  out_strides.batch_stride,
-                  in_strides.inner0_size,
-                  in_strides.inner0_stride,
-                  out_strides.inner0_size,
-                  out_strides.inner0_stride,
-                  in_strides.inner1_size,
-                  in_strides.inner1_stride,
-                  out_strides.inner1_size,
-                  out_strides.inner1_stride);
-            });
+        AT_DISPATCH_WEIGHT_TYPES(input_t, weight_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
+          GemmaRMSNormKernelImplInternal<input_t, weight_t>(
+              input,
+              weight_,
+              M,
+              N,
+              static_cast<acc_type<input_t>>(eps),
+              output,
+              in_strides.batch_stride,
+              out_strides.batch_stride,
+              in_strides.inner0_size,
+              in_strides.inner0_stride,
+              out_strides.inner0_size,
+              out_strides.inner0_stride,
+              in_strides.inner1_size,
+              in_strides.inner1_stride,
+              out_strides.inner1_size,
+              out_strides.inner1_stride);
+        });
       });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
@@ -1009,16 +1003,10 @@ gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Te
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
         using input_t = scalar_t;
-        AT_DISPATCH_FLOATING_TYPES_AND2(
-            at::ScalarType::Half,
-            at::ScalarType::BFloat16,
-            weight_.scalar_type(),
-            "GemmaFusedAddRMSNormKernelImpl",
-            [&]() {
-              using weight_t = scalar_t;
-              GemmaFusedAddRMSNormKernelImplInternal<input_t, weight_t>(
-                  input_, weight_, M, N, static_cast<acc_type<input_t>>(eps), residual_);
-            });
+        AT_DISPATCH_WEIGHT_TYPES(input_t, weight_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
+          GemmaFusedAddRMSNormKernelImplInternal<input_t, weight_t>(
+              input_, weight_, M, N, static_cast<acc_type<input_t>>(eps), residual_);
+        });
       });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)

@@ -73,16 +73,17 @@ endmacro()
 
 setup_common_libraries()
 
-# Architecture probe for the multi-arch wheel. Built independently of
-# SYCL_INTEL_TARGET and installed at the package root (not the per-arch dir) so
-# _arch.py can load it before deciding which backend to import. Deliberately not
-# linked into common_ops: it has to be loadable on its own.
+# Architecture probe for the multi-arch wheel, built from the same Device.cpp
+# that also goes into the backend's sgl-ops-sycl-Device library. Installed at the
+# package root (not the per-arch dir) so _arch.py can load it before deciding
+# which backend to import. Deliberately not linked into common_ops: it has to be
+# loadable on its own.
 sycl_add_library(
   sgl_arch_probe
   ${SYCL_OFFLINE_COMPILER_FLAGS}
   ${COMMON_DEVICE_LINK_FLAGS}
   SHARED
-  SYCL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/arch/sgl_arch_probe.cpp)
+  SYCL_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/sycl/Device.cpp)
 list(APPEND SGL_OPS_LIBRARIES sgl_arch_probe)
 install(TARGETS sgl_arch_probe LIBRARY DESTINATION sgl_kernel)
 set_target_properties(sgl_arch_probe PROPERTIES

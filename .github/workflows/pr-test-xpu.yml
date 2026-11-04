@@ -234,6 +234,7 @@ jobs:
       IGC_VERSION: 2.38.2+22051
       GMM_VERSION: 22.10.0
       TORCH_VERSION: 2.14.0
+      UV_VERSION: 0.12.18
       CONTAINER: ci_sglkernel_xpu_cri
     steps:
       - name: Reclaim workspace
@@ -244,7 +245,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Start container
-        run: docker run -dt --name "${CONTAINER}" -v "${GITHUB_WORKSPACE}:/src" -w /src -e COMPUTE_RUNTIME_VERSION -e IGC_VERSION -e GMM_VERSION -e TORCH_VERSION "${DLE_IMAGE}"
+        run: docker run -dt --name "${CONTAINER}" -v "${GITHUB_WORKSPACE}:/src" -w /src -e COMPUTE_RUNTIME_VERSION -e IGC_VERSION -e GMM_VERSION -e TORCH_VERSION -e UV_VERSION "${DLE_IMAGE}"
 
       - name: Install toolchain
         # Same driver stack and torch as Dockerfile.xpu_kernel; ocloc is needed for the Xe3P AOT link.
@@ -254,7 +255,7 @@ jobs:
           set -euxo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y curl ca-certificates python3-dev python3-venv software-properties-common
+          apt-get install -y curl ca-certificates software-properties-common
           add-apt-repository -y ppa:kobuk-team/intel-graphics
           apt-get update
           apt-get install -y libze1 intel-metrics-discovery clinfo intel-gsc
@@ -276,10 +277,12 @@ jobs:
             intel-igc-core-2 intel-igc-opencl-2
           ocloc ids cri || echo "warning: ocloc does not list cri"
 
-          python3 -m venv /opt/venv
+          curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | UV_NO_MODIFY_PATH=1 sh
+          export PATH="/root/.local/bin:${PATH}" UV_PYTHON_PREFERENCE=only-managed UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=10
+          uv venv --python 3.12 /opt/venv
           . /opt/venv/bin/activate
-          pip install -q --upgrade pip cmake ninja
-          pip install -q --timeout 300 --retries 10 "torch==${TORCH_VERSION}" torchvision triton-xpu --index-url https://download.pytorch.org/whl/xpu
+          uv pip install cmake ninja
+          uv pip install "torch==${TORCH_VERSION}" torchvision triton-xpu --index-url https://download.pytorch.org/whl/xpu
           EOF
 
       - name: Build for CRI

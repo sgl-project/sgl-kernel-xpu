@@ -56,7 +56,7 @@ SGL_KERNEL_EXPORT void moe_sum(
 
   switch (topk) {
     case 2: {
-      DISPATCH_FLOAT_TYPES(input.scalar_type(), "moe_sum", [&] {
+      AT_DISPATCH_FLOATING_TYPES_V2(input.scalar_type(), "moe_sum", [&] {
         using Kernel = MoeSumKernel<scalar_t, 2>;
         Kernel kernel(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         sycl_kernel_submit(range.get_global_range(), range.get_local_range(), queue, kernel);
@@ -64,7 +64,7 @@ SGL_KERNEL_EXPORT void moe_sum(
       break;
     }
     case 3: {
-      DISPATCH_FLOAT_TYPES(input.scalar_type(), "moe_sum", [&] {
+      AT_DISPATCH_FLOATING_TYPES_V2(input.scalar_type(), "moe_sum", [&] {
         using Kernel = MoeSumKernel<scalar_t, 3>;
         Kernel kernel(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         sycl_kernel_submit(range.get_global_range(), range.get_local_range(), queue, kernel);
@@ -72,7 +72,7 @@ SGL_KERNEL_EXPORT void moe_sum(
       break;
     }
     case 4: {
-      DISPATCH_FLOAT_TYPES(input.scalar_type(), "moe_sum", [&] {
+      AT_DISPATCH_FLOATING_TYPES_V2(input.scalar_type(), "moe_sum", [&] {
         using Kernel = MoeSumKernel<scalar_t, 4>;
         Kernel kernel(output.data_ptr<scalar_t>(), input.data_ptr<scalar_t>(), hidden_size);
         sycl_kernel_submit(range.get_global_range(), range.get_local_range(), queue, kernel);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ATen/Dispatch_v2.h>
 #include <ATen/xpu/XPUContext.h>
 
 #include <algorithm>
@@ -23,12 +24,11 @@
   CHECK_DEVICE(x);                         \
   CHECK_LAST_DIM_CONTIGUOUS(x)
 
-#define DISPATCH_CASE_FLOAT_TYPES(...)                 \
-  AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
-  AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)  \
-  AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
-
-#define DISPATCH_FLOAT_TYPES(TYPE, NAME, ...) AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOAT_TYPES(__VA_ARGS__))
+// Use AT_DISPATCH_* for ATen/c10 types; SYCL_DISPATCH_* only when kernel
+// operations require SYCL types (e.g. sycl::vec), not merely because it runs on XPU.
+// Project helper: FP32/FP16/BF16, no Double, no SYCL type mapping.
+#define AT_DISPATCH_FLOATING_TYPES_V2(TYPE, NAME, ...) \
+  AT_DISPATCH_V2(TYPE, NAME, AT_WRAP(__VA_ARGS__), at::kFloat, at::kHalf, at::kBFloat16)
 
 #define SGL_DISPATCH_BOOL(BOOL_V, BOOL_NAME, ...)        \
   [&]() -> decltype(auto) {                              \
@@ -300,52 +300,11 @@ inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_
 
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
 
-#define PRIVATE_CASE_TYPE(enum_type, type, ...) \
-  case enum_type: {                             \
-    using scalar_t = type;                      \
-    return __VA_ARGS__();                       \
-  }
-
-#define SYCL_DISPATCH_FLOATING_TYPES(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)                             \
-  {                                                                                                         \
-    const auto& the_type = TYPE;                                                                            \
-    at::ScalarType _st = ::detail::scalar_type(the_type);                                                   \
-    switch (_st) {                                                                                          \
-      PRIVATE_CASE_TYPE(at::ScalarType::Double, double, __VA_ARGS__)                                        \
-      PRIVATE_CASE_TYPE(at::ScalarType::Float, float, __VA_ARGS__)                                          \
-      PRIVATE_CASE_TYPE(SCALARTYPE1, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE1>::t), __VA_ARGS__) \
-      PRIVATE_CASE_TYPE(SCALARTYPE2, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE2>::t), __VA_ARGS__) \
-      default:                                                                                              \
-        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                                     \
-    }                                                                                                       \
-  }
-
 #define PRIVATE_CASE_TYPE_OUTPLACE(enum_type, type, ...) \
   case enum_type: {                                      \
     using scalar_t = type;                               \
     __VA_ARGS__();                                       \
     break;                                               \
-  }
-
-#define PRIVATE_CASE_WEIGHT_TYPE(enum_type, type, ...) \
-  case enum_type: {                                    \
-    using weight_t = type;                             \
-    __VA_ARGS__();                                     \
-    break;                                             \
-  }
-
-#define SYCL_DISPATCH_WEIGHT_TYPES(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)                                      \
-  {                                                                                                                \
-    const auto& the_weight_type = TYPE;                                                                            \
-    at::ScalarType _wt = ::detail::scalar_type(the_weight_type);                                                   \
-    switch (_wt) {                                                                                                 \
-      PRIVATE_CASE_WEIGHT_TYPE(at::ScalarType::Double, double, __VA_ARGS__)                                        \
-      PRIVATE_CASE_WEIGHT_TYPE(at::ScalarType::Float, float, __VA_ARGS__)                                          \
-      PRIVATE_CASE_WEIGHT_TYPE(SCALARTYPE1, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE1>::t), __VA_ARGS__) \
-      PRIVATE_CASE_WEIGHT_TYPE(SCALARTYPE2, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE2>::t), __VA_ARGS__) \
-      default:                                                                                                     \
-        AT_ERROR(#NAME, " not implemented for weight type '", toString(TYPE), "'");                                \
-    }                                                                                                              \
   }
 
 #define SYCL_DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)    \

@@ -1695,7 +1695,7 @@ SGL_KERNEL_EXPORT at::Tensor inkling_sconv_forward(
   SGL_KERNEL_PERF_SCOPE("inkling_sconv_forward", queue, bytes, flops);
 #endif
 
-  SYCL_DISPATCH_FLOATING_TYPES(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_sconv_forward", [&]() -> at::Tensor {
         SconvForwardParams<scalar_t> params{
             x.data_ptr<scalar_t>(),
@@ -1757,7 +1757,7 @@ SGL_KERNEL_EXPORT void inkling_update_sconv_cache(
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = x.scalar_type();
-  SYCL_DISPATCH_FLOATING_TYPES(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_update_sconv_cache", [&]() {
         UpdateSconvCacheParams<scalar_t> params{
             x.data_ptr<scalar_t>(),
@@ -1819,7 +1819,7 @@ SGL_KERNEL_EXPORT at::Tensor inkling_fused_decode_update_sconv(
   at::Tensor y = at::empty_strided({x.size(0), x.size(1)}, {x.size(1), 1}, x.options());
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = x.scalar_type();
-  SYCL_DISPATCH_FLOATING_TYPES(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half,
       at::ScalarType::BFloat16,
       input_type,
@@ -1886,7 +1886,7 @@ SGL_KERNEL_EXPORT void inkling_gather_scatter_sconv_cache(
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = hidden_states.scalar_type();
-  SYCL_DISPATCH_FLOATING_TYPES(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_gather_scatter_sconv_cache", [&]() {
         GatherScatterParams<scalar_t> params{
             hidden_states.data_ptr<scalar_t>(),
@@ -1965,7 +1965,7 @@ SGL_KERNEL_EXPORT void inkling_draft_extend_sconv_cache(
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = hidden_states.scalar_type();
-  SYCL_DISPATCH_FLOATING_TYPES(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_draft_extend_sconv_cache", [&]() {
         DraftExtendParams<scalar_t> params{
             hidden_states.data_ptr<scalar_t>(),
@@ -2170,7 +2170,7 @@ SGL_KERNEL_EXPORT void inkling_save_intermediate_conv_windows(
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = sconv_cache.scalar_type();
-  SYCL_DISPATCH_FLOATING_TYPES(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_save_intermediate_conv_windows", [&]() {
         SaveWindowsParams<scalar_t> params{
             sconv_cache.data_ptr<scalar_t>(),

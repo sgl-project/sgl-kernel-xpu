@@ -93,7 +93,7 @@ def fused_add_rms_norm(x, residual, weight, eps):
         ],
         # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
         (4096, 2880, torch.bfloat16),
-        # fp32 correctness smoke test for rmsnorm. `SYCL_DISPATCH_FLOATING_TYPES`
+        # fp32 correctness smoke test for rmsnorm. `AT_DISPATCH_FLOATING_TYPES_AND2`
         # instantiates the kernel for Float, so fp32 is a distinct instantiation
         # that the fp16/bf16 sweep above never covers.
         (19, 1024, torch.float32),
@@ -805,6 +805,10 @@ def test_gemma_norm_4d_non_flattenable(
     [
         (torch.float16, torch.float32),
         (torch.bfloat16, torch.float32),
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+        (torch.float32, torch.float16),
+        (torch.float32, torch.bfloat16),
     ],
 )
 def test_norm_mixed_dtype(batch_size, hidden_size, input_dtype, weight_dtype):
@@ -825,6 +829,10 @@ def test_norm_mixed_dtype(batch_size, hidden_size, input_dtype, weight_dtype):
     [
         (torch.float16, torch.float32),
         (torch.bfloat16, torch.float32),
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+        (torch.float32, torch.float16),
+        (torch.float32, torch.bfloat16),
     ],
 )
 def test_fused_add_rmsnorm_mixed_dtype(
@@ -856,6 +864,10 @@ def test_fused_add_rmsnorm_mixed_dtype(
     [
         (torch.float16, torch.float32),
         (torch.bfloat16, torch.float32),
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+        (torch.float32, torch.float16),
+        (torch.float32, torch.bfloat16),
     ],
 )
 def test_gemma_norm_mixed_dtype(batch_size, hidden_size, input_dtype, weight_dtype):
@@ -876,6 +888,10 @@ def test_gemma_norm_mixed_dtype(batch_size, hidden_size, input_dtype, weight_dty
     [
         (torch.float16, torch.float32),
         (torch.bfloat16, torch.float32),
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+        (torch.float32, torch.float16),
+        (torch.float32, torch.bfloat16),
     ],
 )
 def test_gemma_fused_add_rmsnorm_mixed_dtype(

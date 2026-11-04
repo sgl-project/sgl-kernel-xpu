@@ -231,7 +231,7 @@ SGL_KERNEL_EXPORT void multimodal_rotary_embedding(
 #endif
 
 #define LAUNCH_MROPE_KERNEL(IS_NEOX, IS_INTERLEAVED)                                                                 \
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, query.scalar_type(), "multimodal_rotary_embedding", [&]() { \
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, query.scalar_type(), "multimodal_rotary_embedding", [&]() { \
     if (fp32_cache) {                                                                                                \
       launch_mrope<scalar_t, float, IS_NEOX, IS_INTERLEAVED>(                                                        \
           query,                                                                                                     \

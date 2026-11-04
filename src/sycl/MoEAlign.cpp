@@ -333,7 +333,7 @@ SGL_KERNEL_EXPORT void moe_align_block_size(
   SGL_KERNEL_PERF_SCOPE("moe_align_block_size", profiling_queue, bytes, flops);
 #endif
 
-  DISPATCH_INTEGRAL_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
+  AT_DISPATCH_INDEX_TYPES(topk_ids.scalar_type(), "moe_align_block_size_kernel", [&] {
     auto stream = at::xpu::getCurrentXPUStream();
     auto queue = stream.queue();
     // The small-batch path (MOEAlignBlockSizeSmallBatchExpertFunctor) is disabled:
@@ -346,9 +346,9 @@ SGL_KERNEL_EXPORT void moe_align_block_size(
     if (small_batch_expert_mode) {
       const int32_t threads_local = std::max((int32_t)num_experts, sub_group_size);
       auto range = sycl::nd_range<1>(sycl::range<1>(threads_local), sycl::range<1>(threads_local));
-      using SmallKernel = MOEAlignBlockSizeSmallBatchExpertFunctor<scalar_t>;
+      using SmallKernel = MOEAlignBlockSizeSmallBatchExpertFunctor<index_t>;
       SmallKernel kernel(
-          topk_ids.data_ptr<scalar_t>(),
+          topk_ids.data_ptr<index_t>(),
           sorted_token_ids.data_ptr<int32_t>(),
           experts_ids.data_ptr<int32_t>(),
           num_tokens_post_pad.data_ptr<int32_t>(),
@@ -361,9 +361,9 @@ SGL_KERNEL_EXPORT void moe_align_block_size(
       const size_t scan_size = next_pow2(num_experts);
       [[maybe_unused]] const size_t shared_mem_size =
           (num_experts + (num_experts + 1) + scan_size + sub_group_size) * sizeof(int32_t);
-      using Kernel = MOEAlignBlockSizeFunctor<scalar_t>;
+      using Kernel = MOEAlignBlockSizeFunctor<index_t>;
       Kernel kernel(
-          topk_ids.data_ptr<scalar_t>(),
+          topk_ids.data_ptr<index_t>(),
           sorted_token_ids.data_ptr<int32_t>(),
           experts_ids.data_ptr<int32_t>(),
           num_tokens_post_pad.data_ptr<int32_t>(),
@@ -380,9 +380,9 @@ SGL_KERNEL_EXPORT void moe_align_block_size(
       const int block_threads = std::min(256, (int)threads);
       const int num_blocks = (topk_ids.numel() + block_threads - 1) / block_threads;
 
-      using SortKernel = CountAndSortExpertTokensFunctor<scalar_t>;
+      using SortKernel = CountAndSortExpertTokensFunctor<index_t>;
       SortKernel count_and_sort_kernel(
-          topk_ids.data_ptr<scalar_t>(),
+          topk_ids.data_ptr<index_t>(),
           sorted_token_ids.data_ptr<int32_t>(),
           cumsum_buffer.data_ptr<int32_t>(),
           topk_ids.numel());

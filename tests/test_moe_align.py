@@ -138,6 +138,7 @@ def moe_align_block_size_triton(
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
     "block_size,num_tokens,topk,num_experts,pad_sorted_token_ids",
     list(
@@ -151,12 +152,12 @@ def moe_align_block_size_triton(
     ),
 )
 def test_moe_align_block_size_compare_implementations(
-    block_size, num_tokens, topk, num_experts, pad_sorted_token_ids
+    block_size, num_tokens, topk, num_experts, pad_sorted_token_ids, dtype
 ):
 
     topk_ids = torch.argsort(torch.rand(num_tokens, num_experts, device="xpu"), dim=1)[
         :, :topk
-    ]
+    ].to(dtype)
 
     max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
 

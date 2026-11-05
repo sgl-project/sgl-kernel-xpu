@@ -817,8 +817,10 @@ void moe_grouped_mm_nt_xe20_w4a16(
 
 // W8A16 grouped GEMM. Activations are BF16, weights are 8-bit (FP8 E4M3),
 // and weight_scales is 1D [E] / 2D [E, 1] / [E, 2] for float32 per-expert scalar scales,
+// 2D [E, N] for float32 per-output-channel scales,
 // 3D [E, ceil(N/128), K/128] for 128x128 float32 block scales, or
 // 3D [E, N, K/32] uint8/float8_e8m0fnu for MXFP8 (1x32 UE8M0) block scales.
+// n_experts must be 1 (dense GEMM) or a multiple of 8.
 void moe_grouped_mm_nt_xe20_w8a16(
     torch::Tensor& output,
     const torch::Tensor& activations,

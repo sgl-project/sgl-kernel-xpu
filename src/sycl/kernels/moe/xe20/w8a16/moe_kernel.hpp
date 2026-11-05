@@ -115,7 +115,9 @@ class W8A16Kernel {
 
     const bool is_mxfp8 = (params.scale_mode == static_cast<int32_t>(ScaleMode::BlockMXFP8));
     const int64_t K_scale = is_mxfp8 ? (K / 32) : (K / FP8_GROUP_SIZE_K);
-    int64_t scale_n = WeightScalePerExpert ? params.scale_mode : (is_mxfp8 ? N : (N + 127) / 128);
+    const bool per_channel = (params.scale_mode == static_cast<int32_t>(ScaleMode::PerChannel));
+    // Per-expert scales: scale_mode values (1 or 2) per expert, or N for per-channel.
+    int64_t scale_n = WeightScalePerExpert ? (per_channel ? N : params.scale_mode) : (is_mxfp8 ? N : (N + 127) / 128);
 
     int pre_rows = 0;
     int pre_tiles = 0;

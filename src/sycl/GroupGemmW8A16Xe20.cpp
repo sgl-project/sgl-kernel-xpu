@@ -105,23 +105,27 @@ DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_128_128_16, SG_4_2_1)
     }                                                                              \
   } while (0)
 
-#define DISPATCH_MOE_W8A16_SCALAR_TILES()                                                                              \
-  do {                                                                                                                 \
-    if (avg_m <= 8) {                                                                                                  \
-      LAUNCH_MOE_W8A16(false, Tile_16_64_32, SG_1_4_1);                                                                \
-    } else if (avg_m <= 32) {                                                                                          \
-      LAUNCH_MOE_W8A16(false, Tile_32_64_32, SG_1_4_1);                                                                \
-    } else if (scale_mode == static_cast<int>(ScaleMode::ScalarGateUp) && avg_m <= 64 && gemm_k >= 2048) {             \
-      LAUNCH_MOE_W8A16(false, Tile_64_64_32, SG_2_4_1);                                                                \
-    } else if (                                                                                                        \
-        scale_mode == static_cast<int>(ScaleMode::ScalarSingle) && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 128) { \
-      LAUNCH_MOE_W8A16(false, Tile_32_64_32, SG_1_4_1);                                                                \
-    } else if (                                                                                                        \
-        scale_mode == static_cast<int>(ScaleMode::ScalarSingle) && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 512) { \
-      LAUNCH_MOE_W8A16(false, Tile_64_64_32, SG_2_4_1);                                                                \
-    } else {                                                                                                           \
-      LAUNCH_MOE_W8A16(false, Tile_128_128_16, SG_4_2_1);                                                              \
-    }                                                                                                                  \
+#define DISPATCH_MOE_W8A16_SCALAR_TILES()                                                                  \
+  do {                                                                                                     \
+    if (avg_m <= 8) {                                                                                      \
+      LAUNCH_MOE_W8A16(false, Tile_16_64_32, SG_1_4_1);                                                    \
+    } else if (avg_m <= 32) {                                                                              \
+      LAUNCH_MOE_W8A16(false, Tile_32_64_32, SG_1_4_1);                                                    \
+    } else if (scale_mode == static_cast<int>(ScaleMode::ScalarGateUp) && avg_m <= 64 && gemm_k >= 2048) { \
+      LAUNCH_MOE_W8A16(false, Tile_64_64_32, SG_2_4_1);                                                    \
+    } else if (                                                                                            \
+        (scale_mode == static_cast<int>(ScaleMode::ScalarSingle) ||                                        \
+         scale_mode == static_cast<int>(ScaleMode::PerChannel)) &&                                         \
+        gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 128) {                                                \
+      LAUNCH_MOE_W8A16(false, Tile_32_64_32, SG_1_4_1);                                                    \
+    } else if (                                                                                            \
+        (scale_mode == static_cast<int>(ScaleMode::ScalarSingle) ||                                        \
+         scale_mode == static_cast<int>(ScaleMode::PerChannel)) &&                                         \
+        gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 512) {                                                \
+      LAUNCH_MOE_W8A16(false, Tile_64_64_32, SG_2_4_1);                                                    \
+    } else {                                                                                               \
+      LAUNCH_MOE_W8A16(false, Tile_128_128_16, SG_4_2_1);                                                  \
+    }                                                                                                      \
   } while (0)
 
 SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
@@ -159,16 +163,24 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
   if (is_mxfp8) {
     TORCH_CHECK(weight_scales.dim() == 3, "MXFP8 weight scales must be 3D [E, N, K/32]");
   } else {
-    TORCH_CHECK(weight_scales.scalar_type() == at::kFloat, "W8A16 scalar and 128x128 block scales must be float32");
+    TORCH_CHECK(
+        weight_scales.scalar_type() == at::kFloat,
+        "W8A16 scalar, per-channel and 128x128 block scales must be float32");
     TORCH_CHECK(
         weight_scales.dim() == 1 || weight_scales.dim() == 2 || weight_scales.dim() == 3,
-        "W8A16 weight scales must be 1D [E], 2D [E, 1]/[E, 2] or 3D [E, N/128, K/128]");
+        "W8A16 weight scales must be 1D [E], 2D [E, 1]/[E, 2]/[E, N] or 3D [E, N/128, K/128]");
     if (weight_scales.dim() == 2) {
-      TORCH_CHECK(weight_scales.size(1) == 1 || weight_scales.size(1) == 2, "W8A16 scale count must be 1 or 2");
+      // N is a multiple of 64, so a per-channel [E, N] scale never has 1 or 2 columns.
+      TORCH_CHECK(
+          weight_scales.size(1) == 1 || weight_scales.size(1) == 2 || weight_scales.size(1) == weights.size(1),
+          "W8A16 2D weight scales must be [E, 1], [E, 2] or per-channel [E, N]");
     }
   }
   TORCH_CHECK(output.scalar_type() == at::ScalarType::BFloat16, "W8A16 output must be bfloat16");
-  TORCH_CHECK(n_experts > 0 && n_experts % 8 == 0, "n_experts must be a positive multiple of 8");
+  // n_experts == 1 is a plain dense GEMM (fp8_linear on BMG); the device loop has no
+  // multiple-of-8 requirement.
+  TORCH_CHECK(
+      n_experts == 1 || (n_experts > 0 && n_experts % 8 == 0), "n_experts must be 1 or a positive multiple of 8");
   TORCH_CHECK(activations.dim() == 2, "W8A16 activations must be 2D [M_total, K]");
   TORCH_CHECK(weights.dim() == 3, "W8A16 weights must be 3D [E, N, K]");
   TORCH_CHECK(output.dim() == 2, "W8A16 output must be 2D [M_total, N]");
@@ -188,11 +200,11 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
   int gemm_n = static_cast<int>(weights.size(1));
   int avg_m = total_m / static_cast<int>(n_experts);
   int ld_b = static_cast<int>(weights.stride(1));
-  int scale_mode =
-      is_mxfp8 ? static_cast<int>(ScaleMode::BlockMXFP8)
-               : (weight_scales.dim() == 1 ? static_cast<int>(ScaleMode::ScalarSingle)
-                                           : (weight_scales.dim() == 2 ? static_cast<int>(weight_scales.size(1))
-                                                                       : static_cast<int>(ScaleMode::BlockFP32)));
+  int scale_mode = is_mxfp8 ? static_cast<int>(ScaleMode::BlockMXFP8)
+                            : (weight_scales.dim() == 1          ? static_cast<int>(ScaleMode::ScalarSingle)
+                               : weight_scales.dim() == 3        ? static_cast<int>(ScaleMode::BlockFP32)
+                               : weight_scales.size(1) == gemm_n ? static_cast<int>(ScaleMode::PerChannel)
+                                                                 : static_cast<int>(weight_scales.size(1)));
   bool weight_scale_blocked = moe_w8a16::is_block_scale_mode(scale_mode);
   bool static_scheduler = total_m <= n_experts || (!weight_scale_blocked && gemm_k <= 128);
   if (is_mxfp8) {

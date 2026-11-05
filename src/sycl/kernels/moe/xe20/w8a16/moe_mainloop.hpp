@@ -419,8 +419,13 @@ struct W8A16Mainloop<
     CUTLASS_PRAGMA_UNROLL
     for (int sn = 0; sn < SG_N / sg_local_range; ++sn) {
       int global_n = n_tile_start + n_sg_start + sn * sg_local_range + sg_local_id;
-      float weight_scale =
-          w_scale_gmem[scale_mode == static_cast<int>(ScaleMode::ScalarGateUp) && global_n >= gemm_n / 2 ? 1 : 0];
+      float weight_scale;
+      if (scale_mode == static_cast<int>(ScaleMode::PerChannel)) {
+        weight_scale = global_n < gemm_n ? w_scale_gmem[global_n] : 0.0f;
+      } else {
+        weight_scale =
+            w_scale_gmem[scale_mode == static_cast<int>(ScaleMode::ScalarGateUp) && global_n >= gemm_n / 2 ? 1 : 0];
+      }
       CUTLASS_PRAGMA_UNROLL
       for (int sm = 0; sm < SG_M; ++sm) {
         tCrC(sn * SG_M + sm) *= weight_scale;

@@ -167,7 +167,6 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 };
 
-template <typename TensorDType>
 void launch_min_p_sampling(
     const at::Tensor& probs,
     int32_t* output,
@@ -180,19 +179,17 @@ void launch_min_p_sampling(
     uint64_t philox_offset,
     bool deterministic,
     sycl::queue& queue) {
-  using KernelDType = sycl_type_t<TensorDType>;
-
-  const KernelDType* probs_ptr = reinterpret_cast<const KernelDType*>(probs.data_ptr<TensorDType>());
+  const float* probs_ptr = probs.data_ptr<float>();
 
   const int local_size = kMinPWgSize;
   const int global_size = batch_size * local_size;
 
-  const uint32_t preferred_vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(KernelDType));
+  const uint32_t preferred_vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(float));
   const uint32_t vec_size = std::gcd(preferred_vec_size, vocab_size);
 
   DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE, {
     SGL_DISPATCH_BOOL(deterministic, DETERMINISTIC, [&] {
-      auto kernel = MinPSamplingKernel<KernelDType, VEC_SIZE, DETERMINISTIC>(
+      auto kernel = MinPSamplingKernel<float, VEC_SIZE, DETERMINISTIC>(
           probs_ptr,
           output,
           maybe_indices,
@@ -271,7 +268,7 @@ SGL_KERNEL_EXPORT void min_p_sampling_from_probs(
   SGL_KERNEL_PERF_SCOPE("min_p_sampling", queue, bytes, flops);
 #endif
 
-  launch_min_p_sampling<float>(
+  launch_min_p_sampling(
       probs,
       output.data_ptr<int32_t>(),
       indices_ptr,

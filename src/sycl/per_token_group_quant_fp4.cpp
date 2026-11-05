@@ -39,18 +39,6 @@ namespace at::native::xpu {
 
 constexpr float FLOAT4_E2M1_MAX = 6.0f;
 
-template <typename T>
-inline T QuantGroupReduceMaxFP4(T val, sycl::nd_item<1> item) {
-  auto sg = item.get_sub_group();
-
-  val = sycl::fmax(val, sycl::permute_group_by_xor(sg, val, 8));
-  val = sycl::fmax(val, sycl::permute_group_by_xor(sg, val, 4));
-  val = sycl::fmax(val, sycl::permute_group_by_xor(sg, val, 2));
-  val = sycl::fmax(val, sycl::permute_group_by_xor(sg, val, 1));
-
-  return val;
-}
-
 // E2M1 format (4-bit float): 1 sign bit, 2 exponent bits, 1 mantissa bit
 // Encoding: exp=00 (subnormal), exp=01/10/11 (normal with bias=1)
 // Result: bits[3]=sign, bits[2:1]=exponent, bits[0]=mantissa
@@ -118,19 +106,14 @@ inline float silu(const float& val) {
 template <typename T, uint32_t N>
 using vec_t = sycl::vec<T, N>;
 
-// Compile-time constants for group sizes
-template <int GROUP_SIZE>
-struct FP4GroupSizeTraits {
-  static constexpr int THREADS_PER_GROUP = 16;
-  static constexpr int SUB_GROUP_SIZE = 32;
-};
-
+// One work-item owns one quantization group.  The group max must not be reduced
+// across lanes: a 32-element group is far narrower than a sub-group, so any
+// cross-lane reduction only covers the group if the work-item -> lane mapping is
+// linear, which SYCL leaves implementation-defined.
 template <typename T, int GROUP_SIZE = 32, bool FUSE_SILU_AND_MUL = false, bool IS_COLUMN_MAJOR = false>
 struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr uint32_t VEC_SIZE = 16 / sizeof(T);
   static constexpr int32_t NUM_VEC_ELEMS = GROUP_SIZE / VEC_SIZE;
-  static constexpr int32_t THREADS_PER_GROUP = FP4GroupSizeTraits<GROUP_SIZE>::THREADS_PER_GROUP;
-  static constexpr int32_t VECS_PER_THREAD = (NUM_VEC_ELEMS + THREADS_PER_GROUP - 1) / THREADS_PER_GROUP;
 
   PerTokenGroupQuantFP4Kernel(
       const T* input,
@@ -138,7 +121,6 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       uint8_t* output_s,
       const T* input_secondary,
       int num_groups,
-      int groups_per_block,
       float eps,
       int num_tokens_per_expert,
       int hidden_dim_num_groups)
@@ -147,25 +129,17 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
         output_s(output_s),
         input_secondary(input_secondary),
         num_groups(num_groups),
-        groups_per_block(groups_per_block),
         eps(eps),
         num_tokens_per_expert(num_tokens_per_expert),
         hidden_dim_num_groups(hidden_dim_num_groups) {}
 
   void sycl_ker_config_convention([[maybe_unused]] sycl::handler& cgh) {}
 
-  [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
-    const int64_t local_group_id = item.get_local_id(0) / THREADS_PER_GROUP;
-    const int lane_id = item.get_local_id(0) % THREADS_PER_GROUP;
-
-    const int64_t block_group_id = item.get_group(0) * groups_per_block;
-    const int64_t global_group_id = block_group_id + local_group_id;
-
+  void operator()(sycl::nd_item<1> item) const {
+    const int64_t global_group_id = item.get_global_id(0);
     if (global_group_id >= num_groups) return;
 
     const int64_t block_group_offset = global_group_id * GROUP_SIZE;
-
-    float local_absmax = eps;
 
     const T* group_input = input + block_group_offset;
     // Output is packed FP4 (2 values per byte), so offset is halved
@@ -198,49 +172,42 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     using vec_type = vec_t<T, VEC_SIZE>;
     using float_vec_type = vec_t<float, VEC_SIZE>;
 
-    vec_type input_vecs[VECS_PER_THREAD];
-    float_vec_type input_vals[VECS_PER_THREAD];
+    float_vec_type input_vals[NUM_VEC_ELEMS];
+    float local_absmax = eps;
 
 #pragma unroll
-    for (int32_t v = 0; v < VECS_PER_THREAD; ++v) {
-      const int32_t i = lane_id + v * THREADS_PER_GROUP;
-      if (i < NUM_VEC_ELEMS) {
-        // Load primary vector (gate projection for SiLU)
-        input_vecs[v].load(
-            0, sycl::multi_ptr<const T, sycl::access::address_space::global_space>(group_input + i * VEC_SIZE));
+    for (int32_t v = 0; v < NUM_VEC_ELEMS; ++v) {
+      // Load primary vector (gate projection for SiLU)
+      vec_type input_vec;
+      input_vec.load(
+          0, sycl::multi_ptr<const T, sycl::access::address_space::global_space>(group_input + v * VEC_SIZE));
 
-        if constexpr (FUSE_SILU_AND_MUL) {
-          // Load secondary vector (up projection for multiply)
-          vec_type secondary_vec;
-          const T* secondary_group_input = input_secondary + block_group_offset;
-          secondary_vec.load(
-              0,
-              sycl::multi_ptr<const T, sycl::access::address_space::global_space>(
-                  secondary_group_input + i * VEC_SIZE));
+      if constexpr (FUSE_SILU_AND_MUL) {
+        // Load secondary vector (up projection for multiply)
+        vec_type secondary_vec;
+        const T* secondary_group_input = input_secondary + block_group_offset;
+        secondary_vec.load(
+            0,
+            sycl::multi_ptr<const T, sycl::access::address_space::global_space>(secondary_group_input + v * VEC_SIZE));
 
-          // Fuse: SiLU(primary) * secondary
+        // Fuse: SiLU(primary) * secondary
 #pragma unroll
-          for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-            float gate = static_cast<float>(input_vecs[v][j]);
-            float up = static_cast<float>(secondary_vec[j]);
-            float fused_val = silu(gate) * up;  // SiLU+Mul fusion
-            input_vals[v][j] = fused_val;
-            local_absmax = sycl::fmax(local_absmax, sycl::fabs(fused_val));
-          }
-        } else {
-          // Original unfused path
+        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+          float gate = static_cast<float>(input_vec[j]);
+          float up = static_cast<float>(secondary_vec[j]);
+          float fused_val = silu(gate) * up;  // SiLU+Mul fusion
+          input_vals[v][j] = fused_val;
+          local_absmax = sycl::fmax(local_absmax, sycl::fabs(fused_val));
+        }
+      } else {
 #pragma unroll
-          for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-            float val = static_cast<float>(input_vecs[v][j]);
-            input_vals[v][j] = val;
-            local_absmax = sycl::fmax(local_absmax, sycl::fabs(val));
-          }
+        for (uint32_t j = 0; j < VEC_SIZE; ++j) {
+          float val = static_cast<float>(input_vec[j]);
+          input_vals[v][j] = val;
+          local_absmax = sycl::fmax(local_absmax, sycl::fabs(val));
         }
       }
     }
-
-    // Reduce across the threads in the quantization group to find the maximum
-    local_absmax = QuantGroupReduceMaxFP4(local_absmax, item);
 
     // Shared exponent per OCP MX spec / Microsoft micro-scaling:
     //   shared_exp = floor(log2(absmax)) - E2M1_EMAX
@@ -250,44 +217,22 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     int clamped_exponent = sycl::clamp(static_cast<int>(log2_scale), -127, 127);
     float scale_value = sycl::exp2(static_cast<float>(clamped_exponent));
 
-    if (lane_id == 0) {
-      // Store scale as UE8M0: exponent + 127 bias
-      uint8_t scale_ue8m0 = static_cast<uint8_t>(clamped_exponent + 127);
-      *scale_output = scale_ue8m0;
-    }
+    // Store scale as UE8M0: exponent + 127 bias
+    *scale_output = static_cast<uint8_t>(clamped_exponent + 127);
 
     const float inv_scale = 1.0f / scale_value;
 
-    // Second pass: quantize and pack values
-    // Each thread processes VEC_SIZE elements at a time
-    // Two FP4 values are packed into one byte
+    // Second pass: quantize and pack two FP4 values per byte
 #pragma unroll
-    for (int32_t v = 0; v < VECS_PER_THREAD; ++v) {
-      const int32_t i = lane_id + v * THREADS_PER_GROUP;
-      if (i < NUM_VEC_ELEMS) {
-        // Process VEC_SIZE elements, packing pairs into bytes
-        uint8_t packed_output[VEC_SIZE / 2];
-
+    for (int32_t v = 0; v < NUM_VEC_ELEMS; ++v) {
+      uint8_t* out_ptr = group_output + v * (VEC_SIZE / 2);
 #pragma unroll
-        for (uint32_t j = 0; j < VEC_SIZE; j += 2) {
-          float val0 = input_vals[v][j] * inv_scale;
-          float val1 = input_vals[v][j + 1] * inv_scale;
-
-          uint8_t q0 = quantize_to_e2m1(val0);
-          uint8_t q1 = quantize_to_e2m1(val1);
-
-          // Pack: first value in lower nibble, second in upper nibble
-          // No masking needed — quantize_to_e2m1 returns values in [0, 15]
-          packed_output[j / 2] = q0 | (q1 << 4);
-        }
-
-        // Store packed output
-        // Each vec of VEC_SIZE elements becomes VEC_SIZE/2 packed bytes
-        uint8_t* out_ptr = group_output + i * (VEC_SIZE / 2);
-#pragma unroll
-        for (uint32_t j = 0; j < VEC_SIZE / 2; ++j) {
-          out_ptr[j] = packed_output[j];
-        }
+      for (uint32_t j = 0; j < VEC_SIZE; j += 2) {
+        uint8_t q0 = quantize_to_e2m1(input_vals[v][j] * inv_scale);
+        uint8_t q1 = quantize_to_e2m1(input_vals[v][j + 1] * inv_scale);
+        // Pack: first value in lower nibble, second in upper nibble
+        // No masking needed — quantize_to_e2m1 returns values in [0, 15]
+        out_ptr[j / 2] = q0 | (q1 << 4);
       }
     }
   }
@@ -298,7 +243,6 @@ struct PerTokenGroupQuantFP4Kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   uint8_t* output_s;
   const T* input_secondary;  // For fused SiLU+Mul (nullptr if not fused)
   int num_groups;
-  int groups_per_block;
   float eps;
   int num_tokens_per_expert;  // For column-major interleaving
   int hidden_dim_num_groups;  // For column-major interleaving
@@ -376,25 +320,13 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_fp4(
 
   auto queue = dpcppGetCurrentQueue();
 
-  constexpr int THREADS_PER_GROUP = 16;
+  // Fixed rather than derived from num_groups: the old divisor-based sizing
+  // could produce a work-group narrower than the sub-group the kernel ran on.
+  constexpr int WORK_GROUP_SIZE = 256;
+  const int num_blocks = (num_groups + WORK_GROUP_SIZE - 1) / WORK_GROUP_SIZE;
 
-  int groups_per_block = 1;
-
-  if (num_groups % 16 == 0) {
-    groups_per_block = 16;
-  } else if (num_groups % 8 == 0) {
-    groups_per_block = 8;
-  } else if (num_groups % 4 == 0) {
-    groups_per_block = 4;
-  } else if (num_groups % 2 == 0) {
-    groups_per_block = 2;
-  }
-
-  const int num_blocks = num_groups / groups_per_block;
-  const int num_threads = groups_per_block * THREADS_PER_GROUP;
-
-  sycl::range<1> global_range(num_blocks * num_threads);
-  sycl::range<1> local_range(num_threads);
+  sycl::range<1> global_range(num_blocks * WORK_GROUP_SIZE);
+  sycl::range<1> local_range(WORK_GROUP_SIZE);
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const double flops = static_cast<double>(input.numel());
@@ -414,7 +346,6 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_fp4(
         static_cast<uint8_t*>(output_s.data_ptr()),                                                      \
         input_sec_ptr,                                                                                   \
         num_groups,                                                                                      \
-        groups_per_block,                                                                                \
         eps_f,                                                                                           \
         num_tokens_per_expert,                                                                           \
         hidden_dim_num_groups);                                                                          \

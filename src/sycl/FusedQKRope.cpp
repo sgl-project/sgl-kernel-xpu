@@ -600,38 +600,18 @@ SGL_KERNEL_EXPORT void fused_qk_rope_with_cos_sin_cache_inplace(
       TORCH_CHECK(false, "Unsupported rope_dim: ", rope_dim);                        \
   }
 
-// Select cos/sin cache dtype: sglang keeps the cache in fp32 on XPU for RoPE
-// numerical parity with CUDA. A cache matching the query dtype (bf16/half) is
-// also accepted for backward compatibility. The rotation math is fp32 either way.
-#define DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(IS_NEOX, POS_T) \
-  if (cos_sin_cache.scalar_type() == at::kFloat) {         \
-    LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, float, POS_T);       \
-  } else {                                                 \
-    LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, scalar_t, POS_T);    \
-  }
-
-#define DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(POS_T)   \
-  if (is_neox) {                                      \
-    DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(true, POS_T);  \
-  } else {                                            \
-    DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(false, POS_T); \
-  }
-
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      query.scalar_type(),
-      "fused_qk_rope_with_cos_sin_cache_inplace",
-      [&]() {
-        if (positions.scalar_type() == at::kInt) {
-          DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(int32_t);
-        } else {
-          DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(int64_t);
-        }
+  // Cache is FP32 for CUDA parity, or matches query dtype for backward compatibility.
+  AT_DISPATCH_FLOATING_TYPES_V2(query.scalar_type(), "fused_qk_rope_with_cos_sin_cache_inplace", [&]() {
+    AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_qk_rope_with_cos_sin_cache_inplace", [&] {
+      SGL_DISPATCH_BOOL(is_neox, IS_NEOX, [&] {
+        AT_DISPATCH_WEIGHT_TYPES(scalar_t, cos_sin_cache.scalar_type(), "rope cache", [&] {
+          using cache_t = weight_t;
+          LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, cache_t, index_t);
+        });
       });
+    });
+  });
 
-#undef DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT
-#undef DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE
 #undef LAUNCH_ROPE_CACHE_KERNEL
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)

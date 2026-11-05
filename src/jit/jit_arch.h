@@ -29,6 +29,11 @@ struct ArchProfile {
   // Short tag appended to CompileSpec::name so cached .so files and logs are
   // legible per arch (e.g. "..._bmg" vs "..._xe3p").
   std::string suffix;
+  // Kernel source subdirectory and SYCL_INTEL_TARGET value for this arch, i.e.
+  // the @ARCH_TAG@ / @SYCL_TARGET@ the AOT CMake generators (e.g.
+  // MlaDecodeXe20.cmake) substitute into shared *.cpp.in templates.
+  std::string arch_tag;
+  std::string sycl_target;
 };
 
 // Profile for `a`. Unknown/unspecified archs fall back to BMG.
@@ -42,6 +47,8 @@ struct ArchSpec {
   std::vector<std::string> extra_flags;  // base_macro, plus the arch macro if any
   std::string target;                    // -fsycl-targets value (may be empty)
   std::string suffix;                    // name tag (e.g. "bmg")
+  std::string arch_tag;                  // @ARCH_TAG@ (e.g. "xe20")
+  std::string sycl_target;               // @SYCL_TARGET@ (e.g. "20")
 };
 
 ArchSpec arch_spec(Arch a, const std::string& base_macro);

@@ -55,6 +55,8 @@ DecodeFn resolve_decode(bool is_fp16, int page_size, int q_tile, int arch, std::
     spec.subs["Q_TILE"] = std::to_string(q_tile);
     const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
     spec.extra_flags = as.extra_flags;
+    spec.subs["ARCH_TAG"] = as.arch_tag;
+    spec.subs["SYCL_TARGET"] = as.sycl_target;
     spec.target = as.target;
     spec.entry_symbol = "sgl_mla_decode_entry";
     spec.name = std::string("mla_decode_") + elem_tag(is_fp16) + "_" + std::to_string(page_size) + "_q" +
@@ -125,6 +127,8 @@ PrefillFn resolve_prefill(bool is_fp16, int page_size, int arch, std::string* er
     spec.subs["PAGE_SIZE"] = std::to_string(page_size);
     const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
     spec.extra_flags = as.extra_flags;
+    spec.subs["ARCH_TAG"] = as.arch_tag;
+    spec.subs["SYCL_TARGET"] = as.sycl_target;
     spec.target = as.target;
     spec.entry_symbol = "sgl_mla_prefill_entry";
     spec.name = std::string("mla_prefill_") + elem_tag(is_fp16) + "_" + std::to_string(page_size) + "_" + as.suffix;
@@ -230,6 +234,8 @@ void* resolve_sparse(
   spec.subs["HAS_ATTN_SINK"] = sink ? "1" : "0";
   const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_MLA_JIT_ENTRY");
   spec.extra_flags = as.extra_flags;
+  spec.subs["ARCH_TAG"] = as.arch_tag;
+  spec.subs["SYCL_TARGET"] = as.sycl_target;
   spec.target = as.target;
   spec.entry_symbol = entry;
   spec.name = std::string(name_prefix) + "_" + elem_tag(is_fp16) + "_" + std::to_string(d_qk) + "_" +

@@ -422,7 +422,7 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto& queue = stream.queue();
-  SYCL_DISPATCH_FLOATING_TYPES_V3(x.scalar_type(), "fused_scale_residual_norm_scale_shift", [&]() {
+  SYCL_DISPATCH_FLOATING_TYPES_V2(x.scalar_type(), "fused_scale_residual_norm_scale_shift", [&]() {
     using input_t = scalar_t;
     AT_DISPATCH_FLOATING_TYPES_AND2(
         at::ScalarType::Half, at::ScalarType::BFloat16, param_dtype, "fused_scale_residual_norm_scale_shift", [&]() {

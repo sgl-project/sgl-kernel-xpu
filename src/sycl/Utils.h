@@ -24,6 +24,10 @@
   CHECK_DEVICE(x);                         \
   CHECK_LAST_DIM_CONTIGUOUS(x)
 
+#define CHECK_SAME_SHAPE(a, b) check_shape(a, b, #a, #b)
+#define CHECK_DIM(d, x) TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
+#define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
+
 // Use AT_DISPATCH_* for ATen/c10 types; SYCL_DISPATCH_* only when kernel
 // operations require SYCL types (e.g. sycl::vec), not merely because it runs on XPU.
 // Project helper: FP32/FP16/BF16, no Double, no SYCL type mapping.
@@ -381,15 +385,6 @@ inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_
     TORCH_CHECK(a.size(i) == b.size(i), a_name, ".size(", i, ") != ", b_name, ".size(", i, ")");
   }
 }
-
-#define CHECK_SAME_SHAPE(a, b) check_shape(a, b, #a, #b)
-
-#define CHECK_DIM(d, x) TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
-
-#define CHECK_LAST_DIM_CONTIGUOUS(x) \
-  TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
-
-#define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {

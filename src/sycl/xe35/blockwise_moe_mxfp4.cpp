@@ -205,12 +205,7 @@ SGL_KERNEL_EXPORT void mxfp4_blockwise_scaled_grouped_mm(
     const int64_t sb_elem = scales_b.element_size();
 
     // max_m_i drives the padded A-scales scratch.
-    auto problem_sizes_cpu = problem_sizes.to(torch::kCPU);
-    const int32_t* psz = problem_sizes_cpu.data_ptr<int32_t>();
-    int max_m = 0;
-    for (int e = 0; e < E; ++e) {
-      if (psz[e * 3] > max_m) max_m = psz[e * 3];
-    }
+    const int max_m = static_cast<int>(a.size(0));
     TORCH_CHECK(max_m > 0, "max_m must be positive across experts");
     // Xe block-2D scale loads require 4-byte aligned width/pitch: pad the
     // per-column M stride up to ScaleAlignElems = ceil_div(4, sizeof(scale)).

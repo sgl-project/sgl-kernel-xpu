@@ -211,26 +211,7 @@ sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor outpu
         conditional<std::is_same<scalar_t, at::Half>::value, sycl::half, sycl::ext::oneapi::bfloat16>::type;
 
     int vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(sycl_scalar_t));
-
-    switch (vec_size) {
-      case 16:
-        LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, 16);
-        break;
-      case 8:
-        LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, 8);
-        break;
-      case 4:
-        LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, 4);
-        break;
-      case 2:
-        LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, 2);
-        break;
-      case 1:
-        LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, 1);
-        break;
-      default:
-        throw std::runtime_error("Unsupported vector size: " + std::to_string(vec_size));
-    }
+    SGL_DISPATCH_VEC_SIZE(vec_size, [&] { LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, VEC_SIZE); });
   });
 
 #undef LAUNCH_KERNEL

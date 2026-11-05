@@ -83,14 +83,6 @@ struct op_and_mul_functor {
   int64_t dim;
 };
 
-#define VEC_LAUNCH(KERNEL, N)                                                \
-  case N: {                                                                  \
-    op_and_mul_functor<T_to, KERNEL<T_to, accscalar_t>, N> kfn = {           \
-        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim}; \
-    sycl_kernel_submit(num_group* wg_size, wg_size, q, kfn);                 \
-    break;                                                                   \
-  }
-
 template <typename T = float>
 void get_config(
     [[maybe_unused]] const at::Tensor& input,
@@ -128,15 +120,11 @@ void silu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   get_config<T_to>(input, out, numel, dim, wg_size, num_group, vec_size);
 
   using accscalar_t = at::opmath_type<T_to>;
-  switch (vec_size) {
-    VEC_LAUNCH(silu_mul_dpcpp_functor, 1);
-    VEC_LAUNCH(silu_mul_dpcpp_functor, 2);
-    VEC_LAUNCH(silu_mul_dpcpp_functor, 4);
-    VEC_LAUNCH(silu_mul_dpcpp_functor, 8);
-    VEC_LAUNCH(silu_mul_dpcpp_functor, 16);
-    default:
-      TORCH_CHECK(false, "Unsupported vector size: ", vec_size);
-  }
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+    op_and_mul_functor<T_to, silu_mul_dpcpp_functor<T_to, accscalar_t>, VEC_SIZE> kfn = {
+        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim};
+    sycl_kernel_submit(num_group * wg_size, wg_size, q, kfn);
+  });
 
   return;
 }
@@ -199,15 +187,11 @@ void gelu_tanh_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) 
   get_config<T_to>(input, out, numel, dim, wg_size, num_group, vec_size);
 
   using accscalar_t = at::opmath_type<T_to>;
-  switch (vec_size) {
-    VEC_LAUNCH(gelu_tanh_mul_dpcpp_functor, 1);
-    VEC_LAUNCH(gelu_tanh_mul_dpcpp_functor, 2);
-    VEC_LAUNCH(gelu_tanh_mul_dpcpp_functor, 4);
-    VEC_LAUNCH(gelu_tanh_mul_dpcpp_functor, 8);
-    VEC_LAUNCH(gelu_tanh_mul_dpcpp_functor, 16);
-    default:
-      TORCH_CHECK(false, "Unsupported vector size: ", vec_size);
-  }
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+    op_and_mul_functor<T_to, gelu_tanh_mul_dpcpp_functor<T_to, accscalar_t>, VEC_SIZE> kfn = {
+        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim};
+    sycl_kernel_submit(num_group * wg_size, wg_size, q, kfn);
+  });
 
   return;
 }
@@ -270,15 +254,11 @@ void gelu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   get_config<T_to>(input, out, numel, dim, wg_size, num_group, vec_size);
 
   using accscalar_t = at::opmath_type<T_to>;
-  switch (vec_size) {
-    VEC_LAUNCH(gelu_erf_mul_dpcpp_functor, 1);
-    VEC_LAUNCH(gelu_erf_mul_dpcpp_functor, 2);
-    VEC_LAUNCH(gelu_erf_mul_dpcpp_functor, 4);
-    VEC_LAUNCH(gelu_erf_mul_dpcpp_functor, 8);
-    VEC_LAUNCH(gelu_erf_mul_dpcpp_functor, 16);
-    default:
-      TORCH_CHECK(false, "Unsupported vector size: ", vec_size);
-  }
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+    op_and_mul_functor<T_to, gelu_erf_mul_dpcpp_functor<T_to, accscalar_t>, VEC_SIZE> kfn = {
+        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim};
+    sycl_kernel_submit(num_group * wg_size, wg_size, q, kfn);
+  });
 
   return;
 }

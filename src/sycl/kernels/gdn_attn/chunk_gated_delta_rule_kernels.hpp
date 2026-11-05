@@ -919,6 +919,7 @@ void chunk_gated_delta_rule_impl(
       A.data_ptr(),
       w.data_ptr(),
       u.data_ptr(),
+      total_chunks.data_ptr(),
       b.data_ptr(),
       a.data_ptr(),
       A_log.data_ptr(),

@@ -531,28 +531,9 @@ void launch_vectorized_rmsnorm_no_rstd_kernel(Norm& norm, const NormConfig& conf
   const int vec_size = config.update_vec_size;
   const int iters = (config.WGPlane + config.workgroup_size * vec_size - 1) / (config.workgroup_size * vec_size);
 
-#define DISPATCH_RMSNORM_NO_RSTD_VEC(VEC_SIZE) \
-  dispatch_rmsnorm_no_rstd_iters<scalar_t, weight_t, VEC_SIZE>(iters, norm, config)
-
-  switch (vec_size) {
-    case 8: {
-      DISPATCH_RMSNORM_NO_RSTD_VEC(8);
-      break;
-    }
-    case 4: {
-      DISPATCH_RMSNORM_NO_RSTD_VEC(4);
-      break;
-    }
-    case 2: {
-      DISPATCH_RMSNORM_NO_RSTD_VEC(2);
-      break;
-    }
-    default: {
-      DISPATCH_RMSNORM_NO_RSTD_VEC(1);
-      break;
-    }
-  }
-#undef DISPATCH_RMSNORM_NO_RSTD_VEC
+  SGL_DISPATCH_VEC_SIZE_SET(vec_size, (1, 2, 4, 8), [&] {
+    dispatch_rmsnorm_no_rstd_iters<scalar_t, weight_t, VEC_SIZE>(iters, norm, config);
+  });
 }
 
 // Launch for contiguous rows built with NormConfig(FastRowTag): NormFastParams makes every inner

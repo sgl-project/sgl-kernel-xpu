@@ -141,11 +141,9 @@ SGL_KERNEL_EXPORT void silu_and_mul(at::Tensor& out, at::Tensor& input) {
   timer.start();
 #endif
 
-  if (input.scalar_type() == at::ScalarType::Half) {
-    silu_and_mul_sycl<sycl::half, at::Half>(queue, input, out);
-  } else {
-    silu_and_mul_sycl<sycl::ext::oneapi::bfloat16, at::BFloat16>(queue, input, out);
-  }
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "silu_and_mul", [&] {
+    silu_and_mul_sycl<sycl_type_t<scalar_t>, scalar_t>(queue, input, out);
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   queue.wait();
@@ -208,11 +206,9 @@ SGL_KERNEL_EXPORT void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
   timer.start();
 #endif
 
-  if (input.scalar_type() == at::ScalarType::Half) {
-    gelu_tanh_and_mul_sycl<sycl::half, at::Half>(queue, input, out);
-  } else {
-    gelu_tanh_and_mul_sycl<sycl::ext::oneapi::bfloat16, at::BFloat16>(queue, input, out);
-  }
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul", [&] {
+    gelu_tanh_and_mul_sycl<sycl_type_t<scalar_t>, scalar_t>(queue, input, out);
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   queue.wait();
@@ -275,11 +271,9 @@ SGL_KERNEL_EXPORT void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
   timer.start();
 #endif
 
-  if (input.scalar_type() == at::ScalarType::Half) {
-    gelu_and_mul_sycl<sycl::half, at::Half>(queue, input, out);
-  } else {
-    gelu_and_mul_sycl<sycl::ext::oneapi::bfloat16, at::BFloat16>(queue, input, out);
-  }
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gelu_and_mul", [&] {
+    gelu_and_mul_sycl<sycl_type_t<scalar_t>, scalar_t>(queue, input, out);
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   queue.wait();

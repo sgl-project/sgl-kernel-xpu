@@ -319,32 +319,14 @@ void launch_top_p_renorm_kernel(
   // align vec_size with vocab_size
   vec_size = std::gcd(vec_size, vocab_size);
 
-#define LAUNCH_TOP_P(VEC_SIZE)           \
-  sycl_kernel_submit(                    \
-      global_size,                       \
-      local_size,                        \
-      queue,                             \
-      TopPRenormProbsRadixCTA<VEC_SIZE>( \
-          probs_ptr, renorm_probs_ptr, maybe_top_p_ptr, top_p_val, batch_size, vocab_size))
-
-  switch (vec_size) {
-    case 16:
-      LAUNCH_TOP_P(16);
-      break;
-    case 8:
-      LAUNCH_TOP_P(8);
-      break;
-    case 4:
-      LAUNCH_TOP_P(4);
-      break;
-    case 2:
-      LAUNCH_TOP_P(2);
-      break;
-    default:
-      LAUNCH_TOP_P(1);
-  }
-
-#undef LAUNCH_TOP_P
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+    sycl_kernel_submit(
+        global_size,
+        local_size,
+        queue,
+        TopPRenormProbsRadixCTA<VEC_SIZE>(
+            probs_ptr, renorm_probs_ptr, maybe_top_p_ptr, top_p_val, batch_size, vocab_size));
+  });
 }
 
 }  // namespace

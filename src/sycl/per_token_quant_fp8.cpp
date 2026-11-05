@@ -277,42 +277,18 @@ SGL_KERNEL_EXPORT void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor outp
     sycl_kernel_submit(global_range, local_range, Q, kernel);     \
   } while (0)
 
-#define LAUNCH_SWITCH(LAUNCH, T, DST_DTYPE) \
-  switch (vec_size) {                       \
-    case 16:                                \
-      LAUNCH(T, DST_DTYPE, 16);             \
-      break;                                \
-    case 8:                                 \
-      LAUNCH(T, DST_DTYPE, 8);              \
-      break;                                \
-    case 4:                                 \
-      LAUNCH(T, DST_DTYPE, 4);              \
-      break;                                \
-    case 2:                                 \
-      LAUNCH(T, DST_DTYPE, 2);              \
-      break;                                \
-    default:                                \
-      LAUNCH(T, DST_DTYPE, 1);              \
-      break;                                \
-  }
-
-#define LAUNCH_FOR_VEC(T, DST_DTYPE)             \
-  do {                                           \
-    if (use_warp_kernel) {                       \
-      LAUNCH_SWITCH(LAUNCH_WARP, T, DST_DTYPE);  \
-    } else {                                     \
-      LAUNCH_SWITCH(LAUNCH_BLOCK, T, DST_DTYPE); \
-    }                                            \
-  } while (0)
-
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "sgl_per_token_quant_fp8", [&] {
     using sycl_scalar_t = typename std::
         conditional<std::is_same<scalar_t, at::Half>::value, sycl::half, sycl::ext::oneapi::bfloat16>::type;
-    LAUNCH_FOR_VEC(sycl_scalar_t, cutlass::float_e4m3_t);
+    SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+      if (use_warp_kernel) {
+        LAUNCH_WARP(sycl_scalar_t, cutlass::float_e4m3_t, VEC_SIZE);
+      } else {
+        LAUNCH_BLOCK(sycl_scalar_t, cutlass::float_e4m3_t, VEC_SIZE);
+      }
+    });
   });
 
-#undef LAUNCH_FOR_VEC
-#undef LAUNCH_SWITCH
 #undef LAUNCH_BLOCK
 #undef LAUNCH_WARP
 }

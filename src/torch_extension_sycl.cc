@@ -160,6 +160,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "qsa_mqa_decode(Tensor q, Tensor k_cache, Tensor page_table, Tensor context_lens, "
       "int max_model_len, float? score_scale=None) -> Tensor");
   m.impl("qsa_mqa_decode", torch::kXPU, &qsa_mqa_decode);
+#endif
+
+#ifdef USE_QSA_PREPARE
   m.def(
       "qsa_index_q_norm_rope_store(Tensor qk, Tensor positions, Tensor cos_sin_cache, Tensor axis_map, "
       "Tensor weight, Tensor cache_loc, Tensor(a!) key_state_buffer, Tensor(b!) rope_position_buffer, "
@@ -572,8 +575,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "weights_out, float weight_scale, Tensor rope_cache, Tensor positions) -> ()");
   m.impl("fused_q_indexer_rope_hadamard_quant", torch::kXPU, &fused_q_indexer_rope_hadamard_quant);
   m.def(
-      "fused_q_indexer_rope_hadamard_fp4_quant(Tensor q_input, Tensor(a!) q_fp4, Tensor(b!) q_scale, "
-      "Tensor weight, Tensor(c!) weights_out, float weight_scale, Tensor rope_cache, Tensor positions) -> ()");
+      "fused_q_indexer_rope_hadamard_fp4_quant(Tensor q_input, Tensor weight, float weight_scale, "
+      "Tensor freqs_cis, Tensor positions) -> (Tensor, Tensor, Tensor)");
   m.impl("fused_q_indexer_rope_hadamard_fp4_quant", torch::kXPU, &fused_q_indexer_rope_hadamard_fp4_quant);
   m.def(
       "index_q_rope_pack_weights(Tensor input, Tensor freqs_cis, Tensor positions, Tensor head_weights, "

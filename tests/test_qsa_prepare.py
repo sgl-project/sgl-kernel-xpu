@@ -5,7 +5,7 @@ import torch
 pytestmark = pytest.mark.skipif(
     not torch.xpu.is_available()
     or not hasattr(torch.ops.sgl_kernel, "qsa_index_q_norm_rope_store"),
-    reason="Requires USE_QSA on Xe2",
+    reason="Requires USE_QSA",
 )
 
 

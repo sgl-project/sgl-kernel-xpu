@@ -104,9 +104,8 @@ if(USE_GDN
 endif()
 
 # Dispatchers that call the runtime-JIT engine link the static JIT library.
-if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-flash_attentionXe20)
-  target_link_libraries(sgl-ops-sycl-flash_attentionXe20 PRIVATE sgl_jit)
-endif()
+# (flash_attentionXe20 is an xe20 source; its JIT link lives in the xe20 block
+# below, after the target is created.)
 if(USE_MLA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-mla_decode)
   target_link_libraries(sgl-ops-sycl-mla_decode PRIVATE sgl_jit)
 endif()
@@ -235,6 +234,18 @@ foreach(sycl_src ${ATen_XPU_SYCL_XE20})
   )
 endforeach()
 
+# The FMHA decode/prefill dispatch in flash_attentionXe20.cpp calls the runtime-JIT
+# engine. This must come after the xe20 loop above: `if(TARGET ...)` is evaluated
+# in order, so a check placed before the target exists is silently false and the
+# .so ships with undefined sgl::fmha_jit::* symbols (`import sgl_kernel` fails).
+if(USE_FMHA AND USE_SYCL_JIT)
+  if(NOT TARGET sgl-ops-sycl-flash_attentionXe20)
+    message(FATAL_ERROR
+        "USE_FMHA=ON and USE_SYCL_JIT=ON but target "
+        "sgl-ops-sycl-flash_attentionXe20 was not created; cannot link sgl_jit")
+  endif()
+  target_link_libraries(sgl-ops-sycl-flash_attentionXe20 PRIVATE sgl_jit)
+endif()
 # The bf16 grouped GEMM dispatch in GroupGemmXe20.cpp calls the runtime-JIT engine.
 if(USE_MOE AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-GroupGemmXe20)
   target_link_libraries(sgl-ops-sycl-GroupGemmXe20 PRIVATE sgl_jit)

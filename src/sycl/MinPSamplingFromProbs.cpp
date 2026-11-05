@@ -16,35 +16,6 @@
 #include "comm/Sampling.h"
 #include "sgl_kernel_export.h"
 
-#define DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE_VAR, ...) \
-  switch (vec_size) {                                       \
-    case 16: {                                              \
-      constexpr uint32_t VEC_SIZE_VAR = 16;                 \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-    case 8: {                                               \
-      constexpr uint32_t VEC_SIZE_VAR = 8;                  \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-    case 4: {                                               \
-      constexpr uint32_t VEC_SIZE_VAR = 4;                  \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-    case 2: {                                               \
-      constexpr uint32_t VEC_SIZE_VAR = 2;                  \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-    default: {                                              \
-      constexpr uint32_t VEC_SIZE_VAR = 1;                  \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-  }
-
 //----------------- min-p rejection sampling --------------------//
 // One work-group processes one request row.
 
@@ -187,7 +158,7 @@ void launch_min_p_sampling(
   const uint32_t preferred_vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(float));
   const uint32_t vec_size = std::gcd(preferred_vec_size, vocab_size);
 
-  DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE, {
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
     SGL_DISPATCH_BOOL(deterministic, DETERMINISTIC, [&] {
       auto kernel = MinPSamplingKernel<float, VEC_SIZE, DETERMINISTIC>(
           probs_ptr,

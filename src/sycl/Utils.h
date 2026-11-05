@@ -92,6 +92,27 @@ using sycl_type_t = std::conditional_t<
     return SGL_DISPATCH_BOOL2(BOOL_V2, BOOL_NAME2, BOOL_V3, BOOL_NAME3, __VA_ARGS__);          \
   })
 
+// Select 16/8/4/2 elements; all other widths retain the scalar fallback.
+#define SGL_DISPATCH_VEC_SIZE_CASE(SIZE, ...) \
+  case SIZE: {                                \
+    constexpr uint32_t VEC_SIZE = SIZE;       \
+    return (__VA_ARGS__)();                   \
+  }
+
+#define SGL_DISPATCH_VEC_SIZE(SIZE, ...)          \
+  [&] {                                           \
+    switch (SIZE) {                               \
+      SGL_DISPATCH_VEC_SIZE_CASE(16, __VA_ARGS__) \
+      SGL_DISPATCH_VEC_SIZE_CASE(8, __VA_ARGS__)  \
+      SGL_DISPATCH_VEC_SIZE_CASE(4, __VA_ARGS__)  \
+      SGL_DISPATCH_VEC_SIZE_CASE(2, __VA_ARGS__)  \
+      default: {                                  \
+        constexpr uint32_t VEC_SIZE = 1;          \
+        return (__VA_ARGS__)();                   \
+      }                                           \
+    }                                             \
+  }()
+
 #define CUTLASS_CHECK(status)                                                       \
   {                                                                                 \
     cutlass::Status error = status;                                                 \

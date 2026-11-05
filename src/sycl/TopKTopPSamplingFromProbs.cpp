@@ -19,35 +19,6 @@ namespace {
 
 constexpr int kTopKTopPMaxRounds = 32;
 
-#define DISPATCH_TOPKTOPP_VEC_SIZE(vec_size, VEC_SIZE_VAR, ...) \
-  switch (vec_size) {                                           \
-    case 16: {                                                  \
-      constexpr uint32_t VEC_SIZE_VAR = 16;                     \
-      __VA_ARGS__;                                              \
-      break;                                                    \
-    }                                                           \
-    case 8: {                                                   \
-      constexpr uint32_t VEC_SIZE_VAR = 8;                      \
-      __VA_ARGS__;                                              \
-      break;                                                    \
-    }                                                           \
-    case 4: {                                                   \
-      constexpr uint32_t VEC_SIZE_VAR = 4;                      \
-      __VA_ARGS__;                                              \
-      break;                                                    \
-    }                                                           \
-    case 2: {                                                   \
-      constexpr uint32_t VEC_SIZE_VAR = 2;                      \
-      __VA_ARGS__;                                              \
-      break;                                                    \
-    }                                                           \
-    default: {                                                  \
-      constexpr uint32_t VEC_SIZE_VAR = 1;                      \
-      __VA_ARGS__;                                              \
-      break;                                                    \
-    }                                                           \
-  }
-
 //----------------- joint top-k / top-p rejection sampling --------------------//
 // One work-group processes one request row.
 
@@ -244,7 +215,7 @@ void launch_top_k_top_p_sampling(
 
   const uint32_t vec_size = std::gcd(16 / sizeof(float), static_cast<uint32_t>(vocab_size));
 
-  DISPATCH_TOPKTOPP_VEC_SIZE(vec_size, VEC_SIZE, {
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
     SGL_DISPATCH_BOOL(deterministic, DETERMINISTIC, [&] {
       auto kernel = TopKTopPSamplingKernel<VEC_SIZE, DETERMINISTIC>(
           probs,

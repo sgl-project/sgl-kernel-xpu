@@ -131,24 +131,11 @@ static void silu_and_mul_clamp_sycl(sycl::queue& q, at::Tensor& input, at::Tenso
   }
   if (dim % vec_size != 0) vec_size = 1;
 
-#define VEC_LAUNCH_CLAMP(N)                                                      \
-  case N: {                                                                      \
-    SiluAndMulClampFunctor<KernelDType, N> kfn = {                               \
-        .input_ptr = _input, .output_ptr = _output, .dim = dim, .limit = limit}; \
-    sycl_kernel_submit(num_group* wg_size, wg_size, q, kfn);                     \
-    break;                                                                       \
-  }
-
-  switch (vec_size) {
-    VEC_LAUNCH_CLAMP(1);
-    VEC_LAUNCH_CLAMP(2);
-    VEC_LAUNCH_CLAMP(4);
-    VEC_LAUNCH_CLAMP(8);
-    VEC_LAUNCH_CLAMP(16);
-    default:
-      TORCH_CHECK(false, "silu_and_mul_clamp: unsupported vec_size ", vec_size);
-  }
-#undef VEC_LAUNCH_CLAMP
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+    SiluAndMulClampFunctor<KernelDType, VEC_SIZE> kfn = {
+        .input_ptr = _input, .output_ptr = _output, .dim = dim, .limit = limit};
+    sycl_kernel_submit(num_group * wg_size, wg_size, q, kfn);
+  });
 }
 
 SGL_KERNEL_EXPORT void silu_and_mul_clamp(torch::Tensor& output, torch::Tensor& input, double swiglu_limit) {

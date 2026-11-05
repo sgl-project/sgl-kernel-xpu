@@ -41,8 +41,23 @@ if(USE_SYCL_JIT)
   # the per-arch JIT target wins. SGL_SDL_LINK_FLAGS is included because this is
   # a single-shot compile *and* link, so the .so it emits needs the same NX /
   # full-RELRO hardening as its AOT sibling.
+  #
+  # The AOT build hands SYCL_HOST_FLAGS to the host compiler only
+  # (-fsycl-host-compiler-options), but this single-shot compile applies every
+  # flag to the device pass too. -D_FORTIFY_SOURCE turns glibc memcpy/memset into
+  # __memcpy_chk/... calls that have no device definition, so the kernel .so
+  # builds but fails at program load with "Unresolved Symbol <__memcpy_chk>".
+  # Scope it to the host pass with -Xarch_host to keep parity with AOT.
+  set(_sgl_jit_host_flags)
+  foreach(_flag ${SYCL_HOST_FLAGS})
+    if(_flag MATCHES "^-D_FORTIFY_SOURCE")
+      list(APPEND _sgl_jit_host_flags -Xarch_host ${_flag})
+    else()
+      list(APPEND _sgl_jit_host_flags ${_flag})
+    endif()
+  endforeach()
   string(REPLACE ";" " " SGL_JIT_SYCL_FLAGS_VALUE
-    "-shared;${SYCL_HOST_FLAGS};${SYCL_COMPILE_FLAGS};${COMMON_DEVICE_LINK_FLAGS};${SGL_SDL_LINK_FLAGS};-DCUTLASS_ENABLE_SYCL")
+    "-shared;${_sgl_jit_host_flags};${SYCL_COMPILE_FLAGS};${COMMON_DEVICE_LINK_FLAGS};${SGL_SDL_LINK_FLAGS};-DCUTLASS_ENABLE_SYCL")
   # AOT feeds the IGC/ocloc backend the -cl-* codegen options via `-Xs` at the
   # device-link step (SYCL_OFFLINE_COMPILER_CG_OPTIONS). The single-shot JIT must
   # pass the same options (e.g. correctly-rounded fp32 div/sqrt, >4GB buffers,

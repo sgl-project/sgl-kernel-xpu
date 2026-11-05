@@ -242,44 +242,29 @@ template <typename T, typename P>
 void launch(::sycl::queue& queue, const LaunchArgs& a) {
   if (a.num_rows <= 0 || a.hidden <= 0) return;
 
-#define SRNSS_SUBMIT(VEC_SIZE)                                 \
-  sycl_kernel_submit(                                          \
-      static_cast<size_t>(a.num_rows) * kSrnssThreadsPerBlock, \
-      kSrnssThreadsPerBlock,                                   \
-      queue,                                                   \
-      ScaleResidualNormScaleShiftKernel<T, P, VEC_SIZE>(       \
-          static_cast<T*>(a.residual_out),                     \
-          static_cast<T*>(a.out),                              \
-          static_cast<const T*>(a.residual),                   \
-          static_cast<const T*>(a.x),                          \
-          static_cast<const P*>(a.gate),                       \
-          static_cast<const P*>(a.weight),                     \
-          static_cast<const P*>(a.bias),                       \
-          static_cast<const P*>(a.scale),                      \
-          static_cast<const P*>(a.shift),                      \
-          static_cast<uint32_t>(a.num_rows),                   \
-          static_cast<uint32_t>(a.hidden),                     \
-          static_cast<uint32_t>(a.gate_row_div),               \
-          static_cast<uint32_t>(a.gate_row_stride),            \
-          a.scale_is_vec != 0,                                 \
-          a.shift_is_vec != 0,                                 \
-          a.eps))
-
-  switch (a.vec_size) {
-    case 8:
-      SRNSS_SUBMIT(8);
-      break;
-    case 4:
-      SRNSS_SUBMIT(4);
-      break;
-    case 2:
-      SRNSS_SUBMIT(2);
-      break;
-    default:
-      SRNSS_SUBMIT(1);
-      break;
-  }
-#undef SRNSS_SUBMIT
+  SGL_DISPATCH_VEC_SIZE_SET(a.vec_size, (1, 2, 4, 8), [&] {
+    sycl_kernel_submit(
+        static_cast<size_t>(a.num_rows) * kSrnssThreadsPerBlock,
+        kSrnssThreadsPerBlock,
+        queue,
+        ScaleResidualNormScaleShiftKernel<T, P, VEC_SIZE>(
+            static_cast<T*>(a.residual_out),
+            static_cast<T*>(a.out),
+            static_cast<const T*>(a.residual),
+            static_cast<const T*>(a.x),
+            static_cast<const P*>(a.gate),
+            static_cast<const P*>(a.weight),
+            static_cast<const P*>(a.bias),
+            static_cast<const P*>(a.scale),
+            static_cast<const P*>(a.shift),
+            static_cast<uint32_t>(a.num_rows),
+            static_cast<uint32_t>(a.hidden),
+            static_cast<uint32_t>(a.gate_row_div),
+            static_cast<uint32_t>(a.gate_row_stride),
+            a.scale_is_vec != 0,
+            a.shift_is_vec != 0,
+            a.eps));
+  });
 }
 
 void check_param(const torch::Tensor& t, at::ScalarType param_dtype, const char* name) {

@@ -92,26 +92,42 @@ using sycl_type_t = std::conditional_t<
     return SGL_DISPATCH_BOOL2(BOOL_V2, BOOL_NAME2, BOOL_V3, BOOL_NAME3, __VA_ARGS__);          \
   })
 
-// Select 1/2/4/8/16 elements; reject unsupported widths.
+// Expand only the supplied widths (one to five), e.g. (1, 2, 4, 8).
 #define SGL_DISPATCH_VEC_SIZE_CASE(SIZE, ...) \
   case SIZE: {                                \
     constexpr uint32_t VEC_SIZE = SIZE;       \
     return (__VA_ARGS__)();                   \
   }
 
-#define SGL_DISPATCH_VEC_SIZE(SIZE, ...)                            \
+#define SGL_VEC_SIZE_CASES_1(BODY, A) SGL_DISPATCH_VEC_SIZE_CASE(A, BODY)
+#define SGL_VEC_SIZE_CASES_2(BODY, A, ...) SGL_DISPATCH_VEC_SIZE_CASE(A, BODY) SGL_VEC_SIZE_CASES_1(BODY, __VA_ARGS__)
+#define SGL_VEC_SIZE_CASES_3(BODY, A, ...) SGL_DISPATCH_VEC_SIZE_CASE(A, BODY) SGL_VEC_SIZE_CASES_2(BODY, __VA_ARGS__)
+#define SGL_VEC_SIZE_CASES_4(BODY, A, ...) SGL_DISPATCH_VEC_SIZE_CASE(A, BODY) SGL_VEC_SIZE_CASES_3(BODY, __VA_ARGS__)
+#define SGL_VEC_SIZE_CASES_5(BODY, A, ...) SGL_DISPATCH_VEC_SIZE_CASE(A, BODY) SGL_VEC_SIZE_CASES_4(BODY, __VA_ARGS__)
+#define SGL_VEC_SIZE_SELECT(_1, _2, _3, _4, _5, CASES, ...) CASES
+#define SGL_VEC_SIZE_UNPACK(...) __VA_ARGS__
+#define SGL_VEC_SIZE_CASES(BODY, ...) \
+  SGL_VEC_SIZE_SELECT(                \
+      __VA_ARGS__,                    \
+      SGL_VEC_SIZE_CASES_5,           \
+      SGL_VEC_SIZE_CASES_4,           \
+      SGL_VEC_SIZE_CASES_3,           \
+      SGL_VEC_SIZE_CASES_2,           \
+      SGL_VEC_SIZE_CASES_1)           \
+  (BODY, __VA_ARGS__)
+
+#define SGL_DISPATCH_VEC_SIZE_SET(SIZE, SIZES, ...)                 \
   [&] {                                                             \
     const auto _vec_size = SIZE;                                    \
     switch (_vec_size) {                                            \
-      SGL_DISPATCH_VEC_SIZE_CASE(16, __VA_ARGS__)                   \
-      SGL_DISPATCH_VEC_SIZE_CASE(8, __VA_ARGS__)                    \
-      SGL_DISPATCH_VEC_SIZE_CASE(4, __VA_ARGS__)                    \
-      SGL_DISPATCH_VEC_SIZE_CASE(2, __VA_ARGS__)                    \
-      SGL_DISPATCH_VEC_SIZE_CASE(1, __VA_ARGS__)                    \
+      SGL_VEC_SIZE_CASES((__VA_ARGS__), SGL_VEC_SIZE_UNPACK SIZES)  \
       default:                                                      \
         TORCH_CHECK(false, "Unsupported vector size: ", _vec_size); \
     }                                                               \
   }()
+
+// Default widths: 1/2/4/8/16. Other widths throw.
+#define SGL_DISPATCH_VEC_SIZE(SIZE, ...) SGL_DISPATCH_VEC_SIZE_SET(SIZE, (1, 2, 4, 8, 16), __VA_ARGS__)
 
 #define CUTLASS_CHECK(status)                                                       \
   {                                                                                 \

@@ -16,21 +16,6 @@
 #include "comm/Sampling.h"
 #include "sgl_kernel_export.h"
 
-template <typename T>
-struct ToSyclElementType {
-  using type = T;
-};
-
-template <>
-struct ToSyclElementType<at::Half> {
-  using type = sycl::half;
-};
-
-template <>
-struct ToSyclElementType<at::BFloat16> {
-  using type = sycl::ext::oneapi::bfloat16;
-};
-
 #define DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE_VAR, ...) \
   switch (vec_size) {                                       \
     case 16: {                                              \
@@ -195,7 +180,7 @@ void launch_min_p_sampling(
     uint64_t philox_offset,
     bool deterministic,
     sycl::queue& queue) {
-  using KernelDType = typename ToSyclElementType<TensorDType>::type;
+  using KernelDType = sycl_type_t<TensorDType>;
 
   const KernelDType* probs_ptr = reinterpret_cast<const KernelDType*>(probs.data_ptr<TensorDType>());
 

@@ -37,23 +37,6 @@
 
 static constexpr float LOG2E = 1.442695040888963f;  // log2(e) for exp2 conversion
 
-//----------------- set element type options --------------------//
-
-template <typename T>
-struct ToSyclElementType {
-  using type = T;
-};
-
-template <>
-struct ToSyclElementType<at::Half> {
-  using type = sycl::half;
-};
-
-template <>
-struct ToSyclElementType<at::BFloat16> {
-  using type = sycl::ext::oneapi::bfloat16;
-};
-
 // ---------------------------------------------------------------------------
 // Per-element compute: clamp both halves in bf16, then SiLU(gate)*up in fp32.
 // Always clamps through bf16 regardless of input dtype to match the DeepGEMM
@@ -118,7 +101,7 @@ struct SiluAndMulClampFunctor {
 // ---------------------------------------------------------------------------
 template <typename TensorDType>
 static void silu_and_mul_clamp_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& output, float limit) {
-  using KernelDType = typename ToSyclElementType<TensorDType>::type;
+  using KernelDType = sycl_type_t<TensorDType>;
   auto* _input = reinterpret_cast<KernelDType*>(input.data_ptr<TensorDType>());
   auto* _output = reinterpret_cast<KernelDType*>(output.data_ptr<TensorDType>());
 
@@ -189,14 +172,7 @@ SGL_KERNEL_EXPORT void silu_and_mul_clamp(torch::Tensor& output, torch::Tensor& 
   SGL_KERNEL_PERF_SCOPE("silu_and_mul_clamp", queue, bytes, flops);
 #endif
 
-  if (input.scalar_type() == at::ScalarType::Half) {
-    silu_and_mul_clamp_sycl<at::Half>(queue, input, output, limit);
-  } else if (input.scalar_type() == at::ScalarType::BFloat16) {
-    silu_and_mul_clamp_sycl<at::BFloat16>(queue, input, output, limit);
-  } else {
-    TORCH_CHECK(
-        input.dtype() == torch::kBFloat16 || input.dtype() == torch::kFloat16,
-        "silu_and_mul_clamp: only bf16 and fp16 are supported, got ",
-        input.dtype());
-  }
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "silu_and_mul_clamp", [&] {
+    silu_and_mul_clamp_sycl<scalar_t>(queue, input, output, limit);
+  });
 }

@@ -207,8 +207,7 @@ sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor outpu
   } while (0)
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "sgl_per_tensor_quant_fp8", [&] {
-    using sycl_scalar_t = typename std::
-        conditional<std::is_same<scalar_t, at::Half>::value, sycl::half, sycl::ext::oneapi::bfloat16>::type;
+    using sycl_scalar_t = sycl_type_t<scalar_t>;
 
     int vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(sycl_scalar_t));
     SGL_DISPATCH_VEC_SIZE(vec_size, [&] { LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, VEC_SIZE); });

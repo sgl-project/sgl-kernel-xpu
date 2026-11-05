@@ -1164,10 +1164,9 @@ SGL_KERNEL_EXPORT void grouped_gemma_rmsnorm(
 
   const int64_t M = input.numel() / group_size;
   c10::DeviceGuard guard(input.device());
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "grouped_gemma_rmsnorm", [&]() {
-        GroupedGemmaRMSNormKernelImplInternal<scalar_t>(input, weight, M, group_size, hidden / group_size, eps, output);
-      });
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "grouped_gemma_rmsnorm", [&]() {
+    GroupedGemmaRMSNormKernelImplInternal<scalar_t>(input, weight, M, group_size, hidden / group_size, eps, output);
+  });
 }
 
 }  // namespace at::native::xpu

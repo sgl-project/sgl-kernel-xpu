@@ -232,6 +232,11 @@ struct compute_arg_sorts_sycl_K_T {
     if (i >= topk_length_) return;
 
     T expert = topk_ids_[i];
+    // Expert-parallel callers mark non-local experts with -1: drop them.
+    if (expert < 0) {
+      output_permutation_[i] = -1;
+      return;
+    }
 
     sycl::atomic_ref<
         T,
@@ -279,6 +284,7 @@ struct compute_arg_sorts_count_sycl_K_T : public __SYCL_KER_CONFIG_CONVENTION__ 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
     int gid = item.get_global_id(0);
     int lid = item.get_local_id(0);
+    const T expert = gid < (int)topk_length_ ? topk_ids_[gid] : static_cast<T>(-1);
 
     // ===== Phase 1: Zero SLM histogram =====
     for (int e = lid; e < (int)num_experts_; e += wg_size_)
@@ -286,8 +292,7 @@ struct compute_arg_sorts_count_sycl_K_T : public __SYCL_KER_CONFIG_CONVENTION__ 
     sycl::group_barrier(item.get_group());
 
     // ===== Phase 2: Accumulate into SLM histogram, store per-element local offset =====
-    if (gid < (int)topk_length_) {
-      T expert = topk_ids_[gid];
+    if (expert >= 0) {
       sycl::atomic_ref<
           T,
           sycl::memory_order::relaxed,
@@ -321,8 +326,7 @@ struct compute_arg_sorts_count_sycl_K_T : public __SYCL_KER_CONFIG_CONVENTION__ 
 
     // ===== Phase 4: Fix per-element offset to be global =====
     // local_offsets[gid] += this WG's base for that expert
-    if (gid < (int)topk_length_) {
-      T expert = topk_ids_[gid];
+    if (expert >= 0) {
       local_offsets_[gid] += slm_[expert];
     }
   }
@@ -361,6 +365,10 @@ struct compute_arg_sorts_scatter_sycl_K_T {
 
     if (gid < (int)topk_length_) {
       T expert = topk_ids_[gid];
+      if (expert < 0) {
+        output_permutation_[gid] = -1;
+        return;
+      }
       // Final position = expert's base (from prefix-sum) + this element's global offset
       T pos = expert_base_offsets_[expert] + local_offsets_[gid];
 
@@ -549,7 +557,7 @@ struct PrepareMoeInputSmall : public __SYCL_KER_CONFIG_CONVENTION__ {
         hidden_dim_(hidden_dim) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    route_positions_ = sycl::local_accessor<int32_t, 1>(MaxRoutes, cgh);
+    route_positions_ = sycl::local_accessor<int32_t, 1>(MaxRoutes + 1, cgh);
     local_counts_ = sycl::local_accessor<int32_t, 1>(num_experts_, cgh);
   }
 
@@ -576,12 +584,21 @@ struct PrepareMoeInputSmall : public __SYCL_KER_CONFIG_CONVENTION__ {
           }
           order[insert_at] = current;
         }
-        for (int destination = 0; destination < topk_; ++destination) {
-          int32_t route = order[destination];
-          ++expert_counts_[static_cast<int32_t>(topk_ids_[route])];
+        int32_t destination = 0;
+        for (int rank = 0; rank < topk_; ++rank) {
+          int32_t route = order[rank];
+          int32_t expert = static_cast<int32_t>(topk_ids_[route]);
+          if (expert < 0) {
+            route_positions_[route] = -1;
+            output_permutation_[route] = -1;
+            continue;
+          }
+          ++expert_counts_[expert];
           route_positions_[route] = destination;
           output_permutation_[route] = destination;
+          ++destination;
         }
+        route_positions_[MaxRoutes] = destination;
       }
       sycl::group_barrier(item.get_group());
 
@@ -589,23 +606,28 @@ struct PrepareMoeInputSmall : public __SYCL_KER_CONFIG_CONVENTION__ {
       auto input_vectors = reinterpret_cast<const Vector*>(input_);
       auto output_vectors = reinterpret_cast<Vector*>(output_);
       int vector_count = hidden_dim_ % ElementsPerVector == 0 ? hidden_dim_ / ElementsPerVector : 0;
+      // Every valid destination contains the same single input row. The sorting
+      // thread already packed them into [0, valid_routes), so no per-route
+      // validity checks or position reloads are needed in either copy loop.
+      const int valid_routes = route_positions_[MaxRoutes];
       for (int vector_id = local_id; vector_id < vector_count; vector_id += WGSize) {
         Vector value = input_vectors[vector_id];
-        for (int route = 0; route < topk_; ++route) {
-          output_vectors[route_positions_[route] * vector_count + vector_id] = value;
+        for (int route = 0; route < valid_routes; ++route) {
+          output_vectors[route * vector_count + vector_id] = value;
         }
       }
       for (int column = vector_count * ElementsPerVector + local_id; column < hidden_dim_; column += WGSize) {
         ScalarT value = input_[column];
-        for (int route = 0; route < topk_; ++route) {
-          output_[route_positions_[route] * hidden_dim_ + column] = value;
+        for (int route = 0; route < valid_routes; ++route) {
+          output_[route * hidden_dim_ + column] = value;
         }
       }
       return;
     }
 
     int route_count = topk_ * input_rows_;
-    if (local_id < route_count) {
+    // Expert-parallel callers mark non-local experts with -1: drop them.
+    if (local_id < route_count && topk_ids_[local_id] >= 0) {
       int32_t expert = static_cast<int32_t>(topk_ids_[local_id]);
       sycl::atomic_ref<
           int32_t,
@@ -630,9 +652,12 @@ struct PrepareMoeInputSmall : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     if (local_id < route_count) {
       int32_t expert = static_cast<int32_t>(topk_ids_[local_id]);
-      int32_t destination = local_counts_[expert];
-      for (int route = 0; route < local_id; ++route) {
-        destination += static_cast<int32_t>(topk_ids_[route]) == expert;
+      int32_t destination = -1;
+      if (expert >= 0) {
+        destination = local_counts_[expert];
+        for (int route = 0; route < local_id; ++route) {
+          destination += static_cast<int32_t>(topk_ids_[route]) == expert;
+        }
       }
       route_positions_[local_id] = destination;
       output_permutation_[local_id] = destination;
@@ -643,22 +668,22 @@ struct PrepareMoeInputSmall : public __SYCL_KER_CONFIG_CONVENTION__ {
     auto input_vectors = reinterpret_cast<const Vector*>(input_);
     auto output_vectors = reinterpret_cast<Vector*>(output_);
     int vector_count = hidden_dim_ % ElementsPerVector == 0 ? hidden_dim_ / ElementsPerVector : 0;
-    int vector_tasks = route_count * vector_count;
-    for (int task = local_id; task < vector_tasks; task += WGSize) {
-      int route = task / vector_count;
-      int vector_id = task % vector_count;
-      int source_row = route / topk_;
-      output_vectors[route_positions_[route] * vector_count + vector_id] =
-          input_vectors[source_row * vector_count + vector_id];
-    }
-    int tail_start = vector_count * ElementsPerVector;
-    int tail_size = hidden_dim_ - tail_start;
-    int tail_tasks = route_count * tail_size;
-    for (int task = local_id; task < tail_tasks; task += WGSize) {
-      int route = task / tail_size;
-      int column = tail_start + task % tail_size;
-      int source_row = route / topk_;
-      output_[route_positions_[route] * hidden_dim_ + column] = input_[source_row * hidden_dim_ + column];
+    // Preserve route-major whole-WG copies when the vectors tile exactly; use
+    // smaller tiles otherwise to avoid idle lanes on partial vector batches.
+    const bool whole_wg = vector_count >= WGSize && vector_count % WGSize == 0;
+    const int copy_threads = whole_wg ? WGSize : RequiredSubGroupSize;
+    const int routes_per_wg = whole_wg ? 1 : WGSize / RequiredSubGroupSize;
+    const int lane = whole_wg ? local_id : local_id % RequiredSubGroupSize;
+    for (int route = whole_wg ? 0 : local_id / RequiredSubGroupSize; route < route_count; route += routes_per_wg) {
+      const int32_t destination = route_positions_[route];
+      if (destination < 0) continue;
+      const int source_row = route / topk_;
+      for (int vector_id = lane; vector_id < vector_count; vector_id += copy_threads) {
+        output_vectors[destination * vector_count + vector_id] = input_vectors[source_row * vector_count + vector_id];
+      }
+      for (int column = vector_count * ElementsPerVector + lane; column < hidden_dim_; column += copy_threads) {
+        output_[destination * hidden_dim_ + column] = input_[source_row * hidden_dim_ + column];
+      }
     }
   }
 
@@ -745,7 +770,7 @@ SGL_KERNEL_EXPORT void prepare_moe_input_small(
     using Kernel = PrepareMoeInputSmall<index_t, c10::BFloat16>;
     const size_t local_memory_capacity = prepare_moe_input_small_local_memory_capacity<Kernel>(input.device().index());
     const size_t required_local_memory =
-        (static_cast<size_t>(Kernel::MaxRoutes) + static_cast<size_t>(expert_counts.numel())) * sizeof(int32_t);
+        (static_cast<size_t>(Kernel::MaxRoutes + 1) + static_cast<size_t>(expert_counts.numel())) * sizeof(int32_t);
     TORCH_CHECK(
         required_local_memory <= local_memory_capacity,
         "prepare_moe_input_small requires ",
@@ -778,7 +803,7 @@ SGL_KERNEL_EXPORT void prepare_moe_input_small(
 
 // Scatter kernel: 1 WG per source token, reads token once, scatters to topk destinations.
 // Equivalent to IPEX MoEScatter but uses precomputed src2dst_map (c_map / output_permutation).
-template <typename T>
+template <typename T, bool SingleVector>
 struct ScatterTokensToExperts {
   static constexpr int WGSize = 256;
   static constexpr int ElemsPerItem = sizeof(float) * 4 / sizeof(T);  // 4 for bf16/fp16, 16 for fp8
@@ -796,6 +821,11 @@ struct ScatterTokensToExperts {
     int token_id = item.get_group(0);
     int local_id = item.get_local_linear_id();
 
+    // Single-vector rows leave work-items idle; let them exit early.
+    if constexpr (SingleVector) {
+      if (local_id * ElemsPerItem >= hidden_dim_) return;
+    }
+
     // Load topk destination row indices for this token (loop-invariant)
     int dst_rows[MAX_TOPK];
     for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
@@ -805,14 +835,26 @@ struct ScatterTokensToExperts {
     // Source base pointer (sequential, coalesced reads)
     const T* src_base = input_ + token_id * hidden_dim_ + local_id * ElemsPerItem;
 
-    const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
-    for (int loop = 0; loop < loop_count; ++loop) {
-      if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
-        using vec_t = sycl::vec<storage_t, ElemsPerItem>;
-        vec_t data = *(reinterpret_cast<const vec_t*>(reinterpret_cast<const storage_t*>(src_base + loop * Stride)));
-        for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-          T* dst = output_ + dst_rows[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
-          *(reinterpret_cast<vec_t*>(reinterpret_cast<storage_t*>(dst))) = data;
+    using vec_t = sycl::vec<storage_t, ElemsPerItem>;
+    if constexpr (SingleVector) {
+      vec_t data = *(reinterpret_cast<const vec_t*>(reinterpret_cast<const storage_t*>(src_base)));
+      for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
+        if (dst_rows[k] < 0) continue;
+        T* dst = output_ + dst_rows[k] * hidden_dim_ + local_id * ElemsPerItem;
+        *(reinterpret_cast<vec_t*>(reinterpret_cast<storage_t*>(dst))) = data;
+      }
+    } else {
+      // Keep each input vector resident while broadcasting to the routes. Loop
+      // interchange rereads it once per expert and regresses wide-row traffic.
+      const int loop_count = (hidden_dim_ + Stride - 1) / Stride;
+      for (int loop = 0; loop < loop_count; ++loop) {
+        if (loop * Stride + local_id * ElemsPerItem < hidden_dim_) {
+          vec_t data = *(reinterpret_cast<const vec_t*>(reinterpret_cast<const storage_t*>(src_base + loop * Stride)));
+          for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
+            if (dst_rows[k] < 0) continue;
+            T* dst = output_ + dst_rows[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
+            *(reinterpret_cast<vec_t*>(reinterpret_cast<storage_t*>(dst))) = data;
+          }
         }
       }
     }
@@ -840,12 +882,19 @@ void scatter_tokens_to_experts_impl(
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  using Kernel = ScatterTokensToExperts<T>;
-  sycl::range<1> global_range{num_tokens * Kernel::WGSize};
-  sycl::range<1> local_range{Kernel::WGSize};
-
-  Kernel task(input, output, src2dst, topk, hidden_dim);
-  sycl_kernel_submit(global_range, local_range, queue, task);
+  const auto launch = [&]<bool SingleVector>() {
+    using Kernel = ScatterTokensToExperts<T, SingleVector>;
+    sycl::range<1> global_range{num_tokens * Kernel::WGSize};
+    sycl::range<1> local_range{Kernel::WGSize};
+    Kernel task(input, output, src2dst, topk, hidden_dim);
+    sycl_kernel_submit(global_range, local_range, queue, task);
+  };
+  // Compaction pays off when at least half the work-items would be inactive.
+  // Fully occupied rows retain the original broadcast loop.
+  if (hidden_dim <= ScatterTokensToExperts<T, true>::Stride / 2)
+    launch.template operator()<true>();
+  else
+    launch.template operator()<false>();
 }
 
 SGL_KERNEL_EXPORT void scatter_tokens_to_experts(
@@ -884,7 +933,7 @@ SGL_KERNEL_EXPORT void scatter_tokens_to_experts(
 #endif
 }
 
-template <typename T, typename T1, bool APPLY_ROUTED_SCALING>
+template <typename T, typename T1, bool APPLY_ROUTED_SCALING, bool CompactRoutes>
 struct ApplyShuffleMulSum {
   static constexpr int WGSize = 256;
   static constexpr int ElemsPerItem = sizeof(float) * 4 / sizeof(T);  // 4 for bf16/fp16
@@ -911,12 +960,25 @@ struct ApplyShuffleMulSum {
     int out_tkn_id = item.get_group(0);
     int local_id = item.get_local_linear_id();
 
-    // Preload src row indices and weights (loop-invariant over hidden dim)
+    if (local_id * ElemsPerItem >= hidden_dim_) return;
+
+    // When selected, compact routes before the column loop without changing
+    // accumulation order. Fully dropped tokens still write zero output vectors.
     int src_indices[MAX_TOPK];
     float weights[MAX_TOPK];
+    int valid_routes = 0;
     for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
-      src_indices[k] = static_cast<int>(dst2src_map_[out_tkn_id * topk_ + k]);
-      weights[k] = (factors_ != nullptr) ? static_cast<float>(factors_[out_tkn_id * topk_ + k]) : 1.0f;
+      const int source = static_cast<int>(dst2src_map_[out_tkn_id * topk_ + k]);
+      if constexpr (CompactRoutes) {
+        if (source >= 0) {
+          src_indices[valid_routes] = source;
+          weights[valid_routes] = (factors_ != nullptr) ? static_cast<float>(factors_[out_tkn_id * topk_ + k]) : 1.0f;
+          ++valid_routes;
+        }
+      } else {
+        src_indices[k] = source;
+        weights[k] = (factors_ != nullptr) ? static_cast<float>(factors_[out_tkn_id * topk_ + k]) : 1.0f;
+      }
     }
 
     T* dst_base = output_ + out_tkn_id * hidden_dim_ + local_id * ElemsPerItem;
@@ -929,7 +991,11 @@ struct ApplyShuffleMulSum {
         for (int j = 0; j < ElemsPerItem; ++j)
           acc[j] = 0.0f;
 
-        for (int k = 0; k < topk_ && k < MAX_TOPK; ++k) {
+        const int route_count = CompactRoutes ? valid_routes : sycl::min(topk_, MAX_TOPK);
+        for (int k = 0; k < route_count; ++k) {
+          if constexpr (!CompactRoutes) {
+            if (src_indices[k] < 0) continue;
+          }
           const T* src = input_ + src_indices[k] * hidden_dim_ + local_id * ElemsPerItem + loop * Stride;
           using vec_t = sycl::vec<T, ElemsPerItem>;
           vec_t reg = *(reinterpret_cast<const vec_t*>(src));
@@ -973,14 +1039,20 @@ void apply_shuffle_mul_sum_impl(
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
-  using Kernel = ApplyShuffleMulSum<T, T1, APPLY_ROUTED_SCALING>;
-
-  sycl::range<1> global_range{out_tkns * Kernel::WGSize};
-  sycl::range<1> local_range{Kernel::WGSize};
-
-  Kernel task(input, output, dst2src_map, factors, topk, out_hidden_dims, routed_scaling_factor);
-
-  sycl_kernel_submit(global_range, local_range, queue, task);
+  const auto launch = [&]<bool CompactRoutes>() {
+    using Kernel = ApplyShuffleMulSum<T, T1, APPLY_ROUTED_SCALING, CompactRoutes>;
+    sycl::range<1> global_range{out_tkns * Kernel::WGSize};
+    sycl::range<1> local_range{Kernel::WGSize};
+    Kernel task(input, output, dst2src_map, factors, topk, out_hidden_dims, routed_scaling_factor);
+    sycl_kernel_submit(global_range, local_range, queue, task);
+  };
+  constexpr int Stride = ApplyShuffleMulSum<T, T1, APPLY_ROUTED_SCALING, true>::Stride;
+  // Compaction removes repeated checks for wide rows and avoids work for narrow
+  // rows. On a fully occupied single-vector row, it only adds setup overhead.
+  if (out_hidden_dims > Stride || out_hidden_dims <= Stride / 2)
+    launch.template operator()<true>();
+  else
+    launch.template operator()<false>();
   return;
 }
 

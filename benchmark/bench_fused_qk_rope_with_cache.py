@@ -17,6 +17,7 @@ def create_cos_sin_cache(
     rotary_dim: int,
     max_position: int = MAX_SEQ_LEN,
     base: float = ROPE_BASE,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Create cos/sin cache compatible with SGLang layout: [max_pos, rotary_dim]."""
     inv_freq = 1.0 / (
@@ -31,7 +32,7 @@ def create_cos_sin_cache(
     cos = freqs.cos()
     sin = freqs.sin()
     cache = torch.cat((cos, sin), dim=-1)  # [max_pos, rotary_dim]
-    return cache
+    return cache.to(dtype)
 
 
 def sglang_fused_qk_rope_with_cache(

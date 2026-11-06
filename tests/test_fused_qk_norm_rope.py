@@ -559,13 +559,17 @@ def test_fused_qk_norm_rope_fp8_e4m3(
 
 
 @pytest.mark.parametrize(
-    "use_4d,batch_size,seq_len,num_qo_heads,num_kv_heads,head_dim,rope_dim,is_neox,dtype,position_dtype",
+    "use_4d,batch_size,seq_len,num_qo_heads,num_kv_heads,head_dim,rope_dim,is_neox,dtype,position_dtype,cache_dtype",
     [
-        (False, 3, None, 4, 2, 64, 32, False, torch.bfloat16, torch.int32),
-        (False, 4, None, 6, 2, 96, 96, True, torch.bfloat16, torch.int32),
-        (False, 5, None, 8, 4, 128, 64, True, torch.float16, torch.int64),
-        (True, 2, 4, 16, 4, 128, 128, False, torch.bfloat16, torch.int32),
-        (True, 1, 8, 32, 8, 256, 128, True, torch.float16, torch.int64),
+        (False, 3, None, 4, 2, 64, 32, False, torch.bfloat16, torch.int32, torch.float32),
+        (False, 4, None, 6, 2, 96, 96, True, torch.bfloat16, torch.int32, torch.float32),
+        (False, 5, None, 8, 4, 128, 64, True, torch.float16, torch.int64, torch.float32),
+        (True, 2, 4, 16, 4, 128, 128, False, torch.bfloat16, torch.int32, torch.float32),
+        (True, 1, 8, 32, 8, 256, 128, True, torch.float16, torch.int64, torch.float32),
+        # bf16 cos_sin_cache coverage (fused_inplace_qknorm_rope-only feature):
+        # one neox + 3D case, one non-neox + 4D case.
+        (False, 4, None, 6, 2, 96, 96, True, torch.bfloat16, torch.int32, torch.bfloat16),
+        (True, 2, 4, 16, 4, 128, 128, False, torch.bfloat16, torch.int32, torch.bfloat16),
     ],
 )
 def test_fused_qk_norm_rope_with_cache(
@@ -579,6 +583,7 @@ def test_fused_qk_norm_rope_with_cache(
     is_neox,
     dtype,
     position_dtype,
+    cache_dtype,
 ):
     """Test fused QK norm + RoPE with a precomputed cos/sin cache."""
     torch.random.manual_seed(42)
@@ -602,7 +607,9 @@ def test_fused_qk_norm_rope_with_cache(
     q_weight = torch.randn(head_dim, dtype=dtype, device=device)
     k_weight = torch.randn(head_dim, dtype=dtype, device=device)
     positions = torch.arange(num_tokens, dtype=position_dtype, device=device)
-    cos_sin_cache = create_cos_sin_cache(rope_dim, max_position=num_tokens + 1)
+    cos_sin_cache = create_cos_sin_cache(
+        rope_dim, max_position=num_tokens + 1, dtype=cache_dtype
+    )
 
     q_ref, k_ref = fused_qk_norm_rope_with_cache_reference(
         q.clone().float(),
@@ -635,11 +642,13 @@ def test_fused_qk_norm_rope_with_cache(
 
 
 @pytest.mark.parametrize(
-    "use_4d,batch_size,seq_len,num_qo_heads,num_kv_heads,head_dim,rope_dim,is_neox,dtype,position_dtype,last_dim_padding",
+    "use_4d,batch_size,seq_len,num_qo_heads,num_kv_heads,head_dim,rope_dim,is_neox,dtype,position_dtype,cache_dtype,last_dim_padding",
     [
-        (False, 3, None, 4, 2, 64, 32, False, torch.bfloat16, torch.int32, 16),
-        (False, 4, None, 6, 2, 96, 96, True, torch.bfloat16, torch.int32, 16),
-        (True, 2, 4, 16, 4, 128, 128, True, torch.float16, torch.int64, 32),
+        (False, 3, None, 4, 2, 64, 32, False, torch.bfloat16, torch.int32, torch.float32, 16),
+        (False, 4, None, 6, 2, 96, 96, True, torch.bfloat16, torch.int32, torch.float32, 16),
+        (True, 2, 4, 16, 4, 128, 128, True, torch.float16, torch.int64, torch.float32, 32),
+        # bf16 cos_sin_cache + strided-view coverage (fused_inplace_qknorm_rope-only feature).
+        (True, 2, 4, 16, 4, 128, 128, True, torch.float16, torch.int64, torch.bfloat16, 32),
     ],
 )
 def test_fused_qk_norm_rope_with_cache_last_dim_strided(
@@ -653,6 +662,7 @@ def test_fused_qk_norm_rope_with_cache_last_dim_strided(
     is_neox,
     dtype,
     position_dtype,
+    cache_dtype,
     last_dim_padding,
 ):
     """Test fused QK norm + RoPE with non-contiguous Q/K views."""
@@ -706,7 +716,9 @@ def test_fused_qk_norm_rope_with_cache_last_dim_strided(
     q_weight = torch.randn(head_dim, dtype=dtype, device=device)
     k_weight = torch.randn(head_dim, dtype=dtype, device=device)
     positions = torch.arange(num_tokens, dtype=position_dtype, device=device)
-    cos_sin_cache = create_cos_sin_cache(rope_dim, max_position=num_tokens + 1)
+    cos_sin_cache = create_cos_sin_cache(
+        rope_dim, max_position=num_tokens + 1, dtype=cache_dtype
+    )
 
     q_ref, k_ref = fused_qk_norm_rope_with_cache_reference(
         q.clone().float(),

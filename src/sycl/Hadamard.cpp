@@ -137,9 +137,6 @@ inline void hadamard_launch(
   });
 }
 
-#define _LAUNCH(LOGN) \
-  hadamard_launch<T, LOGN, hadamard_nthreads<T, LOGN>()>(q, x, out, batch, x_batch_stride, out_batch_stride, scale)
-
 // Threads per workgroup: enough to cover kN elements at kNElts per thread, capped at 256.
 template <typename T, int kLogN>
 constexpr int hadamard_nthreads() {
@@ -147,6 +144,11 @@ constexpr int hadamard_nthreads() {
   constexpr int kNThreads = (1 << kLogN) / kNElts;
   return kNThreads < 256 ? kNThreads : 256;
 }
+
+#define LAUNCH_CASE(LOGN)                                                                                              \
+  case LOGN:                                                                                                           \
+    hadamard_launch<T, LOGN, hadamard_nthreads<T, LOGN>()>(q, x, out, batch, x_batch_stride, out_batch_stride, scale); \
+    break
 
 template <typename T>
 inline void hadamard_dispatch(
@@ -159,60 +161,30 @@ inline void hadamard_dispatch(
     int log_N,
     float scale) {
   switch (log_N) {
-    case 3:
-      _LAUNCH(3);
-      break;
-    case 4:
-      _LAUNCH(4);
-      break;
-    case 5:
-      _LAUNCH(5);
-      break;
-    case 6:
-      _LAUNCH(6);
-      break;
-    case 7:
-      _LAUNCH(7);
-      break;
-    case 8:
-      _LAUNCH(8);
-      break;
-    case 9:
-      _LAUNCH(9);
-      break;
-    case 10:
-      _LAUNCH(10);
-      break;
-    case 11:
-      _LAUNCH(11);
-      break;
-    case 12:
-      _LAUNCH(12);
-      break;
-    case 13:
-      _LAUNCH(13);
-      break;
-    case 14:
-      _LAUNCH(14);
-      break;
-    case 15:
-      _LAUNCH(15);
-      break;
+    LAUNCH_CASE(3);
+    LAUNCH_CASE(4);
+    LAUNCH_CASE(5);
+    LAUNCH_CASE(6);
+    LAUNCH_CASE(7);
+    LAUNCH_CASE(8);
+    LAUNCH_CASE(9);
+    LAUNCH_CASE(10);
+    LAUNCH_CASE(11);
+    LAUNCH_CASE(12);
+    LAUNCH_CASE(13);
+    LAUNCH_CASE(14);
+    LAUNCH_CASE(15);
     default:
       TORCH_CHECK(false, "hadamard_transform: unsupported log_N=", log_N);
   }
-#undef _LAUNCH
 }
+#undef LAUNCH_CASE
 
 }  // anonymous namespace
 
 SGL_KERNEL_EXPORT at::Tensor hadamard_transform(const at::Tensor& input, double scale) {
   CHECK_INPUT(input);
-  TORCH_CHECK(
-      input.scalar_type() == at::ScalarType::Float || input.scalar_type() == at::ScalarType::Half ||
-          input.scalar_type() == at::ScalarType::BFloat16,
-      "hadamard_transform: unsupported dtype ",
-      input.scalar_type());
+  CHECK_DTYPES(input, at::ScalarType::Float, at::ScalarType::Half, at::ScalarType::BFloat16);
 
   const int64_t dim_og = input.size(-1);
   TORCH_CHECK(dim_og > 0 && dim_og <= 32768, "hadamard_transform: last dim must be in [1, 32768], got ", dim_og);

@@ -511,28 +511,18 @@ SGL_KERNEL_EXPORT void hc_pre_big_fuse(
     double hc_post_mult_value,
     std::optional<at::Tensor> norm_weight,
     std::optional<double> norm_eps) {
-  CHECK_INPUT(gemm_out_mul);
-  CHECK_INPUT(gemm_out_sqrsum);
-  CHECK_INPUT(hc_scale);
-  CHECK_INPUT(hc_base);
-  CHECK_INPUT(residual_flat);
-  CHECK_INPUT(post_mix);
-  CHECK_INPUT(comb_mix);
-  CHECK_INPUT(layer_input);
+  CHECK_INPUT(3, at::kFloat, gemm_out_mul);
+  CHECK_INPUT(2, at::kFloat, gemm_out_sqrsum);
+  CHECK_INPUT(1, at::kFloat, hc_scale);
+  CHECK_INPUT(1, at::kFloat, hc_base);
+  CHECK_INPUT(3, at::kBFloat16, residual_flat);
+  CHECK_INPUT(2, at::kFloat, post_mix);
+  CHECK_INPUT(2, at::kFloat, comb_mix);
+  CHECK_INPUT(2, at::kBFloat16, layer_input);
 
   if (norm_weight.has_value()) {
-    CHECK_INPUT(norm_weight.value());
-    TORCH_CHECK(norm_weight.value().scalar_type() == at::kBFloat16, "norm_weight must be bfloat16");
+    CHECK_INPUT(1, at::kBFloat16, norm_weight.value());
   }
-
-  TORCH_CHECK(gemm_out_mul.scalar_type() == at::kFloat, "gemm_out_mul must be float32");
-  TORCH_CHECK(gemm_out_sqrsum.scalar_type() == at::kFloat, "gemm_out_sqrsum must be float32");
-  TORCH_CHECK(hc_scale.scalar_type() == at::kFloat, "hc_scale must be float32");
-  TORCH_CHECK(hc_base.scalar_type() == at::kFloat, "hc_base must be float32");
-  TORCH_CHECK(residual_flat.scalar_type() == at::kBFloat16, "residual_flat must be bfloat16");
-  TORCH_CHECK(post_mix.scalar_type() == at::kFloat, "post_mix must be float32");
-  TORCH_CHECK(comb_mix.scalar_type() == at::kFloat, "comb_mix must be float32");
-  TORCH_CHECK(layer_input.scalar_type() == at::kBFloat16, "layer_input must be bfloat16");
 
   constexpr int HC = 4;
   constexpr int HC3 = (2 + HC) * HC;
@@ -546,27 +536,20 @@ SGL_KERNEL_EXPORT void hc_pre_big_fuse(
       SINKHORN_ITERS,
       ", got ",
       sinkhorn_iters);
-  TORCH_CHECK(hc_scale.numel() == 3, "hc_scale must have 3 elements");
-  TORCH_CHECK(hc_base.numel() == HC3, "hc_base must have ", HC3, " elements");
-
-  const int64_t n_splits_actual = gemm_out_mul.size(0);
   const int64_t T = gemm_out_mul.size(1);
-  TORCH_CHECK(gemm_out_mul.size(2) == HC3, "gemm_out_mul last dim must be ", HC3);
-  TORCH_CHECK(gemm_out_sqrsum.size(0) == n_splits_actual, "sqrsum n_splits mismatch");
-  TORCH_CHECK(gemm_out_sqrsum.size(1) == T, "sqrsum T mismatch");
-  TORCH_CHECK(
-      n_splits == n_splits_actual, "n_splits argument (", n_splits, ") must match tensor size (", n_splits_actual, ")");
-
-  TORCH_CHECK(residual_flat.size(0) == T, "residual_flat T mismatch");
-  TORCH_CHECK(residual_flat.size(1) == HC, "residual_flat must have ", HC, " channels");
   const int64_t hidden_size = residual_flat.size(2);
 
-  TORCH_CHECK(post_mix.numel() == T * HC, "post_mix size mismatch");
-  TORCH_CHECK(comb_mix.numel() == T * HC2, "comb_mix size mismatch");
-  TORCH_CHECK(layer_input.numel() == T * hidden_size, "layer_input size mismatch");
+  CHECK_SHAPE(gemm_out_mul, n_splits, T, HC3);
+  CHECK_SHAPE(gemm_out_sqrsum, n_splits, T);
+  CHECK_SHAPE(hc_scale, 3);
+  CHECK_SHAPE(hc_base, HC3);
+  CHECK_SHAPE(residual_flat, T, HC, hidden_size);
+  CHECK_SHAPE(post_mix, T, HC);
+  CHECK_SHAPE(comb_mix, T, HC2);
+  CHECK_SHAPE(layer_input, T, hidden_size);
 
   if (norm_weight.has_value()) {
-    TORCH_CHECK(norm_weight.value().numel() == hidden_size, "norm_weight size must match hidden_size");
+    CHECK_SHAPE(norm_weight.value(), hidden_size);
   }
 
   auto q = dpcppGetCurrentQueue();

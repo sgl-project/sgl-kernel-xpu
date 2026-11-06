@@ -132,11 +132,11 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
     const int64_t n_experts) {
-  CHECK_INPUT(output);
-  CHECK_INPUT(activations);
-  CHECK_INPUT(weights);
+  CHECK_INPUT(2, at::ScalarType::BFloat16, output);
+  CHECK_INPUT(2, at::ScalarType::BFloat16, activations);
+  CHECK_INPUT(3, at::ScalarType::Float8_e4m3fn, weights);
   CHECK_INPUT(weight_scales);
-  CHECK_INPUT(total_rows_for_experts);
+  CHECK_INPUT(1, at::ScalarType::Int, total_rows_for_experts);
   TORCH_CHECK(output.device() == activations.device(), "output must be on the same device as activations");
   TORCH_CHECK(weights.device() == activations.device(), "weights must be on the same device as activations");
   TORCH_CHECK(
@@ -146,18 +146,14 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
       "total_rows_for_experts must be on the same device as activations");
   if (bias.has_value()) {
     const auto& bias_tensor = *bias;
-    CHECK_INPUT(bias_tensor);
+    CHECK_INPUT(2, at::kFloat, bias_tensor);
     TORCH_CHECK(bias_tensor.device() == activations.device(), "bias must be on the same device as activations");
-    TORCH_CHECK(bias_tensor.scalar_type() == at::kFloat, "bias must be float32");
-    TORCH_CHECK(bias_tensor.dim() == 2, "bias must be 2D [E, N]");
   }
   const bool is_mxfp8 =
       (weight_scales.scalar_type() == at::ScalarType::Byte ||
        weight_scales.scalar_type() == at::ScalarType::Float8_e8m0fnu);
-  TORCH_CHECK(activations.scalar_type() == at::ScalarType::BFloat16, "W8A16 activations must be bfloat16");
-  TORCH_CHECK(weights.scalar_type() == at::ScalarType::Float8_e4m3fn, "W8A16 weights must be float8_e4m3fn");
   if (is_mxfp8) {
-    TORCH_CHECK(weight_scales.dim() == 3, "MXFP8 weight scales must be 3D [E, N, K/32]");
+    CHECK_DIM(3, weight_scales);
   } else {
     TORCH_CHECK(weight_scales.scalar_type() == at::kFloat, "W8A16 scalar and 128x128 block scales must be float32");
     TORCH_CHECK(
@@ -167,20 +163,11 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
       TORCH_CHECK(weight_scales.size(1) == 1 || weight_scales.size(1) == 2, "W8A16 scale count must be 1 or 2");
     }
   }
-  TORCH_CHECK(output.scalar_type() == at::ScalarType::BFloat16, "W8A16 output must be bfloat16");
   TORCH_CHECK(n_experts > 0 && n_experts % 8 == 0, "n_experts must be a positive multiple of 8");
-  TORCH_CHECK(activations.dim() == 2, "W8A16 activations must be 2D [M_total, K]");
-  TORCH_CHECK(weights.dim() == 3, "W8A16 weights must be 3D [E, N, K]");
-  TORCH_CHECK(output.dim() == 2, "W8A16 output must be 2D [M_total, N]");
   TORCH_CHECK(weights.size(0) == n_experts, "weights expert dimension mismatch");
   TORCH_CHECK(weight_scales.size(0) == n_experts, "weight scales expert dimension mismatch");
-  TORCH_CHECK(
-      total_rows_for_experts.dim() == 1 && total_rows_for_experts.size(0) == n_experts, "rows_for_experts must be [E]");
-  TORCH_CHECK(total_rows_for_experts.scalar_type() == at::ScalarType::Int, "rows_for_experts must be int32");
+  CHECK_SHAPE(total_rows_for_experts, n_experts);
   TORCH_CHECK(weights.size(2) == activations.size(1), "W8A16 K dimension mismatch");
-  TORCH_CHECK(
-      activations.is_contiguous() && weights.is_contiguous() && weight_scales.is_contiguous(),
-      "W8A16 tensors must be contiguous");
   TORCH_CHECK(weights.size(1) % 64 == 0 && weights.size(2) % 32 == 0, "W8A16 N must be divisible by 64 and K by 32");
 
   int total_m = static_cast<int>(activations.size(0));

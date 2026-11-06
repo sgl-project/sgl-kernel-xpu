@@ -290,20 +290,11 @@ struct FlashCompress4WriteKernel {
 
 SGL_KERNEL_EXPORT void flash_compress4_decode(
     torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d) {
-  CHECK_INPUT(kv_buffer);
-  CHECK_DIM(3, kv_buffer);
-  CHECK_INPUT(kv_input);
-  CHECK_DIM(2, kv_input);
-  CHECK_INPUT(kv_output);
-  CHECK_DIM(2, kv_output);
-  CHECK_INPUT(ape);
-  CHECK_DIM(2, ape);
-  CHECK_INPUT(plan_d);
-  CHECK_DIM(2, plan_d);
-  CHECK_EQ(plan_d.dtype(), torch::kUInt8);
-  CHECK_EQ(kv_input.dtype(), torch::kFloat);
-  CHECK_EQ(kv_input.dtype(), kv_output.dtype());
-  CHECK_EQ(kv_input.dtype(), ape.dtype());
+  CHECK_INPUT(3, kv_buffer);
+  CHECK_INPUT(2, torch::kFloat, kv_input);
+  CHECK_INPUT(2, torch::kFloat, kv_output);
+  CHECK_INPUT(2, torch::kFloat, ape);
+  CHECK_INPUT(2, torch::kUInt8, plan_d);
 
   const int64_t batch_size = kv_input.size(0);
   const int64_t elem_size = kv_input.size(1);
@@ -368,23 +359,12 @@ SGL_KERNEL_EXPORT void flash_compress4_prefill(
     torch::Tensor ape,
     torch::Tensor plan_c,
     torch::Tensor plan_w) {
-  CHECK_INPUT(kv_buffer);
-  CHECK_DIM(3, kv_buffer);
-  CHECK_INPUT(kv_input);
-  CHECK_DIM(2, kv_input);
-  CHECK_INPUT(kv_output);
-  CHECK_DIM(2, kv_output);
-  CHECK_INPUT(ape);
-  CHECK_DIM(2, ape);
-  CHECK_INPUT(plan_c);
-  CHECK_DIM(2, plan_c);
-  CHECK_EQ(plan_c.dtype(), torch::kUInt8);
-  CHECK_INPUT(plan_w);
-  CHECK_DIM(2, plan_w);
-  CHECK_EQ(plan_w.dtype(), torch::kUInt8);
-  CHECK_EQ(kv_input.dtype(), torch::kFloat);
-  CHECK_EQ(kv_input.dtype(), kv_output.dtype());
-  CHECK_EQ(kv_input.dtype(), ape.dtype());
+  CHECK_INPUT(3, kv_buffer);
+  CHECK_INPUT(2, torch::kFloat, kv_input);
+  CHECK_INPUT(2, torch::kFloat, kv_output);
+  CHECK_INPUT(2, torch::kFloat, ape);
+  CHECK_INPUT(2, torch::kUInt8, plan_c);
+  CHECK_INPUT(2, torch::kUInt8, plan_w);
 
   const int64_t num_compress = plan_c.size(0);
   const int64_t num_write = plan_w.size(0);

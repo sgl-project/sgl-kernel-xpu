@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <limits>
 #include <sycl/sycl.hpp>
-#include <type_traits>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
@@ -220,9 +219,8 @@ bool can_vectorize(int64_t inner, std::initializer_list<const at::Tensor*> tenso
 }
 
 void check_bf16_xpu(const at::Tensor& t, const char* name) {
-  TORCH_CHECK(t.is_xpu(), name, " must be on XPU");
+  CHECK_INPUT(t);
   TORCH_CHECK(t.scalar_type() == at::kBFloat16, name, " must be bfloat16");
-  TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
 // An output may alias an input exactly (in place) but must not partially overlap it.
@@ -532,12 +530,12 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine(
   SGL_DISPATCH_VEC_SIZE_SET(pick_vec(hidden, {&residual, &block_output, &output}), (1, 2, 4, 8), [&] {
     constexpr int V = VEC_SIZE;
     const uint32_t vecs_per_row = hidden / V;
-    const auto launch = [&](auto has_injection) {
+    SGL_DISPATCH_BOOL(injection_data != nullptr, HAS_INJECTION, [&] {
       launch_rows(
           q,
           rows * hc_count,
           vecs_per_row,
-          CombineKernel<V, decltype(has_injection)::value>{
+          CombineKernel<V, HAS_INJECTION>{
               as<bf16xV<V>>(residual),
               as<bf16xV<V>>(block_output),
               injection_data,
@@ -545,12 +543,7 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine(
               vecs_per_row,
               static_cast<uint32_t>(hc_count),
               1.0f / static_cast<float>(hc_count)});
-    };
-    if (injection_data != nullptr) {
-      launch(std::true_type{});
-    } else {
-      launch(std::false_type{});
-    }
+    });
   });
 }
 
@@ -568,17 +561,15 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine_norm(
   check_bf16_xpu(weight, "weight");
   check_bf16_xpu(combined, "combined");
   check_bf16_xpu(normalized, "normalized");
-  TORCH_CHECK(residual.dim() == 2 && block_output.dim() == 2, "residual and block_output must be 2D");
+  CHECK_DIM(2, residual);
   TORCH_CHECK(hc_count > 0 && residual.size(1) % hc_count == 0, "HC * hidden must be divisible by hc_count");
   const int64_t tokens = residual.size(0), hidden = residual.size(1) / hc_count;
-  TORCH_CHECK(
-      block_output.size(0) == tokens && block_output.size(1) == hidden, "block_output must be [tokens, hidden]");
+  CHECK_SHAPE(block_output, tokens, hidden);
   TORCH_CHECK(
       weight.numel() == hidden || weight.numel() == residual.size(1),
       "weight must have hidden or HC * hidden elements");
-  TORCH_CHECK(
-      combined.sizes() == residual.sizes() && normalized.sizes() == residual.sizes(),
-      "combined and normalized must have the same shape as residual");
+  CHECK_SAME_SHAPE(combined, residual);
+  CHECK_SAME_SHAPE(normalized, residual);
   const bf16* injection_data = injection_ptr(injection, tokens, hc_count);
   check_no_partial_overlap(combined, residual);
   check_no_overlap(combined, {&block_output, &weight});

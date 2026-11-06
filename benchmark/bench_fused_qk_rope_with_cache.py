@@ -32,7 +32,7 @@ def create_cos_sin_cache(
     cos = freqs.cos()
     sin = freqs.sin()
     cache = torch.cat((cos, sin), dim=-1)  # [max_pos, rotary_dim]
-    return cache.to(dtype)
+    return cache.to(dtype=dtype)
 
 
 def sglang_fused_qk_rope_with_cache(

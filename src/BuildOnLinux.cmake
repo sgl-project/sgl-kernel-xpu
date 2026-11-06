@@ -300,6 +300,18 @@ if(USE_MOE AND NOT USE_SYCL_JIT
    sgl-ops-sycl-GroupGemmW8A16Xe20
    PUBLIC sgl-ops-sycl-GroupGemmW8A16Xe20_inst)
 endif()
+# Mono decode: the host library (MonoDecodeXe20) imports the IPC mailboxes
+# through Level Zero and calls the kernel libraries' launchers. Link them
+# explicitly so each is recorded as DT_NEEDED of the host library, whatever
+# their order on common_ops' --as-needed link line.
+if(TARGET sgl-ops-sycl-MonoDecodeXe20)
+  target_link_libraries(sgl-ops-sycl-MonoDecodeXe20 PRIVATE ze_loader)
+  foreach(_mono_kernel mono_gdn_fp16 mono_gdn_bf16 mono_attn_fp16 mono_attn_bf16)
+    if(TARGET sgl-ops-sycl-${_mono_kernel})
+      target_link_libraries(sgl-ops-sycl-MonoDecodeXe20 PUBLIC sgl-ops-sycl-${_mono_kernel})
+    endif()
+  endforeach()
+endif()
 endif() # DPCPP_SYCL_TARGET MATCHES "bmg" (xe20 kernels)
 
 # chunk_gated_delta_rule.cpp lives in the common (non-arch-specific) bucket, so

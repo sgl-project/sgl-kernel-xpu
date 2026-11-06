@@ -66,9 +66,9 @@ static inline const char* get_offset_per_head_lf_tbl(
     int64_t item_size_bytes,
     int64_t head_id,
     int64_t head_num,
-    int64_t /*page_size*/) {
-  return reinterpret_cast<const char*>(tbl[layer_id]) + page_id * item_size_bytes +
-         item_size_bytes / head_num * head_id;
+    int64_t /*page_size*/,
+    int64_t row_stride) {
+  return reinterpret_cast<const char*>(tbl[layer_id]) + page_id * row_stride + item_size_bytes / head_num * head_id;
 }
 
 // Layer-first contiguous, per-head variant (for ph→lf destination path).
@@ -84,8 +84,9 @@ static inline char* get_offset_per_head_lf_mut(
     int64_t item_size_bytes,
     int64_t head_id,
     int64_t head_num,
-    int64_t /*page_size*/) {
-  return base + layer_id * layer_dim + page_id * item_size_bytes + item_size_bytes / head_num * head_id;
+    int64_t /*page_size*/,
+    int64_t row_stride) {
+  return base + layer_id * layer_dim + page_id * row_stride + item_size_bytes / head_num * head_id;
 }
 
 // Page-head layout: [num_pages, head_num, page_size, num_layers, head_dim]
@@ -147,10 +148,11 @@ struct TransferKVKernel {
 
       for (int64_t layer = start_layer_; layer < start_layer_ + num_layers_; ++layer) {
         const char* src_k_ptr = src_k_base_ == nullptr
-                                    ? reinterpret_cast<const char*>(src_k_tbl_[layer]) + src_page * item_size_
-                                    : src_k_base_ + src_page * item_size_;
-        char* dst_k_ptr = dst_k_base_ == nullptr ? reinterpret_cast<char*>(dst_k_tbl_[layer]) + dst_page * item_size_
-                                                 : dst_k_base_ + dst_page * item_size_;
+                                    ? reinterpret_cast<const char*>(src_k_tbl_[layer]) + src_page * src_row_stride_
+                                    : src_k_base_ + src_page * src_row_stride_;
+        char* dst_k_ptr = dst_k_base_ == nullptr
+                              ? reinterpret_cast<char*>(dst_k_tbl_[layer]) + dst_page * dst_row_stride_
+                              : dst_k_base_ + dst_page * dst_row_stride_;
 
         const int64_t chunks = item_size_ / static_cast<int64_t>(sizeof(uint64_t));
         const auto* src64 = reinterpret_cast<const uint64_t*>(src_k_ptr);
@@ -161,10 +163,11 @@ struct TransferKVKernel {
           // simultaneously, hiding load latency across the two independent
           // address streams.
           const char* src_v_ptr = src_v_base_ == nullptr
-                                      ? reinterpret_cast<const char*>(src_v_tbl_[layer]) + src_page * item_size_
-                                      : src_v_base_ + src_page * item_size_;
-          char* dst_v_ptr = dst_v_base_ == nullptr ? reinterpret_cast<char*>(dst_v_tbl_[layer]) + dst_page * item_size_
-                                                   : dst_v_base_ + dst_page * item_size_;
+                                      ? reinterpret_cast<const char*>(src_v_tbl_[layer]) + src_page * src_row_stride_
+                                      : src_v_base_ + src_page * src_row_stride_;
+          char* dst_v_ptr = dst_v_base_ == nullptr
+                                ? reinterpret_cast<char*>(dst_v_tbl_[layer]) + dst_page * dst_row_stride_
+                                : dst_v_base_ + dst_page * dst_row_stride_;
 
           const auto* sv64 = reinterpret_cast<const uint64_t*>(src_v_ptr);
           auto* dv64 = reinterpret_cast<uint64_t*>(dst_v_ptr);
@@ -199,6 +202,9 @@ struct TransferKVKernel {
   int64_t num_items_;
   int64_t items_per_sg_;
   int64_t item_size_;
+  // Bytes between consecutive rows on each side; >= item_size_ (strided unified-memory pools).
+  int64_t src_row_stride_;
+  int64_t dst_row_stride_;
 };
 
 // Page-first transfer kernel (pf↔lf).
@@ -217,10 +223,10 @@ struct TransferKVPageFirstKernel {
   pf_offset(const char* base, int64_t layer, int64_t page, int64_t item_size, int64_t layout_dim) {
     return base + page * layout_dim + layer * item_size;
   }
-  // lf side: flat base (base + page * item_size) or per-layer table.
+  // lf side: flat base (base + page * row_stride) or per-layer table.
   static inline const char*
-  lf_offset(const char* base, const uintptr_t* tbl, int64_t layer, int64_t page, int64_t item_size) {
-    return base == nullptr ? reinterpret_cast<const char*>(tbl[layer]) + page * item_size : base + page * item_size;
+  lf_offset(const char* base, const uintptr_t* tbl, int64_t layer, int64_t page, int64_t row_stride) {
+    return base == nullptr ? reinterpret_cast<const char*>(tbl[layer]) + page * row_stride : base + page * row_stride;
   }
 
   void operator()(sycl::nd_item<1> item) const {
@@ -243,9 +249,9 @@ struct TransferKVPageFirstKernel {
         char* dst_k_ptr;
         if constexpr (IsPfToLf) {
           src_k_ptr = pf_offset(src_k_base_, layer, src_page, item_size_, src_layout_dim_);
-          dst_k_ptr = const_cast<char*>(lf_offset(dst_k_base_, dst_k_tbl_, layer, dst_page, item_size_));
+          dst_k_ptr = const_cast<char*>(lf_offset(dst_k_base_, dst_k_tbl_, layer, dst_page, dst_row_stride_));
         } else {
-          src_k_ptr = lf_offset(src_k_base_, src_k_tbl_, layer, src_page, item_size_);
+          src_k_ptr = lf_offset(src_k_base_, src_k_tbl_, layer, src_page, src_row_stride_);
           dst_k_ptr = const_cast<char*>(pf_offset(dst_k_base_, layer, dst_page, item_size_, dst_layout_dim_));
         }
 
@@ -257,9 +263,9 @@ struct TransferKVPageFirstKernel {
           char* dst_v_ptr;
           if constexpr (IsPfToLf) {
             src_v_ptr = pf_offset(src_v_base_, layer, src_page, item_size_, src_layout_dim_);
-            dst_v_ptr = const_cast<char*>(lf_offset(dst_v_base_, dst_v_tbl_, layer, dst_page, item_size_));
+            dst_v_ptr = const_cast<char*>(lf_offset(dst_v_base_, dst_v_tbl_, layer, dst_page, dst_row_stride_));
           } else {
-            src_v_ptr = lf_offset(src_v_base_, src_v_tbl_, layer, src_page, item_size_);
+            src_v_ptr = lf_offset(src_v_base_, src_v_tbl_, layer, src_page, src_row_stride_);
             dst_v_ptr = const_cast<char*>(pf_offset(dst_v_base_, layer, dst_page, item_size_, dst_layout_dim_));
           }
           const auto* sv64 = reinterpret_cast<const uint64_t*>(src_v_ptr);
@@ -297,6 +303,9 @@ struct TransferKVPageFirstKernel {
   int64_t item_size_;
   int64_t src_layout_dim_;
   int64_t dst_layout_dim_;
+  // Row strides of the lf side (the pf side steps by layout_dim); >= item_size_.
+  int64_t src_row_stride_;
+  int64_t dst_row_stride_;
 };
 
 // Page-head transfer kernel: loops over heads because each head's data is
@@ -329,11 +338,11 @@ struct TransferKVPageHeadKernel {
           if constexpr (IsLfToPh) {
             // src: lf_tbl per-head  dst: ph
             sk = get_offset_per_head_lf_tbl(
-                nullptr, src_k_tbl_, layer, 0, src_page, item_size_, head, head_num_, page_size_);
+                nullptr, src_k_tbl_, layer, 0, src_page, item_size_, head, head_num_, page_size_, lf_row_stride_);
             dk = get_offset_ph_mut(
                 dst_k_base_, nullptr, layer, dst_layout_dim_, dst_page, item_size_, head, head_num_, page_size_);
             sv = get_offset_per_head_lf_tbl(
-                nullptr, src_v_tbl_, layer, 0, src_page, item_size_, head, head_num_, page_size_);
+                nullptr, src_v_tbl_, layer, 0, src_page, item_size_, head, head_num_, page_size_, lf_row_stride_);
             dv = get_offset_ph_mut(
                 dst_v_base_, nullptr, layer, dst_layout_dim_, dst_page, item_size_, head, head_num_, page_size_);
           } else {
@@ -341,11 +350,11 @@ struct TransferKVPageHeadKernel {
             sk = get_offset_ph(
                 src_k_base_, nullptr, layer, src_layout_dim_, src_page, item_size_, head, head_num_, page_size_);
             dk = get_offset_per_head_lf_mut(
-                dst_k_base_, nullptr, layer, 0, dst_page, item_size_, head, head_num_, page_size_);
+                dst_k_base_, nullptr, layer, 0, dst_page, item_size_, head, head_num_, page_size_, lf_row_stride_);
             sv = get_offset_ph(
                 src_v_base_, nullptr, layer, src_layout_dim_, src_page, item_size_, head, head_num_, page_size_);
             dv = get_offset_per_head_lf_mut(
-                dst_v_base_, nullptr, layer, 0, dst_page, item_size_, head, head_num_, page_size_);
+                dst_v_base_, nullptr, layer, 0, dst_page, item_size_, head, head_num_, page_size_, lf_row_stride_);
           }
 
           const int64_t chunks = head_dim_bytes / static_cast<int64_t>(sizeof(uint64_t));
@@ -381,6 +390,8 @@ struct TransferKVPageHeadKernel {
   int64_t dst_layout_dim_;
   int64_t page_size_;
   int64_t head_num_;
+  // Row stride of the lf side (src for lf→ph, dst for ph→lf); >= item_size_.
+  int64_t lf_row_stride_;
 };
 
 // ---------------------------------------------------------------------------
@@ -389,6 +400,21 @@ struct TransferKVPageHeadKernel {
 
 static int64_t div_up(int64_t x, int64_t y) {
   return (x + y - 1) / y;
+}
+
+// 0 selects packed rows (stride == item_size); a strided pool must keep 8-byte aligned rows.
+static int64_t resolve_row_stride(int64_t row_stride, int64_t item_size, const char* name) {
+  if (row_stride == 0) return item_size;
+  TORCH_CHECK(row_stride >= item_size, name, " must be 0 or >= item_size");
+  TORCH_CHECK(row_stride % 8 == 0, name, " must be divisible by 8");
+  return row_stride;
+}
+
+// The pf/ph side of a transfer is addressed by layout_dim, not a row stride, so
+// a non-zero stride there would be silently ignored; reject it instead.
+static void check_no_row_stride(int64_t row_stride, const char* name) {
+  TORCH_CHECK(
+      row_stride == 0, name, " must be 0: only the lf side takes a row stride (the pf/ph side uses layout_dim)");
 }
 
 // Validate a per-layer pointer table: it must hold exactly num_layers entries
@@ -418,8 +444,12 @@ static void launch_transfer_kv(
     int64_t num_layers,
     int64_t item_size,
     int64_t block_quota,
-    int64_t sgs_per_wg) {
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
+  src_row_stride = resolve_row_stride(src_row_stride, item_size, "src_row_stride");
+  dst_row_stride = resolve_row_stride(dst_row_stride, item_size, "dst_row_stride");
   TORCH_CHECK(sgs_per_wg > 0, "sgs_per_wg must be positive");
   TORCH_CHECK(src_indices.scalar_type() == at::kLong, "src_indices must be int64");
   TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "dst_indices must be int64");
@@ -456,6 +486,8 @@ static void launch_transfer_kv(
       .num_items_ = num_items,
       .items_per_sg_ = items_per_sg,
       .item_size_ = item_size,
+      .src_row_stride_ = src_row_stride,
+      .dst_row_stride_ = dst_row_stride,
   };
 
   auto cgf = DPCPP_Q_CGF(cgh) {
@@ -488,8 +520,17 @@ static void launch_transfer_kv_page_first(
     int64_t src_layout_dim,
     int64_t dst_layout_dim,
     int64_t block_quota,
-    int64_t sgs_per_wg) {
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
+  if constexpr (IsPfToLf) {
+    check_no_row_stride(src_row_stride, "src_row_stride");
+  } else {
+    check_no_row_stride(dst_row_stride, "dst_row_stride");
+  }
+  src_row_stride = resolve_row_stride(src_row_stride, item_size, "src_row_stride");
+  dst_row_stride = resolve_row_stride(dst_row_stride, item_size, "dst_row_stride");
   TORCH_CHECK(sgs_per_wg > 0, "sgs_per_wg must be positive");
   TORCH_CHECK(src_indices.scalar_type() == at::kLong, "src_indices must be int64");
   TORCH_CHECK(dst_indices.scalar_type() == at::kLong, "dst_indices must be int64");
@@ -522,6 +563,8 @@ static void launch_transfer_kv_page_first(
       .item_size_ = item_size,
       .src_layout_dim_ = src_layout_dim,
       .dst_layout_dim_ = dst_layout_dim,
+      .src_row_stride_ = src_row_stride,
+      .dst_row_stride_ = dst_row_stride,
   };
 
   auto cgf = DPCPP_Q_CGF(cgh) {
@@ -553,8 +596,18 @@ static void launch_transfer_kv_page_head(
     int64_t head_num,
     int64_t block_quota,
     int64_t sgs_per_wg,
-    int64_t start_layer = 0) {
+    int64_t start_layer,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   TORCH_CHECK(item_size % 8 == 0, "item_size must be divisible by 8");
+  int64_t lf_row_stride;
+  if constexpr (IsLfToPh) {
+    check_no_row_stride(dst_row_stride, "dst_row_stride");
+    lf_row_stride = resolve_row_stride(src_row_stride, item_size, "src_row_stride");
+  } else {
+    check_no_row_stride(src_row_stride, "src_row_stride");
+    lf_row_stride = resolve_row_stride(dst_row_stride, item_size, "dst_row_stride");
+  }
   TORCH_CHECK(head_num > 0, "head_num must be positive");
   TORCH_CHECK(item_size % head_num == 0, "item_size must be divisible by head_num");
   TORCH_CHECK(sgs_per_wg > 0, "sgs_per_wg must be positive");
@@ -591,6 +644,7 @@ static void launch_transfer_kv_page_head(
       .dst_layout_dim_ = dst_layout_dim,
       .page_size_ = page_size,
       .head_num_ = head_num,
+      .lf_row_stride_ = lf_row_stride,
   };
 
   auto cgf = DPCPP_Q_CGF(cgh) {
@@ -616,7 +670,9 @@ SGL_KERNEL_EXPORT void transfer_kv_per_layer(
     const at::Tensor& dst_indices,
     int64_t item_size,
     int64_t block_quota,
-    int64_t sgs_per_wg) {
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   launch_transfer_kv<false>(
       src_k.data_ptr(),
       dst_k.data_ptr(),
@@ -632,7 +688,9 @@ SGL_KERNEL_EXPORT void transfer_kv_per_layer(
       1,
       item_size,
       block_quota,
-      sgs_per_wg);
+      sgs_per_wg,
+      src_row_stride,
+      dst_row_stride);
 }
 
 // Single-layer, lf→lf, K only (MLA).
@@ -643,7 +701,9 @@ SGL_KERNEL_EXPORT void transfer_kv_per_layer_mla(
     const at::Tensor& dst_indices,
     int64_t item_size,
     int64_t block_quota,
-    int64_t sgs_per_wg) {
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   launch_transfer_kv<true>(
       src.data_ptr(),
       dst.data_ptr(),
@@ -659,7 +719,9 @@ SGL_KERNEL_EXPORT void transfer_kv_per_layer_mla(
       1,
       item_size,
       block_quota,
-      sgs_per_wg);
+      sgs_per_wg,
+      src_row_stride,
+      dst_row_stride);
 }
 
 // All-layers, lf_tbl→lf_tbl, K+V.
@@ -673,7 +735,9 @@ SGL_KERNEL_EXPORT void transfer_kv_all_layer(
     int64_t item_size,
     int64_t num_layers,
     int64_t block_quota,
-    int64_t sgs_per_wg) {
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   check_layer_ptr_table(src_k_layers, num_layers, "src_k_layers");
   check_layer_ptr_table(dst_k_layers, num_layers, "dst_k_layers");
   check_layer_ptr_table(src_v_layers, num_layers, "src_v_layers");
@@ -693,7 +757,9 @@ SGL_KERNEL_EXPORT void transfer_kv_all_layer(
       num_layers,
       item_size,
       block_quota,
-      sgs_per_wg);
+      sgs_per_wg,
+      src_row_stride,
+      dst_row_stride);
 }
 
 // All-layers, lf_tbl→lf_tbl, K only (MLA).
@@ -705,7 +771,9 @@ SGL_KERNEL_EXPORT void transfer_kv_all_layer_mla(
     int64_t item_size,
     int64_t num_layers,
     int64_t block_quota,
-    int64_t sgs_per_wg) {
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   check_layer_ptr_table(src_layers, num_layers, "src_layers");
   check_layer_ptr_table(dst_layers, num_layers, "dst_layers");
   launch_transfer_kv<true>(
@@ -723,7 +791,9 @@ SGL_KERNEL_EXPORT void transfer_kv_all_layer_mla(
       num_layers,
       item_size,
       block_quota,
-      sgs_per_wg);
+      sgs_per_wg,
+      src_row_stride,
+      dst_row_stride);
 }
 
 // All-layers, lf_tbl→ph (page-head destination).
@@ -740,7 +810,9 @@ SGL_KERNEL_EXPORT void transfer_kv_all_layer_lf_ph(
     int64_t page_size,
     int64_t head_num,
     int64_t block_quota,
-    int64_t sgs_per_wg) {
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   check_layer_ptr_table(src_k_layers, num_layers, "src_k_layers");
   check_layer_ptr_table(src_v_layers, num_layers, "src_v_layers");
   launch_transfer_kv_page_head<true>(
@@ -761,7 +833,10 @@ SGL_KERNEL_EXPORT void transfer_kv_all_layer_lf_ph(
       page_size,
       head_num,
       block_quota,
-      sgs_per_wg);
+      sgs_per_wg,
+      0,
+      src_row_stride,
+      dst_row_stride);
 }
 
 // Single-layer, ph→lf.
@@ -780,7 +855,9 @@ SGL_KERNEL_EXPORT void transfer_kv_per_layer_ph_lf(
     int64_t page_size,
     int64_t head_num,
     int64_t block_quota,
-    int64_t sgs_per_wg) {
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   // We launch with start_layer=layer_id, num_layers=1 so the ph offset
   // function reads the correct layer slot from the source.
   launch_transfer_kv_page_head<false>(
@@ -802,7 +879,9 @@ SGL_KERNEL_EXPORT void transfer_kv_per_layer_ph_lf(
       head_num,
       block_quota,
       sgs_per_wg,
-      layer_id);
+      layer_id,
+      src_row_stride,
+      dst_row_stride);
 }
 
 // Single-layer, pf→lf, K+V.
@@ -819,7 +898,9 @@ SGL_KERNEL_EXPORT void transfer_kv_per_layer_pf_lf(
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
-    int64_t sgs_per_wg) {
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   launch_transfer_kv_page_first<false, true>(
       src_k.data_ptr(),
       dst_k.data_ptr(),
@@ -837,7 +918,9 @@ SGL_KERNEL_EXPORT void transfer_kv_per_layer_pf_lf(
       src_layout_dim,
       0,
       block_quota,
-      sgs_per_wg);
+      sgs_per_wg,
+      src_row_stride,
+      dst_row_stride);
 }
 
 // All-layers, lf_tbl→pf, K+V.
@@ -852,7 +935,9 @@ SGL_KERNEL_EXPORT void transfer_kv_all_layer_lf_pf(
     int64_t dst_layout_dim,
     int64_t num_layers,
     int64_t block_quota,
-    int64_t sgs_per_wg) {
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   check_layer_ptr_table(src_k_layers, num_layers, "src_k_layers");
   check_layer_ptr_table(src_v_layers, num_layers, "src_v_layers");
   launch_transfer_kv_page_first<false, false>(
@@ -872,7 +957,9 @@ SGL_KERNEL_EXPORT void transfer_kv_all_layer_lf_pf(
       0,
       dst_layout_dim,
       block_quota,
-      sgs_per_wg);
+      sgs_per_wg,
+      src_row_stride,
+      dst_row_stride);
 }
 
 // Single-layer, pf→lf, K only (MLA).
@@ -885,7 +972,9 @@ SGL_KERNEL_EXPORT void transfer_kv_per_layer_mla_pf_lf(
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
-    int64_t sgs_per_wg) {
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   launch_transfer_kv_page_first<true, true>(
       src.data_ptr(),
       dst.data_ptr(),
@@ -903,7 +992,9 @@ SGL_KERNEL_EXPORT void transfer_kv_per_layer_mla_pf_lf(
       src_layout_dim,
       0,
       block_quota,
-      sgs_per_wg);
+      sgs_per_wg,
+      src_row_stride,
+      dst_row_stride);
 }
 
 // All-layers, lf_tbl→pf, K only (MLA).
@@ -916,7 +1007,9 @@ SGL_KERNEL_EXPORT void transfer_kv_all_layer_mla_lf_pf(
     int64_t dst_layout_dim,
     int64_t num_layers,
     int64_t block_quota,
-    int64_t sgs_per_wg) {
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride) {
   check_layer_ptr_table(src_layers, num_layers, "src_layers");
   launch_transfer_kv_page_first<true, false>(
       nullptr,
@@ -935,7 +1028,9 @@ SGL_KERNEL_EXPORT void transfer_kv_all_layer_mla_lf_pf(
       0,
       dst_layout_dim,
       block_quota,
-      sgs_per_wg);
+      sgs_per_wg,
+      src_row_stride,
+      dst_row_stride);
 }
 
 // ===========================================================================

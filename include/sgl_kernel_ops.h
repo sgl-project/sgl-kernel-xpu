@@ -312,7 +312,9 @@ void transfer_kv_per_layer(
     const at::Tensor& dst_indices,
     int64_t item_size,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_per_layer_mla(
     const at::Tensor& src,
     at::Tensor& dst,
@@ -320,7 +322,9 @@ void transfer_kv_per_layer_mla(
     const at::Tensor& dst_indices,
     int64_t item_size,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_all_layer(
     const at::Tensor& src_k_layers,
     const at::Tensor& dst_k_layers,
@@ -331,7 +335,9 @@ void transfer_kv_all_layer(
     int64_t item_size,
     int64_t num_layers,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_all_layer_mla(
     const at::Tensor& src_layers,
     const at::Tensor& dst_layers,
@@ -340,7 +346,9 @@ void transfer_kv_all_layer_mla(
     int64_t item_size,
     int64_t num_layers,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_all_layer_lf_ph(
     const at::Tensor& src_k_layers,
     at::Tensor& dst_k,
@@ -354,7 +362,9 @@ void transfer_kv_all_layer_lf_ph(
     int64_t page_size,
     int64_t head_num,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_per_layer_ph_lf(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
@@ -368,7 +378,9 @@ void transfer_kv_per_layer_ph_lf(
     int64_t page_size,
     int64_t head_num,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_per_layer_pf_lf(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
@@ -380,7 +392,9 @@ void transfer_kv_per_layer_pf_lf(
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_all_layer_lf_pf(
     const at::Tensor& src_k_layers,
     at::Tensor& dst_k,
@@ -392,7 +406,9 @@ void transfer_kv_all_layer_lf_pf(
     int64_t dst_layout_dim,
     int64_t num_layers,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_per_layer_mla_pf_lf(
     const at::Tensor& src,
     at::Tensor& dst,
@@ -402,7 +418,9 @@ void transfer_kv_per_layer_mla_pf_lf(
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_all_layer_mla_lf_pf(
     const at::Tensor& src_layers,
     at::Tensor& dst,
@@ -412,7 +430,9 @@ void transfer_kv_all_layer_mla_lf_pf(
     int64_t dst_layout_dim,
     int64_t num_layers,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_mamba_pf_lf(
     const at::Tensor& src,
     at::Tensor& dst,

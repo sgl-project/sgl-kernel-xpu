@@ -660,66 +660,55 @@ SGL_KERNEL_EXPORT void causal_conv1d_fwd(
     int64_t pad_slot_id) {
   auto input_type = x.scalar_type();
   auto weight_type = weight.scalar_type();
-  TORCH_CHECK(
-      input_type == at::ScalarType::Float || input_type == at::ScalarType::Half ||
-      input_type == at::ScalarType::BFloat16);
-  TORCH_CHECK(
-      weight_type == at::ScalarType::Float || weight_type == at::ScalarType::Half ||
-      weight_type == at::ScalarType::BFloat16);
+  CHECK_DTYPES(x, at::kFloat, at::kHalf, at::kBFloat16);
   TORCH_CHECK(
       weight_type == input_type,
       "weight type must equal to input type, other variations are disabled due to binary size limitations");
 
-  TORCH_CHECK(x.is_xpu(), "x must be an XPU tensor");
-  TORCH_CHECK(weight.is_xpu(), "weight must be an XPU tensor");
+  CHECK_DEVICE(x);
+  CHECK_DEVICE(weight);
 
   const bool varlen = query_start_loc.has_value();
+  CHECK_DIM(varlen ? 2 : 3, x);
   const auto sizes = x.sizes();
   const int batch_size = varlen ? query_start_loc.value().size(0) - 1 : sizes[0];
   const int dim = varlen ? sizes[0] : sizes[1];
   const int seqlen = varlen ? sizes[1] : sizes[2];
   const int width = weight.size(-1);
-  if (varlen) {
-    CHECK_SHAPE(x, dim, seqlen);
-  } else {
-    CHECK_SHAPE(x, batch_size, dim, seqlen);
-  }
   CHECK_SHAPE(weight, dim, width);
 
   TORCH_CHECK(width >= 2 && width <= 4, "causal_conv1d_fwd: width must be 2, 3, or 4");
 
   if (bias_.has_value()) {
     const auto& bias = bias_.value();
-    TORCH_CHECK(bias.scalar_type() == weight_type, "bias dtype must match weight dtype");
-    TORCH_CHECK(bias.is_xpu(), "bias must be an XPU tensor");
-    TORCH_CHECK(bias.stride(-1) == 1, "bias must be contiguous on last dim");
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(1, weight_type, bias);
     CHECK_SHAPE(bias, dim);
   }
 
   if (has_initial_state.has_value()) {
     const auto& has_initial_state_ = has_initial_state.value();
-    TORCH_CHECK(has_initial_state_.scalar_type() == at::ScalarType::Bool, "has_initial_state must be bool");
-    TORCH_CHECK(has_initial_state_.is_xpu(), "has_initial_state must be an XPU tensor");
+    CHECK_DTYPE(at::kBool, has_initial_state_);
+    CHECK_DEVICE(has_initial_state_);
     CHECK_SHAPE(has_initial_state_, batch_size);
   }
 
   if (query_start_loc.has_value()) {
     const auto& query_start_loc_ = query_start_loc.value();
-    TORCH_CHECK(query_start_loc_.scalar_type() == at::ScalarType::Int, "query_start_loc must be int32");
-    TORCH_CHECK(query_start_loc_.is_xpu(), "query_start_loc must be an XPU tensor");
+    CHECK_DTYPE(at::kInt, query_start_loc_);
+    CHECK_DEVICE(query_start_loc_);
   }
 
   if (cache_indices.has_value()) {
     const auto& cache_indices_ = cache_indices.value();
-    TORCH_CHECK(cache_indices_.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
-    TORCH_CHECK(cache_indices_.is_xpu(), "cache_indices must be an XPU tensor");
+    CHECK_DTYPE(at::kInt, cache_indices_);
+    CHECK_DEVICE(cache_indices_);
     CHECK_SHAPE(cache_indices_, batch_size);
   }
 
   if (conv_states.has_value()) {
     const auto& conv_states_ = conv_states.value();
-    TORCH_CHECK(conv_states_.scalar_type() == input_type, "conv_states dtype must match x dtype");
-    TORCH_CHECK(conv_states_.is_xpu(), "conv_states must be an XPU tensor");
+    CHECK_DTYPE(input_type, conv_states_);
+    CHECK_DEVICE(conv_states_);
   }
 
   // Predict `block_t`/`time_blocks` before allocating anything, so we can
@@ -812,22 +801,18 @@ SGL_KERNEL_EXPORT void causal_conv1d_update(
     const std::optional<at::Tensor>& cache_seqlens_,
     const std::optional<at::Tensor>& conv_state_indices_,
     int64_t pad_slot_id) {
+  CHECK_DIM(3, x);
   auto input_type = x.scalar_type();
   auto weight_type = weight.scalar_type();
-  TORCH_CHECK(
-      input_type == at::ScalarType::Float || input_type == at::ScalarType::Half ||
-      input_type == at::ScalarType::BFloat16);
-  TORCH_CHECK(
-      weight_type == at::ScalarType::Float || weight_type == at::ScalarType::Half ||
-      weight_type == at::ScalarType::BFloat16);
+  CHECK_DTYPES(x, at::kFloat, at::kHalf, at::kBFloat16);
   TORCH_CHECK(
       weight_type == input_type,
       "weight type must equal to input type, other variations are disabled due to binary size limitations");
   TORCH_CHECK(conv_state.scalar_type() == input_type);
 
-  TORCH_CHECK(x.is_xpu(), "x must be an XPU tensor");
-  TORCH_CHECK(conv_state.is_xpu(), "conv_state must be an XPU tensor");
-  TORCH_CHECK(weight.is_xpu(), "weight must be an XPU tensor");
+  CHECK_DEVICE(x);
+  CHECK_DEVICE(conv_state);
+  CHECK_DEVICE(weight);
 
   const int batch_size = x.size(0);
   const int dim = x.size(1);
@@ -835,32 +820,25 @@ SGL_KERNEL_EXPORT void causal_conv1d_update(
   const int width = weight.size(-1);
   const int conv_state_len = conv_state.size(2);
 
-  CHECK_SHAPE(x, batch_size, dim, seqlen);
   CHECK_SHAPE(weight, dim, width);
   TORCH_CHECK(conv_state_len >= width - 1, "conv_state_len must be >= width - 1");
   TORCH_CHECK(width >= 2 && width <= 4, "causal_conv1d only supports width between 2 and 4");
 
   if (bias_.has_value()) {
     const auto& bias = bias_.value();
-    TORCH_CHECK(bias.scalar_type() == weight_type, "bias dtype must match weight dtype");
-    TORCH_CHECK(bias.is_xpu(), "bias must be an XPU tensor");
-    TORCH_CHECK(bias.stride(-1) == 1, "bias must be contiguous on last dim");
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(1, weight_type, bias);
     CHECK_SHAPE(bias, dim);
   }
 
   if (cache_seqlens_.has_value()) {
     const auto& cache_seqlens = cache_seqlens_.value();
-    TORCH_CHECK(cache_seqlens.scalar_type() == at::ScalarType::Int, "cache_seqlens must be int32");
-    TORCH_CHECK(cache_seqlens.is_xpu(), "cache_seqlens must be an XPU tensor");
-    TORCH_CHECK(cache_seqlens.stride(-1) == 1, "cache_seqlens must be contiguous");
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(1, at::kInt, cache_seqlens);
     CHECK_SHAPE(cache_seqlens, batch_size);
   }
 
   if (conv_state_indices_.has_value()) {
     const auto& conv_state_indices = conv_state_indices_.value();
-    TORCH_CHECK(conv_state_indices.scalar_type() == at::ScalarType::Int, "conv_state_indices must be int32");
-    TORCH_CHECK(conv_state_indices.is_xpu(), "conv_state_indices must be an XPU tensor");
-    TORCH_CHECK(conv_state_indices.stride(0) == 1, "conv_state_indices must be contiguous");
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(1, at::kInt, conv_state_indices);
     CHECK_SHAPE(conv_state_indices, batch_size);
     const int conv_state_entries = conv_state.size(0);
     CHECK_SHAPE(conv_state, conv_state_entries, dim, conv_state_len);
@@ -1061,13 +1039,13 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
     int64_t pad_slot_id) {
   auto input_type = x.scalar_type();
   auto weight_type = weight.scalar_type();
-  TORCH_CHECK(
-      input_type == at::ScalarType::Float || input_type == at::ScalarType::Half ||
-      input_type == at::ScalarType::BFloat16);
+  CHECK_DTYPES(x, at::kFloat, at::kHalf, at::kBFloat16);
   TORCH_CHECK(weight_type == input_type, "weight type must equal to input type");
-  TORCH_CHECK(conv_state.scalar_type() == input_type);
-  TORCH_CHECK(x.is_xpu() && conv_state.is_xpu() && weight.is_xpu(), "all inputs must be XPU tensors");
-  TORCH_CHECK(x.dim() == 3, "x must be (batch, dim, cache_steps)");
+  CHECK_DTYPE(input_type, conv_state);
+  CHECK_DEVICE(x);
+  CHECK_DEVICE(conv_state);
+  CHECK_DEVICE(weight);
+  CHECK_DIM(3, x);
 
   const int batch_size = x.size(0);
   const int dim = x.size(1);
@@ -1087,11 +1065,8 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
     TORCH_CHECK(bias_.value().scalar_type() == weight_type, "bias dtype must match weight dtype");
     CHECK_SHAPE(bias_.value(), dim);
   }
+  CHECK_INPUT(1, at::kInt, intermediate_state_indices);
   CHECK_SHAPE(intermediate_state_indices, batch_size);
-  TORCH_CHECK(
-      intermediate_state_indices.is_xpu() && intermediate_state_indices.scalar_type() == at::kInt &&
-          intermediate_state_indices.is_contiguous(),
-      "intermediate_state_indices must be contiguous XPU int32");
   const bool has_tree = retrieve_next_token.has_value();
   TORCH_CHECK(
       retrieve_next_sibling.has_value() == has_tree && retrieve_parent_token.has_value() == has_tree,
@@ -1100,24 +1075,17 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
     const auto& next_token = *retrieve_next_token;
     const auto& next_sibling = *retrieve_next_sibling;
     const auto& parent_token = *retrieve_parent_token;
-    CHECK_SHAPE(next_token, batch_size, cache_steps);
-    CHECK_SHAPE(next_sibling, batch_size, cache_steps);
-    CHECK_SHAPE(parent_token, batch_size, cache_steps);
     const auto index_type = retrieve_next_token->scalar_type();
     TORCH_CHECK(index_type == at::kInt || index_type == at::kLong, "retrieve_next_token must be int32 or int64");
     TORCH_CHECK(
-        retrieve_next_sibling->scalar_type() == index_type && retrieve_parent_token->scalar_type() == index_type,
+        next_sibling.scalar_type() == index_type && parent_token.scalar_type() == index_type,
         "retrieve_next_sibling and retrieve_parent_token must match retrieve_next_token dtype");
-    TORCH_CHECK(
-        retrieve_next_token->is_xpu() && retrieve_next_sibling->is_xpu() && retrieve_parent_token->is_xpu(),
-        "tree indices must be XPU tensors");
-    TORCH_CHECK(
-        retrieve_next_token->is_contiguous() && retrieve_next_sibling->is_contiguous() &&
-            retrieve_parent_token->is_contiguous(),
-        "tree indices must be contiguous");
-    TORCH_CHECK(
-        intermediate_conv_window.is_xpu() && intermediate_conv_window.scalar_type() == input_type,
-        "intermediate_conv_window must be an XPU tensor matching x dtype");
+    CHECK_INPUT(2, next_token);
+    CHECK_INPUT(2, next_sibling);
+    CHECK_INPUT(2, parent_token);
+    CHECK_SHAPE(next_token, batch_size, cache_steps);
+    CHECK_SHAPE(next_sibling, batch_size, cache_steps);
+    CHECK_SHAPE(parent_token, batch_size, cache_steps);
   }
   TORCH_CHECK(
       intermediate_conv_window.dim() == 4, "intermediate_conv_window must be (rows, cache_steps, dim, width-1)");
@@ -1128,10 +1096,8 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
   TORCH_CHECK(intermediate_conv_window.size(2) == dim);
   TORCH_CHECK(intermediate_conv_window.size(3) == width - 1);
   if (cache_indices_.has_value()) {
+    CHECK_INPUT(1, at::kInt, cache_indices_.value());
     CHECK_SHAPE(cache_indices_.value(), batch_size);
-    TORCH_CHECK(
-        cache_indices_->is_xpu() && cache_indices_->scalar_type() == at::kInt, "cache_indices must be XPU int32");
-    TORCH_CHECK(cache_indices_->is_contiguous(), "cache_indices must be contiguous");
   }
 
   at::Tensor out = at::empty_like(x);

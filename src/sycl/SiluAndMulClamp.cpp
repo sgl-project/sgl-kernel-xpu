@@ -139,9 +139,9 @@ static void silu_and_mul_clamp_sycl(sycl::queue& q, at::Tensor& input, at::Tenso
 }
 
 SGL_KERNEL_EXPORT void silu_and_mul_clamp(torch::Tensor& output, torch::Tensor& input, double swiglu_limit) {
-  CHECK_INPUT(input)
-  CHECK_INPUT(output)
-  TORCH_CHECK(output.dtype() == input.dtype(), "silu_and_mul_clamp: dtype mismatch");
+  CHECK_INPUT(input);
+  CHECK_INPUT(output);
+  CHECK_DTYPE(input.scalar_type(), output);
   TORCH_CHECK(input.size(-1) % 2 == 0, "silu_and_mul_clamp: input last dim must be even");
   TORCH_CHECK(output.numel() * 2 == input.numel(), "silu_and_mul_clamp: output numel must be half of input numel");
   TORCH_CHECK(swiglu_limit > 0.0, "silu_and_mul_clamp: swiglu_limit must be > 0");

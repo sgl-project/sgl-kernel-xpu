@@ -94,40 +94,29 @@ void check_common_inputs(
     int64_t v_off,
     int64_t dq,
     int64_t dkv) {
-  TORCH_CHECK(qkvr.is_xpu(), "qkvr must be an XPU tensor");
-  TORCH_CHECK(k_cache.is_xpu(), "k_cache must be an XPU tensor");
-  TORCH_CHECK(v_cache.is_xpu(), "v_cache must be an XPU tensor");
-  TORCH_CHECK(k_weight.is_xpu(), "k_weight must be an XPU tensor");
-  TORCH_CHECK(v_weight.is_xpu(), "v_weight must be an XPU tensor");
-  TORCH_CHECK(q_gamma.is_xpu(), "q_gamma must be an XPU tensor");
-  TORCH_CHECK(k_gamma.is_xpu(), "k_gamma must be an XPU tensor");
-  TORCH_CHECK(loc.is_xpu(), "loc must be an XPU tensor");
-  TORCH_CHECK(k_buf.is_xpu(), "k_buf must be an XPU tensor");
-  TORCH_CHECK(v_buf.is_xpu(), "v_buf must be an XPU tensor");
-  TORCH_CHECK(qkvr.dim() == 2, "qkvr must be a 2D row-major tensor/view");
-  TORCH_CHECK(qkvr.stride(1) == 1, "qkvr must be contiguous on the last dimension");
-  TORCH_CHECK(k_cache.dim() == 3, "k_cache must have shape [slots, W-1, Dkv]");
-  TORCH_CHECK(v_cache.dim() == 3, "v_cache must have shape [slots, W-1, Dkv]");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, qkvr);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(3, qkvr.scalar_type(), k_cache);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(3, qkvr.scalar_type(), v_cache);
+  CHECK_DEVICE(k_weight);
+  CHECK_DEVICE(v_weight);
+  CHECK_DEVICE(q_gamma);
+  CHECK_DEVICE(k_gamma);
+  CHECK_DEVICE(loc);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, qkvr.scalar_type(), k_buf);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, qkvr.scalar_type(), v_buf);
   TORCH_CHECK(k_cache.size(1) == v_cache.size(1), "k/v cache windows must match");
   TORCH_CHECK(k_cache.size(2) == dkv && v_cache.size(2) == dkv, "cache D must match dkv");
-  TORCH_CHECK(k_cache.stride(2) == 1 && v_cache.stride(2) == 1, "conv caches must be contiguous on D");
   TORCH_CHECK(dq > 0 && dkv > 0, "dq and dkv must be positive");
   TORCH_CHECK(dq % kHeadDim == 0 && dkv % kHeadDim == 0, "dq and dkv must be multiples of 128");
   TORCH_CHECK(q_off >= 0 && k_off >= 0 && v_off >= 0, "slice offsets must be non-negative");
   TORCH_CHECK(q_gamma.numel() >= kHeadDim, "q_gamma must have at least 128 elements");
   TORCH_CHECK(k_gamma.numel() >= kHeadDim, "k_gamma must have at least 128 elements");
-  TORCH_CHECK(k_buf.dim() == 2 && v_buf.dim() == 2, "k_buf/v_buf must be flattened [slots, dkv] views");
   TORCH_CHECK(k_buf.size(1) == dkv && v_buf.size(1) == dkv, "k_buf/v_buf second dimension must equal dkv");
-  TORCH_CHECK(k_buf.stride(1) == 1 && v_buf.stride(1) == 1, "k_buf/v_buf must be contiguous on D");
-  TORCH_CHECK(k_cache.scalar_type() == qkvr.scalar_type(), "k_cache dtype must match qkvr dtype");
-  TORCH_CHECK(v_cache.scalar_type() == qkvr.scalar_type(), "v_cache dtype must match qkvr dtype");
-  TORCH_CHECK(k_weight.scalar_type() == qkvr.scalar_type(), "k_weight dtype must match qkvr dtype");
-  TORCH_CHECK(v_weight.scalar_type() == qkvr.scalar_type(), "v_weight dtype must match qkvr dtype");
-  TORCH_CHECK(q_gamma.scalar_type() == qkvr.scalar_type(), "q_gamma dtype must match qkvr dtype");
-  TORCH_CHECK(k_gamma.scalar_type() == qkvr.scalar_type(), "k_gamma dtype must match qkvr dtype");
-  TORCH_CHECK(k_buf.scalar_type() == qkvr.scalar_type(), "k_buf dtype must match qkvr dtype");
-  TORCH_CHECK(v_buf.scalar_type() == qkvr.scalar_type(), "v_buf dtype must match qkvr dtype");
-  TORCH_CHECK(loc.scalar_type() == at::ScalarType::Long, "loc must be int64");
+  CHECK_DTYPE(qkvr.scalar_type(), k_weight);
+  CHECK_DTYPE(qkvr.scalar_type(), v_weight);
+  CHECK_DTYPE(qkvr.scalar_type(), q_gamma);
+  CHECK_DTYPE(qkvr.scalar_type(), k_gamma);
+  CHECK_DTYPE(at::kLong, loc);
 }
 
 template <typename scalar_t>
@@ -734,14 +723,14 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
     bool do_store) {
   check_common_inputs(
       qkvr, k_cache, v_cache, k_weight, v_weight, q_gamma, k_gamma, loc, k_buf, v_buf, q_off, k_off, v_off, dq, dkv);
-  TORCH_CHECK(cache_indices.is_xpu(), "cache_indices must be an XPU tensor");
-  TORCH_CHECK(cache_mask.is_xpu(), "cache_mask must be an XPU tensor");
-  TORCH_CHECK(k_inter.is_xpu(), "k_inter must be an XPU tensor");
-  TORCH_CHECK(v_inter.is_xpu(), "v_inter must be an XPU tensor");
-  TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
-  TORCH_CHECK(cache_mask.scalar_type() == at::ScalarType::Bool, "cache_mask must be bool");
-  TORCH_CHECK(k_inter.scalar_type() == qkvr.scalar_type(), "k_inter dtype must match qkvr dtype");
-  TORCH_CHECK(v_inter.scalar_type() == qkvr.scalar_type(), "v_inter dtype must match qkvr dtype");
+  CHECK_DEVICE(cache_indices);
+  CHECK_DEVICE(cache_mask);
+  CHECK_DEVICE(k_inter);
+  CHECK_DEVICE(v_inter);
+  CHECK_DTYPE(at::kInt, cache_indices);
+  CHECK_DTYPE(at::kBool, cache_mask);
+  CHECK_DTYPE(qkvr.scalar_type(), k_inter);
+  CHECK_DTYPE(qkvr.scalar_type(), v_inter);
   TORCH_CHECK(draft_token_num > 0, "draft_token_num must be positive");
   const int64_t T = qkvr.size(0);
   const int64_t B = cache_indices.numel();
@@ -860,10 +849,10 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
     bool do_store) {
   check_common_inputs(
       qkvr, k_cache, v_cache, k_weight, v_weight, q_gamma, k_gamma, loc, k_buf, v_buf, q_off, k_off, v_off, dq, dkv);
-  TORCH_CHECK(cache_indices.is_xpu(), "cache_indices must be an XPU tensor");
-  TORCH_CHECK(cache_mask.is_xpu(), "cache_mask must be an XPU tensor");
-  TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
-  TORCH_CHECK(cache_mask.scalar_type() == at::ScalarType::Bool, "cache_mask must be bool");
+  CHECK_DEVICE(cache_indices);
+  CHECK_DEVICE(cache_mask);
+  CHECK_DTYPE(at::kInt, cache_indices);
+  CHECK_DTYPE(at::kBool, cache_mask);
   const int64_t T = qkvr.size(0);
   TORCH_CHECK(cache_indices.numel() >= T, "cache_indices must have at least T entries");
   TORCH_CHECK(cache_mask.numel() >= T, "cache_mask must have at least T entries");
@@ -871,10 +860,10 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
   const bool do_track = track_mask.has_value();
   if (do_track) {
     TORCH_CHECK(track_indices.has_value(), "track_indices is required when track_mask is provided");
-    TORCH_CHECK(track_mask.value().is_xpu(), "track_mask must be an XPU tensor");
-    TORCH_CHECK(track_indices.value().is_xpu(), "track_indices must be an XPU tensor");
-    TORCH_CHECK(track_mask.value().scalar_type() == at::ScalarType::Bool, "track_mask must be bool");
-    TORCH_CHECK(track_indices.value().scalar_type() == at::ScalarType::Long, "track_indices must be int64");
+    CHECK_DEVICE(track_mask.value());
+    CHECK_DEVICE(track_indices.value());
+    CHECK_DTYPE(at::kBool, track_mask.value());
+    CHECK_DTYPE(at::kLong, track_indices.value());
     TORCH_CHECK(track_mask.value().numel() >= T, "track_mask must have at least T entries");
     TORCH_CHECK(track_indices.value().numel() >= T, "track_indices must have at least T entries");
   }
@@ -986,16 +975,16 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
     bool do_cache_update) {
   check_common_inputs(
       qkvr, k_cache, v_cache, k_weight, v_weight, q_gamma, k_gamma, loc, k_buf, v_buf, q_off, k_off, v_off, dq, dkv);
-  TORCH_CHECK(cache_indices.is_xpu(), "cache_indices must be an XPU tensor");
-  TORCH_CHECK(cache_mask.is_xpu(), "cache_mask must be an XPU tensor");
-  TORCH_CHECK(has_initial_state.is_xpu(), "has_initial_state must be an XPU tensor");
-  TORCH_CHECK(cu.is_xpu(), "cu must be an XPU tensor");
-  TORCH_CHECK(si.is_xpu(), "si must be an XPU tensor");
-  TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
-  TORCH_CHECK(cache_mask.scalar_type() == at::ScalarType::Bool, "cache_mask must be bool");
-  TORCH_CHECK(has_initial_state.scalar_type() == at::ScalarType::Bool, "has_initial_state must be bool");
-  TORCH_CHECK(cu.scalar_type() == at::ScalarType::Long, "cu must be int64");
-  TORCH_CHECK(si.scalar_type() == at::ScalarType::Int, "si must be int32");
+  CHECK_DEVICE(cache_indices);
+  CHECK_DEVICE(cache_mask);
+  CHECK_DEVICE(has_initial_state);
+  CHECK_DEVICE(cu);
+  CHECK_DEVICE(si);
+  CHECK_DTYPE(at::kInt, cache_indices);
+  CHECK_DTYPE(at::kBool, cache_mask);
+  CHECK_DTYPE(at::kBool, has_initial_state);
+  CHECK_DTYPE(at::kLong, cu);
+  CHECK_DTYPE(at::kInt, si);
   const int64_t T = qkvr.size(0);
   const int64_t B = cache_indices.numel();
   TORCH_CHECK(cache_mask.numel() >= B, "cache_mask must have at least B entries");
@@ -1007,12 +996,12 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
   if (do_track) {
     TORCH_CHECK(
         track_rows.has_value() && track_dst.has_value(), "track_rows and track_dst are required with track_mask");
-    TORCH_CHECK(track_rows.value().is_xpu(), "track_rows must be an XPU tensor");
-    TORCH_CHECK(track_mask.value().is_xpu(), "track_mask must be an XPU tensor");
-    TORCH_CHECK(track_dst.value().is_xpu(), "track_dst must be an XPU tensor");
-    TORCH_CHECK(track_rows.value().scalar_type() == at::ScalarType::Long, "track_rows must be int64");
-    TORCH_CHECK(track_mask.value().scalar_type() == at::ScalarType::Bool, "track_mask must be bool");
-    TORCH_CHECK(track_dst.value().scalar_type() == at::ScalarType::Long, "track_dst must be int64");
+    CHECK_DEVICE(track_rows.value());
+    CHECK_DEVICE(track_mask.value());
+    CHECK_DEVICE(track_dst.value());
+    CHECK_DTYPE(at::kLong, track_rows.value());
+    CHECK_DTYPE(at::kBool, track_mask.value());
+    CHECK_DTYPE(at::kLong, track_dst.value());
     TORCH_CHECK(track_rows.value().dim() == 2, "track_rows must have shape [B, W-1]");
     TORCH_CHECK(track_rows.value().size(0) >= B, "track_rows must cover B");
     TORCH_CHECK(track_mask.value().numel() >= B, "track_mask must cover B");

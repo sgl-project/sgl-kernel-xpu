@@ -333,7 +333,7 @@ SGL_KERNEL_EXPORT void flash_compress4_decode(
 
   using input_t = float;
   using output_t = float;
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress4Decode", [&]() {
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress4Decode", [&]() {
     queue.submit([&](sycl::handler& cgh) {
       FlashCompress4Impl::FlashCompress4DecodeKernel<scalar_t, input_t, output_t> kernel{
           kv_buffer.data_ptr<scalar_t>(),
@@ -420,7 +420,7 @@ SGL_KERNEL_EXPORT void flash_compress4_prefill(
 
   using input_t = float;
   using output_t = float;
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress4Prefill", [&]() {
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress4Prefill", [&]() {
     if (num_compress > 0) {
       queue.submit([&](sycl::handler& cgh) {
         FlashCompress4Impl::FlashCompress4CompressKernel<scalar_t, input_t, output_t> kernel{

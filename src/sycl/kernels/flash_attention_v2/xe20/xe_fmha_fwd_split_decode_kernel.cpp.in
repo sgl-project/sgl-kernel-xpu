@@ -61,7 +61,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
     // keeps the always-off LSE instantiations only.
     if (params.return_softmax_lse) {
         TORCH_CHECK(!params.use_sink, "return_softmax_lse is not supported with sink masking");
-        AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        SGL_DISPATCH_BOOL(params.is_local, LocalMask, [&] {
             using Element = @ELEM_TYPE@;
             dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;
@@ -96,7 +96,7 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
         "relative attention expects a decode-sheared bias with ",
         flash_attention_v2::relative_attention::decode_padded_cols(params.rel_bias_extent, @PAGE_SIZE@),
         " columns");
-    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+    SGL_DISPATCH_BOOL(params.is_local, LocalMask, [&] {
       using Element = @ELEM_TYPE@;
       // softcap+rel_bias is host-rejected (runner TORCH_CHECK); Softcap=false only.
       constexpr bool Softcap = false;
@@ -135,35 +135,33 @@ __attribute__((visibility("default"))) void FmhaSplitDecodeRunner<@QG_SZ@, @HEAD
 #endif
 
 #if @HEAD_DIM@ == 64
-    AT_DISPATCH_BOOL_NO_RETURN(params.use_sink, Sink, {
-      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
-          using Element = @ELEM_TYPE@;
-          dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
-      constexpr bool Softcap = decltype(softcap_tag)::value;
-          SplitDecodeConfig<
-              false,
-              LocalMask,
-              Sink,
-              Softcap,
-              /*LSE=*/false,
-              TileShapeQK,
-              TileShapePV,
-              TileShapeOutput,
-              SubgroupLayoutQK,
-              void,
-              1,
-              Element,
-              Element,
-              Element,
-              Element>::run(params);
-          });
+    SGL_DISPATCH_BOOL2(params.use_sink, Sink, params.is_local, LocalMask, [&] {
+      using Element = @ELEM_TYPE@;
+      dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+        constexpr bool Softcap = decltype(softcap_tag)::value;
+        SplitDecodeConfig<
+            false,
+            LocalMask,
+            Sink,
+            Softcap,
+            /*LSE=*/false,
+            TileShapeQK,
+            TileShapePV,
+            TileShapeOutput,
+            SubgroupLayoutQK,
+            void,
+            1,
+            Element,
+            Element,
+            Element,
+            Element>::run(params);
       });
     });
 #else
     TORCH_CHECK(
         !params.use_sink,
         "sink is only supported for head_size == 64, got @HEAD_DIM@");
-    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+    SGL_DISPATCH_BOOL(params.is_local, LocalMask, [&] {
         using Element = @ELEM_TYPE@;
         dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;

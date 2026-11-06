@@ -12,23 +12,6 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
-//----------------- set element type options --------------------//
-
-template <typename T>
-struct ToSyclElementType {
-  using type = T;
-};
-
-template <>
-struct ToSyclElementType<at::Half> {
-  using type = sycl::half;
-};
-
-template <>
-struct ToSyclElementType<at::BFloat16> {
-  using type = sycl::ext::oneapi::bfloat16;
-};
-
 //----------------- radix traits for bit-pattern transformation --------------------//
 
 template <typename T>
@@ -284,7 +267,7 @@ void launch_single_cta_kernel(
     int batch_size,
     int vocab_size,
     sycl::queue& queue) {
-  using KernelDType = typename ToSyclElementType<TensorDType>::type;
+  using KernelDType = sycl_type_t<TensorDType>;
 
   const KernelDType* probs_ptr = reinterpret_cast<const KernelDType*>(probs.data_ptr<TensorDType>());
   auto* renorm_probs_ptr = reinterpret_cast<KernelDType*>(renorm_probs.data_ptr<TensorDType>());
@@ -330,8 +313,6 @@ SGL_KERNEL_EXPORT void top_k_renorm_probs(
 
   const int64_t* maybe_top_k_ptr = maybe_top_k_arr.has_value() ? maybe_top_k_arr->data_ptr<int64_t>() : nullptr;
 
-  auto dtype = probs.scalar_type();
-
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const double flops = 0.0;
   const double bytes = static_cast<double>(probs.numel()) * static_cast<double>(probs.element_size()) +
@@ -339,14 +320,8 @@ SGL_KERNEL_EXPORT void top_k_renorm_probs(
   SGL_KERNEL_PERF_SCOPE("top_k_renorm_probs", queue, bytes, flops);
 #endif
 
-  if (dtype == torch::kFloat32) {
-    launch_single_cta_kernel<float>(
+  AT_DISPATCH_FLOATING_TYPES_V2(probs.scalar_type(), "top_k_renorm_probs", [&] {
+    launch_single_cta_kernel<scalar_t>(
         probs, renorm_probs, maybe_top_k_ptr, static_cast<int>(top_k_val), batch_size, vocab_size, queue);
-  } else if (dtype == torch::kHalf) {
-    launch_single_cta_kernel<at::Half>(
-        probs, renorm_probs, maybe_top_k_ptr, static_cast<int>(top_k_val), batch_size, vocab_size, queue);
-  } else if (dtype == torch::kBFloat16) {
-    launch_single_cta_kernel<at::BFloat16>(
-        probs, renorm_probs, maybe_top_k_ptr, static_cast<int>(top_k_val), batch_size, vocab_size, queue);
-  }
+  });
 }

@@ -750,8 +750,8 @@ SGL_KERNEL_EXPORT void prepare_moe_input_small(
   TORCH_CHECK(expert_counts.scalar_type() == at::kInt, "expert_counts must be int32");
   TORCH_CHECK(output_permutation.scalar_type() == at::kInt, "output_permutation must be int32");
   TORCH_CHECK(output.scalar_type() == input.scalar_type(), "output dtype must match input");
-  TORCH_CHECK(output.size(0) == topk_ids.numel() && output.size(1) == input.size(1), "output shape mismatch");
-  TORCH_CHECK(output_permutation.numel() == topk_ids.numel(), "output_permutation shape mismatch");
+  CHECK_SHAPE(output, topk_ids.numel(), input.size(1));
+  CHECK_SHAPE(output_permutation, topk_ids.numel());
   TORCH_CHECK(
       expert_counts.numel() <= std::numeric_limits<int32_t>::max() &&
           input.size(0) <= std::numeric_limits<int32_t>::max() && input.size(1) <= std::numeric_limits<int32_t>::max(),

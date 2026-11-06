@@ -4,6 +4,7 @@
 #include <ATen/xpu/XPUContext.h>
 
 #include <algorithm>
+#include <iterator>
 #include <stdexcept>
 #include <type_traits>
 
@@ -16,16 +17,53 @@
   TORCH_CHECK(x.sizes() == c10::ArrayRef<int64_t>({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_LAST_DIM_CONTIGUOUS(x) \
-  TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
-#define CHECK_INPUT(x) \
-  CHECK_DEVICE(x);     \
-  CHECK_CONTIGUOUS(x);
-#define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
-  CHECK_DEVICE(x);                         \
-  CHECK_LAST_DIM_CONTIGUOUS(x)
+  TORCH_CHECK((x).dim() > 0 && (x).stride(-1) == 1, #x " must be contiguous at last dimension")
+#define CHECK_DIM(d, x) TORCH_CHECK((x).dim() == (d), #x " must be a " #d "D tensor")
 
-#define CHECK_SAME_SHAPE(a, b) check_shape(a, b, #a, #b)
-#define CHECK_DIM(d, x) TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
+#define CHECK_DTYPE(dtype, x) \
+  TORCH_CHECK((x).scalar_type() == (dtype), #x " must have dtype ", (dtype), ", got ", (x).scalar_type())
+
+// CHECK_DTYPES(tensor, dtype1, dtype2, ...)
+#define CHECK_DTYPES(x, ...)                                                                \
+  [&] {                                                                                     \
+    const at::ScalarType _allowed[] = {__VA_ARGS__};                                        \
+    const auto _actual = (x).scalar_type();                                                 \
+    TORCH_CHECK(                                                                            \
+        std::find(std::begin(_allowed), std::end(_allowed), _actual) != std::end(_allowed), \
+        #x " must have dtype ",                                                             \
+        c10::ArrayRef<at::ScalarType>(_allowed),                                            \
+        ", got ",                                                                           \
+        _actual);                                                                           \
+  }()
+
+#define SGL_CHECK_INPUT_SELECT(_1, _2, _3, CHECK, ...) CHECK
+#define SGL_CHECK_INPUT_1(CONTIGUOUS, x) \
+  do {                                   \
+    CHECK_DEVICE(x);                     \
+    CONTIGUOUS(x);                       \
+  } while (0)
+#define SGL_CHECK_INPUT_2(CONTIGUOUS, d, x) \
+  do {                                      \
+    CHECK_DIM(d, x);                        \
+    SGL_CHECK_INPUT_1(CONTIGUOUS, x);       \
+  } while (0)
+#define SGL_CHECK_INPUT_3(CONTIGUOUS, d, dtype, x) \
+  do {                                             \
+    SGL_CHECK_INPUT_2(CONTIGUOUS, d, x);           \
+    CHECK_DTYPE(dtype, x);                         \
+  } while (0)
+// CHECK_INPUT(tensor) / CHECK_INPUT(dim, tensor) / CHECK_INPUT(dim, dtype, tensor)
+#define CHECK_INPUT(...)                                                                       \
+  SGL_CHECK_INPUT_SELECT(__VA_ARGS__, SGL_CHECK_INPUT_3, SGL_CHECK_INPUT_2, SGL_CHECK_INPUT_1) \
+  (CHECK_CONTIGUOUS, __VA_ARGS__)
+// CHECK_LAST_DIM_CONTIGUOUS_INPUT(tensor) / (dim, tensor) / (dim, dtype, tensor)
+#define CHECK_LAST_DIM_CONTIGUOUS_INPUT(...)                                                   \
+  SGL_CHECK_INPUT_SELECT(__VA_ARGS__, SGL_CHECK_INPUT_3, SGL_CHECK_INPUT_2, SGL_CHECK_INPUT_1) \
+  (CHECK_LAST_DIM_CONTIGUOUS, __VA_ARGS__)
+
+#define CHECK_SAME_SHAPE(a, b) \
+  TORCH_CHECK(                 \
+      (a).sizes() == (b).sizes(), #a " and " #b " must have the same shape, got ", (a).sizes(), " vs ", (b).sizes())
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
 
 // Use AT_DISPATCH_* for ATen/c10 types; SYCL_DISPATCH_* only when kernel
@@ -377,13 +415,6 @@ template <typename Func, typename... Args>
 int get_min(Func limit_func, int X, Args*... args) {
   X = std::min({X, limit_func(X, args)...});
   return X;
-}
-
-inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_name, const char* b_name) {
-  TORCH_CHECK(a.dim() == b.dim(), a_name, ".dim() != ", b_name, ".dim(). ", a.dim(), " vs ", b.dim());
-  for (int i = 0; i < a.dim(); ++i) {
-    TORCH_CHECK(a.size(i) == b.size(i), a_name, ".size(", i, ") != ", b_name, ".size(", i, ")");
-  }
 }
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>

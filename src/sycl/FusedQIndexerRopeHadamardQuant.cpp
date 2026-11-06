@@ -178,26 +178,14 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_quant(
     double weight_scale,
     const at::Tensor& rope_cache,
     const at::Tensor& positions) {
-  CHECK_INPUT(q_input);
-  CHECK_INPUT(q_fp8);
-  CHECK_INPUT(weight);
-  CHECK_INPUT(weights_out);
-  CHECK_INPUT(rope_cache);
-  CHECK_INPUT(positions);
-
-  CHECK_DIM(3, q_input);
-  CHECK_DIM(3, q_fp8);
-  CHECK_DIM(2, weight);
-  CHECK_DIM(3, weights_out);
-  CHECK_DIM(2, rope_cache);
-  CHECK_DIM(1, positions);
-
-  CHECK_SHAPE(q_input, q_input.size(0), q_input.size(1), kHeadDim);
-  CHECK_SHAPE(q_fp8, q_fp8.size(0), q_fp8.size(1), kHeadDim);
-  CHECK_SHAPE(weight, weight.size(0), weight.size(1));
-  CHECK_SHAPE(weights_out, weights_out.size(0), weights_out.size(1), 1);
-  CHECK_SHAPE(rope_cache, rope_cache.size(0), kRopeDim);
-  CHECK_SHAPE(positions, positions.size(0));
+  CHECK_INPUT(3, q_input);
+  CHECK_DTYPES(q_input, at::kFloat, at::kHalf, at::kBFloat16);
+  CHECK_INPUT(3, at::kFloat8_e4m3fn, q_fp8);
+  CHECK_INPUT(2, q_input.scalar_type(), weight);
+  CHECK_INPUT(3, at::kFloat, weights_out);
+  CHECK_INPUT(2, at::kFloat, rope_cache);
+  CHECK_INPUT(1, positions);
+  CHECK_DTYPES(positions, at::kInt, at::kLong);
 
   CHECK_SAME_SHAPE(q_input, q_fp8);
   TORCH_CHECK(
@@ -208,19 +196,7 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_quant(
   TORCH_CHECK(q_input.size(0) == positions.size(0), "q_input and positions batch mismatch");
 
   TORCH_CHECK(q_input.size(2) == kHeadDim, "q_input head_dim must be 128, got ", q_input.size(2));
-  TORCH_CHECK(q_fp8.size(2) == kHeadDim, "q_fp8 head_dim must be 128, got ", q_fp8.size(2));
   TORCH_CHECK(rope_cache.size(1) == kRopeDim, "rope_cache last dim must be 64, got ", rope_cache.size(1));
-
-  TORCH_CHECK(
-      q_input.scalar_type() == at::kHalf || q_input.scalar_type() == at::kBFloat16 ||
-          q_input.scalar_type() == at::kFloat,
-      "q_input must be fp16/bf16/fp32");
-  TORCH_CHECK(weight.scalar_type() == q_input.scalar_type(), "weight dtype must match q_input dtype");
-  TORCH_CHECK(q_fp8.scalar_type() == at::kFloat8_e4m3fn, "q_fp8 must be Float8_e4m3fn");
-  TORCH_CHECK(weights_out.scalar_type() == at::kFloat, "weights_out must be float32");
-  TORCH_CHECK(rope_cache.scalar_type() == at::kFloat, "rope_cache must be float32");
-  TORCH_CHECK(
-      positions.scalar_type() == at::kInt || positions.scalar_type() == at::kLong, "positions must be int32 or int64");
 
   TORCH_CHECK(
       q_input.stride(2) == 1 && q_input.stride(1) == kHeadDim, "q_input must be contiguous in [B,H,128] layout");
@@ -233,8 +209,6 @@ SGL_KERNEL_EXPORT void fused_q_indexer_rope_hadamard_quant(
 
   TORCH_CHECK(rope_cache.stride(1) == 1, "rope_cache last dim must be contiguous");
   TORCH_CHECK(rope_cache.stride(0) == kRopeDim, "rope_cache must be contiguous in [max_pos,64] layout");
-
-  TORCH_CHECK(positions.is_contiguous(), "positions must be contiguous");
 
   const int64_t expected_q_stride0 = q_input.size(1) * kHeadDim;
   TORCH_CHECK(

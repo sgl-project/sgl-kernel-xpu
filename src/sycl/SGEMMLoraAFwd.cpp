@@ -89,19 +89,12 @@ SGL_KERNEL_EXPORT void sgemm_lora_a_fwd(
     [[maybe_unused]] const std::optional<torch::Tensor>&
         seg_lens  // [num_segments,] optional; currently unused, reserved for future per-segment optimizations
 ) {
-  CHECK_INPUT(input_x);
-  CHECK_INPUT(weights);
-  CHECK_INPUT(seg_indptr);
-  CHECK_INPUT(weight_indices);
-  CHECK_INPUT(lora_ranks);
-  CHECK_INPUT(output);
-
-  TORCH_CHECK(input_x.dim() == 2, "input_x must be a 2D tensor");
-  TORCH_CHECK(weights.dim() == 3, "weights must be a 3D tensor");
-  TORCH_CHECK(seg_indptr.dim() == 1, "seg_indptr must be a 1D tensor");
-  TORCH_CHECK(weight_indices.dim() == 1, "weight_indices must be a 1D tensor");
-  TORCH_CHECK(lora_ranks.dim() == 1, "lora_ranks must be a 1D tensor");
-  TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
+  CHECK_INPUT(2, input_x);
+  CHECK_INPUT(3, weights);
+  CHECK_INPUT(1, seg_indptr);
+  CHECK_INPUT(1, weight_indices);
+  CHECK_INPUT(1, lora_ranks);
+  CHECK_INPUT(2, output);
 
   TORCH_CHECK(stack_num > 0, "stack_num must be > 0");
   TORCH_CHECK(weights.size(1) % stack_num == 0, "weights.size(1) must be divisible by stack_num");

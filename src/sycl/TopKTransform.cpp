@@ -345,24 +345,22 @@ FastTopKParams get_params(
     const at::Tensor& lengths,
     std::optional<at::Tensor> row_starts_opt = std::nullopt,
     std::optional<at::Tensor> indices_opt = std::nullopt) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, at::kFloat, score);
   const auto B = score.size(0);
-  TORCH_CHECK(score.dim() == 2 && score.stride(1) == 1, "score must be 2D with contiguous last dim");
-  TORCH_CHECK(score.scalar_type() == at::kFloat, "score must be float32");
   if (row_starts_opt.has_value()) {
     const auto& row_starts = row_starts_opt.value();
-    TORCH_CHECK(row_starts.dim() == 1 && row_starts.is_contiguous() && row_starts.size(0) == B);
-    TORCH_CHECK(row_starts.scalar_type() == at::kInt, "row_starts must be int32");
+    CHECK_INPUT(1, at::kInt, row_starts);
+    CHECK_SHAPE(row_starts, B);
   }
-  TORCH_CHECK(lengths.dim() == 1 && lengths.is_contiguous() && lengths.size(0) == B);
-  TORCH_CHECK(lengths.scalar_type() == at::kInt, "lengths must be int32");
+  CHECK_INPUT(1, at::kInt, lengths);
+  CHECK_SHAPE(lengths, B);
 
   int32_t* indices_ptr = nullptr;
   if (indices_opt.has_value()) {
     const auto& indices = indices_opt.value();
-    TORCH_CHECK(indices.dim() == 2 && indices.is_contiguous());
-    TORCH_CHECK(indices.size(0) == B, "indices.size(0) must equal score.size(0)");
+    CHECK_INPUT(2, at::kInt, indices);
+    CHECK_SHAPE(indices, B, indices.size(1));
     TORCH_CHECK(is_supported_topk(indices.size(1)), "topk (indices.size(1)) must be ", get_supported_topk_str());
-    TORCH_CHECK(indices.scalar_type() == at::kInt, "indices must be int32");
     indices_ptr = indices.data_ptr<int32_t>();
   }
 
@@ -683,11 +681,7 @@ struct TopKTransformRaggedKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
 SGL_KERNEL_EXPORT at::Tensor
 fast_topk(const at::Tensor& score, const at::Tensor& lengths, int64_t topk, std::optional<at::Tensor> row_starts_opt) {
-  CHECK_INPUT(score);
-  CHECK_DEVICE(lengths);
-  if (row_starts_opt.has_value()) {
-    CHECK_DEVICE(row_starts_opt.value());
-  }
+  CHECK_INPUT(2, score);
   TORCH_CHECK(is_supported_topk(topk), "fast_topk only supports topk=", get_supported_topk_str());
 
   at::Tensor indices = at::empty({score.size(0), topk}, score.options().dtype(at::kInt));
@@ -710,25 +704,17 @@ SGL_KERNEL_EXPORT at::Tensor fast_topk_transform_fused(
     const at::Tensor& cu_seqlens_q,
     int64_t topk,
     std::optional<at::Tensor> row_starts_opt) {
-  CHECK_INPUT(score);
-  CHECK_DEVICE(lengths);
-  CHECK_DEVICE(src_page_table);
-  CHECK_DEVICE(cu_seqlens_q);
-  if (row_starts_opt.has_value()) {
-    CHECK_DEVICE(row_starts_opt.value());
-  }
+  CHECK_INPUT(2, score);
   TORCH_CHECK(topk == kMaxTopK, "fast_topk_transform_fused only supports topk=", kMaxTopK);
 
   const auto params = get_params(score, lengths, row_starts_opt);
   const int64_t B = score.size(0);
 
-  TORCH_CHECK(src_page_table.dim() == 2 && src_page_table.stride(1) == 1);
-  TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.is_contiguous());
-  TORCH_CHECK(src_page_table.scalar_type() == at::kInt);
-  TORCH_CHECK(cu_seqlens_q.scalar_type() == at::kInt);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, at::kInt, src_page_table);
+  CHECK_INPUT(1, at::kInt, cu_seqlens_q);
 
   const int64_t prefill_bs = cu_seqlens_q.size(0) - 1;
-  TORCH_CHECK(src_page_table.size(0) == prefill_bs);
+  CHECK_SHAPE(src_page_table, prefill_bs, src_page_table.size(1));
   TORCH_CHECK(prefill_bs <= B);
 
   at::Tensor dst_page_table = at::empty({B, kMaxTopK}, score.options().dtype(at::kInt));
@@ -763,19 +749,13 @@ SGL_KERNEL_EXPORT at::Tensor fast_topk_transform_ragged_fused(
     const at::Tensor& topk_indices_offset,
     int64_t topk,
     std::optional<at::Tensor> row_starts_opt) {
-  CHECK_INPUT(score);
-  CHECK_DEVICE(lengths);
-  CHECK_DEVICE(topk_indices_offset);
-  if (row_starts_opt.has_value()) {
-    CHECK_DEVICE(row_starts_opt.value());
-  }
+  CHECK_INPUT(2, score);
   TORCH_CHECK(topk == kMaxTopK, "fast_topk_transform_ragged_fused only supports topk=", kMaxTopK);
 
   const auto params = get_params(score, lengths, row_starts_opt);
   const int64_t B = score.size(0);
-  TORCH_CHECK(topk_indices_offset.dim() == 1 && topk_indices_offset.is_contiguous());
-  TORCH_CHECK(topk_indices_offset.size(0) == B);
-  TORCH_CHECK(topk_indices_offset.scalar_type() == at::kInt);
+  CHECK_INPUT(1, at::kInt, topk_indices_offset);
+  CHECK_SHAPE(topk_indices_offset, B);
 
   at::Tensor topk_indices_ragged = at::empty({B, kMaxTopK}, score.options().dtype(at::kInt));
 
@@ -797,19 +777,7 @@ void topk_transform_paged_launch(
     at::Tensor& out_page_indices,
     int64_t page_size,
     std::optional<at::Tensor> out_raw_indices_opt) {
-  CHECK_DEVICE(scores);
-  CHECK_DEVICE(seq_lens);
-  if (page_tables_opt.has_value()) {
-    CHECK_DEVICE(page_tables_opt.value());
-  }
-  CHECK_DEVICE(out_page_indices);
-  if (out_raw_indices_opt.has_value()) {
-    CHECK_DEVICE(out_raw_indices_opt.value());
-  }
-
-  TORCH_CHECK(scores.dim() == 2, "scores must be 2D");
-  TORCH_CHECK(scores.stride(1) == 1, "scores must have unit last-dim stride");
-  TORCH_CHECK(scores.scalar_type() == at::kFloat, "scores must be float32");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, at::kFloat, scores);
 
   const int64_t B = scores.size(0);
 
@@ -818,23 +786,17 @@ void topk_transform_paged_launch(
     TORCH_CHECK(seq_lens_flat.size(1) == 1, "2-D seq_lens must have size(1) == 1");
     seq_lens_flat = seq_lens_flat.squeeze(-1);
   }
-  TORCH_CHECK(seq_lens_flat.dim() == 1, "seq_lens must be 1-D or (B, 1)");
-  TORCH_CHECK(seq_lens_flat.size(0) == B, "seq_lens.size(0) must equal scores.size(0)");
-  TORCH_CHECK(seq_lens_flat.is_contiguous(), "seq_lens must be contiguous after squeeze");
-  TORCH_CHECK(seq_lens_flat.scalar_type() == at::kInt, "seq_lens must be int32");
+  CHECK_INPUT(1, at::kInt, seq_lens_flat);
+  CHECK_SHAPE(seq_lens_flat, B);
 
   if (page_tables_opt.has_value()) {
     const auto& page_tables = page_tables_opt.value();
-    TORCH_CHECK(page_tables.dim() == 2, "page_tables must be 2D");
-    TORCH_CHECK(page_tables.size(0) == B, "page_tables.size(0) must equal scores.size(0)");
-    TORCH_CHECK(page_tables.stride(1) == 1, "page_tables must have unit last-dim stride");
-    TORCH_CHECK(page_tables.scalar_type() == at::kInt, "page_tables must be int32");
+    CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, at::kInt, page_tables);
+    CHECK_SHAPE(page_tables, B, page_tables.size(1));
   }
 
-  TORCH_CHECK(out_page_indices.dim() == 2, "out_page_indices must be 2D");
-  TORCH_CHECK(out_page_indices.is_contiguous(), "out_page_indices must be contiguous");
-  TORCH_CHECK(out_page_indices.size(0) == B, "out_page_indices.size(0) must equal scores.size(0)");
-  TORCH_CHECK(out_page_indices.scalar_type() == at::kInt, "out_page_indices must be int32");
+  CHECK_INPUT(2, at::kInt, out_page_indices);
+  CHECK_SHAPE(out_page_indices, B, out_page_indices.size(1));
   const int64_t topk = out_page_indices.size(1);
   TORCH_CHECK(0 < topk && topk <= kMaxTopK, "topk (out_page_indices.size(1)) must be in (0, ", kMaxTopK, "]");
   TORCH_CHECK(page_size > 0, "page_size must be positive");
@@ -844,11 +806,8 @@ void topk_transform_paged_launch(
   int32_t* out_raw_ptr = nullptr;
   if (out_raw_indices_opt.has_value()) {
     const auto& out_raw_indices = out_raw_indices_opt.value();
-    TORCH_CHECK(out_raw_indices.dim() == 2, "out_raw_indices must be 2D");
-    TORCH_CHECK(out_raw_indices.is_contiguous(), "out_raw_indices must be contiguous");
-    TORCH_CHECK(out_raw_indices.size(0) == B, "out_raw_indices.size(0) must equal scores.size(0)");
-    TORCH_CHECK(out_raw_indices.size(1) == topk, "out_raw_indices.size(1) must equal topk");
-    TORCH_CHECK(out_raw_indices.scalar_type() == at::kInt, "out_raw_indices must be int32");
+    CHECK_INPUT(2, at::kInt, out_raw_indices);
+    CHECK_SHAPE(out_raw_indices, B, topk);
     out_raw_ptr = out_raw_indices.data_ptr<int32_t>();
   }
 
@@ -922,36 +881,24 @@ SGL_KERNEL_EXPORT void topk_transform_ragged(
     at::Tensor& out_indices,
     const at::Tensor& out_offsets,
     std::optional<at::Tensor> row_starts_opt) {
-  CHECK_DEVICE(scores);
-  CHECK_DEVICE(seq_lens);
-  CHECK_DEVICE(out_indices);
-  CHECK_DEVICE(out_offsets);
-  if (row_starts_opt.has_value()) {
-    CHECK_DEVICE(row_starts_opt.value());
-  }
-
-  TORCH_CHECK(scores.dim() == 2, "scores must be 2D");
-  TORCH_CHECK(scores.stride(1) == 1, "scores must have unit last-dim stride");
-  TORCH_CHECK(scores.scalar_type() == at::kFloat, "scores must be float32");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, at::kFloat, scores);
 
   const int64_t B = scores.size(0);
 
-  TORCH_CHECK(seq_lens.dim() == 1 && seq_lens.is_contiguous() && seq_lens.size(0) == B);
-  TORCH_CHECK(seq_lens.scalar_type() == at::kInt, "seq_lens must be int32");
+  CHECK_INPUT(1, at::kInt, seq_lens);
+  CHECK_SHAPE(seq_lens, B);
 
-  TORCH_CHECK(out_offsets.dim() == 1 && out_offsets.is_contiguous() && out_offsets.size(0) == B);
-  TORCH_CHECK(out_offsets.scalar_type() == at::kInt, "out_offsets must be int32");
+  CHECK_INPUT(1, at::kInt, out_offsets);
+  CHECK_SHAPE(out_offsets, B);
 
   if (row_starts_opt.has_value()) {
     const auto& row_starts = row_starts_opt.value();
-    TORCH_CHECK(row_starts.dim() == 1 && row_starts.is_contiguous() && row_starts.size(0) == B);
-    TORCH_CHECK(row_starts.scalar_type() == at::kInt, "row_starts must be int32");
+    CHECK_INPUT(1, at::kInt, row_starts);
+    CHECK_SHAPE(row_starts, B);
   }
 
-  TORCH_CHECK(out_indices.dim() == 2, "out_indices must be 2D");
-  TORCH_CHECK(out_indices.is_contiguous(), "out_indices must be contiguous");
-  TORCH_CHECK(out_indices.size(0) == B, "out_indices.size(0) must equal scores.size(0)");
-  TORCH_CHECK(out_indices.scalar_type() == at::kInt, "out_indices must be int32");
+  CHECK_INPUT(2, at::kInt, out_indices);
+  CHECK_SHAPE(out_indices, B, out_indices.size(1));
   const int64_t topk = out_indices.size(1);
   TORCH_CHECK(0 < topk && topk <= kMaxTopK, "topk (out_indices.size(1)) must be in (0, ", kMaxTopK, "]");
 

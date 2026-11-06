@@ -1650,27 +1650,22 @@ SGL_KERNEL_EXPORT at::Tensor inkling_sconv_forward(
     bool silu_activation,
     bool use_residual,
     bool is_decode) {
-  check_xpu_tensor(x, "x");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, x);
   check_xpu_tensor(weight, "weight");
-  check_xpu_tensor(sconv_cache, "sconv_cache");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(3, x.scalar_type(), sconv_cache);
   check_xpu_tensor(cache_mask, "cache_mask");
   check_xpu_tensor(safe_idx, "safe_idx");
   check_xpu_tensor(cu, "cu");
   check_xpu_tensor(si, "si");
-  TORCH_CHECK(x.dim() == 2, "x must have shape [T, D]");
-  TORCH_CHECK(weight.dim() == 2, "weight must have shape [D, W] or [W, D]");
-  TORCH_CHECK(sconv_cache.dim() == 3, "sconv_cache must have shape [slots, W-1, D]");
+  CHECK_DIM(2, weight);
   TORCH_CHECK(cache_mask.dim() >= 1, "cache_mask must have at least one dimension");
-  TORCH_CHECK(safe_idx.scalar_type() == at::ScalarType::Long, "safe_idx must be int64");
-  TORCH_CHECK(cu.scalar_type() == at::ScalarType::Long, "cu must be int64");
-  TORCH_CHECK(si.scalar_type() == at::ScalarType::Int, "si must be int32");
-  TORCH_CHECK(cache_mask.scalar_type() == at::ScalarType::Bool, "cache_mask must be bool");
+  CHECK_DTYPE(at::ScalarType::Long, safe_idx);
+  CHECK_DTYPE(at::ScalarType::Long, cu);
+  CHECK_DTYPE(at::ScalarType::Int, si);
+  CHECK_DTYPE(at::ScalarType::Bool, cache_mask);
   check_sconv_dtype(x, weight, "weight");
-  check_sconv_dtype(x, sconv_cache, "sconv_cache");
-  TORCH_CHECK(sconv_cache.size(2) == x.size(1), "sconv_cache.size(2) must equal x.size(1)");
+  CHECK_SHAPE(sconv_cache, sconv_cache.size(0), sconv_cache.size(1), x.size(1));
   TORCH_CHECK(si.numel() == x.size(0), "si must have one entry per token");
-  TORCH_CHECK(x.stride(1) == 1, "x must be contiguous on D");
-  TORCH_CHECK(sconv_cache.stride(2) == 1, "sconv_cache must be contiguous on D");
   const WeightLayout weight_layout = resolve_weight_layout(weight, x.size(1), sconv_cache.size(1) + 1, false);
 
   at::Tensor y = at::empty_strided({x.size(0), x.size(1)}, {x.size(1), 1}, x.options());
@@ -1732,22 +1727,17 @@ SGL_KERNEL_EXPORT void inkling_update_sconv_cache(
     const at::Tensor& cache_indices,
     const at::Tensor& has_initial_state,
     const at::Tensor& query_start_loc) {
-  check_xpu_tensor(x, "x");
-  check_xpu_tensor(sconv_cache, "sconv_cache");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, x);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(3, x.scalar_type(), sconv_cache);
   check_xpu_tensor(cache_indices, "cache_indices");
   check_xpu_tensor(has_initial_state, "has_initial_state");
   check_xpu_tensor(query_start_loc, "query_start_loc");
-  TORCH_CHECK(x.dim() == 2, "x must have shape [T, D]");
-  TORCH_CHECK(sconv_cache.dim() == 3, "sconv_cache must have shape [slots, W-1, D]");
-  TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
-  TORCH_CHECK(has_initial_state.scalar_type() == at::ScalarType::Bool, "has_initial_state must be bool");
-  TORCH_CHECK(query_start_loc.scalar_type() == at::ScalarType::Int, "query_start_loc must be int32");
-  check_sconv_dtype(x, sconv_cache, "sconv_cache");
-  TORCH_CHECK(sconv_cache.size(2) == x.size(1), "sconv_cache.size(2) must equal x.size(1)");
+  CHECK_DTYPE(at::ScalarType::Int, cache_indices);
+  CHECK_DTYPE(at::ScalarType::Bool, has_initial_state);
+  CHECK_DTYPE(at::ScalarType::Int, query_start_loc);
+  CHECK_SHAPE(sconv_cache, sconv_cache.size(0), sconv_cache.size(1), x.size(1));
   TORCH_CHECK(cache_indices.numel() + 1 == query_start_loc.numel(), "query_start_loc must have B + 1 entries");
   TORCH_CHECK(has_initial_state.numel() == cache_indices.numel(), "has_initial_state must have B entries");
-  TORCH_CHECK(x.stride(1) == 1, "x must be contiguous on D");
-  TORCH_CHECK(sconv_cache.stride(2) == 1, "sconv_cache must be contiguous on D");
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = x.scalar_type();
@@ -1780,31 +1770,26 @@ SGL_KERNEL_EXPORT at::Tensor inkling_fused_decode_update_sconv(
     bool use_residual,
     const std::optional<at::Tensor>& track_mask,
     const std::optional<at::Tensor>& track_indices) {
-  check_xpu_tensor(x, "x");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, x);
   check_xpu_tensor(weight, "weight");
-  check_xpu_tensor(sconv_cache, "sconv_cache");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(3, x.scalar_type(), sconv_cache);
   check_xpu_tensor(cache_indices, "cache_indices");
   check_xpu_tensor(cache_mask, "cache_mask");
-  TORCH_CHECK(x.dim() == 2, "x must have shape [T, D]");
-  TORCH_CHECK(weight.dim() == 2, "weight must have shape [D, W] or [W, D]");
-  TORCH_CHECK(sconv_cache.dim() == 3, "sconv_cache must have shape [slots, W-1, D]");
-  TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
-  TORCH_CHECK(cache_mask.scalar_type() == at::ScalarType::Bool, "cache_mask must be bool");
+  CHECK_DIM(2, weight);
+  CHECK_DTYPE(at::ScalarType::Int, cache_indices);
+  CHECK_DTYPE(at::ScalarType::Bool, cache_mask);
   check_sconv_dtype(x, weight, "weight");
-  check_sconv_dtype(x, sconv_cache, "sconv_cache");
   TORCH_CHECK(cache_indices.numel() == x.size(0), "cache_indices must have one entry per token");
   TORCH_CHECK(cache_mask.numel() >= x.size(0), "cache_mask must have at least T entries");
-  TORCH_CHECK(sconv_cache.size(2) == x.size(1), "sconv_cache.size(2) must equal x.size(1)");
-  TORCH_CHECK(x.stride(1) == 1, "x must be contiguous on D");
-  TORCH_CHECK(sconv_cache.stride(2) == 1, "sconv_cache must be contiguous on D");
+  CHECK_SHAPE(sconv_cache, sconv_cache.size(0), sconv_cache.size(1), x.size(1));
   const WeightLayout weight_layout = resolve_weight_layout(weight, x.size(1), sconv_cache.size(1) + 1, false);
   const bool do_track = track_mask.has_value();
   if (do_track) {
     TORCH_CHECK(track_indices.has_value(), "track_indices must be provided when track_mask is provided");
     check_xpu_tensor(track_mask.value(), "track_mask");
     check_xpu_tensor(track_indices.value(), "track_indices");
-    TORCH_CHECK(track_mask.value().scalar_type() == at::ScalarType::Bool, "track_mask must be bool");
-    TORCH_CHECK(track_indices.value().scalar_type() == at::ScalarType::Long, "track_indices must be int64");
+    CHECK_DTYPE(at::ScalarType::Bool, track_mask.value());
+    CHECK_DTYPE(at::ScalarType::Long, track_indices.value());
     TORCH_CHECK(track_mask.value().numel() >= x.size(0), "track_mask must have at least T entries");
     TORCH_CHECK(track_indices.value().numel() >= x.size(0), "track_indices must have at least T entries");
   }
@@ -1854,24 +1839,19 @@ SGL_KERNEL_EXPORT void inkling_gather_scatter_sconv_cache(
     const at::Tensor& track_conv_indices,
     const at::Tensor& mask,
     const at::Tensor& dst_indices) {
-  check_xpu_tensor(hidden_states, "hidden_states");
-  check_xpu_tensor(sconv_cache, "sconv_cache");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, hidden_states);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(3, hidden_states.scalar_type(), sconv_cache);
   check_xpu_tensor(track_conv_indices, "track_conv_indices");
   check_xpu_tensor(mask, "mask");
   check_xpu_tensor(dst_indices, "dst_indices");
-  TORCH_CHECK(hidden_states.dim() == 2, "hidden_states must have shape [T, D]");
-  TORCH_CHECK(sconv_cache.dim() == 3, "sconv_cache must have shape [slots, W-1, D]");
-  TORCH_CHECK(track_conv_indices.dim() == 2, "track_conv_indices must have shape [B, W-1]");
-  TORCH_CHECK(mask.scalar_type() == at::ScalarType::Bool, "mask must be bool");
-  TORCH_CHECK(track_conv_indices.scalar_type() == at::ScalarType::Int, "track_conv_indices must be int32");
-  TORCH_CHECK(dst_indices.scalar_type() == at::ScalarType::Long, "dst_indices must be int64");
-  check_sconv_dtype(hidden_states, sconv_cache, "sconv_cache");
+  CHECK_DIM(2, track_conv_indices);
+  CHECK_DTYPE(at::ScalarType::Bool, mask);
+  CHECK_DTYPE(at::ScalarType::Int, track_conv_indices);
+  CHECK_DTYPE(at::ScalarType::Long, dst_indices);
   TORCH_CHECK(track_conv_indices.size(1) == sconv_cache.size(1), "track_conv_indices.size(1) must equal W-1");
   TORCH_CHECK(track_conv_indices.size(0) == mask.numel(), "mask must have B entries");
   TORCH_CHECK(dst_indices.numel() >= mask.numel(), "dst_indices must have at least B entries");
-  TORCH_CHECK(sconv_cache.size(2) == hidden_states.size(1), "sconv_cache.size(2) must equal hidden_states.size(1)");
-  TORCH_CHECK(hidden_states.stride(1) == 1, "hidden_states must be contiguous on D");
-  TORCH_CHECK(sconv_cache.stride(2) == 1, "sconv_cache must be contiguous on D");
+  CHECK_SHAPE(sconv_cache, sconv_cache.size(0), sconv_cache.size(1), hidden_states.size(1));
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = hidden_states.scalar_type();
@@ -1907,22 +1887,18 @@ SGL_KERNEL_EXPORT void inkling_draft_extend_sconv_cache(
     const std::optional<at::Tensor>& crossed,
     const std::optional<at::Tensor>& track_step,
     const std::optional<at::Tensor>& mamba_track_indices) {
-  check_xpu_tensor(hidden_states, "hidden_states");
-  check_xpu_tensor(sconv_cache, "sconv_cache");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(hidden_states);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(3, hidden_states.scalar_type(), sconv_cache);
   check_xpu_tensor(cache_indices, "cache_indices");
   check_xpu_tensor(num_accepted_tokens, "num_accepted_tokens");
   TORCH_CHECK(
       hidden_states.dim() == 2 || hidden_states.dim() == 3, "hidden_states must have shape [B*T, D] or [B, T, D]");
-  TORCH_CHECK(sconv_cache.dim() == 3, "sconv_cache must have shape [slots, W-1, D]");
-  TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
-  TORCH_CHECK(num_accepted_tokens.scalar_type() == at::ScalarType::Int, "num_accepted_tokens must be int32");
-  check_sconv_dtype(hidden_states, sconv_cache, "sconv_cache");
+  CHECK_DTYPE(at::ScalarType::Int, cache_indices);
+  CHECK_DTYPE(at::ScalarType::Int, num_accepted_tokens);
   const int64_t B = cache_indices.numel();
   const int64_t D = sconv_cache.size(2);
   TORCH_CHECK(num_accepted_tokens.numel() == B, "num_accepted_tokens must have B entries");
   TORCH_CHECK(draft_token_num >= 0, "draft_token_num must be non-negative");
-  TORCH_CHECK(sconv_cache.stride(2) == 1, "sconv_cache must be contiguous on D");
-  TORCH_CHECK(hidden_states.stride(hidden_states.dim() - 1) == 1, "hidden_states must be contiguous on D");
   if (hidden_states.dim() == 2) {
     TORCH_CHECK(hidden_states.size(1) == D, "hidden_states.size(1) must equal cache D");
     TORCH_CHECK(hidden_states.size(0) >= B * draft_token_num, "hidden_states has too few rows");
@@ -1938,9 +1914,9 @@ SGL_KERNEL_EXPORT void inkling_draft_extend_sconv_cache(
     check_xpu_tensor(crossed.value(), "crossed");
     check_xpu_tensor(track_step.value(), "track_step");
     check_xpu_tensor(mamba_track_indices.value(), "mamba_track_indices");
-    TORCH_CHECK(crossed.value().scalar_type() == at::ScalarType::Bool, "crossed must be bool");
-    TORCH_CHECK(track_step.value().scalar_type() == at::ScalarType::Int, "track_step must be int32");
-    TORCH_CHECK(mamba_track_indices.value().scalar_type() == at::ScalarType::Long, "mamba_track_indices must be int64");
+    CHECK_DTYPE(at::ScalarType::Bool, crossed.value());
+    CHECK_DTYPE(at::ScalarType::Int, track_step.value());
+    CHECK_DTYPE(at::ScalarType::Long, mamba_track_indices.value());
     TORCH_CHECK(crossed.value().numel() >= B, "crossed must have at least B entries");
     TORCH_CHECK(track_step.value().numel() >= B, "track_step must have at least B entries");
     TORCH_CHECK(mamba_track_indices.value().numel() >= B, "mamba_track_indices must have at least B entries");
@@ -2119,17 +2095,14 @@ SGL_KERNEL_EXPORT void inkling_save_intermediate_conv_windows(
     at::Tensor& intermediate_out,
     int64_t batch_size,
     int64_t draft_token_num) {
-  check_xpu_tensor(sconv_cache, "sconv_cache");
-  check_xpu_tensor(hidden_states, "hidden_states");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(3, sconv_cache);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(hidden_states);
   check_xpu_tensor(cache_indices, "cache_indices");
-  check_xpu_tensor(intermediate_out, "intermediate_out");
-  TORCH_CHECK(sconv_cache.dim() == 3, "sconv_cache must have shape [slots, W-1, D]");
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(4, sconv_cache.scalar_type(), intermediate_out);
   TORCH_CHECK(
       hidden_states.dim() == 2 || hidden_states.dim() == 3, "hidden_states must have shape [B*T, D] or [B, T, D]");
-  TORCH_CHECK(intermediate_out.dim() == 4, "intermediate_out must have shape [B, T, W-1, D]");
-  TORCH_CHECK(cache_indices.scalar_type() == at::ScalarType::Int, "cache_indices must be int32");
+  CHECK_DTYPE(at::ScalarType::Int, cache_indices);
   check_sconv_dtype(sconv_cache, hidden_states, "hidden_states");
-  check_sconv_dtype(sconv_cache, intermediate_out, "intermediate_out");
   TORCH_CHECK(batch_size >= 0, "batch_size must be non-negative");
   TORCH_CHECK(draft_token_num >= 0, "draft_token_num must be non-negative");
   TORCH_CHECK(cache_indices.numel() >= batch_size, "cache_indices must have at least batch_size entries");
@@ -2137,9 +2110,6 @@ SGL_KERNEL_EXPORT void inkling_save_intermediate_conv_windows(
   TORCH_CHECK(intermediate_out.size(1) >= draft_token_num, "intermediate_out.size(1) must be >= draft_token_num");
   TORCH_CHECK(intermediate_out.size(2) == sconv_cache.size(1), "intermediate_out.size(2) must equal W-1");
   TORCH_CHECK(intermediate_out.size(3) == sconv_cache.size(2), "intermediate_out.size(3) must equal D");
-  TORCH_CHECK(sconv_cache.stride(2) == 1, "sconv_cache must be contiguous on D");
-  TORCH_CHECK(hidden_states.stride(hidden_states.dim() - 1) == 1, "hidden_states must be contiguous on D");
-  TORCH_CHECK(intermediate_out.stride(3) == 1, "intermediate_out must be contiguous on D");
   const int64_t D = sconv_cache.size(2);
   if (hidden_states.dim() == 2) {
     TORCH_CHECK(hidden_states.size(1) == D, "hidden_states.size(1) must equal D");

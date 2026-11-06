@@ -51,3 +51,6 @@ build
 
 # benchmark run logs (benchmark/run_suite.py writes one per benchmark)
 benchmark/*.log
+
+# NEO driver debug-settings dump, written into the cwd when PrintDebugSettings=1
+igdrcl_dumped.config

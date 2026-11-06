@@ -202,6 +202,7 @@ def prepare_kernel_inputs(
     scales_a_list: list,
     scales_b_list: list,
     device: str,
+    out_dtype: torch.dtype = torch.float32,
 ):
     """Flat-2D inputs + empty-ptr sentinels for on-device prep. Uniform m."""
     num_experts = len(a_list)
@@ -228,7 +229,7 @@ def prepare_kernel_inputs(
         [ensure_contiguous_layout(s) for s in scales_b_list], dim=0
     ).contiguous()
 
-    output = torch.zeros((total_m, n), dtype=torch.float32, device=device)
+    output = torch.zeros((total_m, n), dtype=out_dtype, device=device)
     expert_offsets = torch.arange(0, total_m, m, dtype=torch.int32, device=device)
     empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
 
@@ -403,6 +404,53 @@ class TestMXFP4BlockwiseScaledGroupedMM:
         assert 4.0 < ref_mean < 8.0
         assert abs(kernel_mean - ref_mean) < 1.0
 
+    @torch.inference_mode()
+    def test_bf16_output(self):
+        """A bf16 output tensor selects the bf16 epilogue instantiation. Only the
+        store conversion differs from fp32, so the two must agree to bf16 precision."""
+        from sgl_kernel import mxfp4_blockwise_scaled_grouped_mm
+
+        device = "xpu"
+        m, n, k = 128, 128, 128
+        num_experts = 2
+
+        a_list, b_list, scales_a_list, scales_b_list = [], [], [], []
+        for i in range(num_experts):
+            a_packed, scales_a, _ = create_random_mxfp4_data(m, k, "cpu", seed=42 + i)
+            b_packed, scales_b, _ = create_random_mxfp4_data(n, k, "cpu", seed=100 + i)
+            a_list.append(ensure_contiguous_layout(a_packed).to(device))
+            b_list.append(ensure_contiguous_layout(b_packed).to(device))
+            scales_a_list.append(ensure_contiguous_layout(scales_a).to(device))
+            scales_b_list.append(ensure_contiguous_layout(scales_b).to(device))
+
+        outs = {}
+        for dtype in (torch.float32, torch.bfloat16):
+            inputs = prepare_kernel_inputs(
+                a_list, b_list, scales_a_list, scales_b_list, device, out_dtype=dtype
+            )
+            mxfp4_blockwise_scaled_grouped_mm(
+                inputs["output"],
+                inputs["a_ptrs"],
+                inputs["b_ptrs"],
+                inputs["out_ptrs"],
+                inputs["a_scales_ptrs"],
+                inputs["b_scales_ptrs"],
+                inputs["a_stack"],
+                inputs["b_stack"],
+                inputs["scales_a_stack"],
+                inputs["scales_b_stack"],
+                inputs["problem_sizes"],
+                inputs["expert_offsets"],
+                inputs["workspace"],
+            )
+            assert inputs["output"].dtype == dtype
+            outs[dtype] = inputs["output"].to("cpu")
+
+        assert not torch.isnan(outs[torch.bfloat16]).any()
+        torch.testing.assert_close(
+            outs[torch.bfloat16].float(), outs[torch.float32], rtol=2**-8, atol=1e-2
+        )
+
 
 # Ragged-M (varying m_i per expert) — flat-2D layout with expert_offsets.
 # Catches per-expert A-scale M-stride bug when scale_cols > 1.
@@ -425,14 +473,21 @@ class TestMXFP4RaggedM:
             )
         skip_if_kernel_unavailable()
 
+    # max_m picks the tile shape: decode <=32, step <=512, prefill >512. The
+    # decode case also leaves max_m off a 4-byte boundary, which the u8 A-scale
+    # pitch has to round up on its own.
+    @pytest.mark.parametrize(
+        "m_per_expert",
+        [[1, 2, 3], [32, 64, 96, 64], [520, 600]],
+        ids=["decode", "step", "prefill"],
+    )
     @torch.inference_mode()
-    def test_flat_2d_ragged_distribution(self):
+    def test_flat_2d_ragged_distribution(self, m_per_expert):
         """k=64 (scale_cols=2) exercises per-expert A-scale M-stride."""
         from sgl_kernel import mxfp4_blockwise_scaled_grouped_mm
 
         device = "xpu"
         n, k = 64, 64
-        m_per_expert = [32, 64, 96, 64]
         num_experts = len(m_per_expert)
         total_m = sum(m_per_expert)
         packed_k = k // 2

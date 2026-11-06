@@ -618,7 +618,7 @@ void cutlass_scaled_fp4_mm(
     torch::Tensor const& B,
     torch::Tensor const& A_sf,
     torch::Tensor const& B_sf,
-    torch::Tensor const& alpha);
+    c10::optional<torch::Tensor> const& alpha);
 torch::Tensor int8_scaled_mm(
     const torch::Tensor& mat_a,
     const torch::Tensor& mat_b,

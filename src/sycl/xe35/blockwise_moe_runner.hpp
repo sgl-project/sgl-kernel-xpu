@@ -5,15 +5,16 @@
 /*! \file
     \brief Shared grouped-GEMM runner template for MXFP4/MXFP8 blockwise MoE on Intel XPU (xe35).
 
-    Header-only so that each including TU controls its own preprocessor state
-    (notably CUTE_ENABLE_XE_BLOCK_2D_ASSERT, which the MXFP4 path requires as a
-    compiler barrier and the MXFP8 path must NOT define because its D-store
-    triggers spurious x%4 asserts that the hardware silently handles).
+    Header-only so each including TU keeps its own preprocessor state. No TU defines
+    CUTE_ENABLE_XE_BLOCK_2D_ASSERT: its A-scale width assert rejects legal ragged-M
+    layouts, and these TUs build without -DNDEBUG so it would really fire. See
+    blockwise_moe_mxfp4.cpp.
 */
 
 #pragma once
 
 // clang-format off
+#include <numeric>
 #include <utility>
 
 #include <ATen/ATen.h>
@@ -23,6 +24,7 @@
 #include <cute/tensor.hpp>
 #include <cute/arch/mma_xe.hpp>
 
+#include "cutlass/bfloat16.h"
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/collective/xe_epilogue.hpp"
@@ -41,6 +43,57 @@ namespace at::native::xpu {
 
 using GroupedProblemShape = cutlass::gemm::GroupProblemShape<cute::Shape<int, int, int>>;
 using UnderlyingProblemShapeType = typename GroupedProblemShape::UnderlyingProblemShape;
+
+// Subgroup grid for a workgroup tile: 32 subgroups either way, M taking
+// min(8, BLK_M / atom_M) of them and N the rest.
+//
+// The cap reproduces the 8x4 split the large tiles were tuned with; the divide is
+// what lets BLK_M go below 8 atoms at all. A fixed 8x4 forces BLK_M >= 64, so a
+// decode expert with one routed row pads its MMA 64x. It also cuts the dominant
+// redundancy: B is reloaded once per row of subgroups, so 2x16 fetches each B
+// slice twice instead of eight times, and only tiny A pays the reverse.
+template <class TileShape, class MmaAtom>
+struct MoeSubgroupLayout {
+  using AtomShape = typename MmaAtom::Shape_MNK;
+  static constexpr int kAtomM = cute::size<0>(AtomShape{});
+  static constexpr int kAtomN = cute::size<1>(AtomShape{});
+
+  static constexpr int kBlkM = cute::size<0>(TileShape{});
+  static constexpr int kBlkN = cute::size<1>(TileShape{});
+
+  static constexpr int kSubgroups = 32;
+  static constexpr int kMaxAlongM = 8;
+
+  static constexpr int M = kBlkM / kAtomM < kMaxAlongM ? kBlkM / kAtomM : kMaxAlongM;
+  static constexpr int N = kSubgroups / M;
+
+  static_assert(M >= 1, "BLK_M must be at least the MMA atom's M");
+  static_assert(kBlkM % (kAtomM * M) == 0, "BLK_M must tile evenly over the M subgroups");
+  static_assert(kBlkN % (kAtomN * N) == 0, "BLK_N must tile evenly over the N subgroups");
+  // Accumulators are fp32 whatever the input format, and live across the whole
+  // K-loop, so they set the tile ceiling: one GRF per subgroup lane per float,
+  // 256 GRF per thread. IGC spill sizes measured on CRI track this exactly —
+  // 128 GRF of accumulator costs 1.3-8.6 KB of spill, 256 costs ~12 KB and 512
+  // costs 27-61 KB. 128 is the last usable step, which caps a 32-subgroup
+  // workgroup tile at 65,536 elements however it is shaped.
+  static constexpr int kAccumGrf = (kBlkM / M) * (kBlkN / N) / 16;
+  static_assert(kAccumGrf <= 128,
+                "Workgroup tile's fp32 accumulator exceeds half the GRF budget");
+
+  // N-major, the warp-layout convention for CuTe's Xe MMA atoms.
+  using type = cute::Layout<cute::Shape<cute::Int<M>, cute::Int<N>, cute::_1>,
+                            cute::Stride<cute::Int<N>, cute::_1, cute::_0>>;
+};
+
+// The epilogue writes ElementOutput, so the caller's tensor has to match it
+// exactly; a mismatch would reinterpret the store, not convert it.
+template <typename T> struct TorchScalarTypeOf;
+template <> struct TorchScalarTypeOf<float> {
+  static constexpr torch::ScalarType value = torch::kFloat32;
+};
+template <> struct TorchScalarTypeOf<cutlass::bfloat16_t> {
+  static constexpr torch::ScalarType value = torch::kBFloat16;
+};
 
 template <typename Types>
 class BlockScaledGroupedGemmRunner {
@@ -76,7 +129,10 @@ class BlockScaledGroupedGemmRunner {
       // value (used when scales were packed with stride max_m for padded
       // ragged-M layouts, not per-expert m_i). When 0/default, build the
       // stride from problem_sizes[e][0].
-      int scales_a_m_stride_override = 0) {
+      int scales_a_m_stride_override = 0,
+      // Reuse the caller's D->H copy of problem_sizes when it already made one
+      // for tile-bucket dispatch; otherwise the runner does its own D->H below.
+      const torch::Tensor* problem_sizes_host_opt = nullptr) {
 
     TORCH_CHECK(problem_sizes.dim() == 2 && problem_sizes.size(1) == 3,
                 "problem_sizes must be (num_experts, 3)");
@@ -85,8 +141,9 @@ class BlockScaledGroupedGemmRunner {
     TORCH_CHECK(problem_sizes.scalar_type() == torch::kInt32 &&
                 expert_offsets.scalar_type() == torch::kInt32,
                 "Indices must be int32");
-    TORCH_CHECK(output.scalar_type() == torch::kFloat32,
-                "Output must be float32");
+    TORCH_CHECK(output.scalar_type() == TorchScalarTypeOf<ElementOutput>::value,
+                "Output dtype must match the instantiated ElementOutput, expected ",
+                TorchScalarTypeOf<ElementOutput>::value, " got ", output.scalar_type());
 
     int num_groups = static_cast<int>(expert_offsets.size(0));
     TORCH_CHECK(num_groups > 0,
@@ -167,12 +224,31 @@ class BlockScaledGroupedGemmRunner {
 
     auto* problem_sizes_ptr = reinterpret_cast<UnderlyingProblemShapeType*>(
         problem_sizes.data_ptr<int32_t>());
-    // Pass nullptr for the host problem-shape pointer. can_implement is
-    // skipped upstream (see the comment further down), and the group tile
-    // scheduler's get_work_idx_m_and_n uses the device pointer at runtime.
-    // Avoiding the D->H copy keeps dispatch fully async — matches vLLM's
-    // SM100 shape (grouped_mm_c3x.cuh: ProblemShape{n, dev, nullptr}).
-    UnderlyingProblemShapeType const* problem_sizes_host_ptr = nullptr;
+    // PersistentTileSchedulerXeGroup falls back to hw_info.sm_count CTAs when
+    // is_host_problem_shape_available() is false (xe_tile_scheduler_group.hpp:187),
+    // over-executing MMA work by ~sm_count/real_tiles when real_tiles < sm_count
+    // (decode / small-M MoE). Xe scheduler gates differently from sm100/103, so
+    // we cannot follow vLLM's ProblemShape{n, dev, nullptr} pattern here.
+    // Host tensor must outlive gemm_op.initialize() + gemm_op.run().
+    torch::Tensor problem_sizes_host_owned;
+    const torch::Tensor* problem_sizes_host_p;
+    if (problem_sizes_host_opt != nullptr) {
+      TORCH_CHECK(problem_sizes_host_opt->device().is_cpu(),
+                  "problem_sizes_host_opt must be a CPU tensor");
+      TORCH_CHECK(problem_sizes_host_opt->scalar_type() == torch::kInt32 &&
+                      problem_sizes_host_opt->dim() == 2 &&
+                      problem_sizes_host_opt->size(1) == 3 &&
+                      problem_sizes_host_opt->size(0) == problem_sizes.size(0) &&
+                      problem_sizes_host_opt->is_contiguous(),
+                  "problem_sizes_host_opt shape/dtype mismatch");
+      problem_sizes_host_p = problem_sizes_host_opt;
+    } else {
+      problem_sizes_host_owned = problem_sizes.to(torch::kCPU);
+      problem_sizes_host_p = &problem_sizes_host_owned;
+    }
+    UnderlyingProblemShapeType const* problem_sizes_host_ptr =
+        reinterpret_cast<UnderlyingProblemShapeType const*>(
+            problem_sizes_host_p->data_ptr<int32_t>());
     auto* stride_A_ptr   = reinterpret_cast<StrideA*>(stride_A_dev.data_ptr<int64_t>());
     auto* stride_B_ptr   = reinterpret_cast<StrideB*>(stride_B_dev.data_ptr<int64_t>());
     auto* stride_C_ptr   = reinterpret_cast<StrideC*>(stride_CD_dev.data_ptr<int64_t>());
@@ -242,13 +318,9 @@ class BlockScaledGroupedGemmRunner {
   }
 
  private:
-  // We pass out_ptrs as the source pointer array on both paths. For MXFP8 with
-  // ElementC=void the source load is elided (is_source_supported=false), but
-  // the generic-group epilogue's to_base_arguments still dereferences
-  // args.ptr_C[idx] to build per-group sub-arguments, so the array itself must
-  // be a valid device pointer — nullptr hangs on some XPU targets. For MXFP4
-  // (ElementC=float) the read is mathematically inert because alpha=1, beta=0
-  // applied to the zero-initialized output has no effect.
+  // out_ptrs serves as both the C and the D pointer array. No format reads C
+  // (ElementC=void everywhere), but to_base_arguments still dereferences
+  // args.ptr_C[idx], and nullptr hangs on some XPU targets.
   using EpilogueArguments = typename GemmKernel::EpilogueArguments;
   using PtrCType = decltype(std::declval<EpilogueArguments>().ptr_C);
 
@@ -302,5 +374,61 @@ class BlockScaledGroupedGemmRunner {
     return torch::stack({scale_k, zeros}, /*dim=*/1).contiguous();
   }
 };
+
+// Two independent block-2D constraints on the transposed A-scales, both keyed on M:
+//
+//   base:  per-expert pointers are spaced scale_cols * M * sizeof(scale) apart and
+//          each must be 64-byte aligned. Decode is where this bites — max_m 1-32
+//          over a couple of scale columns leaves an expert far short of 64 bytes.
+//   pitch: scale columns are M * sizeof(scale) apart and that must be a multiple
+//          of 4. Wide K is where this bites — K=2048 MXFP8 gives scale_cols=64, so
+//          the base constraint alone asks for no padding and an odd max_m leaves a
+//          pitch like 33. CUTLASS rounds the pitch it programs up to 4 while the
+//          buffer keeps the unrounded spacing, so the loader reads wrong addresses and
+//          the assert that would catch it sits behind CUTE_ENABLE_XE_BLOCK_2D_ASSERT.
+//
+// Round M up to the lcm so one padding satisfies both.
+inline int moe_pad_scale_m(int max_m, int scale_cols, int scale_elem_bytes) {
+  constexpr int kScaleBaseAlign = 64;
+  constexpr int kPitchAlign = 4;
+  const int row_bytes = scale_cols * scale_elem_bytes;
+  const int base_align = kScaleBaseAlign / std::gcd(row_bytes, kScaleBaseAlign);
+  const int pitch_align = (kPitchAlign + scale_elem_bytes - 1) / scale_elem_bytes;
+  const int align_m = std::lcm(base_align, pitch_align);
+  return (max_m + align_m - 1) / align_m * align_m;
+}
+
+// Each CTA computes M_TILE rows and pads any shortfall to zero, so a tile-M
+// above the true per-expert M is wasted MMA work. Buckets key on max(M_i), not
+// the sum, because the grouped kernel instantiates one tile for all experts.
+//
+// Each format supplies a policy naming its tuned shape per bucket, so retuning a
+// shape or adding a bucket touches the policy alone and never a call site.
+enum class MoETileBucket { Decode, Step, Prefill };
+
+inline constexpr int kMoEDecodeMaxM = 32;
+inline constexpr int kMoEStepMaxM   = 512;
+
+inline MoETileBucket moe_tile_bucket(int max_m) {
+  if (max_m <= kMoEDecodeMaxM) return MoETileBucket::Decode;
+  if (max_m <= kMoEStepMaxM) return MoETileBucket::Step;
+  return MoETileBucket::Prefill;
+}
+
+template <typename Policy, typename... Args>
+void moe_run_bucketed(MoETileBucket bucket, Args&&... args) {
+  switch (bucket) {
+    case MoETileBucket::Decode:
+      BlockScaledGroupedGemmRunner<typename Policy::Decode>::run(std::forward<Args>(args)...);
+      return;
+    case MoETileBucket::Step:
+      BlockScaledGroupedGemmRunner<typename Policy::Step>::run(std::forward<Args>(args)...);
+      return;
+    case MoETileBucket::Prefill:
+      BlockScaledGroupedGemmRunner<typename Policy::Prefill>::run(std::forward<Args>(args)...);
+      return;
+  }
+  TORCH_CHECK(false, "unhandled MoE tile bucket");
+}
 
 }  // namespace at::native::xpu

@@ -44,13 +44,16 @@ class BuildPointersAndTransposeScalesU8Flat;
 /// u8 B-scale transpose (MXFP4 and MXFP8).
 class TransposeScalesU8B;
 
+// Namespace scope, not function scope: as locals these get captured, and under
+// -fsycl-host-compiler g++ and the device compiler disagree on the lambda size.
+constexpr int kBScaleTransposeTile = 64;  // one cache line either way
+constexpr int kBScaleTransposeWG = 256;
+// +4 B so the strided pass steps 17 dwords per lane, keeping a subgroup off one bank.
+constexpr int kBScaleTransposePitch = kBScaleTransposeTile + 4;
+
 // ---------------------------------------------------------------------------
 // Helper 1: fill {5, num_experts} int64 ptr_table from 3D uniform tensors.
-//
-// One work-item per expert.
-// Row layout:  0 = a_ptrs,  1 = b_ptrs,  2 = out_ptrs,
-//              3 = scales_a_ptrs,  4 = scales_b_ptrs.
-// Each entry   = base_bytes + expert_id * stride_bytes.
+// Rows are a / b / out / scales_a / scales_b.
 // ---------------------------------------------------------------------------
 inline void build_group_gemm_pointers(
     sycl::queue& queue,
@@ -80,12 +83,8 @@ inline void build_group_gemm_pointers(
 }
 
 // ---------------------------------------------------------------------------
-// Helper 2: combined A-scale transpose + pointer-build for the FP4 adapter.
-//
-// Work-range = {num_experts, max_m}.
-// work-item(e, 0) writes 5 pointer-table entries for expert e.
-// work-item(e, r) transposes one row of A-scales for expert e:
-//   a_scales_3d[e, s, r] = a_scales_flat[scale_offsets[e] + r, s]
+// Helper 2: A-scale transpose + pointer-build for the FP4 adapter. scales_a is 3D and
+// indexed by scale_offsets[], not expert_offsets[].
 // ---------------------------------------------------------------------------
 inline void launch_fp4_transpose_scales_and_build_pointers(
     sycl::queue& queue,
@@ -146,31 +145,10 @@ inline void launch_fp4_transpose_scales_and_build_pointers(
 }
 
 // ---------------------------------------------------------------------------
-// Helper 3: combined ptr-build + A-scale transpose for MXFP8 / FP8 blockwise
-//           grouped GEMM with **flat 2D** A / scales_a / output. Per-expert
-//           pointers come from expert_offsets[]; B / scales_b are still 3D.
-//
-// Inputs:
-//   - a_scales_in:  fp32, shape (sum_m_i, scale_cols), row-major flat.
-//                   Per-expert sub-slice: rows expert_offsets[e]..[e]+m_i.
-//   - a_scales_out: fp32, padded (E, scale_cols, max_m).
-//                   Each expert's slice is packed with stride max_m between
-//                   scale columns (matches StrideScaleA override = max_m).
-//   - problem_sizes_ptr: per-expert (M_i, N, K). Used to bound the transpose
-//                        loop so we never read past the expert's actual rows.
-//   - expert_offsets_ptr: cumulative per-expert row index (in tokens). Expert
-//                         e's flat-A rows start at expert_offsets[e].
-//
-// Work-range = {num_experts, max_m}.
-//   work-item(e, 0)            writes 5 pointer-table entries for expert e.
-//   work-item(e, r), r < m_e   transposes one row of A-scales for expert e.
-//
-// Pointer-table layout (matches the other helpers):
-//   row 0 = a_ptrs (a_base + expert_offsets[e] * K * a_elem),
-//   row 1 = b_ptrs (b_base + e * b_stride),
-//   row 2 = out_ptrs (out_base + expert_offsets[e] * N * out_elem),
-//   row 3 = a_scales_ptrs -> transposed buffer slot (a_scales_out_base + e * stride),
-//   row 4 = b_scales_ptrs (b_scales_base + e * b_scales_stride).
+// Helper 3: ptr-build + A-scale transpose for MXFP8 / FP8. A, scales_a and output are
+// flat 2D indexed by expert_offsets[]; B and scales_b stay 3D. a_scales_out is padded
+// (E, scale_cols, padded_max_m) so the stride between scale columns matches the
+// StrideScaleA override rather than the expert's own m_i.
 // ---------------------------------------------------------------------------
 inline void launch_mxfp8_build_pointers_and_transpose_scales_flat(
     sycl::queue& queue,
@@ -285,8 +263,10 @@ inline void launch_u8_scale_build_pointers_and_transpose_scales_flat(
   });
 }
 
-// u8 B-scale transpose: (E, N, cols) -> (E, cols, N). Required by MN-major
-// StrideScaleB. One-time per-call cost since B is uniform per expert.
+// u8 B-scale transpose: (E, N, cols) -> (E, cols, N), needed because StrideScaleB is
+// MN-major. Runs on every call. One work-item per element dirtied a cache line per
+// byte written, ~1 GB/layer at Qwen3 sizes; staging a tile through shared local memory
+// lets both the reads and the writes use whole lines.
 inline void launch_u8_transpose_b_scales(
     sycl::queue& queue,
     int num_experts,
@@ -294,17 +274,45 @@ inline void launch_u8_transpose_b_scales(
     int scale_cols,
     const uint8_t* b_scales_in_ptr,
     uint8_t* b_scales_out_ptr) {
+  const int n_tiles = (n + kBScaleTransposeTile - 1) / kBScaleTransposeTile;
+  const int s_tiles = (scale_cols + kBScaleTransposeTile - 1) / kBScaleTransposeTile;
+  const size_t groups = static_cast<size_t>(num_experts) * n_tiles * s_tiles;
+
   queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<uint8_t, 1> tile(static_cast<size_t>(kBScaleTransposeTile) * kBScaleTransposePitch, cgh);
     cgh.parallel_for<TransposeScalesU8B>(
-        sycl::range<3>(static_cast<size_t>(num_experts), static_cast<size_t>(n), static_cast<size_t>(scale_cols)),
-        [=](sycl::id<3> id) {
-          const int e = static_cast<int>(id[0]);
-          const int row = static_cast<int>(id[1]);
-          const int s = static_cast<int>(id[2]);
-          const int64_t ei = static_cast<int64_t>(e);
-          const int64_t in_idx = ei * static_cast<int64_t>(n) * scale_cols + static_cast<int64_t>(row) * scale_cols + s;
-          const int64_t out_idx = ei * static_cast<int64_t>(scale_cols) * n + static_cast<int64_t>(s) * n + row;
-          b_scales_out_ptr[out_idx] = b_scales_in_ptr[in_idx];
+        sycl::nd_range<1>(groups * kBScaleTransposeWG, kBScaleTransposeWG), [=](sycl::nd_item<1> item) {
+          const int g = static_cast<int>(item.get_group(0));
+          const int lid = static_cast<int>(item.get_local_id(0));
+
+          const int s_tile = g % s_tiles;
+          const int n_tile = (g / s_tiles) % n_tiles;
+          const int e = g / (s_tiles * n_tiles);
+
+          const int n0 = n_tile * kBScaleTransposeTile;
+          const int s0 = s_tile * kBScaleTransposeTile;
+          const int ne = (n - n0) < kBScaleTransposeTile ? (n - n0) : kBScaleTransposeTile;
+          const int se = (scale_cols - s0) < kBScaleTransposeTile ? (scale_cols - s0) : kBScaleTransposeTile;
+          const int count = ne * se;
+
+          const int64_t in_base = static_cast<int64_t>(e) * n * scale_cols;
+          const int64_t out_base = static_cast<int64_t>(e) * scale_cols * n;
+
+          for (int idx = lid; idx < count; idx += kBScaleTransposeWG) {
+            const int s_off = idx % se;
+            const int n_off = idx / se;
+            tile[s_off * kBScaleTransposePitch + n_off] =
+                b_scales_in_ptr[in_base + static_cast<int64_t>(n0 + n_off) * scale_cols + s0 + s_off];
+          }
+
+          sycl::group_barrier(item.get_group());
+
+          for (int idx = lid; idx < count; idx += kBScaleTransposeWG) {
+            const int n_off = idx % ne;
+            const int s_off = idx / ne;
+            b_scales_out_ptr[out_base + static_cast<int64_t>(s0 + s_off) * n + n0 + n_off] =
+                tile[s_off * kBScaleTransposePitch + n_off];
+          }
         });
   });
 }

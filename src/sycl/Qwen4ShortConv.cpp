@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <limits>
 #include <sycl/sycl.hpp>
-#include <type_traits>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
@@ -14,7 +13,6 @@
 namespace {
 
 using bf16 = sycl::ext::oneapi::bfloat16;
-using fp16 = sycl::half;
 
 constexpr int WG_SIZE = 256;
 constexpr int64_t CHANNELS_PER_WG = WG_SIZE;
@@ -258,33 +256,22 @@ SGL_KERNEL_EXPORT void qwen4_short_conv_state(
                          reinterpret_cast<uintptr_t>(conv_input.data_ptr()) % pack_bytes == 0;
 
   auto q = c10::xpu::getCurrentXPUStream().queue();
-  auto launch = [&](auto tag, auto vec) {
-    using T = decltype(tag);
-    ShortConvStateKernel<T, decltype(vec)::value> kernel{
-        {},
-        reinterpret_cast<T*>(state.data_ptr()),
-        state_indices.data_ptr<int64_t>(),
-        reinterpret_cast<const T*>(x.data_ptr()),
-        reinterpret_cast<T*>(conv_input.data_ptr()),
-        channels,
-        static_cast<int>(state_len),
-        {},
-        {}};
-    sycl_kernel_submit(
-        sycl::range<2>(tokens, channel_blocks * STATE_WG_SIZE), sycl::range<2>(1, STATE_WG_SIZE), q, kernel);
-  };
-  auto launch_dtype = [&](auto vec) {
-    if (state.scalar_type() == at::kBFloat16) {
-      launch(bf16{}, vec);
-    } else {
-      launch(fp16{}, vec);
-    }
-  };
-  if (vectorize) {
-    launch_dtype(std::integral_constant<int, STATE_VEC>{});
-  } else {
-    launch_dtype(std::integral_constant<int, 1>{});
-  }
+  SYCL_DISPATCH_FLOATING_TYPES_V1(state.scalar_type(), "qwen4_short_conv_state", [&] {
+    SGL_DISPATCH_VEC_SIZE_SET(vectorize ? STATE_VEC : 1, (1, 8), [&] {
+      ShortConvStateKernel<scalar_t, VEC_SIZE> kernel{
+          {},
+          reinterpret_cast<scalar_t*>(state.data_ptr()),
+          state_indices.data_ptr<int64_t>(),
+          reinterpret_cast<const scalar_t*>(x.data_ptr()),
+          reinterpret_cast<scalar_t*>(conv_input.data_ptr()),
+          channels,
+          static_cast<int>(state_len),
+          {},
+          {}};
+      sycl_kernel_submit(
+          sycl::range<2>(tokens, channel_blocks * STATE_WG_SIZE), sycl::range<2>(1, STATE_WG_SIZE), q, kernel);
+    });
+  });
 }
 
 // Verify-step short conv: with conv_input[r] = [state[state_indices[r]] as bf16, x viewed as [R, W, C] transposed],

@@ -405,18 +405,10 @@ SGL_KERNEL_EXPORT torch::Tensor plan_compress_decode(
     int64_t compress_ratio,
     int64_t swa_page_size,
     int64_t ring_size) {
-  CHECK_INPUT(req_pool_indices);
-  CHECK_DIM(1, req_pool_indices);
-  CHECK_EQ(req_pool_indices.dtype(), torch::kInt64);
-  CHECK_INPUT(req_to_token);
-  CHECK_DIM(2, req_to_token);
-  CHECK_EQ(req_to_token.dtype(), torch::kInt32);
-  CHECK_INPUT(full_to_state);
-  CHECK_DIM(1, full_to_state);
-  CHECK_EQ(full_to_state.dtype(), torch::kInt64);
-  CHECK_INPUT(seq_lens);
-  CHECK_DIM(1, seq_lens);
-  CHECK_EQ(seq_lens.dtype(), torch::kInt64);
+  CHECK_INPUT(1, torch::kInt64, req_pool_indices);
+  CHECK_INPUT(2, torch::kInt32, req_to_token);
+  CHECK_INPUT(1, torch::kInt64, full_to_state);
+  CHECK_INPUT(1, torch::kInt64, seq_lens);
   CHECK_EQ(req_pool_indices.numel(), seq_lens.numel());
   TORCH_CHECK(compress_ratio > 0, "compress_ratio must be > 0");
 
@@ -479,15 +471,9 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
   (void)pin_buffer;
   (void)use_cuda_graph;
 
-  CHECK_INPUT(req_pool_indices);
-  CHECK_DIM(1, req_pool_indices);
-  CHECK_EQ(req_pool_indices.dtype(), torch::kInt64);
-  CHECK_INPUT(req_to_token);
-  CHECK_DIM(2, req_to_token);
-  CHECK_EQ(req_to_token.dtype(), torch::kInt32);
-  CHECK_INPUT(full_to_state);
-  CHECK_DIM(1, full_to_state);
-  CHECK_EQ(full_to_state.dtype(), torch::kInt64);
+  CHECK_INPUT(1, torch::kInt64, req_pool_indices);
+  CHECK_INPUT(2, torch::kInt32, req_to_token);
+  CHECK_INPUT(1, torch::kInt64, full_to_state);
   TORCH_CHECK(
       (seq_lens.is_xpu() || seq_lens.device().is_cpu()) && seq_lens.dtype() == torch::kInt64 && seq_lens.dim() == 1 &&
           seq_lens.is_contiguous(),

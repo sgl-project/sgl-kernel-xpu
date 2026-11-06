@@ -310,13 +310,10 @@ SGL_KERNEL_EXPORT void flash_compress4_decode(
   const int64_t head_dim = kv_output.size(1);
   TORCH_CHECK(head_dim % kTileDim == 0, "flash_compress4_decode requires head_dim divisible by ", kTileDim);
   TORCH_CHECK(elem_size == 4 * head_dim, "kv_input last dim must be 4 * head_dim");
-  TORCH_CHECK(
-      kv_buffer.size(1) == 4 && kv_buffer.size(2) == elem_size, "kv_buffer shape must be [num_pages, 4, 4*head_dim]");
-  TORCH_CHECK(kv_output.size(0) == batch_size, "kv_output batch must match kv_input batch");
-  TORCH_CHECK(ape.size(0) == 8 && ape.size(1) == head_dim, "ape shape must be [8, head_dim]");
-  TORCH_CHECK(
-      plan_d.size(0) == batch_size && plan_d.size(1) == static_cast<int64_t>(sizeof(DecodePlan)),
-      "plan_d shape must be [B, 16]");
+  CHECK_SHAPE(kv_buffer, kv_buffer.size(0), 4, elem_size);
+  CHECK_SHAPE(kv_output, batch_size, head_dim);
+  CHECK_SHAPE(ape, 8, head_dim);
+  CHECK_SHAPE(plan_d, batch_size, static_cast<int64_t>(sizeof(DecodePlan)));
 
   if (batch_size == 0) {
     return;
@@ -396,13 +393,11 @@ SGL_KERNEL_EXPORT void flash_compress4_prefill(
   const int64_t head_dim = kv_output.size(1);
   TORCH_CHECK(head_dim % kTileDim == 0, "flash_compress4_prefill requires head_dim divisible by ", kTileDim);
   TORCH_CHECK(elem_size == 4 * head_dim, "kv_input last dim must be 4 * head_dim");
-  TORCH_CHECK(
-      kv_buffer.size(1) == 4 && kv_buffer.size(2) == elem_size, "kv_buffer shape must be [num_pages, 4, 4*head_dim]");
-  TORCH_CHECK(ape.size(0) == 8 && ape.size(1) == head_dim, "ape shape must be [8, head_dim]");
-  TORCH_CHECK(
-      plan_c.size(1) == static_cast<int64_t>(sizeof(CompressPlan)), "plan_c row size must be sizeof(CompressPlan)");
-  TORCH_CHECK(plan_w.size(1) == static_cast<int64_t>(sizeof(WritePlan)), "plan_w row size must be sizeof(WritePlan)");
-  TORCH_CHECK(kv_output.size(0) == num_compress, "kv_output rows must match num compress plans");
+  CHECK_SHAPE(kv_buffer, kv_buffer.size(0), 4, elem_size);
+  CHECK_SHAPE(ape, 8, head_dim);
+  CHECK_SHAPE(plan_c, num_compress, static_cast<int64_t>(sizeof(CompressPlan)));
+  CHECK_SHAPE(plan_w, num_write, static_cast<int64_t>(sizeof(WritePlan)));
+  CHECK_SHAPE(kv_output, num_compress, head_dim);
   TORCH_CHECK(num_q_tokens >= num_write, "invalid prefill plan: num_q < num_w");
 
   if (num_compress == 0 && num_write == 0) {

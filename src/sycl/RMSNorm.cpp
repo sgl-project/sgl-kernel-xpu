@@ -1120,7 +1120,7 @@ SGL_KERNEL_EXPORT void grouped_gemma_rmsnorm(
   CHECK_INPUT(weight);
   CHECK_INPUT(output);
   TORCH_CHECK(input.dim() >= 1, "input must have at least 1 dim");
-  TORCH_CHECK(input.sizes() == output.sizes(), "output must have the same shape as input");
+  CHECK_SAME_SHAPE(output, input);
   TORCH_CHECK(
       input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
       "grouped_gemma_rmsnorm supports bfloat16 and float16, got ",
@@ -1140,7 +1140,7 @@ SGL_KERNEL_EXPORT void grouped_gemma_rmsnorm(
 
   const int64_t hidden = input.size(-1);
   TORCH_CHECK(hidden % group_size == 0, "hidden size ", hidden, " must be divisible by group_size ", group_size);
-  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == hidden, "weight must be 1-D with hidden_size elements");
+  CHECK_SHAPE(weight, hidden);
   TORCH_CHECK(
       weight.device() == input.device() && output.device() == input.device(),
       "input, weight and output must be on the same device");

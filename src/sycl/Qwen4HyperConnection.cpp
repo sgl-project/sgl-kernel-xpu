@@ -202,21 +202,6 @@ void launch_rows(sycl::queue& q, int64_t rows, int64_t cols, const Kernel& kerne
   sycl_kernel_submit(sycl::range<2>(rows, groups * FLAT_WG), sycl::range<2>(1, FLAT_WG), q, kernel);
 }
 
-// Calls f(std::integral_constant<int, V>) for a runtime V in {8, 4, 2, 1}.
-template <typename F>
-void dispatch_vec(int v, F&& f) {
-  switch (v) {
-    case 8:
-      return f(std::integral_constant<int, 8>{});
-    case 4:
-      return f(std::integral_constant<int, 4>{});
-    case 2:
-      return f(std::integral_constant<int, 2>{});
-    default:
-      return f(std::integral_constant<int, 1>{});
-  }
-}
-
 // Widest V <= max_v such that `inner` elements (the contiguous extent every vector must tile) and all pointers are
 // V-aligned.
 int pick_vec(int64_t inner, std::initializer_list<const at::Tensor*> tensors, int max_v = VEC_SIZE) {
@@ -469,7 +454,7 @@ namespace at::native::xpu {
 SGL_KERNEL_EXPORT void qwen4_hc_silu(torch::Tensor& output, const torch::Tensor& input, int64_t hc_count) {
   check_bf16_xpu(input, "input");
   check_bf16_xpu(output, "output");
-  TORCH_CHECK(output.sizes() == input.sizes(), "output must have the same shape as input");
+  CHECK_SAME_SHAPE(output, input);
   TORCH_CHECK(hc_count > 0, "hc_count must be positive");
   check_no_partial_overlap(output, input);
   const int64_t n = input.numel();
@@ -480,8 +465,8 @@ SGL_KERNEL_EXPORT void qwen4_hc_silu(torch::Tensor& output, const torch::Tensor&
   auto q = c10::xpu::getCurrentXPUStream().queue();
   const float inv_hc = 1.0f / static_cast<float>(hc_count);
   const int max_v = n <= NARROW_MAX_OUTPUTS ? NARROW_VEC : VEC_SIZE;
-  dispatch_vec(pick_vec(n, {&input, &output}, max_v), [&](auto vec) {
-    constexpr int V = decltype(vec)::value;
+  SGL_DISPATCH_VEC_SIZE_SET(pick_vec(n, {&input, &output}, max_v), (1, 2, 4, 8), [&] {
+    constexpr int V = VEC_SIZE;
     const uint32_t items = n / V;
     launch_flat(q, items, SiluKernel<V>{as<bf16xV<V>>(input), as_mut<bf16xV<V>>(output), items, inv_hc});
   });
@@ -492,11 +477,11 @@ qwen4_hc_gate_mix(torch::Tensor& output, const torch::Tensor& input, const torch
   check_bf16_xpu(input, "input");
   check_bf16_xpu(gate, "gate");
   check_bf16_xpu(output, "output");
-  TORCH_CHECK(input.dim() == 2 && gate.sizes() == input.sizes(), "input and gate must be [tokens, HC * hidden]");
+  CHECK_DIM(2, input);
+  CHECK_SAME_SHAPE(gate, input);
   TORCH_CHECK(hc_count > 0 && input.size(1) % hc_count == 0, "HC * hidden must be divisible by hc_count");
   const int64_t rows = input.size(0), hidden = input.size(1) / hc_count;
-  TORCH_CHECK(
-      output.dim() == 2 && output.size(0) == rows && output.size(1) == hidden, "output must be [tokens, hidden]");
+  CHECK_SHAPE(output, rows, hidden);
   check_no_overlap(output, {&input, &gate});
   if (rows == 0 || hidden == 0) return;
   TORCH_CHECK(input.numel() <= MAX_ID, "qwen4_hc_gate_mix: input too large: ", input.sizes());
@@ -504,8 +489,8 @@ qwen4_hc_gate_mix(torch::Tensor& output, const torch::Tensor& input, const torch
   c10::DeviceGuard guard(input.device());
   auto q = c10::xpu::getCurrentXPUStream().queue();
   const int max_v = rows * hidden <= NARROW_MAX_OUTPUTS ? NARROW_VEC : VEC_SIZE;
-  dispatch_vec(pick_vec(hidden, {&input, &gate, &output}, max_v), [&](auto vec) {
-    constexpr int V = decltype(vec)::value;
+  SGL_DISPATCH_VEC_SIZE_SET(pick_vec(hidden, {&input, &gate, &output}, max_v), (1, 2, 4, 8), [&] {
+    constexpr int V = VEC_SIZE;
     const uint32_t vecs_per_row = hidden / V;
     launch_rows(
         q,
@@ -530,11 +515,11 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine(
   check_bf16_xpu(residual, "residual");
   check_bf16_xpu(block_output, "block_output");
   check_bf16_xpu(output, "output");
-  TORCH_CHECK(residual.dim() == 2 && block_output.dim() == 2, "residual and block_output must be 2D");
+  CHECK_DIM(2, residual);
   TORCH_CHECK(hc_count > 0 && residual.size(1) % hc_count == 0, "HC * hidden must be divisible by hc_count");
   const int64_t rows = residual.size(0), hidden = residual.size(1) / hc_count;
-  TORCH_CHECK(block_output.size(0) == rows && block_output.size(1) == hidden, "block_output must be [tokens, hidden]");
-  TORCH_CHECK(output.sizes() == residual.sizes(), "output must have the same shape as residual");
+  CHECK_SHAPE(block_output, rows, hidden);
+  CHECK_SAME_SHAPE(output, residual);
   const bf16* injection_data = injection_ptr(injection, rows, hc_count);
   check_no_partial_overlap(output, residual);
   check_no_overlap(output, {&block_output});
@@ -544,8 +529,8 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine(
 
   c10::DeviceGuard guard(residual.device());
   auto q = c10::xpu::getCurrentXPUStream().queue();
-  dispatch_vec(pick_vec(hidden, {&residual, &block_output, &output}), [&](auto vec) {
-    constexpr int V = decltype(vec)::value;
+  SGL_DISPATCH_VEC_SIZE_SET(pick_vec(hidden, {&residual, &block_output, &output}), (1, 2, 4, 8), [&] {
+    constexpr int V = VEC_SIZE;
     const uint32_t vecs_per_row = hidden / V;
     const auto launch = [&](auto has_injection) {
       launch_rows(

@@ -169,13 +169,13 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_q_indexer
   CHECK_INPUT(2, at::kFloat, rope_cache);
   CHECK_INPUT(1, positions);
   CHECK_DTYPES(positions, at::kInt, at::kLong);
-  TORCH_CHECK(q_input.size(2) == kHeadDim, "q_input head_dim must be 128");
-  TORCH_CHECK(weight.size(0) == q_input.size(0) && weight.size(1) == q_input.size(1), "weight must be [B, H]");
-  TORCH_CHECK(
-      rope_cache.size(1) == kRopeDim && positions.size(0) == q_input.size(0), "invalid rope_cache or positions shape");
-
   const int64_t batch = q_input.size(0);
   const int64_t heads = q_input.size(1);
+  CHECK_SHAPE(q_input, batch, heads, kHeadDim);
+  CHECK_SHAPE(weight, batch, heads);
+  CHECK_SHAPE(rope_cache, rope_cache.size(0), kRopeDim);
+  CHECK_SHAPE(positions, batch);
+
   at::Tensor q_fp4 = at::empty({batch, heads, kBlockSize}, q_input.options().dtype(at::kChar));
   // One packed int32 per head; the kernel writes its four ue8m0 exponent
   // bytes through this zero-copy uint8 view.

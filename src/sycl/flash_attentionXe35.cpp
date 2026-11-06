@@ -36,10 +36,15 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     bool return_softmax_lse,
     std::optional<const at::Tensor>& rel_bias_,
     bool rel_bias_is_sheared,
-    std::optional<const at::Tensor>& bidirectional_block_ids_) {
+    std::optional<const at::Tensor>& bidirectional_block_ids_,
+    std::optional<const at::Tensor>& seqused_q_,
+    std::optional<const at::Tensor>& seqused_k_) {
   TORCH_CHECK(!return_softmax_lse, "flash_attentionXe35: softmax LSE is not supported");
   TORCH_CHECK(!rel_bias_.has_value() && !rel_bias_is_sheared, "flash_attentionXe35: relative bias is not supported");
   TORCH_CHECK(!bidirectional_block_ids_.has_value(), "flash_attentionXe35: bidirectional blocks are not supported");
+  TORCH_CHECK(
+      !seqused_q_.has_value() && !seqused_k_.has_value(),
+      "flash_attentionXe35: seqused_q / seqused_k are not supported");
   const int batch = static_cast<int>(cu_seqlens_q.size(0) - 1);
   TORCH_CHECK(batch > 0, "flash_attentionXe35: empty batch is not supported");
   const bool is_paged = page_table.has_value();

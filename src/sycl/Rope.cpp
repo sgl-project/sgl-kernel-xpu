@@ -353,7 +353,7 @@ void rotary_embedding_2D_kernel_impl(
   }
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "rotary_embedding_2D_kernel_impl", [=]() {
+      at::kHalf, at::kBFloat16, query.scalar_type(), "rotary_embedding_2D_kernel_impl", [=]() {
         auto cgf = DPCPP_Q_CGF(cgh) {
           if (is_neox) {
             RotaryEmbeddingBatched<scalar_t, EmbeddingAlgorithm::RotateHalf, false> kernel = {

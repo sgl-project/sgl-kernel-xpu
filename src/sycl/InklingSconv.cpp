@@ -1695,39 +1695,38 @@ SGL_KERNEL_EXPORT at::Tensor inkling_sconv_forward(
   SGL_KERNEL_PERF_SCOPE("inkling_sconv_forward", queue, bytes, flops);
 #endif
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_sconv_forward", [&]() -> at::Tensor {
-        SconvForwardParams<scalar_t> params{
-            x.data_ptr<scalar_t>(),
-            sconv_cache.data_ptr<scalar_t>(),
-            cache_mask.data_ptr<bool>(),
-            safe_idx.data_ptr<int64_t>(),
-            cu.data_ptr<int64_t>(),
-            si.data_ptr<int32_t>(),
-            weight.data_ptr<scalar_t>(),
-            y.data_ptr<scalar_t>(),
-            x.size(0),
-            x.size(1),
-            weight_layout.W,
-            x.stride(0),
-            x.stride(1),
-            sconv_cache.stride(0),
-            sconv_cache.stride(1),
-            sconv_cache.stride(2),
-            cache_mask.stride(0),
-            weight_layout.stride_d,
-            weight_layout.stride_w,
-            y.stride(0),
-            y.stride(1),
-            silu_activation,
-            use_residual,
-            is_decode,
-            weight_layout.current_first};
-        if (!try_launch_sconv_forward_block<scalar_t>(queue, params)) {
-          launch_sconv_forward<scalar_t>(queue, params);
-        }
-        return y;
-      });
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input_type, "inkling_sconv_forward", [&]() -> at::Tensor {
+    SconvForwardParams<scalar_t> params{
+        x.data_ptr<scalar_t>(),
+        sconv_cache.data_ptr<scalar_t>(),
+        cache_mask.data_ptr<bool>(),
+        safe_idx.data_ptr<int64_t>(),
+        cu.data_ptr<int64_t>(),
+        si.data_ptr<int32_t>(),
+        weight.data_ptr<scalar_t>(),
+        y.data_ptr<scalar_t>(),
+        x.size(0),
+        x.size(1),
+        weight_layout.W,
+        x.stride(0),
+        x.stride(1),
+        sconv_cache.stride(0),
+        sconv_cache.stride(1),
+        sconv_cache.stride(2),
+        cache_mask.stride(0),
+        weight_layout.stride_d,
+        weight_layout.stride_w,
+        y.stride(0),
+        y.stride(1),
+        silu_activation,
+        use_residual,
+        is_decode,
+        weight_layout.current_first};
+    if (!try_launch_sconv_forward_block<scalar_t>(queue, params)) {
+      launch_sconv_forward<scalar_t>(queue, params);
+    }
+    return y;
+  });
 
   return y;
 }
@@ -1757,24 +1756,23 @@ SGL_KERNEL_EXPORT void inkling_update_sconv_cache(
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = x.scalar_type();
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_update_sconv_cache", [&]() {
-        UpdateSconvCacheParams<scalar_t> params{
-            x.data_ptr<scalar_t>(),
-            sconv_cache.data_ptr<scalar_t>(),
-            cache_indices.data_ptr<int32_t>(),
-            has_initial_state.data_ptr<bool>(),
-            query_start_loc.data_ptr<int32_t>(),
-            cache_indices.numel(),
-            x.size(1),
-            sconv_cache.size(1),
-            x.stride(0),
-            x.stride(1),
-            sconv_cache.stride(0),
-            sconv_cache.stride(1),
-            sconv_cache.stride(2)};
-        launch_update_sconv_cache<scalar_t>(queue, params);
-      });
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input_type, "inkling_update_sconv_cache", [&]() {
+    UpdateSconvCacheParams<scalar_t> params{
+        x.data_ptr<scalar_t>(),
+        sconv_cache.data_ptr<scalar_t>(),
+        cache_indices.data_ptr<int32_t>(),
+        has_initial_state.data_ptr<bool>(),
+        query_start_loc.data_ptr<int32_t>(),
+        cache_indices.numel(),
+        x.size(1),
+        sconv_cache.size(1),
+        x.stride(0),
+        x.stride(1),
+        sconv_cache.stride(0),
+        sconv_cache.stride(1),
+        sconv_cache.stride(2)};
+    launch_update_sconv_cache<scalar_t>(queue, params);
+  });
 }
 
 SGL_KERNEL_EXPORT at::Tensor inkling_fused_decode_update_sconv(
@@ -1820,11 +1818,7 @@ SGL_KERNEL_EXPORT at::Tensor inkling_fused_decode_update_sconv(
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = x.scalar_type();
   AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      input_type,
-      "inkling_fused_decode_update_sconv",
-      [&]() -> at::Tensor {
+      at::kHalf, at::kBFloat16, input_type, "inkling_fused_decode_update_sconv", [&]() -> at::Tensor {
         FusedDecodeUpdateParams<scalar_t> params{
             x.data_ptr<scalar_t>(),
             sconv_cache.data_ptr<scalar_t>(),
@@ -1886,27 +1880,26 @@ SGL_KERNEL_EXPORT void inkling_gather_scatter_sconv_cache(
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = hidden_states.scalar_type();
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_gather_scatter_sconv_cache", [&]() {
-        GatherScatterParams<scalar_t> params{
-            hidden_states.data_ptr<scalar_t>(),
-            sconv_cache.data_ptr<scalar_t>(),
-            track_conv_indices.data_ptr<int32_t>(),
-            mask.data_ptr<bool>(),
-            dst_indices.data_ptr<int64_t>(),
-            mask.numel(),
-            hidden_states.size(1),
-            sconv_cache.size(1),
-            hidden_states.stride(0),
-            hidden_states.stride(1),
-            sconv_cache.stride(0),
-            sconv_cache.stride(1),
-            sconv_cache.stride(2),
-            track_conv_indices.stride(0),
-            track_conv_indices.stride(1),
-            dst_indices.stride(0)};
-        launch_gather_scatter<scalar_t>(queue, params);
-      });
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input_type, "inkling_gather_scatter_sconv_cache", [&]() {
+    GatherScatterParams<scalar_t> params{
+        hidden_states.data_ptr<scalar_t>(),
+        sconv_cache.data_ptr<scalar_t>(),
+        track_conv_indices.data_ptr<int32_t>(),
+        mask.data_ptr<bool>(),
+        dst_indices.data_ptr<int64_t>(),
+        mask.numel(),
+        hidden_states.size(1),
+        sconv_cache.size(1),
+        hidden_states.stride(0),
+        hidden_states.stride(1),
+        sconv_cache.stride(0),
+        sconv_cache.stride(1),
+        sconv_cache.stride(2),
+        track_conv_indices.stride(0),
+        track_conv_indices.stride(1),
+        dst_indices.stride(0)};
+    launch_gather_scatter<scalar_t>(queue, params);
+  });
 }
 
 SGL_KERNEL_EXPORT void inkling_draft_extend_sconv_cache(
@@ -1965,28 +1958,27 @@ SGL_KERNEL_EXPORT void inkling_draft_extend_sconv_cache(
 
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = hidden_states.scalar_type();
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_draft_extend_sconv_cache", [&]() {
-        DraftExtendParams<scalar_t> params{
-            hidden_states.data_ptr<scalar_t>(),
-            sconv_cache.data_ptr<scalar_t>(),
-            cache_indices.data_ptr<int32_t>(),
-            num_accepted_tokens.data_ptr<int32_t>(),
-            do_tracking ? crossed.value().data_ptr<bool>() : nullptr,
-            do_tracking ? track_step.value().data_ptr<int32_t>() : nullptr,
-            do_tracking ? mamba_track_indices.value().data_ptr<int64_t>() : nullptr,
-            B,
-            D,
-            sconv_cache.size(1),
-            hidden_stride_b,
-            hidden_stride_t,
-            hidden_stride_d,
-            sconv_cache.stride(0),
-            sconv_cache.stride(1),
-            sconv_cache.stride(2),
-            do_tracking};
-        launch_draft_extend<scalar_t>(queue, params);
-      });
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input_type, "inkling_draft_extend_sconv_cache", [&]() {
+    DraftExtendParams<scalar_t> params{
+        hidden_states.data_ptr<scalar_t>(),
+        sconv_cache.data_ptr<scalar_t>(),
+        cache_indices.data_ptr<int32_t>(),
+        num_accepted_tokens.data_ptr<int32_t>(),
+        do_tracking ? crossed.value().data_ptr<bool>() : nullptr,
+        do_tracking ? track_step.value().data_ptr<int32_t>() : nullptr,
+        do_tracking ? mamba_track_indices.value().data_ptr<int64_t>() : nullptr,
+        B,
+        D,
+        sconv_cache.size(1),
+        hidden_stride_b,
+        hidden_stride_t,
+        hidden_stride_d,
+        sconv_cache.stride(0),
+        sconv_cache.stride(1),
+        sconv_cache.stride(2),
+        do_tracking};
+    launch_draft_extend<scalar_t>(queue, params);
+  });
 }
 
 SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
@@ -2171,7 +2163,7 @@ SGL_KERNEL_EXPORT void inkling_save_intermediate_conv_windows(
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   const auto input_type = sconv_cache.scalar_type();
   AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "inkling_save_intermediate_conv_windows", [&]() {
+      at::kHalf, at::kBFloat16, input_type, "inkling_save_intermediate_conv_windows", [&]() {
         SaveWindowsParams<scalar_t> params{
             sconv_cache.data_ptr<scalar_t>(),
             hidden_states.data_ptr<scalar_t>(),

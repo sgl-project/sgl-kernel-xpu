@@ -163,24 +163,16 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> fused_q_indexer
   // ue8m0 scale bytes per head are returned packed as one int32.
   const at::Tensor rope_cache =
       freqs_cis.is_complex() ? at::view_as_real(freqs_cis).flatten(-2).contiguous() : freqs_cis;
-  CHECK_INPUT(q_input);
-  CHECK_INPUT(weight);
-  CHECK_INPUT(rope_cache);
-  CHECK_INPUT(positions);
-  CHECK_DIM(3, q_input);
-  CHECK_DIM(2, weight);
-  CHECK_DIM(2, rope_cache);
-  CHECK_DIM(1, positions);
+  CHECK_INPUT(3, q_input);
+  CHECK_DTYPES(q_input, at::kHalf, at::kBFloat16);
+  CHECK_INPUT(2, q_input.scalar_type(), weight);
+  CHECK_INPUT(2, at::kFloat, rope_cache);
+  CHECK_INPUT(1, positions);
+  CHECK_DTYPES(positions, at::kInt, at::kLong);
   TORCH_CHECK(q_input.size(2) == kHeadDim, "q_input head_dim must be 128");
   TORCH_CHECK(weight.size(0) == q_input.size(0) && weight.size(1) == q_input.size(1), "weight must be [B, H]");
   TORCH_CHECK(
       rope_cache.size(1) == kRopeDim && positions.size(0) == q_input.size(0), "invalid rope_cache or positions shape");
-  TORCH_CHECK(
-      q_input.scalar_type() == at::kBFloat16 || q_input.scalar_type() == at::kHalf, "q_input must be bf16 or fp16");
-  TORCH_CHECK(weight.scalar_type() == q_input.scalar_type(), "weight dtype must match q_input");
-  TORCH_CHECK(rope_cache.scalar_type() == at::kFloat, "rope_cache must be float32 (or complex64 freqs_cis)");
-  TORCH_CHECK(
-      positions.scalar_type() == at::kInt || positions.scalar_type() == at::kLong, "positions must be int32 or int64");
 
   const int64_t batch = q_input.size(0);
   const int64_t heads = q_input.size(1);

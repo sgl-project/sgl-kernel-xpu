@@ -1682,4 +1682,32 @@ std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_table(
     int64_t topk,
     int64_t page_size);
 
+/*
+ * Mono decode (Xe2, USE_MONO_DECODE): one resident kernel per Qwen3.5 / Qwen3.6
+ * MoE decoder layer at TP2, the TP all-reduces done inside the kernel through a
+ * P2P mailbox in the peer card's memory (src/sycl/MonoDecodeXe20.cpp).
+ */
+bool mono_decode_supported(int64_t device);
+int64_t mono_max_context();
+at::Tensor mono_health(int64_t device);
+void mono_set_deadline(double seconds);
+void mono_fault_inject(int64_t layer, int64_t delta);
+int64_t mono_ipc_create(int64_t bytes);
+std::vector<int64_t> mono_ipc_export(int64_t handle);
+int64_t mono_ipc_open(int64_t handle, std::vector<int64_t> peer_info, int64_t local_fd);
+int64_t mono_ipc_ptr(int64_t handle, bool peer);
+int64_t mono_mbox_bytes();
+void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, const std::vector<at::Tensor>& tensors);
+void mono_bind_caches(int64_t layer, const std::vector<at::Tensor>& caches, int64_t page_size);
+void mono_decode_layer(
+    int64_t layer,
+    const at::Tensor& hidden,
+    const at::Tensor& residual,
+    at::Tensor& hid_out,
+    at::Tensor& res_out,
+    const at::Tensor& positions,
+    const at::Tensor& m0,
+    const std::optional<at::Tensor>& m1,
+    const std::optional<at::Tensor>& m2);
+
 #pragma GCC visibility pop

@@ -765,6 +765,40 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 #endif  // USE_GDN
 
   /*
+   * Mono decode (Qwen3.5 / Qwen3.6 MoE decoder layers, TP2, Xe2)
+   */
+#ifdef USE_MONO_DECODE
+  m.def("mono_decode_supported(int device) -> bool");
+  m.impl("mono_decode_supported", c10::DispatchKey::BackendSelect, &mono_decode_supported);
+  m.def("mono_max_context() -> int");
+  m.impl("mono_max_context", c10::DispatchKey::BackendSelect, &mono_max_context);
+  m.def("mono_health(int device) -> Tensor");
+  m.impl("mono_health", c10::DispatchKey::BackendSelect, &mono_health);
+  m.def("mono_set_deadline(float seconds) -> ()");
+  m.impl("mono_set_deadline", c10::DispatchKey::BackendSelect, &mono_set_deadline);
+  m.def("mono_fault_inject(int layer, int delta) -> ()");
+  m.impl("mono_fault_inject", c10::DispatchKey::BackendSelect, &mono_fault_inject);
+  m.def("mono_ipc_create(int bytes) -> int");
+  m.impl("mono_ipc_create", c10::DispatchKey::BackendSelect, &mono_ipc_create);
+  m.def("mono_ipc_export(int handle) -> int[]");
+  m.impl("mono_ipc_export", c10::DispatchKey::BackendSelect, &mono_ipc_export);
+  m.def("mono_ipc_open(int handle, int[] peer_info, int local_fd) -> int");
+  m.impl("mono_ipc_open", c10::DispatchKey::BackendSelect, &mono_ipc_open);
+  m.def("mono_ipc_ptr(int handle, bool peer) -> int");
+  m.impl("mono_ipc_ptr", c10::DispatchKey::BackendSelect, &mono_ipc_ptr);
+  m.def("mono_mbox_bytes() -> int");
+  m.impl("mono_mbox_bytes", c10::DispatchKey::BackendSelect, &mono_mbox_bytes);
+  m.def("mono_register_layer(int layer, bool attn, int mbox, int peer, Tensor[] tensors) -> ()");
+  m.impl("mono_register_layer", torch::kXPU, &mono_register_layer);
+  m.def("mono_bind_caches(int layer, Tensor[] caches, int page_size) -> ()");
+  m.impl("mono_bind_caches", torch::kXPU, &mono_bind_caches);
+  m.def(
+      "mono_decode_layer(int layer, Tensor hidden, Tensor residual, Tensor! hid_out, Tensor! res_out, "
+      "Tensor positions, Tensor m0, Tensor? m1, Tensor? m2) -> ()");
+  m.impl("mono_decode_layer", torch::kXPU, &mono_decode_layer);
+#endif  // USE_MONO_DECODE
+
+  /*
    * Mamba causal conv1d (XPU)
    */
   m.def(

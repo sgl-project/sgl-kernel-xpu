@@ -647,22 +647,10 @@ namespace mmtopk = sgl::sycl_kernel;
 
 namespace {
 
-// Both widths are instantiated because callers pass whichever their scheduler produced.
-enum class SeqLenKind { kI32, kI64 };
-
-SeqLenKind seq_len_kind(const at::Tensor& seq_lens) {
-  TORCH_CHECK(
-      seq_lens.scalar_type() == at::kInt || seq_lens.scalar_type() == at::kLong,
-      "seq_lens must be int32 or int64, got ",
-      seq_lens.scalar_type());
-  return seq_lens.scalar_type() == at::kInt ? SeqLenKind::kI32 : SeqLenKind::kI64;
-}
-
 void check_score_and_seq_lens(const at::Tensor& score, const at::Tensor& seq_lens, int64_t block_size, int64_t topk) {
-  TORCH_CHECK(score.scalar_type() == at::kFloat, "score must be float32, got ", score.scalar_type());
-  TORCH_CHECK(score.dim() == 3, "score must be 3-D, got ", score.dim(), "-D");
-  TORCH_CHECK(seq_lens.dim() == 1, "seq_lens must be 1-D, got ", seq_lens.dim(), "-D");
-  TORCH_CHECK(score.device().is_xpu(), "score must be on XPU, got ", score.device());
+  CHECK_DTYPE(at::kFloat, score);
+  CHECK_DIM(3, score);
+  CHECK_DEVICE(score);
   TORCH_CHECK(
       seq_lens.device() == score.device(),
       "score and seq_lens must be on the same device, got ",
@@ -678,7 +666,7 @@ void check_score_and_seq_lens(const at::Tensor& score, const at::Tensor& seq_len
 
   const int64_t batch = score.size(1);
   const int64_t max_seqblock = score.size(2);
-  TORCH_CHECK(seq_lens.numel() == batch, "seq_lens length (", seq_lens.numel(), ") must match batch (", batch, ")");
+  CHECK_SHAPE(seq_lens, batch);
   TORCH_CHECK(
       max_seqblock <= mmtopk::kMaxNumBlocks,
       "max_seqblock (",
@@ -698,19 +686,10 @@ SGL_KERNEL_EXPORT void minimax_decode_topk(
   const int64_t batch = score.size(1);
   const int64_t max_seqblock = score.size(2);
 
-  TORCH_CHECK(out.scalar_type() == at::kInt, "out must be int32, got ", out.scalar_type());
-  TORCH_CHECK(
-      out.dim() == 3 && out.size(0) == num_heads && out.size(1) == batch && out.size(2) == topk,
-      "out shape must be (",
-      num_heads,
-      ", ",
-      batch,
-      ", ",
-      topk,
-      "), got ",
-      out.sizes());
+  CHECK_DTYPE(at::kInt, out);
+  CHECK_SHAPE(out, num_heads, batch, topk);
   TORCH_CHECK(out.device() == score.device(), "out device (", out.device(), ") must match score device");
-  TORCH_CHECK(out.is_contiguous(), "out must be contiguous");
+  CHECK_CONTIGUOUS(out);
 
   const at::Tensor score_c = score.contiguous();
   const at::Tensor seq_lens_c = seq_lens.contiguous();
@@ -728,16 +707,10 @@ SGL_KERNEL_EXPORT void minimax_decode_topk(
   timer.start();
 #endif
 
-  switch (seq_len_kind(seq_lens_c)) {
-    case SeqLenKind::kI32:
-      mmtopk::minimax_decode_topk_launcher<int32_t>(
-          queue, score_c.const_data_ptr(), seq_lens_c.const_data_ptr(), out.data_ptr(), b, h, s, bs, k);
-      break;
-    case SeqLenKind::kI64:
-      mmtopk::minimax_decode_topk_launcher<int64_t>(
-          queue, score_c.const_data_ptr(), seq_lens_c.const_data_ptr(), out.data_ptr(), b, h, s, bs, k);
-      break;
-  }
+  AT_DISPATCH_INDEX_TYPES(seq_lens_c.scalar_type(), "minimax_decode_topk", [&] {
+    mmtopk::minimax_decode_topk_launcher<index_t>(
+        queue, score_c.const_data_ptr(), seq_lens_c.const_data_ptr(), out.data_ptr(), b, h, s, bs, k);
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const double flops = 0.0;
@@ -758,10 +731,9 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_ta
     int64_t page_size) {
   check_score_and_seq_lens(score, seq_lens, block_size, topk);
 
-  TORCH_CHECK(req_to_token.scalar_type() == at::kInt, "req_to_token must be int32, got ", req_to_token.scalar_type());
-  TORCH_CHECK(slot_ids.scalar_type() == at::kLong, "slot_ids must be int64, got ", slot_ids.scalar_type());
-  TORCH_CHECK(req_to_token.dim() == 2, "req_to_token must be 2-D, got ", req_to_token.dim(), "-D");
-  TORCH_CHECK(slot_ids.dim() == 1, "slot_ids must be 1-D, got ", slot_ids.dim(), "-D");
+  CHECK_DTYPE(at::kInt, req_to_token);
+  CHECK_DTYPE(at::kLong, slot_ids);
+  CHECK_DIM(2, req_to_token);
   TORCH_CHECK(req_to_token.device() == score.device(), "score and req_to_token must be on the same device");
   TORCH_CHECK(slot_ids.device() == score.device(), "score and slot_ids must be on the same device");
 
@@ -772,7 +744,7 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_ta
   const int64_t num_heads = score.size(0);
   const int64_t batch = score.size(1);
   const int64_t max_seqblock = score.size(2);
-  TORCH_CHECK(slot_ids.numel() == batch, "slot_ids length (", slot_ids.numel(), ") must match batch (", batch, ")");
+  CHECK_SHAPE(slot_ids, batch);
 
   // The kernel addresses req_to_token flat as r2t_base + tok, so only the inner stride
   // must be 1; row-pitched slices of a larger pool are common, so don't demand contiguity.
@@ -811,48 +783,26 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_ta
   const auto reqs = static_cast<int32_t>(max_reqs);
   const auto pages = static_cast<int32_t>(max_sparse_pages);
 
-  switch (seq_len_kind(seq_lens_c)) {
-    case SeqLenKind::kI32:
-      mmtopk::minimax_decode_topk_page_table_launcher<int32_t>(
-          queue,
-          score_c.const_data_ptr(),
-          seq_lens_c.const_data_ptr(),
-          req_to_token.const_data_ptr(),
-          slot_ids_c.const_data_ptr(),
-          page_table.data_ptr(),
-          real_seq_lens.data_ptr(),
-          b,
-          h,
-          s,
-          bs,
-          k,
-          ps,
-          stride,
-          kv_len,
-          reqs,
-          pages);
-      break;
-    case SeqLenKind::kI64:
-      mmtopk::minimax_decode_topk_page_table_launcher<int64_t>(
-          queue,
-          score_c.const_data_ptr(),
-          seq_lens_c.const_data_ptr(),
-          req_to_token.const_data_ptr(),
-          slot_ids_c.const_data_ptr(),
-          page_table.data_ptr(),
-          real_seq_lens.data_ptr(),
-          b,
-          h,
-          s,
-          bs,
-          k,
-          ps,
-          stride,
-          kv_len,
-          reqs,
-          pages);
-      break;
-  }
+  AT_DISPATCH_INDEX_TYPES(seq_lens_c.scalar_type(), "minimax_decode_topk_page_table", [&] {
+    mmtopk::minimax_decode_topk_page_table_launcher<index_t>(
+        queue,
+        score_c.const_data_ptr(),
+        seq_lens_c.const_data_ptr(),
+        req_to_token.const_data_ptr(),
+        slot_ids_c.const_data_ptr(),
+        page_table.data_ptr(),
+        real_seq_lens.data_ptr(),
+        b,
+        h,
+        s,
+        bs,
+        k,
+        ps,
+        stride,
+        kv_len,
+        reqs,
+        pages);
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const double flops = 0.0;

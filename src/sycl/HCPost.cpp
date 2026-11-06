@@ -146,24 +146,18 @@ SGL_KERNEL_EXPORT void hc_post(
     const at::Tensor& comb_res_mix,
     at::Tensor& out) {
   CHECK_INPUT(x);
-  CHECK_INPUT(residual);
+  CHECK_INPUT(3, at::kBFloat16, residual);
   CHECK_INPUT(post_layer_mix);
-  CHECK_INPUT(comb_res_mix);
-  CHECK_INPUT(out);
+  CHECK_INPUT(3, at::kFloat, comb_res_mix);
+  CHECK_INPUT(3, at::kBFloat16, out);
 
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16, "x must be bfloat16");
-  TORCH_CHECK(residual.scalar_type() == at::kBFloat16, "residual must be bfloat16");
-  TORCH_CHECK(post_layer_mix.scalar_type() == at::kFloat, "post_layer_mix must be float32");
-  TORCH_CHECK(comb_res_mix.scalar_type() == at::kFloat, "comb_res_mix must be float32");
-  TORCH_CHECK(out.scalar_type() == at::kBFloat16, "out must be bfloat16");
+  CHECK_DTYPE(at::kBFloat16, x);
+  CHECK_DTYPE(at::kFloat, post_layer_mix);
 
   int64_t T = x.size(0);
   int64_t D = x.size(1);
 
-  TORCH_CHECK(residual.dim() == 3, "residual must be 3D [T, HC, D]");
-  TORCH_CHECK(residual.size(0) == T, "residual T mismatch");
-  TORCH_CHECK(residual.size(1) == 4, "residual must have 4 channels (HC=4)");
-  TORCH_CHECK(residual.size(2) == D, "residual D mismatch");
+  CHECK_SHAPE(residual, T, 4, D);
 
   at::Tensor post_layer_mix_2d = post_layer_mix;
   if (post_layer_mix_2d.dim() == 3) {
@@ -171,19 +165,9 @@ SGL_KERNEL_EXPORT void hc_post(
     post_layer_mix_2d = post_layer_mix_2d.squeeze(-1);
   }
 
-  TORCH_CHECK(post_layer_mix_2d.dim() == 2, "post_layer_mix must be [T, HC] or [T, HC, 1]");
-  TORCH_CHECK(post_layer_mix_2d.size(0) == T, "post_layer_mix T mismatch");
-  TORCH_CHECK(post_layer_mix_2d.size(1) == 4, "post_layer_mix must have 4 elements (HC=4)");
-
-  TORCH_CHECK(comb_res_mix.dim() == 3, "comb_res_mix must be 3D [T, HC, HC]");
-  TORCH_CHECK(comb_res_mix.size(0) == T, "comb_res_mix T mismatch");
-  TORCH_CHECK(comb_res_mix.size(1) == 4, "comb_res_mix must have 4 rows (HC=4)");
-  TORCH_CHECK(comb_res_mix.size(2) == 4, "comb_res_mix must have 4 cols (HC=4)");
-
-  TORCH_CHECK(out.dim() == 3, "out must be 3D [T, HC, D]");
-  TORCH_CHECK(out.size(0) == T, "out T mismatch");
-  TORCH_CHECK(out.size(1) == 4, "out must have 4 channels (HC=4)");
-  TORCH_CHECK(out.size(2) == D, "out D mismatch");
+  CHECK_SHAPE(post_layer_mix_2d, T, 4);
+  CHECK_SHAPE(comb_res_mix, T, 4, 4);
+  CHECK_SAME_SHAPE(out, residual);
 
   auto q = dpcppGetCurrentQueue();
 

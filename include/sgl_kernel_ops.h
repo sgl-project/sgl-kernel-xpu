@@ -26,6 +26,10 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
+torch::Tensor bf16_dense_gemm_xe20(const torch::Tensor& input, const torch::Tensor& weight);
+torch::Tensor bf16_dense_rank_argmax_xe20(
+    const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& comparison_ranks);
+
 #define _CONCAT(A, B) A##B
 #define CONCAT(A, B) _CONCAT(A, B)
 

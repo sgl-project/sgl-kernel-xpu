@@ -6,11 +6,13 @@ namespace jit {
 const ArchProfile& arch_profile(Arch a) {
   // BMG keeps `target` empty so the existing SGLANG_SYCL_AOT_TARGETS / default
   // (intel_gpu_bmg_g21) behavior is preserved unchanged.
-  static const ArchProfile kBmg{/*target=*/"", /*macro=*/"", /*suffix=*/"bmg"};
+  static const ArchProfile kBmg{
+      /*target=*/"", /*macro=*/"", /*suffix=*/"bmg", /*arch_tag=*/"xe20", /*sycl_target=*/"20"};
   // XE3P selects the Xe35 kernel code path via -DXPU_ENABLED_XE3P. Its concrete
   // -fsycl-targets id is filled in once Xe35 AOT targets are finalized; until
   // then it leaves `target` empty (falls back to the default/env target).
-  static const ArchProfile kXe3p{/*target=*/"", /*macro=*/"XPU_ENABLED_XE3P", /*suffix=*/"xe3p"};
+  static const ArchProfile kXe3p{
+      /*target=*/"", /*macro=*/"XPU_ENABLED_XE3P", /*suffix=*/"xe3p", /*arch_tag=*/"xe35", /*sycl_target=*/"35"};
 
   switch (a) {
     case Arch::XE3P:
@@ -28,6 +30,8 @@ ArchSpec arch_spec(Arch a, const std::string& base_macro) {
   if (!prof.macro.empty()) s.extra_flags.push_back("-D" + prof.macro);
   s.target = prof.target;
   s.suffix = prof.suffix;
+  s.arch_tag = prof.arch_tag;
+  s.sycl_target = prof.sycl_target;
   return s;
 }
 

@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List, Optional
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -194,8 +194,15 @@ def auto_partition(files, rank, size):
     return [files[i] for i in partitions[rank]]
 
 
-def run_benchmark_files(files: List[BenchFile], timeout_per_file: float) -> int:
+def run_benchmark_files(
+    files: List[BenchFile],
+    timeout_per_file: float,
+    timeout_overrides: Optional[Dict[str, float]] = None,
+) -> int:
     """Run each benchmark, tee-ing combined output to its log file.
+
+    ``timeout_overrides`` maps a benchmark name to its own time limit, used
+    instead of ``timeout_per_file`` (the JIT nightly uses it for FMHA).
 
     Every benchmark runs even if an earlier one fails, so one broken kernel
     does not hide the results of everything after it; the failures are
@@ -216,6 +223,7 @@ def run_benchmark_files(files: List[BenchFile], timeout_per_file: float) -> int:
             flush=True,
         )
         start = time.perf_counter()
+        timeout = (timeout_overrides or {}).get(bench.name, timeout_per_file)
 
         try:
             proc = subprocess.run(
@@ -223,7 +231,7 @@ def run_benchmark_files(files: List[BenchFile], timeout_per_file: float) -> int:
                 cwd=BENCH_DIR,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                timeout=timeout_per_file,
+                timeout=timeout,
             )
             with open(log_path, "wb") as log_f:
                 log_f.write(proc.stdout)
@@ -239,7 +247,7 @@ def run_benchmark_files(files: List[BenchFile], timeout_per_file: float) -> int:
             with open(log_path, "wb") as log_f:
                 log_f.write(e.output or b"")
             print(
-                f"\nTIMEOUT: {bench.name} exceeded {timeout_per_file}s\n",
+                f"\nTIMEOUT: {bench.name} exceeded {timeout}s\n",
                 flush=True,
             )
             failed.append(bench.name)

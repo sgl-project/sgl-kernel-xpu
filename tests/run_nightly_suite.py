@@ -77,6 +77,21 @@ JIT_ONLY_BENCHMARKS = []
 #   ]
 AOT_ONLY_BENCHMARKS = []
 
+# Per-file time limits (seconds) that replace --timeout-per-file in the JIT nightly.
+# :latest-jit starts with an empty JIT kernel cache, and each new FMHA config takes
+# ~90-100 s to compile on first use. Measured on a B60 (2026-11-05):
+# test_flash_attention.py takes ~70 min with a warm cache and ~3.75 h with a cold one,
+# so the default 7200 s limit stops it at ~23%. bench_flash_attn.py hit its 1800 s
+# limit while still compiling; its cold time has not been measured yet.
+JIT_TIMEOUT_OVERRIDES = {
+    "test_flash_attention.py": 16200,
+    "bench_flash_attn.py": 7200,
+}
+
+TIMEOUT_OVERRIDES = {
+    "jit": JIT_TIMEOUT_OVERRIDES,
+}
+
 SUITES = {
     "sgl-kernel-test": ("test", TESTS_DIR, test_suite.suites["per-commit"]),
     "sgl-kernel-benchmark": ("bench", BENCH_DIR, bench_suite.suites["per-commit"]),
@@ -103,16 +118,20 @@ def select_entries(suite: str, variant):
     return entries
 
 
-def run_tests(files, workdir: str, timeout_per_file: int) -> int:
+def run_tests(files, workdir: str, timeout_per_file: int, overrides=None) -> int:
     # run_unittest_files resolves file names against the cwd.
     os.chdir(workdir)
     tic = time.perf_counter()
     failed = []
     for i, f in enumerate(files):
-        print(f"\n===== [{i + 1}/{len(files)}] {f.name} =====", flush=True)
+        timeout = (overrides or {}).get(f.name, timeout_per_file)
+        print(
+            f"\n===== [{i + 1}/{len(files)}] {f.name} (timeout {timeout}s) =====",
+            flush=True,
+        )
         # One file per call keeps run_unittest_files' timeout/retry handling
         # but stops its stop-at-first-failure from skipping the rest.
-        if run_unittest_files([f], timeout_per_file) != 0:
+        if run_unittest_files([f], timeout) != 0:
             failed.append(f.name)
             # Give a crashed or wedged device time to reset before the next file.
             _recover_xpu()
@@ -128,9 +147,9 @@ def run_tests(files, workdir: str, timeout_per_file: int) -> int:
     return 0
 
 
-def run_benchmarks(files, workdir: str, timeout_per_file: int) -> int:
+def run_benchmarks(files, workdir: str, timeout_per_file: int, overrides=None) -> int:
     # benchmark/run_suite.py already runs every benchmark and reports failures at the end.
-    return bench_suite.run_benchmark_files(files, timeout_per_file)
+    return bench_suite.run_benchmark_files(files, timeout_per_file, overrides)
 
 
 if __name__ == "__main__":
@@ -193,9 +212,17 @@ if __name__ == "__main__":
     )
     print("Selected entries:", [e.name for e in entries])
 
+    overrides = {
+        name: t
+        for name, t in TIMEOUT_OVERRIDES.get(args.variant, {}).items()
+        if name in {e.name for e in entries}
+    }
+    if overrides:
+        print("Per-file timeout overrides:", overrides)
+
     if kind == "test":
-        rc = run_tests(entries, workdir, args.timeout_per_file)
+        rc = run_tests(entries, workdir, args.timeout_per_file, overrides)
     else:
-        rc = run_benchmarks(entries, workdir, args.timeout_per_file)
+        rc = run_benchmarks(entries, workdir, args.timeout_per_file, overrides)
 
     sys.exit(rc)

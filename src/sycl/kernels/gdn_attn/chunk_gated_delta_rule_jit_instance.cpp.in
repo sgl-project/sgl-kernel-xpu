@@ -6,11 +6,19 @@
 // marshalling stays in the AOT dispatcher) so this TU only instantiates the one
 // selected kernel_launcher<@SCALAR_T@, @STATE_T@> config.
 
+// The AOT build defines SYCL_INTEL_TARGET globally (add_compile_definitions in
+// CMakeLists.txt); this single-shot JIT TU does not inherit it, and cutlass-sycl
+// gates its Xe paths (reorder, subgroup helpers) on it. Same value as AOT.
+#define SYCL_INTEL_TARGET @SYCL_TARGET@
+
 #include <torch/all.h>
 
 #include <sycl/sycl.hpp>
 
 #include "sycl/kernels/gdn_attn/chunk_gated_delta_rule_kernels.hpp"
+// Defines launch_chunk_compute_A_inverse_fused (declared in the header above),
+// matching the AOT TU chunk_gated_delta_rule.cpp.
+#include "sycl/kernels/gdn_attn/chunk_compute_A_inverse_fused.hpp"
 
 #ifdef SGL_GDN_JIT_ENTRY
 // Stable C ABI entry for the runtime-JIT path. The fixed symbol name never
@@ -24,6 +32,7 @@ extern "C" __attribute__((visibility("default"))) void sgl_gdn_chunk_entry(
     void* A,
     void* w,
     void* u,
+    void* total_chunks,
     const void* b,
     const void* a,
     const void* A_log,
@@ -49,7 +58,7 @@ extern "C" __attribute__((visibility("default"))) void sgl_gdn_chunk_entry(
       static_cast<@SCALAR_T@*>(A),
       static_cast<@SCALAR_T@*>(w),
       static_cast<@SCALAR_T@*>(u),
-      static_cast<int*> total_chunks,
+      static_cast<int*>(total_chunks),
       static_cast<const float*>(b),
       static_cast<const float*>(a),
       static_cast<const float*>(A_log),

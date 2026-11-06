@@ -76,6 +76,10 @@ jobs:
       matrix:
         variant: ${{ fromJSON(needs.select.outputs.variants) }}
     name: sgl-kernel-nightly (${{ matrix.variant }})
+    # JIT starts from an empty kernel cache, so FMHA alone needs ~3.75 h of the tests
+    # step (see JIT_TIMEOUT_OVERRIDES in tests/run_nightly_suite.py). Without this the
+    # 360 min default would cut the JIT job off.
+    timeout-minutes: ${{ matrix.variant == 'jit' && 780 || 360 }}
     env:
       DOCKERHUB_INTEL_USERNAME: ${{ secrets.DOCKERHUB_INTEL_USERNAME }}
       DOCKERHUB_INTEL_TOKEN: ${{ secrets.DOCKERHUB_INTEL_TOKEN }}
@@ -132,7 +136,7 @@ jobs:
       # Suites keep going past failures (continue-on-error); the last step turns the job red.
       - name: Kernel tests (per-commit suite)
         id: tests
-        timeout-minutes: 240
+        timeout-minutes: ${{ matrix.variant == 'jit' && 540 || 240 }}
         continue-on-error: true
         run: |
           docker exec -w /root/sglang/sgl-kernel-xpu/tests "${CONTAINER}" \
@@ -143,7 +147,7 @@ jobs:
 
       - name: Kernel benchmarks (per-commit suite)
         id: bench
-        timeout-minutes: 60
+        timeout-minutes: ${{ matrix.variant == 'jit' && 240 || 60 }}
         continue-on-error: true
         run: |
           docker exec -w /root/sglang/sgl-kernel-xpu/tests "${CONTAINER}" \

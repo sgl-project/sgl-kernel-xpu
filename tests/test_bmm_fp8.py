@@ -41,6 +41,7 @@ def test_bmm_fp8(input_dtype, mat2_dtype, res_dtype):
 
     reference = torch.bmm(input, mat2)
     cos_sim = F.cosine_similarity(reference.reshape(-1), res.reshape(-1), dim=0)
+    print("cos_sim = ", cos_sim.item())
     assert cos_sim > 0.99
 
 

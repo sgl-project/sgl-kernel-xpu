@@ -101,7 +101,10 @@ struct TopKRenormProbsSingleCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
   static constexpr uint32_t kWgSize = 1024;
   static constexpr uint32_t kRadix = Traits::kRadix;
   static constexpr uint32_t kNumRounds = Traits::kNumRounds;
-  static constexpr uint32_t kNumSubGroups = kWgSize / 32;
+  static constexpr uint32_t kSubGroupSize = 32;
+  static constexpr uint32_t kNumSubGroups = kWgSize / kSubGroupSize;
+  // The final sum reduces one partial per lane of a single sub-group.
+  static_assert(kNumSubGroups == kSubGroupSize);
 
   const DType* probs;
   DType* renorm_probs;
@@ -117,7 +120,7 @@ struct TopKRenormProbsSingleCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
   void sycl_ker_config_convention(sycl::handler& cgh) {
     subgroup_hist_ = sycl::local_accessor<uint32_t, 1>(sycl::range<1>(kNumSubGroups * kRadix), cgh);
     scalars_ = sycl::local_accessor<uint32_t, 1>(sycl::range<1>(2), cgh);
-    block_sum_ = sycl::local_accessor<float, 1>(sycl::range<1>(1), cgh);
+    block_sum_ = sycl::local_accessor<float, 1>(sycl::range<1>(kNumSubGroups), cgh);
   }
 
   TopKRenormProbsSingleCTA(
@@ -134,7 +137,7 @@ struct TopKRenormProbsSingleCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
         batch_size(batch_size),
         vocab_size(vocab_size) {}
 
-  [[sycl::reqd_sub_group_size(32)]]
+  [[sycl::reqd_sub_group_size(kSubGroupSize)]]
   void operator()(sycl::nd_item<1> item) const {
     const uint32_t row_idx = item.get_group(0);
     if (row_idx >= static_cast<uint32_t>(batch_size)) return;
@@ -214,9 +217,6 @@ struct TopKRenormProbsSingleCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     const float pivot = static_cast<float>(Traits::from_ordered(static_cast<OrderedType>(scalars_[0])));
 
-    if (tid == 0) block_sum_[0] = 0.0f;
-    item.barrier(sycl::access::fence_space::local_space);
-
     constexpr uint32_t kVecSize = 4;
     using vec_in = vec_t<DType, kVecSize>;
     const uint32_t num_vec_elems = vocab_u32 / kVecSize;
@@ -239,18 +239,14 @@ struct TopKRenormProbsSingleCTA : public __SYCL_KER_CONFIG_CONVENTION__ {
       thread_sum += sycl::select(0.0f, val, val >= pivot);
     }
 
-    float warp_sum = sycl::reduce_over_group(sg, thread_sum, sycl::plus<float>());
-    if (sg_lid == 0) {
-      sycl::atomic_ref<
-          float,
-          sycl::memory_order::relaxed,
-          sycl::memory_scope::work_group,
-          sycl::access::address_space::local_space>(block_sum_[0])
-          .fetch_add(warp_sum);
-    }
+    // Sum the per-sub-group partials in a fixed order so the result is bit-reproducible;
+    // every sub-group reduces the same slots and gets the same total.
+    const float warp_sum = sycl::reduce_over_group(sg, thread_sum, sycl::plus<float>());
+    if (sg_lid == 0) block_sum_[sg_id] = warp_sum;
     item.barrier(sycl::access::fence_space::local_space);
+    const float block_sum = sycl::reduce_over_group(sg, block_sum_[sg_lid], sycl::plus<float>());
 
-    const float inv_sum = (block_sum_[0] > 0.0f) ? (1.0f / block_sum_[0]) : 0.0f;
+    const float inv_sum = (block_sum > 0.0f) ? (1.0f / block_sum) : 0.0f;
 
     using vec_out = vec_t<DType, kVecSize>;
     for (uint32_t i = tid; i < num_vec_elems; i += kWgSize) {

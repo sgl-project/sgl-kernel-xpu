@@ -258,6 +258,18 @@ def test_top_k_renorm_probs_array(batch_size, vocab_size, k_range):
     )
 
 
+@pytest.mark.parametrize("k", [40, 1000])
+def test_top_k_renorm_probs_deterministic(k):
+    # Repeated calls on the same input must be bit-identical.
+    torch.manual_seed(42)
+    logits = torch.randn(256, 128256, device=f"{device}:0") * 0.1
+    probs = torch.softmax(logits, dim=-1)
+
+    ref = sgl_kernel.top_k_renorm_prob(probs, k)
+    for _ in range(50):
+        assert torch.equal(sgl_kernel.top_k_renorm_prob(probs, k), ref)
+
+
 def torch_min_p_sampling(batch_size, vocab_size, p, normalized_prob):
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
     # scale min-p

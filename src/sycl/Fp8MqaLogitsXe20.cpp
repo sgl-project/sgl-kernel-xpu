@@ -215,18 +215,18 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
     int64_t max_seq_len,
     bool clean_logits) {
   TORCH_CHECK(!schedule_metadata.has_value(), "fp8_paged_mqa_logits does not support schedule_metadata on XPU");
-  TORCH_CHECK(q_fp8.is_xpu(), "q_fp8 must be on XPU");
-  TORCH_CHECK(kv_cache.is_xpu(), "kv_cache must be on XPU");
-  TORCH_CHECK(q_fp8.dim() == 4, "q_fp8 must be 4D (B, 1, H, D)");
-  TORCH_CHECK(kv_cache.dim() == 4, "kv_cache must be 4D");
-  TORCH_CHECK(q_fp8.size(1) == 1, "q_fp8 must have shape (B, 1, H, D) with size(1)=1");
-  TORCH_CHECK(q_fp8.scalar_type() == at::kByte, "q_fp8 must be uint8 (FP8 e4m3)");
-  TORCH_CHECK(kv_cache.scalar_type() == at::kByte, "kv_cache must be uint8");
-  TORCH_CHECK(weights.scalar_type() == at::kFloat, "weights must be float32");
-  TORCH_CHECK(seq_lens.scalar_type() == at::kInt, "seq_lens must be int32");
-  TORCH_CHECK(block_tables.scalar_type() == at::kInt, "block_tables must be int32");
-  TORCH_CHECK(block_tables.dim() == 2, "block_tables must be 2D (B, max_num_blocks)");
-  TORCH_CHECK(block_tables.size(0) == q_fp8.size(0), "block_tables batch size must match q_fp8 batch size");
+  CHECK_DEVICE(q_fp8);
+  CHECK_DEVICE(kv_cache);
+  CHECK_DIM(4, q_fp8);
+  CHECK_DIM(4, kv_cache);
+  CHECK_SHAPE(q_fp8, q_fp8.size(0), 1, q_fp8.size(2), q_fp8.size(3));
+  CHECK_DTYPE(at::kByte, q_fp8);
+  CHECK_DTYPE(at::kByte, kv_cache);
+  CHECK_DTYPE(at::kFloat, weights);
+  CHECK_DTYPE(at::kInt, seq_lens);
+  CHECK_DTYPE(at::kInt, block_tables);
+  CHECK_DIM(2, block_tables);
+  CHECK_SHAPE(block_tables, q_fp8.size(0), block_tables.size(1));
   // schedule_metadata is accepted for API compatibility with DeepGEMM but not
   // used on XPU — scheduling is handled internally by the SYCL runtime.
   if (schedule_metadata.has_value()) {
@@ -258,7 +258,7 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
       ") must cover max_seq_len (",
       msl,
       ")");
-  TORCH_CHECK(weights.dim() == 2 && weights.size(0) == B && weights.size(1) == H, "weights must be (B, H)");
+  CHECK_SHAPE(weights, B, H);
 
   // clean_logits is accepted for API compatibility but output is always
   // zero-initialized — the cost is negligible relative to GEMM.

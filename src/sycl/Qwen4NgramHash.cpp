@@ -155,16 +155,13 @@ SGL_KERNEL_EXPORT void qwen4_ngram_hash(
   check_int64_xpu(multipliers, "multipliers");
   check_int64_xpu(vocab_sizes, "vocab_sizes");
   check_int64_xpu(offsets, "offsets");
-  TORCH_CHECK(contexts.dim() == 2 && contexts.size(1) == NGRAM_SIZE, "contexts must have shape [N, ", NGRAM_SIZE, "]");
+  CHECK_DIM(2, contexts);
+  const int64_t tokens = contexts.size(0);
+  CHECK_SHAPE(contexts, tokens, NGRAM_SIZE);
   TORCH_CHECK(multipliers.numel() == NGRAM_SIZE, "multipliers must have ", NGRAM_SIZE, " elements");
   TORCH_CHECK(vocab_sizes.numel() == NGRAM_HEADS, "vocab_sizes must have ", NGRAM_HEADS, " elements");
   TORCH_CHECK(offsets.numel() == NGRAM_HEADS, "offsets must have ", NGRAM_HEADS, " elements");
-  const int64_t tokens = contexts.size(0);
-  TORCH_CHECK(
-      output.dim() == 2 && output.size(0) == tokens && output.size(1) == NGRAM_HEADS,
-      "output must have shape [N, ",
-      NGRAM_HEADS,
-      "]");
+  CHECK_SHAPE(output, tokens, NGRAM_HEADS);
   TORCH_CHECK(
       multipliers.device() == contexts.device() && vocab_sizes.device() == contexts.device() &&
           offsets.device() == contexts.device() && output.device() == contexts.device(),

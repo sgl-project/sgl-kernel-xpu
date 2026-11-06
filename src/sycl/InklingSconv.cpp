@@ -1604,12 +1604,7 @@ at::Tensor allocate_or_validate_metadata_output(
   check_xpu_tensor(output, name);
   TORCH_CHECK(output.device() == reference.device(), name, " must be on the same XPU device as cache_indices");
   TORCH_CHECK(output.scalar_type() == dtype, name, " has an unexpected dtype");
-  TORCH_CHECK(output.dim() == static_cast<int64_t>(shape.size()), name, " has an unexpected rank");
-  int64_t dim = 0;
-  for (int64_t expected : shape) {
-    TORCH_CHECK(output.size(dim) == expected, name, " has an unexpected shape");
-    ++dim;
-  }
+  TORCH_CHECK(output.sizes() == c10::IntArrayRef(shape), name, " has an unexpected shape");
   TORCH_CHECK(output.is_contiguous(), name, " must be contiguous");
   return output;
 }

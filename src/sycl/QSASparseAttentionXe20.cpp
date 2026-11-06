@@ -207,17 +207,14 @@ SGL_KERNEL_EXPORT at::Tensor qsa_sparse_attention(
     const at::Tensor& v_cache,
     const at::Tensor& token_slots,
     std::optional<double> softmax_scale) {
-  CHECK_INPUT(q);
-  CHECK_INPUT(k_cache);
-  CHECK_INPUT(v_cache);
-  CHECK_INPUT(token_slots);
+  CHECK_INPUT(3, q);
+  CHECK_INPUT(3, k_cache);
+  CHECK_INPUT(3, v_cache);
+  CHECK_INPUT(2, token_slots);
   TORCH_CHECK(
       q.device() == k_cache.device() && q.device() == v_cache.device() && q.device() == token_slots.device(),
       "QSA tensors must be on the same XPU device");
-  TORCH_CHECK(q.dim() == 3 && k_cache.dim() == 3 && v_cache.dim() == 3, "QSA Q/K/V must be rank-3");
-  TORCH_CHECK(
-      token_slots.dim() == 2 && token_slots.size(0) == q.size(0),
-      "QSA token_slots must have shape [query_rows, selected_tokens]");
+  CHECK_SHAPE(token_slots, q.size(0), token_slots.size(1));
   TORCH_CHECK(
       q.scalar_type() == at::kBFloat16 && k_cache.scalar_type() == at::kBFloat16 &&
           v_cache.scalar_type() == at::kBFloat16,
@@ -226,8 +223,9 @@ SGL_KERNEL_EXPORT at::Tensor qsa_sparse_attention(
   TORCH_CHECK(
       q.size(2) == kHeadDim && k_cache.size(2) == kHeadDim && v_cache.size(2) == kHeadDim,
       "QSA head dimension must be 256");
+  CHECK_SAME_SHAPE(k_cache, v_cache);
   TORCH_CHECK(
-      q.size(1) > 0 && k_cache.size(1) > 0 && q.size(1) % k_cache.size(1) == 0 && k_cache.sizes() == v_cache.sizes(),
+      q.size(1) > 0 && k_cache.size(1) > 0 && q.size(1) % k_cache.size(1) == 0,
       "QSA requires matching K/V caches and query heads divisible by KV heads");
   const double scale = softmax_scale.value_or(0.0) == 0.0 ? 1.0 / std::sqrt(kHeadDim) : *softmax_scale;
   TORCH_CHECK(std::isfinite(scale), "QSA softmax scale must be finite");

@@ -759,55 +759,50 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
   timer.start();
 #endif
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      input_type,
-      "inkling_attn_prologue_verify",
-      [&]() -> std::tuple<at::Tensor, at::Tensor, at::Tensor> {
-        AttnPrologueVerifyParams<scalar_t> params{
-            qkvr.data_ptr<scalar_t>(),
-            k_cache.data_ptr<scalar_t>(),
-            v_cache.data_ptr<scalar_t>(),
-            cache_indices.data_ptr<int32_t>(),
-            cache_mask.data_ptr<bool>(),
-            k_weight.data_ptr<scalar_t>(),
-            v_weight.data_ptr<scalar_t>(),
-            k_inter.data_ptr<scalar_t>(),
-            v_inter.data_ptr<scalar_t>(),
-            q_gamma.data_ptr<scalar_t>(),
-            k_gamma.data_ptr<scalar_t>(),
-            q_out.data_ptr<scalar_t>(),
-            k_out.data_ptr<scalar_t>(),
-            v_out.data_ptr<scalar_t>(),
-            loc.data_ptr<int64_t>(),
-            k_buf.data_ptr<scalar_t>(),
-            v_buf.data_ptr<scalar_t>(),
-            k_layout,
-            v_layout,
-            static_cast<float>(eps),
-            T,
-            B,
-            draft_token_num,
-            dq,
-            dkv,
-            qkvr.stride(0),
-            q_off,
-            k_off,
-            v_off,
-            k_cache.stride(0),
-            k_cache.stride(1),
-            k_inter.stride(0),
-            k_inter.stride(1),
-            k_inter.stride(2),
-            k_buf.stride(0),
-            loc.stride(0),
-            silu_activation,
-            use_residual,
-            do_store};
-        launch_verify<scalar_t>(queue, params);
-        return {q_out, k_out, v_out};
-      });
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input_type, "inkling_attn_prologue_verify", [&]() {
+    AttnPrologueVerifyParams<scalar_t> params{
+        qkvr.data_ptr<scalar_t>(),
+        k_cache.data_ptr<scalar_t>(),
+        v_cache.data_ptr<scalar_t>(),
+        cache_indices.data_ptr<int32_t>(),
+        cache_mask.data_ptr<bool>(),
+        k_weight.data_ptr<scalar_t>(),
+        v_weight.data_ptr<scalar_t>(),
+        k_inter.data_ptr<scalar_t>(),
+        v_inter.data_ptr<scalar_t>(),
+        q_gamma.data_ptr<scalar_t>(),
+        k_gamma.data_ptr<scalar_t>(),
+        q_out.data_ptr<scalar_t>(),
+        k_out.data_ptr<scalar_t>(),
+        v_out.data_ptr<scalar_t>(),
+        loc.data_ptr<int64_t>(),
+        k_buf.data_ptr<scalar_t>(),
+        v_buf.data_ptr<scalar_t>(),
+        k_layout,
+        v_layout,
+        static_cast<float>(eps),
+        T,
+        B,
+        draft_token_num,
+        dq,
+        dkv,
+        qkvr.stride(0),
+        q_off,
+        k_off,
+        v_off,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_inter.stride(0),
+        k_inter.stride(1),
+        k_inter.stride(2),
+        k_buf.stride(0),
+        loc.stride(0),
+        silu_activation,
+        use_residual,
+        do_store};
+    launch_verify<scalar_t>(queue, params);
+    return std::make_tuple(q_out, k_out, v_out);
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const double flops = 0.0;
@@ -883,52 +878,47 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
   timer.start();
 #endif
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      input_type,
-      "inkling_attn_prologue_decode",
-      [&]() -> std::tuple<at::Tensor, at::Tensor, at::Tensor> {
-        AttnPrologueDecodeParams<scalar_t> params{
-            qkvr.data_ptr<scalar_t>(),
-            k_cache.data_ptr<scalar_t>(),
-            v_cache.data_ptr<scalar_t>(),
-            cache_indices.data_ptr<int32_t>(),
-            cache_mask.data_ptr<bool>(),
-            k_weight.data_ptr<scalar_t>(),
-            v_weight.data_ptr<scalar_t>(),
-            do_track ? track_mask.value().data_ptr<bool>() : nullptr,
-            do_track ? track_indices.value().data_ptr<int64_t>() : nullptr,
-            q_gamma.data_ptr<scalar_t>(),
-            k_gamma.data_ptr<scalar_t>(),
-            q_out.data_ptr<scalar_t>(),
-            k_out.data_ptr<scalar_t>(),
-            v_out.data_ptr<scalar_t>(),
-            loc.data_ptr<int64_t>(),
-            k_buf.data_ptr<scalar_t>(),
-            v_buf.data_ptr<scalar_t>(),
-            k_layout,
-            v_layout,
-            static_cast<float>(eps),
-            T,
-            dq,
-            dkv,
-            qkvr.stride(0),
-            q_off,
-            k_off,
-            v_off,
-            k_cache.stride(0),
-            k_cache.stride(1),
-            k_buf.stride(0),
-            loc.stride(0),
-            do_track ? track_indices.value().stride(0) : 0,
-            silu_activation,
-            use_residual,
-            do_track,
-            do_store};
-        launch_decode<scalar_t>(queue, params);
-        return {q_out, k_out, v_out};
-      });
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input_type, "inkling_attn_prologue_decode", [&]() {
+    AttnPrologueDecodeParams<scalar_t> params{
+        qkvr.data_ptr<scalar_t>(),
+        k_cache.data_ptr<scalar_t>(),
+        v_cache.data_ptr<scalar_t>(),
+        cache_indices.data_ptr<int32_t>(),
+        cache_mask.data_ptr<bool>(),
+        k_weight.data_ptr<scalar_t>(),
+        v_weight.data_ptr<scalar_t>(),
+        do_track ? track_mask.value().data_ptr<bool>() : nullptr,
+        do_track ? track_indices.value().data_ptr<int64_t>() : nullptr,
+        q_gamma.data_ptr<scalar_t>(),
+        k_gamma.data_ptr<scalar_t>(),
+        q_out.data_ptr<scalar_t>(),
+        k_out.data_ptr<scalar_t>(),
+        v_out.data_ptr<scalar_t>(),
+        loc.data_ptr<int64_t>(),
+        k_buf.data_ptr<scalar_t>(),
+        v_buf.data_ptr<scalar_t>(),
+        k_layout,
+        v_layout,
+        static_cast<float>(eps),
+        T,
+        dq,
+        dkv,
+        qkvr.stride(0),
+        q_off,
+        k_off,
+        v_off,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_buf.stride(0),
+        loc.stride(0),
+        do_track ? track_indices.value().stride(0) : 0,
+        silu_activation,
+        use_residual,
+        do_track,
+        do_store};
+    launch_decode<scalar_t>(queue, params);
+    return std::make_tuple(q_out, k_out, v_out);
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const double flops = 0.0;
@@ -1026,60 +1016,55 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_pr
   timer.start();
 #endif
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      input_type,
-      "inkling_attn_prologue_extend",
-      [&]() -> std::tuple<at::Tensor, at::Tensor, at::Tensor> {
-        AttnPrologueExtendParams<scalar_t> params{
-            qkvr.data_ptr<scalar_t>(),
-            k_cache.data_ptr<scalar_t>(),
-            v_cache.data_ptr<scalar_t>(),
-            cache_indices.data_ptr<int32_t>(),
-            cache_mask.data_ptr<bool>(),
-            has_initial_state.data_ptr<bool>(),
-            cu.data_ptr<int64_t>(),
-            si.data_ptr<int32_t>(),
-            k_weight.data_ptr<scalar_t>(),
-            v_weight.data_ptr<scalar_t>(),
-            do_track ? track_rows.value().data_ptr<int64_t>() : nullptr,
-            do_track ? track_mask.value().data_ptr<bool>() : nullptr,
-            do_track ? track_dst.value().data_ptr<int64_t>() : nullptr,
-            q_gamma.data_ptr<scalar_t>(),
-            k_gamma.data_ptr<scalar_t>(),
-            q_out.data_ptr<scalar_t>(),
-            k_out.data_ptr<scalar_t>(),
-            v_out.data_ptr<scalar_t>(),
-            loc.data_ptr<int64_t>(),
-            k_buf.data_ptr<scalar_t>(),
-            v_buf.data_ptr<scalar_t>(),
-            k_layout,
-            v_layout,
-            static_cast<float>(eps),
-            T,
-            B,
-            dq,
-            dkv,
-            qkvr.stride(0),
-            q_off,
-            k_off,
-            v_off,
-            k_cache.stride(0),
-            k_cache.stride(1),
-            k_buf.stride(0),
-            loc.stride(0),
-            do_track ? track_rows.value().stride(0) : 0,
-            do_track ? track_rows.value().stride(1) : 0,
-            do_track ? track_dst.value().stride(0) : 0,
-            silu_activation,
-            use_residual,
-            do_track,
-            do_store,
-            do_cache_update};
-        launch_extend<scalar_t>(queue, params);
-        return {q_out, k_out, v_out};
-      });
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input_type, "inkling_attn_prologue_extend", [&]() {
+    AttnPrologueExtendParams<scalar_t> params{
+        qkvr.data_ptr<scalar_t>(),
+        k_cache.data_ptr<scalar_t>(),
+        v_cache.data_ptr<scalar_t>(),
+        cache_indices.data_ptr<int32_t>(),
+        cache_mask.data_ptr<bool>(),
+        has_initial_state.data_ptr<bool>(),
+        cu.data_ptr<int64_t>(),
+        si.data_ptr<int32_t>(),
+        k_weight.data_ptr<scalar_t>(),
+        v_weight.data_ptr<scalar_t>(),
+        do_track ? track_rows.value().data_ptr<int64_t>() : nullptr,
+        do_track ? track_mask.value().data_ptr<bool>() : nullptr,
+        do_track ? track_dst.value().data_ptr<int64_t>() : nullptr,
+        q_gamma.data_ptr<scalar_t>(),
+        k_gamma.data_ptr<scalar_t>(),
+        q_out.data_ptr<scalar_t>(),
+        k_out.data_ptr<scalar_t>(),
+        v_out.data_ptr<scalar_t>(),
+        loc.data_ptr<int64_t>(),
+        k_buf.data_ptr<scalar_t>(),
+        v_buf.data_ptr<scalar_t>(),
+        k_layout,
+        v_layout,
+        static_cast<float>(eps),
+        T,
+        B,
+        dq,
+        dkv,
+        qkvr.stride(0),
+        q_off,
+        k_off,
+        v_off,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_buf.stride(0),
+        loc.stride(0),
+        do_track ? track_rows.value().stride(0) : 0,
+        do_track ? track_rows.value().stride(1) : 0,
+        do_track ? track_dst.value().stride(0) : 0,
+        silu_activation,
+        use_residual,
+        do_track,
+        do_store,
+        do_cache_update};
+    launch_extend<scalar_t>(queue, params);
+    return std::make_tuple(q_out, k_out, v_out);
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const double flops = 0.0;

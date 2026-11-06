@@ -556,10 +556,7 @@ SGL_KERNEL_EXPORT void fused_norm_rope_store(
   TORCH_CHECK(page_size > 0 && (page_size & (page_size - 1)) == 0, "page_size must be power of 2");
 
   TORCH_CHECK(input.scalar_type() == norm_weight.scalar_type(), "input and norm_weight dtypes must match");
-  TORCH_CHECK(
-      input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16 ||
-          input.scalar_type() == at::ScalarType::Float,
-      "input dtype must be fp16/bf16/fp32");
+  CHECK_DTYPES(input, at::ScalarType::Half, at::ScalarType::BFloat16, at::ScalarType::Float);
 
   if (use_fp4) {
     TORCH_CHECK(head_dim == kIndexerHeadDim, "use_fp4 is only supported for head_dim=128");

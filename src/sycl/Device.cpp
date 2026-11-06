@@ -1,9 +1,15 @@
 #include <c10/xpu/XPUFunctions.h>
 #include <c10/xpu/XPUStream.h>
 
+#include <cstdint>
 #include <sycl/sycl.hpp>
 
 #include "sgl_kernel_export.h"
+
+// Compiled twice: into each backend's device library (for the `query_device`
+// op) and into the standalone libsgl_arch_probe.so, which python/sgl_kernel/_arch.py
+// loads with ctypes to pick the backend before any backend is imported. Keep this
+// file free of operator registrations and kernel launches so both stay valid.
 
 namespace syclex = sycl::ext::oneapi::experimental;
 
@@ -31,5 +37,23 @@ SGL_KERNEL_EXPORT std::tuple<int64_t, int64_t> query_device(int64_t device_index
     // more arch is coming soon
     default:
       throw std::runtime_error("Unsupported XPU architecture.");
+  }
+}
+
+// C entry point for the architecture probe. Out-parameters rather than a returned
+// std::tuple, which comes back through a hidden sret pointer and is not safely
+// callable through ctypes. Returns 0 on success, -1 for null outputs, -2 if the
+// device query fails or the architecture is unsupported.
+extern "C" SGL_KERNEL_EXPORT int sgl_probe_device_capability(int64_t device_index, int64_t* major, int64_t* minor) {
+  if (major == nullptr || minor == nullptr) {
+    return -1;
+  }
+  try {
+    auto [maj, min] = query_device(device_index);
+    *major = maj;
+    *minor = min;
+    return 0;
+  } catch (...) {
+    return -2;
   }
 }

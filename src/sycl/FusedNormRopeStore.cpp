@@ -527,35 +527,24 @@ SGL_KERNEL_EXPORT void fused_norm_rope_store(
     bool use_fp4,
     int64_t preshuffle_size,
     bool use_bf16_store) {
-  CHECK_INPUT(input);
-  CHECK_DIM(2, input);
-  CHECK_INPUT(plan);
-  CHECK_DIM(2, plan);
-  CHECK_EQ(plan.dtype(), torch::kUInt8);
-  CHECK_INPUT(norm_weight);
-  CHECK_DIM(1, norm_weight);
-  CHECK_INPUT(freq_cis);
-  CHECK_DIM(2, freq_cis);
-  CHECK_EQ(freq_cis.dtype(), torch::kFloat);
-  CHECK_INPUT(out_loc);
-  CHECK_DIM(1, out_loc);
-  CHECK_INPUT(kvcache);
-  CHECK_DIM(2, kvcache);
-  CHECK_EQ(kvcache.dtype(), torch::kUInt8);
+  CHECK_INPUT(2, input);
+  CHECK_INPUT(2, torch::kUInt8, plan);
+  CHECK_INPUT(1, input.scalar_type(), norm_weight);
+  CHECK_INPUT(2, torch::kFloat, freq_cis);
+  CHECK_INPUT(1, out_loc);
+  CHECK_INPUT(2, torch::kUInt8, kvcache);
 
   const int64_t num_tokens = input.size(0);
   const int64_t head_dim = input.size(1);
 
   TORCH_CHECK(
       head_dim == kIndexerHeadDim || head_dim == kFlashMLAHeadDim, "head_dim must be 128 or 512, got ", head_dim);
-  TORCH_CHECK(norm_weight.size(0) == head_dim, "norm_weight size must equal head_dim");
-  TORCH_CHECK(freq_cis.size(1) == kRopeDim, "freq_cis last dim must be 64");
-  TORCH_CHECK(
-      plan.size(0) == num_tokens && plan.size(1) == static_cast<int64_t>(sizeof(DecodePlan)), "plan must be [N, 16]");
+  CHECK_SHAPE(norm_weight, head_dim);
+  CHECK_SHAPE(freq_cis, freq_cis.size(0), kRopeDim);
+  CHECK_SHAPE(plan, num_tokens, static_cast<int64_t>(sizeof(DecodePlan)));
   TORCH_CHECK(compress_ratio > 0, "compress_ratio must be > 0");
   TORCH_CHECK(page_size > 0 && (page_size & (page_size - 1)) == 0, "page_size must be power of 2");
 
-  TORCH_CHECK(input.scalar_type() == norm_weight.scalar_type(), "input and norm_weight dtypes must match");
   CHECK_DTYPES(input, at::ScalarType::Half, at::ScalarType::BFloat16, at::ScalarType::Float);
 
   if (use_fp4) {
@@ -580,12 +569,7 @@ SGL_KERNEL_EXPORT void fused_norm_rope_store(
       (head_dim == kIndexerHeadDim)
           ? ((use_fp4 ? 68 : 132) * page_size)
           : (use_bf16_store ? (kFlashMLAHeadDim * 2 * page_size) : flashmla_page_bytes(page_size));
-  TORCH_CHECK(
-      kvcache.size(1) == expected_page_bytes,
-      "kvcache page_bytes mismatch. expected ",
-      expected_page_bytes,
-      ", got ",
-      kvcache.size(1));
+  CHECK_SHAPE(kvcache, kvcache.size(0), expected_page_bytes);
 
   if (num_tokens == 0) {
     return;

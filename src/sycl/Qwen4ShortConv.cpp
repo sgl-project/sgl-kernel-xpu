@@ -227,10 +227,10 @@ namespace at::native::xpu {
 // slot of state[slots, C, L] advances in place to conv_input[:, :, 1:]. Real slots must be unique.
 SGL_KERNEL_EXPORT void qwen4_short_conv_state(
     torch::Tensor& conv_input, torch::Tensor& state, torch::Tensor& state_indices, torch::Tensor& x) {
-  CHECK_INPUT(conv_input);
-  CHECK_INPUT(state);
-  CHECK_INPUT(state_indices);
-  CHECK_INPUT(x);
+  CHECK_INPUT(3, conv_input);
+  CHECK_INPUT(3, state);
+  CHECK_INPUT(1, state_indices);
+  CHECK_INPUT(2, x);
   TORCH_CHECK(
       state.scalar_type() == at::kBFloat16 || state.scalar_type() == at::kHalf,
       "state must be bfloat16 or float16, got ",
@@ -238,17 +238,12 @@ SGL_KERNEL_EXPORT void qwen4_short_conv_state(
   TORCH_CHECK(x.scalar_type() == state.scalar_type(), "x must have the same dtype as state");
   TORCH_CHECK(conv_input.scalar_type() == state.scalar_type(), "conv_input must have the same dtype as state");
   TORCH_CHECK(state_indices.scalar_type() == at::kLong, "state_indices must be int64");
-  TORCH_CHECK(state.dim() == 3, "state must have shape [slots, C, L]");
   const int64_t channels = state.size(1);
   const int64_t state_len = state.size(2);
   TORCH_CHECK(state_len > 0 && state_len <= MAX_STATE_LEN, "state length must be in [1, ", MAX_STATE_LEN, "]");
-  TORCH_CHECK(state_indices.dim() == 1, "state_indices must be 1-D");
   const int64_t tokens = state_indices.size(0);
-  TORCH_CHECK(x.dim() == 2 && x.size(0) == tokens && x.size(1) == channels, "x must have shape [N, C]");
-  TORCH_CHECK(
-      conv_input.dim() == 3 && conv_input.size(0) == tokens && conv_input.size(1) == channels &&
-          conv_input.size(2) == state_len + 1,
-      "conv_input must have shape [N, C, L + 1]");
+  CHECK_SHAPE(x, tokens, channels);
+  CHECK_SHAPE(conv_input, tokens, channels, state_len + 1);
   at::assert_no_overlap(conv_input, state);
   at::assert_no_overlap(conv_input, x);
   at::assert_no_overlap(state, x);
@@ -308,33 +303,30 @@ SGL_KERNEL_EXPORT void qwen4_verify_conv(
     int64_t width,
     int64_t dilation) {
   CHECK_INPUT(output);
-  CHECK_INPUT(x);
+  CHECK_INPUT(2, x);
   CHECK_INPUT(residual);
-  CHECK_INPUT(weight);
+  CHECK_INPUT(3, at::kBFloat16, weight);
   CHECK_INPUT(valid);
   CHECK_DEVICE(state);
   CHECK_DEVICE(state_indices);
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 2, "x must be a 2-D bfloat16 tensor");
-  TORCH_CHECK(state.dim() == 3 && state.size(1) == x.size(1), "state must have shape [slots, C, L]");
-  TORCH_CHECK(state_indices.dim() == 1, "state_indices must be 1-D");
+  TORCH_CHECK(x.scalar_type() == at::kBFloat16, "x must be a 2-D bfloat16 tensor");
+  CHECK_DIM(3, state);
+  CHECK_SHAPE(state, state.size(0), x.size(1), state.size(2));
+  CHECK_DIM(1, state_indices);
   const int64_t requests = state_indices.size(0);
   const int64_t channels = x.size(1);
   const int64_t state_len = state.size(2);
   TORCH_CHECK(width > 0 && width <= MAX_VERIFY_WIDTH, "width must be in [1, ", MAX_VERIFY_WIDTH, "]");
   TORCH_CHECK(state_len <= MAX_STATE_LEN, "state length must be at most ", MAX_STATE_LEN);
-  TORCH_CHECK(x.size(0) == requests * width, "x must have shape [R * W, C]");
-  TORCH_CHECK(
-      valid.scalar_type() == at::kBool && valid.dim() == 1 && valid.size(0) == x.size(0),
-      "valid must be a bool tensor of shape [R * W]");
+  CHECK_SHAPE(x, requests * width, channels);
+  TORCH_CHECK(valid.scalar_type() == at::kBool, "valid must be a bool tensor of shape [R * W]");
+  CHECK_SHAPE(valid, x.size(0));
   TORCH_CHECK(
       residual.scalar_type() == at::kBFloat16 && residual.sizes() == x.sizes(),
       "residual must be bfloat16 with shape [R * W, C]");
-  TORCH_CHECK(
-      output.scalar_type() == at::kBFloat16 && output.sizes() == x.sizes(),
-      "output must be bfloat16 with shape [R * W, C]");
-  TORCH_CHECK(
-      weight.scalar_type() == at::kBFloat16 && weight.dim() == 3 && weight.size(0) == channels && weight.size(1) == 1,
-      "weight must be bfloat16 with shape [C, 1, K]");
+  CHECK_DTYPE(at::kBFloat16, output);
+  CHECK_SAME_SHAPE(output, x);
+  CHECK_SHAPE(weight, channels, 1, weight.size(2));
   const int64_t kernel_size = weight.size(2);
   TORCH_CHECK(
       dilation > 0 && kernel_size > 0 && (kernel_size - 1) * dilation == state_len,

@@ -142,16 +142,14 @@ namespace at::native::xpu {
 // output[N, HC, H] = gate_activation(gate[N, HC, 1]) * value[N, H]
 SGL_KERNEL_EXPORT void qwen4_gate_value(torch::Tensor& output, torch::Tensor& gate, torch::Tensor& value) {
   check_bf16_xpu(output, "output");
-  CHECK_INPUT(gate);
-  TORCH_CHECK(gate.scalar_type() == at::kBFloat16, "gate must be bfloat16, got ", gate.scalar_type());
+  CHECK_INPUT(3, at::kBFloat16, gate);
   check_bf16_xpu(value, "value");
-  TORCH_CHECK(gate.dim() == 3 && gate.size(2) == 1, "gate must have shape [N, HC, 1]");
-  TORCH_CHECK(value.dim() == 2 && value.size(0) == gate.size(0), "value must have shape [N, H]");
+  CHECK_DIM(2, value);
   const int64_t tokens = gate.size(0), hc_count = gate.size(1), hidden = value.size(1);
+  CHECK_SHAPE(gate, tokens, hc_count, 1);
+  CHECK_SHAPE(value, tokens, hidden);
   TORCH_CHECK(hidden > 0 && hidden % VEC == 0, "hidden size must be a positive multiple of ", VEC);
-  TORCH_CHECK(
-      output.dim() == 3 && output.size(0) == tokens && output.size(1) == hc_count && output.size(2) == hidden,
-      "output must have shape [N, HC, H]");
+  CHECK_SHAPE(output, tokens, hc_count, hidden);
   TORCH_CHECK(
       gate.device() == value.device() && output.device() == value.device(),
       "gate, value and output must be on the same device");
@@ -182,11 +180,12 @@ qwen4_gate_reduce(torch::Tensor& output, torch::Tensor& key, torch::Tensor& quer
   check_bf16_xpu(key, "key");
   check_bf16_xpu(query, "query");
   check_bf16_xpu(value, "value");
-  TORCH_CHECK(key.dim() == 3, "key must have shape [N, HC, H]");
-  TORCH_CHECK(query.sizes() == key.sizes() && output.sizes() == key.sizes(), "query and output must match key's shape");
+  CHECK_DIM(3, key);
+  CHECK_SAME_SHAPE(query, key);
+  CHECK_SAME_SHAPE(output, key);
   const int64_t tokens = key.size(0), hc_count = key.size(1), hidden = key.size(2);
   TORCH_CHECK(hidden > 0 && hidden % VEC == 0, "hidden size must be a positive multiple of ", VEC);
-  TORCH_CHECK(value.dim() == 2 && value.size(0) == tokens && value.size(1) == hidden, "value must have shape [N, H]");
+  CHECK_SHAPE(value, tokens, hidden);
   TORCH_CHECK(
       query.device() == key.device() && value.device() == key.device() && output.device() == key.device(),
       "key, query, value and output must be on the same device");

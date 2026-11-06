@@ -38,6 +38,7 @@ __attribute__((visibility("default"))) void Xe20MoEGEMMLauncher(
     const int gemm_k,
     const int* num_rows_per_expert_device,
     const int num_experts,
+    const int total_rows,
     int* workspace,
     float gemm1_alpha,
     float gemm1_limit,
@@ -67,6 +68,7 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
       const int,                                                                        \
       const int,                                                                        \
       const int*,                                                                       \
+      const int,                                                                        \
       const int,                                                                        \
       int*,                                                                             \
       float,                                                                            \
@@ -119,6 +121,7 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
       gemm_k,                                 \
       total_rows_for_experts.data_ptr<int>(), \
       n_experts,                              \
+      total_m,                                \
       atomic_buffer.data_ptr<int>(),          \
       static_cast<float>(gemm1_alpha),        \
       static_cast<float>(gemm1_limit),        \
@@ -255,6 +258,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
             gemm_k,
             total_rows_for_experts.data_ptr<int>(),
             static_cast<int>(n_experts),
+            total_m,
             atomic_buffer.data_ptr<int>(),
             static_cast<float>(gemm1_alpha),
             static_cast<float>(gemm1_limit),

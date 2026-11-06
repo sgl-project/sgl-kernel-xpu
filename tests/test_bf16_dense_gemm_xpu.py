@@ -1,0 +1,224 @@
+import pytest
+import torch
+import torch.nn.functional as F
+from sgl_kernel import bf16_dense_gemm_xe20
+
+pytestmark = pytest.mark.skipif(
+    not torch.xpu.is_available()
+    or not hasattr(torch.ops.sgl_kernel, "bf16_dense_gemm_xe20"),
+    reason="requires the Xe2 BF16 dense GEMM operator",
+)
+
+
+def assert_reference_quality(actual, a, weight):
+    reference = F.linear(a.float(), weight.float())
+    native = F.linear(a, weight)
+    torch.testing.assert_close(actual.float(), reference, atol=0.01, rtol=0.01)
+    rms = lambda value: (value.float() - reference).square().mean().sqrt()
+    assert rms(actual).item() <= rms(native).item() * 1.1 + 1e-6
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (1, 64, 32),
+        (3, 192, 64),
+        (127, 192, 96),
+        (129, 1536, 6144),
+        (128, 1536, 12288),
+        (256, 1536, 6144),
+        (256, 1536, 12288),
+        (256, 2560, 1536),
+        (256, 1536, 2048),
+        (256, 1536, 4096),
+        (512, 1536, 6144),
+        (512, 1536, 12288),
+        (257, 1536, 12288),
+    ],
+)
+def test_reference_and_partial_tiles(m, n, k):
+    torch.manual_seed(42)
+    a = torch.randn(m, k, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="xpu", dtype=torch.bfloat16) * 0.02
+    actual = bf16_dense_gemm_xe20(a, weight)
+    assert actual.shape == (m, n)
+    assert actual.dtype == torch.bfloat16
+    assert_reference_quality(actual, a, weight)
+
+
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (128, 1536, 12288),
+        (256, 1536, 6144),
+        (512, 1536, 6144),
+        (512, 1536, 12288),
+        (256, 2560, 1536),
+        (256, 1536, 2048),
+        (256, 1536, 4096),
+    ],
+)
+def test_graph_replay_uses_current_inputs(m, n, k):
+    a = torch.randn(m, k, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randn(n, k, device="xpu", dtype=torch.bfloat16) * 0.02
+    bf16_dense_gemm_xe20(a, weight)
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        output = bf16_dense_gemm_xe20(a, weight)
+    for scale in (1.0, 0.5):
+        a.mul_(scale)
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.xpu.synchronize()
+        assert torch.isfinite(output).all().item()
+        assert_reference_quality(output, a, weight)
+
+
+@pytest.mark.parametrize("m,n", [(0, 64), (128, 0)])
+def test_empty_output(m, n):
+    a = torch.empty(m, 32, device="xpu", dtype=torch.bfloat16)
+    weight = torch.empty(n, 32, device="xpu", dtype=torch.bfloat16)
+    assert bf16_dense_gemm_xe20(a, weight).shape == (m, n)
+
+
+@pytest.mark.parametrize(
+    "case", ["dtype", "rank", "k_mismatch", "k_alignment", "n_alignment", "strides"]
+)
+def test_invalid_inputs(case):
+    a = torch.empty(4, 32, device="xpu", dtype=torch.bfloat16)
+    weight = torch.empty(64, 32, device="xpu", dtype=torch.bfloat16)
+    if case == "dtype":
+        a = a.float()
+    elif case == "rank":
+        a = a.unsqueeze(0)
+    elif case == "k_mismatch":
+        weight = weight[:, :16].contiguous()
+    elif case == "k_alignment":
+        a, weight = a[:, :16].contiguous(), weight[:, :16].contiguous()
+    elif case == "n_alignment":
+        weight = weight[:63]
+    else:
+        a = torch.empty(32, 4, device="xpu", dtype=torch.bfloat16).t()
+    with pytest.raises(RuntimeError):
+        bf16_dense_gemm_xe20(a, weight)
+
+
+def test_fake_and_compile():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        a = torch.empty(128, 12288, device="xpu", dtype=torch.bfloat16)
+        weight = torch.empty(1536, 12288, device="xpu", dtype=torch.bfloat16)
+        actual = bf16_dense_gemm_xe20(a, weight)
+        assert actual.shape == (128, 1536)
+    a = torch.randn(128, 12288, device="xpu", dtype=torch.bfloat16)
+    weight = torch.randn(1536, 12288, device="xpu", dtype=torch.bfloat16) * 0.02
+    compiled = torch.compile(bf16_dense_gemm_xe20, backend="eager", fullgraph=True)
+    torch.testing.assert_close(
+        compiled(a, weight), bf16_dense_gemm_xe20(a, weight), atol=0, rtol=0
+    )
+
+
+@pytest.mark.parametrize(
+    "m,n,k,valid",
+    [
+        (0xFFFFFF, 64, 32, True),
+        (0x1000000, 64, 32, False),
+        (1, 8388544, 32, True),
+        (1, 8388608, 32, False),
+        (1, 64, 8388576, True),
+        (1, 64, 8388608, False),
+        # Rank-two block loads use separate coordinates, so total matrix size
+        # may exceed int32 without overflowing a flattened element offset.
+        (65536, 65536, 65536, True),
+        (16777215, 8388544, 32, False),
+    ],
+)
+def test_fake_descriptor_boundaries_without_allocation(m, n, k, valid):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        a = torch.empty(m, k, device="xpu", dtype=torch.bfloat16)
+        weight = torch.empty(n, k, device="xpu", dtype=torch.bfloat16)
+        if valid:
+            assert bf16_dense_gemm_xe20(a, weight).shape == (m, n)
+        else:
+            with pytest.raises(RuntimeError):
+                bf16_dense_gemm_xe20(a, weight)
+
+
+@pytest.mark.parametrize("operand", ["input", "weight"])
+@pytest.mark.parametrize("offset", [1, 32])
+def test_contiguous_storage_offset_alignment(operand, offset):
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    def inputs():
+        a = torch.randn(4, 32, device="xpu", dtype=torch.bfloat16)
+        weight = torch.randn(64, 32, device="xpu", dtype=torch.bfloat16) * 0.02
+        shape = a.shape if operand == "input" else weight.shape
+        storage = torch.randn(
+            shape.numel() + offset, device="xpu", dtype=torch.bfloat16
+        )
+        view = storage[offset:].view(shape)
+        assert view.is_contiguous() and view.storage_offset() == offset
+        return (view, weight) if operand == "input" else (a, view)
+
+    with FakeTensorMode():
+        a, weight = inputs()
+        assert bf16_dense_gemm_xe20(a, weight).shape == (4, 64)
+    a, weight = inputs()
+    assert_reference_quality(bf16_dense_gemm_xe20(a, weight), a, weight)
+
+
+def test_misaligned_graph_replay_copies_current_inputs_and_weight():
+    def misaligned(shape):
+        return torch.randn(shape[0] * shape[1] + 1, device="xpu", dtype=torch.bfloat16)[
+            1:
+        ].view(shape)
+
+    a, weight = misaligned((4, 32)), misaligned((64, 32))
+    bf16_dense_gemm_xe20(a, weight)
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        output = bf16_dense_gemm_xe20(a, weight)
+    for scale in (0.5, -1.0):
+        a.mul_(scale)
+        weight.mul_(0.75)
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.xpu.synchronize()
+        torch.testing.assert_close(
+            output, bf16_dense_gemm_xe20(a, weight), atol=0, rtol=0
+        )
+        assert_reference_quality(output, a, weight)
+
+
+def test_fullgraph_reuses_native_op_across_storage_offsets():
+    graphs = []
+
+    def backend(graph, example_inputs):
+        graphs.append(graph)
+        assert (
+            sum(
+                node.op == "call_function"
+                and node.target == torch.ops.sgl_kernel.bf16_dense_gemm_xe20.default
+                for node in graph.graph.nodes
+            )
+            == 1
+        )
+        return graph.forward
+
+    compiled = torch.compile(bf16_dense_gemm_xe20, backend=backend, fullgraph=True)
+    for offset in (32, 1, 0, 1, 32):
+        a = torch.randn(4 * 32 + offset, device="xpu", dtype=torch.bfloat16)[
+            offset:
+        ].view(4, 32)
+        weight = torch.randn(64 * 32 + offset, device="xpu", dtype=torch.bfloat16)[
+            offset:
+        ].view(64, 32)
+        torch.testing.assert_close(
+            compiled(a, weight), bf16_dense_gemm_xe20(a, weight), atol=0, rtol=0
+        )
+    assert graphs

@@ -232,6 +232,11 @@ inline void tail(
   // WG = (slot j = wg/4, quarter q4): gate rows q4*64..+64 (SGs 0..15) and the
   // same up rows (+256, SGs 16..31), 4 rows per SG, each row 8 chunks of 16 B a
   // lane (one N block per SG).
+  // the down rows of this WG's 64 outputs (routed slot s/4, rows (s&3)*16 +
+  // lane, a whole 256-B row a lane) and the shared down rows: issued right
+  // after the gate|up rows, in flight during S6 and the hand-off
+  sycl::uint4 wd[16], wsd[2];
+  float dsc[2];
   {
     const int j = wg >> 2, q4 = wg & 3, e = L.route_e[j];
     const int r0 = (s >> 4) * INTER + q4 * 64 + (s & 15) * 4;
@@ -241,12 +246,30 @@ inline void tail(
     for (int b = 0; b < 4; ++b)
       load_row<8>(gw[b], P.w13 + ((size_t)e * 2 * INTER + r0 + b) * HID, lane);
     load_scales<8>(gsc, P.w13_s + ((size_t)e * (2 * INTER / QB) + r0 / QB) * KB_HID, lane);
+    {
+      const int jd = s >> 2, ed = L.route_e[jd];
+      const int n = wg * 64 + (s & 3) * 16 + lane;
+      const uint8_t* rowd = P.w2 + ((size_t)ed * HID + n) * INTER;
+#pragma unroll
+      for (int c = 0; c < 16; ++c)
+        wd[c] = *reinterpret_cast<const sycl::uint4*>(rowd + c * 16);
+      const float* sd = P.w2_s + ((size_t)ed * KB_HID + (wg * 64) / QB) * (INTER / QB);
+      dsc[0] = sd[0];
+      dsc[1] = sd[1];
+#pragma unroll
+      for (int rr = 0; rr < 2; ++rr)
+        wsd[rr] = *reinterpret_cast<const sycl::uint4*>(P.sw2 + (size_t)(wg * 64 + 2 * s + rr) * INTER + lane * 16);
+    }
     float v[4];
 #pragma unroll
     for (int b = 0; b < 4; ++b)
       v[b] = dot_row_regs<8>(sg, lane, gw[b], L.xp32, gsc);
     if (lane < 4)
-      L.qk[(s >> 4) * 64 + (s & 15) * 4 + lane] = (lane == 0 ? v[0] : lane == 1 ? v[1] : lane == 2 ? v[2] : v[3]) * 256.f;
+      L.qk[(s >> 4) * 64 + (s & 15) * 4 + lane] = (lane == 0   ? v[0]
+                                                   : lane == 1 ? v[1]
+                                                   : lane == 2 ? v[2]
+                                                               : v[3]) *
+                                                  256.f;
     wg_bar(grp);
     if (lid < 64) {
       const float g = L.qk[lid], u = L.qk[64 + lid];
@@ -254,25 +277,6 @@ inline void tail(
     }
   }
   signal(it, S.cnt + C_GU * 16);
-  // the down rows of this WG's 64 outputs (routed slot s/4, rows (s&3)*16 +
-  // lane, a whole 256-B row a lane) and the shared down rows: in flight during
-  // the hand-off
-  sycl::uint4 wd[16], wsd[2];
-  float dsc[2];
-  {
-    const int jd = s >> 2, ed = L.route_e[jd];
-    const int n = wg * 64 + (s & 3) * 16 + lane;
-    const uint8_t* rowd = P.w2 + ((size_t)ed * HID + n) * INTER;
-#pragma unroll
-    for (int c = 0; c < 16; ++c)
-      wd[c] = *reinterpret_cast<const sycl::uint4*>(rowd + c * 16);
-    const float* sd = P.w2_s + ((size_t)ed * KB_HID + (wg * 64) / QB) * (INTER / QB);
-    dsc[0] = sd[0];
-    dsc[1] = sd[1];
-#pragma unroll
-    for (int rr = 0; rr < 2; ++rr)
-      wsd[rr] = *reinterpret_cast<const sycl::uint4*>(P.sw2 + (size_t)(wg * 64 + 2 * s + rr) * INTER + lane * 16);
-  }
 
   // ---------------- S7: down for this WG's 64 rows ; all-reduce #2
   // -----------------------------
@@ -320,8 +324,7 @@ inline void tail(
 }
 
 // PRT column blocks of this WG (router 16-bit, shared gate|up fp8) -> registers
-inline void
-load_prt(const Ptrs& P, int wg, int s, int lane, sycl::uint4 (&prt_r)[4], sycl::uint4 (&prt_s)[SHR / 4]) {
+inline void load_prt(const Ptrs& P, int wg, int s, int lane, sycl::uint4 (&prt_r)[4], sycl::uint4 (&prt_s)[SHR / 4]) {
 #pragma unroll
   for (int t = 0; t < 4; ++t)  // experts s*8 + 2t + (lane>>3), halves (lane&7)*8..+8
     prt_r[t] = *reinterpret_cast<const sycl::uint4*>(
@@ -398,7 +401,8 @@ inline void gdn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Sc
   sycl::vec<float, 8> st[2];  // recurrent state block: rows v = c*64 + 2s + rr, k = lane*8..+8
 #pragma unroll
   for (int rr = 0; rr < 2; ++rr)
-    st[rr] = *reinterpret_cast<const sycl::vec<float, 8>*>(ssm + ((size_t)h * DV + c * 64 + 2 * s + rr) * DK + lane * 8);
+    st[rr] =
+        *reinterpret_cast<const sycl::vec<float, 8>*>(ssm + ((size_t)h * DV + c * 64 + 2 * s + rr) * DK + lane * 8);
   const int cch = lid < 128   ? kh * DK + lid
                   : lid < 256 ? KD + kh * DK + (lid - 128)
                               : 2 * KD + h * DV + c * 64 + (lid - 256);
@@ -413,21 +417,41 @@ inline void gdn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Sc
     for (int i = 0; i < 4; ++i)
       cwt[i] = f32<DT>(w4[i]);
   }
+  // S1's block scales (this SG's rows lie in one 128-row block), ahead of the
+  // norm: loaded after S1's weights they would hold up its first dot product
+  float sc1[8];
+  load_scales<8>(sc1, P.qkvz_s + (size_t)(((wg * NSG + s) * 4) / QB) * KB_HID, lane);
+  // b (SG 0) and a (SG 1) rows of v head h, 16-bit: the first half in flight
+  // during the norm, the second during S1
+  sycl::uint4 baw[8];
+  const e16* barow = P.ba_w + (size_t)(s * NVH + h) * HID;
+  if (s < 2) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      baw[j] = *reinterpret_cast<const sycl::uint4*>(barow + j * 128 + lane * 8);
+  }
   input_norm<DT>(it, P, L.xn, L.xp);
   wg_bar(grp);
+  float bav = 0.f;
+  if (s < 2) {
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      bav += dot8_w16<DT>(baw[j], L.xn + j * 128 + lane * 8);
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      baw[j] = *reinterpret_cast<const sycl::uint4*>(barow + (8 + j) * 128 + lane * 8);
+  }
 
   // ---------------- S1: q|k|v rows of in_proj_qkvz (4 per SG) ----------------
   {
     const int r0 = (wg * NSG + s) * 4;
     sycl::uint4 w[4][8];
-    float sc[8];
 #pragma unroll
     for (int b = 0; b < 4; ++b)
       load_row<8>(w[b], P.qkvz_w + (size_t)(r0 + b) * HID, lane);
-    load_scales<8>(sc, P.qkvz_s + (size_t)(r0 / QB) * KB_HID, lane);
 #pragma unroll
     for (int b = 0; b < 4; ++b) {
-      const float v = dot_row_regs<8>(sg, lane, w[b], L.xp32, sc);
+      const float v = dot_row_regs<8>(sg, lane, w[b], L.xp32, sc1);
       if (lane == 0) S.qkv[r0 + b] = toh<DT>(v * 256.f);
     }
   }
@@ -443,16 +467,10 @@ inline void gdn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Sc
     load_scales<8>(zsc, P.qkvz_s + (size_t)(zr / QB) * KB_HID, lane);
   }
   if (s < 2) {  // b, a of v head h (16-bit rows, 8 halves a lane a chunk; DT, as SGLang's GEMM output)
-    sycl::uint4 baw[16];
-    const e16* row = P.ba_w + (size_t)(s * NVH + h) * HID;
 #pragma unroll
-    for (int j = 0; j < 16; ++j)
-      baw[j] = *reinterpret_cast<const sycl::uint4*>(row + j * 128 + lane * 8);
-    float v = 0.f;
-#pragma unroll
-    for (int j = 0; j < 16; ++j)
-      v += dot8_w16<DT>(baw[j], L.xn + j * 128 + lane * 8);
-    v = sycl::reduce_over_group(sg, v, sycl::plus<float>());
+    for (int j = 0; j < 8; ++j)
+      bav += dot8_w16<DT>(baw[j], L.xn + (8 + j) * 128 + lane * 8);
+    const float v = sycl::reduce_over_group(sg, bav, sycl::plus<float>());
     if (lane == 0) red[s] = rnd<DT>(v);
   }
 
@@ -579,56 +597,56 @@ inline void gdn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Sc
 // full-attention layer
 // one flash step over NT 16-token tiles from token tb: trow(t) gives the slot
 // of token t (past the context: a valid slot, masked by the score select)
-#define MONO_ATTN_STEP(tb, NT)                                                                         \
-  do {                                                                                                 \
-    const e16* kb[NT];                                                                                 \
-    _Pragma("unroll") for (int tt = 0; tt < NT; ++tt) kb[tt] = P.kc + trow((tb) + tt * 16) * HD;       \
-    v8f S4[NT];                                                                                        \
-    _Pragma("unroll") for (int tt = 0; tt < NT; ++tt) {                                                \
-      S4[tt] = v8f(0.f);                                                                               \
-      _Pragma("unroll") for (int kt = 0; kt < 16; ++kt) {                                              \
-        const v8u bk = load_k_tile(kb[tt], kt * 8);                                                    \
-        const v4u qa = *reinterpret_cast<const v4u*>(qpk + (kt * 16 + lane) * 4);                      \
-        dpas16<DT>(S4[tt], qa, bk);                                                                    \
-      }                                                                                                \
-    }                                                                                                  \
-    float sv[NT][8];                                                                                   \
-    _Pragma("unroll") for (int tt = 0; tt < NT; ++tt) {                                                \
-      const bool ok = (tb) + tt * 16 + lane < lc; /* token = column = lane */                          \
-      _Pragma("unroll") for (int i = 0; i < 8; ++i) sv[tt][i] = ok ? S4[tt][i] * SM_SCALE : -INFINITY; \
-    }                                                                                                  \
-    float alpha[8];                                                                                    \
-    _Pragma("unroll") for (int i = 0; i < 8; ++i) {                                                    \
-      float lm = sv[0][i];                                                                             \
-      _Pragma("unroll") for (int tt = 1; tt < NT; ++tt) lm = sycl::fmax(lm, sv[tt][i]);                \
-      const float mn = sycl::fmax(m[i], sycl::reduce_over_group(sg, lm, sycl::maximum<float>()));      \
-      alpha[i] = mn == -INFINITY ? 1.f : sycl::native::exp2(m[i] - mn);                                \
-      m[i] = mn;                                                                                       \
-      lp[i] *= alpha[i];                                                                               \
-    }                                                                                                  \
-    _Pragma("unroll") for (int nt = 0; nt < 8; ++nt) _Pragma("unroll") for (int i = 0; i < 8; ++i)     \
-        O[nt][i] *= alpha[i];                                                                          \
-    _Pragma("unroll") for (int tt = 0; tt < NT; ++tt) {                                                \
-      uint16_t pv[8];                                                                                  \
-      _Pragma("unroll") for (int i = 0; i < 8; ++i) {                                                  \
-        const float p = m[i] == -INFINITY ? 0.f : sycl::native::exp2(sv[tt][i] - m[i]);                \
-        lp[i] += p;                                                                                    \
-        pv[i] = bits<DT>(p);                                                                           \
-      }                                                                                                \
-      /* P (lane = token, element = head) -> dpas A: lane l, element j = P[2j                          \
-       * + l/8][2(l%8) + {0,1}] */                                                                     \
-      v4u pa;                                                                                          \
-      _Pragma("unroll") for (int j = 0; j < 4; ++j) {                                                  \
-        const int t0_ = 2 * (lane & 7);                                                                \
-        const uint16_t a0 = sycl::select_from_group(sg, pv[2 * j], t0_);                               \
-        const uint16_t a1 = sycl::select_from_group(sg, pv[2 * j + 1], t0_);                           \
-        const uint16_t b0 = sycl::select_from_group(sg, pv[2 * j], t0_ + 1);                           \
-        const uint16_t b1 = sycl::select_from_group(sg, pv[2 * j + 1], t0_ + 1);                       \
-        pa[j] = (lane < 8) ? pack16(a0, b0) : pack16(a1, b1);                                          \
-      }                                                                                                \
-      const e16* vb = P.vc + (kb[tt] - P.kc) + dh * 128;                                               \
-      _Pragma("unroll") for (int nt = 0; nt < 8; ++nt) dpas16<DT>(O[nt], pa, load_v_tile(vb, nt * 16)); \
-    }                                                                                                  \
+#define MONO_ATTN_STEP(tb, NT)                                                                                 \
+  do {                                                                                                         \
+    const e16* kb[NT];                                                                                         \
+    _Pragma("unroll") for (int tt = 0; tt < NT; ++tt) kb[tt] = P.kc + trow((tb) + tt * 16) * HD;               \
+    v8f S4[NT];                                                                                                \
+    _Pragma("unroll") for (int tt = 0; tt < NT; ++tt) {                                                        \
+      S4[tt] = v8f(0.f);                                                                                       \
+      _Pragma("unroll") for (int kt = 0; kt < 16; ++kt) {                                                      \
+        const v8u bk = load_k_tile(kb[tt], kt * 8);                                                            \
+        const v4u qa = *reinterpret_cast<const v4u*>(qpk + (kt * 16 + lane) * 4);                              \
+        dpas16<DT>(S4[tt], qa, bk);                                                                            \
+      }                                                                                                        \
+    }                                                                                                          \
+    float sv[NT][8];                                                                                           \
+    _Pragma("unroll") for (int tt = 0; tt < NT; ++tt) {                                                        \
+      const bool ok = (tb) + tt * 16 + lane < lc; /* token = column = lane */                                  \
+      _Pragma("unroll") for (int i = 0; i < 8; ++i) sv[tt][i] = ok ? S4[tt][i] * SM_SCALE : -INFINITY;         \
+    }                                                                                                          \
+    float alpha[8];                                                                                            \
+    _Pragma("unroll") for (int i = 0; i < 8; ++i) {                                                            \
+      float lm = sv[0][i];                                                                                     \
+      _Pragma("unroll") for (int tt = 1; tt < NT; ++tt) lm = sycl::fmax(lm, sv[tt][i]);                        \
+      const float mn = sycl::fmax(m[i], sycl::reduce_over_group(sg, lm, sycl::maximum<float>()));              \
+      alpha[i] = mn == -INFINITY ? 1.f : sycl::native::exp2(m[i] - mn);                                        \
+      m[i] = mn;                                                                                               \
+      lp[i] *= alpha[i];                                                                                       \
+    }                                                                                                          \
+    _Pragma("unroll") for (int nt = 0; nt < 8; ++nt) _Pragma("unroll") for (int i = 0; i < 8; ++i) O[nt][i] *= \
+        alpha[i];                                                                                              \
+    _Pragma("unroll") for (int tt = 0; tt < NT; ++tt) {                                                        \
+      uint16_t pv[8];                                                                                          \
+      _Pragma("unroll") for (int i = 0; i < 8; ++i) {                                                          \
+        const float p = m[i] == -INFINITY ? 0.f : sycl::native::exp2(sv[tt][i] - m[i]);                        \
+        lp[i] += p;                                                                                            \
+        pv[i] = bits<DT>(p);                                                                                   \
+      }                                                                                                        \
+      /* P (lane = token, element = head) -> dpas A: lane l, element j = P[2j                                  \
+       * + l/8][2(l%8) + {0,1}] */                                                                             \
+      v4u pa;                                                                                                  \
+      _Pragma("unroll") for (int j = 0; j < 4; ++j) {                                                          \
+        const int t0_ = 2 * (lane & 7);                                                                        \
+        const uint16_t a0 = sycl::select_from_group(sg, pv[2 * j], t0_);                                       \
+        const uint16_t a1 = sycl::select_from_group(sg, pv[2 * j + 1], t0_);                                   \
+        const uint16_t b0 = sycl::select_from_group(sg, pv[2 * j], t0_ + 1);                                   \
+        const uint16_t b1 = sycl::select_from_group(sg, pv[2 * j + 1], t0_ + 1);                               \
+        pa[j] = (lane < 8) ? pack16(a0, b0) : pack16(a1, b1);                                                  \
+      }                                                                                                        \
+      const e16* vb = P.vc + (kb[tt] - P.kc) + dh * 128;                                                       \
+      _Pragma("unroll") for (int nt = 0; nt < 8; ++nt) dpas16<DT>(O[nt], pa, load_v_tile(vb, nt * 16));        \
+    }                                                                                                          \
   } while (0)
 
 // zero the V rows r0 .. 15 of the 16-token tile at slot `tile` (the stale rows
@@ -867,7 +885,8 @@ inline void attn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const S
       if (s == 0)
         head_norm_rope<DT>(sg, lane, S.qkv_raw + NQ * 512, P.k_norm_w, rope, kvn, wr ? P.kc + slot * HD : nullptr);
       else if (s == 1)
-        head_norm_rope<DT>(sg, lane, S.qkv_raw + NQ * 512 + HD, nullptr, rope, kvn + HD, wr ? P.vc + slot * HD : nullptr);
+        head_norm_rope<DT>(
+            sg, lane, S.qkv_raw + NQ * 512 + HD, nullptr, rope, kvn + HD, wr ? P.vc + slot * HD : nullptr);
       wg_bar(grp);
     }
     if (s == 0) {  // new-token score
@@ -929,8 +948,7 @@ void launch_t(sycl::queue& q, const Ptrs& P, const Scratch& S) {
     // 256 GRF: the 32 sub-groups of a work-group must all be resident on one
     // Xe core (8 XVEs x 4 threads), and the register-held weights need it
     syclex::properties props{syclex::sub_group_size<16>, intelex::grf_size<256>};
-    h.parallel_for<MonoLayerK<ATTN, DT>>(
-        sycl::nd_range<1>(NWG * WGS, WGS), props, [=](sycl::nd_item<1> it) {
+    h.parallel_for<MonoLayerK<ATTN, DT>>(sycl::nd_range<1>(NWG * WGS, WGS), props, [=](sycl::nd_item<1> it) {
       if constexpr (ATTN)
         attn_layer<DT>(it, slm.get_multi_ptr<sycl::access::decorated::no>().get(), P, S);
       else

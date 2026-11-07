@@ -1690,8 +1690,12 @@ std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_table(
 bool mono_decode_supported(int64_t device);
 int64_t mono_max_context();
 at::Tensor mono_health(int64_t device);
+void mono_register_mtp(int64_t layer, int64_t mbox, int64_t peer, const std::vector<at::Tensor>& t, int64_t rank);
+bool mono_mtp_prologue(int64_t layer, const at::Tensor& embed, const at::Tensor& hidden, at::Tensor& out);
+at::Tensor mono_health_host(int64_t device);
 void mono_set_deadline(double seconds);
 void mono_fault_inject(int64_t layer, int64_t delta);
+at::Tensor mono_layer_counters(int64_t layer);
 int64_t mono_ipc_create(int64_t bytes);
 std::vector<int64_t> mono_ipc_export(int64_t handle);
 int64_t mono_ipc_open(int64_t handle, std::vector<int64_t> peer_info, int64_t local_fd);
@@ -1701,6 +1705,17 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
 void mono_bind_caches(int64_t layer, const std::vector<at::Tensor>& caches, int64_t page_size);
 void mono_decode_layer(
     int64_t layer,
+    const at::Tensor& hidden,
+    const at::Tensor& residual,
+    at::Tensor& hid_out,
+    at::Tensor& res_out,
+    const at::Tensor& positions,
+    const at::Tensor& m0,
+    const std::optional<at::Tensor>& m1,
+    const std::optional<at::Tensor>& m2);
+bool mono_decode_layer_verify(
+    int64_t layer,
+    int64_t tokens,
     const at::Tensor& hidden,
     const at::Tensor& residual,
     at::Tensor& hid_out,

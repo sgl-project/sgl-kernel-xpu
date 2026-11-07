@@ -206,20 +206,20 @@ constexpr int mb_tag() {
 static_assert(MBOX_WORDS_B >= MBOX_WORDS, "the batched mailbox covers the single-row one");
 
 // -------------------------------------------------------- SLM layout (batched)
-constexpr int B_XA = 0,                 // A tiles of the current activations: 128 chunks x 256 B
-    B_RED = B_XA + 32768,               // SG partials: [32][8][16] f32
-    B_QK = B_RED + 16384,               // GDN: per row q[128] k[128] v[64] beta g (384 f32 per row)
-    B_SM = B_QK + 8 * 384 * 4,          // small reductions: 1024 f32
-    B_RB = B_SM + 4096,                 // tail: res2 block [8][64] f32
-    B_XAN = B_RB + 2048,                // tail: router A tiles (nat, 4 chunks)
-    B_XAP = B_XAN + 1024,               // tail: shared gate|up A tiles (perm, 4 chunks)
-    B_LG = B_XAP + 1024,                // logits [8][256] f32
-    B_S6R = B_RED,                      // S6 SG partials [32][2 tiles][8][16] f32 / S7 [32][4][8][16]
-                                        // over RED .. LG (dead in S6 / S7)
-    B_RT = B_RED + 65536,               // route_e [8][8] int, route_w [8][8] f32
-    B_U = B_RT + 512,                   // union: e [64] int, w [64][8] f32, count
-    B_SGT = B_U + 256 + 2048 + 64,      // shared-expert gate per row [8] f32
-    B_CS = B_SGT + 64,                  // GDN: conv states of the WG's 320 channels [8][3][320] f16
+constexpr int B_XA = 0,             // A tiles of the current activations: 128 chunks x 256 B
+    B_RED = B_XA + 32768,           // SG partials: [32][8][16] f32
+    B_QK = B_RED + 16384,           // GDN: per row q[128] k[128] v[64] beta g (384 f32 per row)
+    B_SM = B_QK + 8 * 384 * 4,      // small reductions: 1024 f32
+    B_RB = B_SM + 4096,             // tail: res2 block [8][64] f32
+    B_XAN = B_RB + 2048,            // tail: router A tiles (nat, 4 chunks)
+    B_XAP = B_XAN + 1024,           // tail: shared gate|up A tiles (perm, 4 chunks)
+    B_LG = B_XAP + 1024,            // logits [8][256] f32
+    B_S6R = B_RED,                  // S6 SG partials [32][2 tiles][8][16] f32 / S7 [32][4][8][16]
+                                    // over RED .. LG (dead in S6 / S7)
+    B_RT = B_RED + 65536,           // route_e [8][8] int, route_w [8][8] f32
+    B_U = B_RT + 512,               // union: e [64] int, w [64][8] f32, count
+    B_SGT = B_U + 256 + 2048 + 64,  // shared-expert gate per row [8] f32
+    B_CS = B_SGT + 64,              // GDN: conv states of the WG's 320 channels [8][3][320] f16
     B_BYTES = B_CS + 8 * 3 * 320 * 2;
 static_assert(B_LG + 8192 <= B_RT, "S6 partials alias only dead tail SLM");
 
@@ -300,7 +300,7 @@ inline void input_norm_b(sycl::nd_item<1> it, const Ptrs& P, const SlmB& L) {
 inline void
 ar_two(uint64_t* peer, uint64_t* mine, size_t word, float& v0, float& v1, uint32_t call, const uint32_t* cnt) {
   const half a0 = (half)v0, a1 = (half)v1;
-  mb_ref(peer[word]).store(mb_word(pack_h2(a0, a1), call));
+  mb_put(peer + word, mb_word(pack_h2(a0, a1), call));
   const uint64_t w = mb_wait(mine + word, call, cnt);
   const h2 b = sycl::bit_cast<h2>(mb_val(w));
   v0 = (float)a0 + (float)b[0];
@@ -747,7 +747,9 @@ template <int NR, typename ConvOf>
 inline void load_conv_b(e16* csl, ConvOf conv_of, const int (&chs)[NR], int h, int c, int kh, int lid) {
   for (int v = lid; v < NR * 40; v += WGS) {
     const int r = v / 40, j8 = (v % 40) * 8;
-    const int ch = j8 < 128 ? kh * DK + j8 : j8 < 256 ? KD + kh * DK + (j8 - 128) : 2 * KD + h * DV + c * 64 + (j8 - 256);
+    const int ch = j8 < 128   ? kh * DK + j8
+                   : j8 < 256 ? KD + kh * DK + (j8 - 128)
+                              : 2 * KD + h * DV + c * 64 + (j8 - 256);
     const e16* src = conv_of(r) + (size_t)ch * chs[r];
     e16 t[24];
     if (chs[r] == 3) {
@@ -828,11 +830,17 @@ inline void gdn_layer_b(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const 
   {
     v8f cc = v8f(0.f);
     mm_rows<32>(cc, w1, L.xa, ks1 * 32, lane, P.qkvz_s + (size_t)((wg * 128 + tile1 * 16) / QB) * KB_HID);
-    // z rows of this WG (4 tiles x 8 K slices), b|a rows of all heads (2 tiles
-    // x 16 K slices, 16-bit: two uint4 a chunk): in flight from here
+    // z rows of this WG (4 tiles x 8 K slices), b|a rows (2 tiles x 16 K
+    // slices, 16-bit: two uint4 a chunk): in flight from here. Only head h's
+    // column of each b|a tile is kept, so the other lanes feed zeros instead
+    // of streaming all 32 rows into every WG.
     ld_rows<16>(zw, P.qkvz_w + (size_t)(CONVD + h * DV + c * 64 + tz * 16 + lane) * HID + kz * 256);
-    ld_rows<16>(
-        bw, reinterpret_cast<const uint8_t*>(P.ba_w + (size_t)((s >> 4) * 16 + lane) * HID + (s & 15) * 128));
+    if (lane == h)
+      ld_rows<16>(bw, reinterpret_cast<const uint8_t*>(P.ba_w + (size_t)((s >> 4) * 16 + h) * HID + (s & 15) * 128));
+    else
+#pragma unroll
+      for (int t = 0; t < 16; ++t)
+        bw[t] = sycl::uint4(0u);
     red_put(L.red, s, lane, cc);
   }
   wg_bar(grp);
@@ -1026,9 +1034,9 @@ constexpr int ADYN_MIN = 96 * 1024;  // cached tokens per step from which the
 constexpr int ATK = EPOCH + 8;       // batched attention: ticket counter per row [8] (reset each call)
 constexpr int AB_QPK = 49152, AB_CS = AB_QPK + NBMAX * 4096, AB_KVN = AB_CS + NBMAX * 256,
               AB_QS = AB_KVN + NBMAX * 1024, AB_W = AB_QS + NQ * HD * 2, AB_SM3 = AB_W + 2048,
-              AB_LST = AB_SM3 + 1024,           // merge: slot lists [8][512] i16
-    AB_WL = AB_LST + NBMAX * 512 * 2,           // merge: weights [8][512] f32
-    AB_TK = AB_WL + NBMAX * 512 * 4,            // ticket ring [16][2] + ack [16]
+              AB_LST = AB_SM3 + 1024,  // merge: slot lists [8][512] i16
+    AB_WL = AB_LST + NBMAX * 512 * 2,  // merge: weights [8][512] f32
+    AB_TK = AB_WL + NBMAX * 512 * 4,   // ticket ring [16][2] + ack [16]
     AB_BYTES = AB_TK + 256;
 static_assert(AB_BYTES <= 131072, "SLM of the batched attention layer");
 constexpr int AB_SLM = AB_BYTES > B_BYTES ? AB_BYTES : B_BYTES;  // the tail reuses the (dead) attention data
@@ -1038,7 +1046,8 @@ static_assert(AB_SLM <= 131072, "SLM of the batched attention layer + tail");
 // qpk[(kt*16 + l)*4 + j] = (q[2j + l/8][kt*16 + 2(l%8)], +1): head hh, dim
 // lane*16 + i -> half ((lane*16 + (hh&1)*8 + i/2)*4 + hh/2)*2 + i%2
 template <typename DT>
-inline void q_norm_rope_b(sycl::sub_group sg, int lane, const Ptrs& P, const float* src, const float* cs, e16* qh, int hh) {
+inline void
+q_norm_rope_b(sycl::sub_group sg, int lane, const Ptrs& P, const float* src, const float* cs, e16* qh, int hh) {
   float y[16];
 #pragma unroll
   for (int i = 0; i < 16; ++i)
@@ -1141,15 +1150,15 @@ inline void attn_chunks_b(
         t = sycl::select_from_group(sg, t, 0);
         const int u = t < na ? 4 * t : 4 * na + (t - na);
         if (u >= nu) break;
-        const int t0 = u * 16, te = sycl::min(lc, (u + (t < na ? 4 : 1)) * 16);
-        auto trow = [&](int tk) {  // slot of token tk of row b; past the
-          if (tk >= te) tk = 0;    // segment: token 0 (masked by the score select)
+        const int t0 = u * 16, t_end = sycl::min(lc, (u + (t < na ? 4 : 1)) * 16);
+        auto trow = [&](int tk) {   // slot of token tk of row b; past the
+          if (tk >= t_end) tk = 0;  // segment: token 0 (masked by the score select)
           return kv_slot(btab, P.ps, tk);
         };
-        if ((lc & 15) && (lc & ~15) >= t0 && (lc & ~15) < te)  // stale V rows of the partial tile -> 0
+        if ((lc & 15) && (lc & ~15) >= t0 && (lc & ~15) < t_end)  // stale V rows of the partial tile -> 0
           zero_v_tail(P, trow(lc & ~15), lc & 15, dh, lane);
         {
-          const int lc = te;  // the step masks columns >= lc
+          const int lc = t_end;  // the step masks columns >= lc
           int tq = t0;
 #pragma unroll 1
           for (; tq + 48 < lc; tq += 64)
@@ -1397,8 +1406,8 @@ inline void attn_layer_b(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const
       for (int i = 0; i < 16; ++i) {  // q[hh][dd] from the packed q: kt = dd/16, l = (hh&1)*8 +
                                       // (dd%16)/2, j = hh/2
         const int dd = lane * 16 + i, kt = dd >> 4, l = (hh & 1) * 8 + ((dd & 15) >> 1);
-        const float qv = ld16<DT>(
-            reinterpret_cast<const e16*>(qpk_all + s * 1024), ((kt * 16 + l) * 4 + (hh >> 1)) * 2 + (dd & 1));
+        const float qv =
+            ld16<DT>(reinterpret_cast<const e16*>(qpk_all + s * 1024), ((kt * 16 + l) * 4 + (hh >> 1)) * 2 + (dd & 1));
         d += qv * ld16<DT>(kvn_all, s * 512 + dd);
       }
       d = sycl::reduce_over_group(sg, d, sycl::plus<float>());
@@ -1410,7 +1419,7 @@ inline void attn_layer_b(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const
       // for the weighted sums (deterministic: atomic max only, fixed-order
       // sums)
       int* mkey = reinterpret_cast<int*>(sm3 + 16);
-      float* lwp = sm3 + 32;  // [NB][T / 16] per-SG weight sums
+      float* lwp = sm3 + 32;  // [NB][TW / 16] per-SG weight sums
       auto key = [](float f) {
         const int k = sycl::bit_cast<int>(f);
         return k >= 0 ? k : k ^ 0x7fffffff;
@@ -1441,40 +1450,43 @@ inline void attn_layer_b(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const
       wg_bar(grp);
       if (live) wgt[g] = lg > 0.f ? lg * sycl::native::exp2(mg - unkey(mkey[gb])) : 0.f;
       wg_bar(grp);
-      constexpr int T = WGS / NB, PARTS = T / 64;
-      const int b = lid / T, r = lid % T, part = r >> 6, d = r & 63;
-      const int g0 = coff[b], n = coff[b + 1] - coff[b];
-      {
-        float lw = 0.f;
-        for (int i2 = r; i2 < n; i2 += T)
-          lw += wgt[g0 + i2];
-        lw = sycl::reduce_over_group(sg, lw, sycl::plus<float>());
-        if (lane == 0) lwp[b * (T / 16) + (r >> 4)] = lw;
-      }
-      float acc = 0.f;
-      {  // 8 independent loads in flight (the loop is latency bound otherwise)
-        float a8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-        int i2 = part;
-        for (; i2 + 7 * PARTS < n; i2 += 8 * PARTS) {
+      constexpr int TW = WGS / NB / 64 * 64, PARTS = TW / 64;  // whole SGs per row (NB = 3, 6: idle tail)
+      const int b = lid / TW, r = lid % TW, part = r >> 6, d = r & 63;
+      if (b < NB) {
+        const int g0 = coff[b], n = coff[b + 1] - coff[b];
+        {
+          float lw = 0.f;
+          for (int i2 = r; i2 < n; i2 += TW)
+            lw += wgt[g0 + i2];
+          lw = sycl::reduce_over_group(sg, lw, sycl::plus<float>());
+          if (lane == 0) lwp[b * (TW / 16) + (r >> 4)] = lw;
+        }
+        float acc = 0.f;
+        {  // 8 independent loads in flight (the loop is latency bound otherwise)
+          float a8[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+          int i2 = part;
+          for (; i2 + 7 * PARTS < n; i2 += 8 * PARTS) {
+#pragma unroll
+            for (int q = 0; q < 8; ++q)
+              a8[q] +=
+                  wgt[g0 + i2 + q * PARTS] * (float)SB.pa_o[((size_t)(g0 + i2 + q * PARTS) * NQ + hh) * HD + d0 + d];
+          }
+          for (; i2 < n; i2 += PARTS)
+            a8[0] += wgt[g0 + i2] * (float)SB.pa_o[((size_t)(g0 + i2) * NQ + hh) * HD + d0 + d];
 #pragma unroll
           for (int q = 0; q < 8; ++q)
-            a8[q] += wgt[g0 + i2 + q * PARTS] * (float)SB.pa_o[((size_t)(g0 + i2 + q * PARTS) * NQ + hh) * HD + d0 + d];
+            acc += a8[q];
         }
-        for (; i2 < n; i2 += PARTS)
-          a8[0] += wgt[g0 + i2] * (float)SB.pa_o[((size_t)(g0 + i2) * NQ + hh) * HD + d0 + d];
-#pragma unroll
-        for (int q = 0; q < 8; ++q)
-          acc += a8[q];
+        L.red[(b * PARTS + part) * 64 + d] = acc;
       }
-      L.red[(b * PARTS + part) * 64 + d] = acc;
       wg_bar(grp);
       if (lid < NB * 64) {
         const int b2 = lid >> 6, d2 = lid & 63;
         const float M = unkey(mkey[b2]);
         const float en = sycl::native::exp2(sm3[b2] - M);
         float Lw = en;
-        for (int k2 = 0; k2 < T / 16; ++k2)
-          Lw += lwp[b2 * (T / 16) + k2];
+        for (int k2 = 0; k2 < TW / 16; ++k2)
+          Lw += lwp[b2 * (TW / 16) + k2];
         float a = en * ld16<DT>(kvn_all, b2 * 512 + HD + d0 + d2);
 #pragma unroll
         for (int pp = 0; pp < PARTS; ++pp)
@@ -1511,8 +1523,7 @@ void launch_attn_b(sycl::queue& q, const Ptrs& P, const Scratch& S, const Scratc
   q.submit([&](sycl::handler& h) {
     sycl::local_accessor<uint8_t, 1> slm(sycl::range<1>(AB_SLM), h);
     syclex::properties props{syclex::sub_group_size<16>, intelex::grf_size<256>};
-    h.parallel_for<MonoAttnBK<NB, DT>>(
-        sycl::nd_range<1>(NWG * WGS, WGS), props, [=](sycl::nd_item<1> it) {
+    h.parallel_for<MonoAttnBK<NB, DT>>(sycl::nd_range<1>(NWG * WGS, WGS), props, [=](sycl::nd_item<1> it) {
       attn_layer_b<NB, DT>(it, slm.get_multi_ptr<sycl::access::decorated::no>().get(), P, S, SB);
     });
   });
@@ -1523,14 +1534,13 @@ void launch_gdn_b(sycl::queue& q, const Ptrs& P, const Scratch& S, const Scratch
   q.submit([&](sycl::handler& h) {
     sycl::local_accessor<uint8_t, 1> slm(sycl::range<1>(B_BYTES), h);
     syclex::properties props{syclex::sub_group_size<16>, intelex::grf_size<256>};
-    h.parallel_for<MonoGdnBK<NB, DT>>(
-        sycl::nd_range<1>(NWG * WGS, WGS), props, [=](sycl::nd_item<1> it) {
+    h.parallel_for<MonoGdnBK<NB, DT>>(sycl::nd_range<1>(NWG * WGS, WGS), props, [=](sycl::nd_item<1> it) {
       gdn_layer_b<NB, DT>(it, slm.get_multi_ptr<sycl::access::decorated::no>().get(), P, S, SB);
     });
   });
 }
 
-// decode launchers of one layer kind and dtype, 1, 2, 4 or 8 rows: each
+// decode launchers of one layer kind and dtype, 1, 2, 3, 4, 6 or 8 rows: each
 // instance is compiled in its own translation unit and library
 // (mono_{gdn,attn}_{fp16,bf16}, built with -fvisibility=hidden) and called
 // from MonoDecodeXe20: exported
@@ -1541,8 +1551,12 @@ void launch_gdn(sycl::queue& q, int nb, const Ptrs& P, const Scratch& S, const S
     launch_t<false, DT>(q, P, S);
   else if (nb == 2)
     launch_gdn_b<2, DT>(q, P, S, SB);
+  else if (nb == 3)
+    launch_gdn_b<3, DT>(q, P, S, SB);
   else if (nb == 4)
     launch_gdn_b<4, DT>(q, P, S, SB);
+  else if (nb == 6)
+    launch_gdn_b<6, DT>(q, P, S, SB);
   else
     launch_gdn_b<8, DT>(q, P, S, SB);
 }
@@ -1552,8 +1566,12 @@ void launch_attn(sycl::queue& q, int nb, const Ptrs& P, const Scratch& S, const 
     launch_t<true, DT>(q, P, S);
   else if (nb == 2)
     launch_attn_b<2, DT>(q, P, S, SB);
+  else if (nb == 3)
+    launch_attn_b<3, DT>(q, P, S, SB);
   else if (nb == 4)
     launch_attn_b<4, DT>(q, P, S, SB);
+  else if (nb == 6)
+    launch_attn_b<6, DT>(q, P, S, SB);
   else
     launch_attn_b<8, DT>(q, P, S, SB);
 }

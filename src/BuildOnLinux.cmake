@@ -306,7 +306,9 @@ endif()
 # their order on common_ops' --as-needed link line.
 if(TARGET sgl-ops-sycl-MonoDecodeXe20)
   target_link_libraries(sgl-ops-sycl-MonoDecodeXe20 PRIVATE ze_loader)
-  foreach(_mono_kernel mono_gdn_fp16 mono_gdn_bf16 mono_attn_fp16 mono_attn_bf16)
+  foreach(_mono_kernel mono_gdn_fp16 mono_gdn_bf16 mono_attn_fp16 mono_attn_bf16
+                       mono_gdn_verify_fp16 mono_gdn_verify_bf16 mono_attn_verify_fp16 mono_attn_verify_bf16
+                       mono_mtp_fp16 mono_mtp_bf16)
     if(TARGET sgl-ops-sycl-${_mono_kernel})
       target_link_libraries(sgl-ops-sycl-MonoDecodeXe20 PUBLIC sgl-ops-sycl-${_mono_kernel})
     endif()

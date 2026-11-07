@@ -774,10 +774,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("mono_max_context", c10::DispatchKey::BackendSelect, &mono_max_context);
   m.def("mono_health(int device) -> Tensor");
   m.impl("mono_health", c10::DispatchKey::BackendSelect, &mono_health);
+  m.def("mono_health_host(int device) -> Tensor");
+  m.impl("mono_health_host", c10::DispatchKey::BackendSelect, &mono_health_host);
   m.def("mono_set_deadline(float seconds) -> ()");
   m.impl("mono_set_deadline", c10::DispatchKey::BackendSelect, &mono_set_deadline);
   m.def("mono_fault_inject(int layer, int delta) -> ()");
   m.impl("mono_fault_inject", c10::DispatchKey::BackendSelect, &mono_fault_inject);
+  m.def("mono_layer_counters(int layer) -> Tensor");
+  m.impl("mono_layer_counters", c10::DispatchKey::BackendSelect, &mono_layer_counters);
   m.def("mono_ipc_create(int bytes) -> int");
   m.impl("mono_ipc_create", c10::DispatchKey::BackendSelect, &mono_ipc_create);
   m.def("mono_ipc_export(int handle) -> int[]");
@@ -790,12 +794,20 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("mono_mbox_bytes", c10::DispatchKey::BackendSelect, &mono_mbox_bytes);
   m.def("mono_register_layer(int layer, bool attn, int mbox, int peer, Tensor[] tensors) -> ()");
   m.impl("mono_register_layer", torch::kXPU, &mono_register_layer);
+  m.def("mono_register_mtp(int layer, int mbox, int peer, Tensor[] tensors, int rank) -> ()");
+  m.impl("mono_register_mtp", torch::kXPU, &mono_register_mtp);
+  m.def("mono_mtp_prologue(int layer, Tensor embed, Tensor hidden, Tensor! out) -> bool");
+  m.impl("mono_mtp_prologue", torch::kXPU, &mono_mtp_prologue);
   m.def("mono_bind_caches(int layer, Tensor[] caches, int page_size) -> ()");
   m.impl("mono_bind_caches", torch::kXPU, &mono_bind_caches);
   m.def(
       "mono_decode_layer(int layer, Tensor hidden, Tensor residual, Tensor! hid_out, Tensor! res_out, "
       "Tensor positions, Tensor m0, Tensor? m1, Tensor? m2) -> ()");
   m.impl("mono_decode_layer", torch::kXPU, &mono_decode_layer);
+  m.def(
+      "mono_decode_layer_verify(int layer, int tokens, Tensor hidden, Tensor residual, Tensor! hid_out, "
+      "Tensor! res_out, Tensor positions, Tensor m0, Tensor? m1, Tensor? m2) -> bool");
+  m.impl("mono_decode_layer_verify", torch::kXPU, &mono_decode_layer_verify);
 #endif  // USE_MONO_DECODE
 
   /*

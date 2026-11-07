@@ -144,6 +144,9 @@ struct Ptrs {
   const e16 *hs_in, *res_in;  // layer input hidden / residual (zeros for layer 0)
   e16 *hid_out, *res_out;     // MoE output (after all-reduce #2), residual after the mixer
   const e16 *in_norm_w, *post_norm_w, *router_w, *sgate_w;
+  // router / in_proj_ba in fp16 for the DPAS paths (batched and verify kernels):
+  // the layer's own tensors in an fp16 layer, rounded copies in a bf16 one
+  const e16 *router_h, *ba_h;
   // out_proj / o_proj [2048][2048], w13 [E][512][2048], w2 [E][2048][256],
   // shared w13 [512][2048], shared w2 [2048][256]
   const uint8_t *out_w, *w13, *w2, *sw13, *sw2;

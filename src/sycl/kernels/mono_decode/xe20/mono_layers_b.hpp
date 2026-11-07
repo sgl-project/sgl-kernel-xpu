@@ -111,6 +111,19 @@ inline void mm_rows(v8f& c, const sycl::uint4 (&w)[NC], const uint32_t* xa, int 
     c += t * srow[(kc0 >> 3) + b8];
   }
 }
+// as mm_rows, with the NC / 8 block scales already in registers
+template <int NC>
+inline void
+mm_rows_r(v8f& c, const sycl::uint4 (&w)[NC], const uint32_t* xa, int kc0, int lane, const float (&sr)[NC / 8]) {
+#pragma unroll
+  for (int b8 = 0; b8 < NC / 8; ++b8) {
+    v8f t = v8f(0.f);
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      dpas_hf(t, *reinterpret_cast<const v4u*>(xa + ((kc0 + b8 * 8 + i) * 16 + lane) * 4), cvt16(w[b8 * 8 + i]));
+    c += t * sr[b8];
+  }
+}
 // unscaled: c += A . B over NC chunks (one K block, scaled by the caller)
 template <int NC>
 inline void mm_rows_u(v8f& c, const sycl::uint4 (&w)[NC], const uint32_t* xa, int kc0, int lane) {
@@ -571,18 +584,27 @@ inline void tail_b(
       return P.w13 + ((size_t)L.uexp[task >> 3] * 2 * INTER + gu * INTER + (task & 7) * 32 + tl * 16 + lane) * HID +
              ks * QB;
     };
+    // the task's block scale, loaded ahead of its weights (behind them it
+    // waits for their last bytes)
+    auto wsc = [&](int task) {
+      return P
+          .w13_s[((size_t)L.uexp[task >> 3] * (2 * INTER / QB) + (gu * INTER + (task & 7) * 32) / QB) * KB_HID + ks];
+    };
     sycl::uint4 wb[2][8];
+    float scn = 0.f;
     if (wg < ntask) {
+      scn = wsc(wg);
 #pragma unroll
       for (int tl = 0; tl < 2; ++tl)
         ld_rows<8>(wb[tl], wrow(wg, tl));
     }
     for (int task = wg; task < ntask; task += NWG) {
-      const int u = task >> 3, j8 = task & 7, e = L.uexp[u];
+      const int u = task >> 3, j8 = task & 7;
       const int nxt = task + NWG;
       const bool more = nxt < ntask;
       // one N block (32 rows inside 128) and one K block per SG
-      const float sc = P.w13_s[((size_t)e * (2 * INTER / QB) + (gu * INTER + j8 * 32) / QB) * KB_HID + ks];
+      const float sc = scn;
+      if (more) scn = wsc(nxt);
       v8f c[2];
 #pragma unroll
       for (int tl = 0; tl < 2; ++tl) {  // each consumed tile is refilled with the next task's
@@ -620,33 +642,43 @@ inline void tail_b(
   signal(it, S.cnt + C_GU * 16);
 
   // --- S7: down for this WG's 64 output rows ; shared down ; all-reduce #2.
-  // Blocks (union expert u, K quarter-of-a-block q: 32 K = 2 chunks) x the WG's
-  // 4 row tiles (lane = row of w2 [E][2048][256]), dealt round-robin to the SGs
-  // (8 per expert: the SGs' counts differ by at most one block), 4 blocks in
-  // flight per SG; the first 2 are in flight during the hand-off (they need the
-  // union only).
+  // Blocks (union expert u, K quarter q: 64 K = 4 chunks = one 64-B line of
+  // each row, row-tile pair p) of 2 x 16 rows (lane = row of w2 [E][2048][256]),
+  // dealt round-robin to the SGs (8 per expert: the SGs' counts differ by at
+  // most one block), 4 blocks in flight per SG; the first 2 are in flight
+  // during the hand-off (they need the union only).
   const int nblk = nu * 8;
-  auto brow = [&](int j, int ct) {
-    return P.w2 + ((size_t)L.uexp[j >> 3] * HID + n0 + ct * 16 + lane) * INTER + (j & 7) * 32;
+  auto brow = [&](int j, int ct) {  // j = (u, q, p): u = j >> 3, q = (j >> 1) & 3, p = j & 1
+    return P.w2 + ((size_t)L.uexp[j >> 3] * HID + n0 + ((j & 1) * 2 + ct) * 16 + lane) * INTER + ((j >> 1) & 3) * 64;
+  };
+  // block j's scale (the WG's 64 rows: one N block; K block q / 2), loaded
+  // ahead of the block's weights
+  auto bsc = [&](int j) {
+    return P.w2_s[((size_t)L.uexp[j >> 3] * KB_HID + n0 / QB) * (INTER / QB) + (((j >> 1) & 3) >> 1)];
   };
   constexpr int S7PRE = 2;
-  sycl::uint4 wb7[4][4][2];
+  sycl::uint4 wb7[4][2][4];
+  float sc7[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
   for (int t = 0; t < S7PRE; ++t) {  // (not all 4: the counter poll would queue behind them)
     const int j = s + NSG * t;
-    if (j < nblk)
+    if (j < nblk) {
+      sc7[t] = bsc(j);
 #pragma unroll
-      for (int ct = 0; ct < 4; ++ct)
-        ld_rows<2>(wb7[t][ct], brow(j, ct));
+      for (int ct = 0; ct < 2; ++ct)
+        ld_rows<4>(wb7[t][ct], brow(j, ct));
+    }
   }
   wait_for(it, S.cnt + C_GU * 16, NWG * call);
 #pragma unroll
   for (int t = S7PRE; t < 4; ++t) {
     const int j = s + NSG * t;
-    if (j < nblk)
+    if (j < nblk) {
+      sc7[t] = bsc(j);
 #pragma unroll
-      for (int ct = 0; ct < 4; ++ct)
-        ld_rows<2>(wb7[t][ct], brow(j, ct));
+      for (int ct = 0; ct < 2; ++ct)
+        ld_rows<4>(wb7[t][ct], brow(j, ct));
+    }
   }
   if (wg == 0 && lid == 0) {  // every WG has read the epoch and the mailbox tag
     cnt_ref(S.cnt[EPOCH]).store(call);
@@ -662,24 +694,29 @@ inline void tail_b(
       for (int t = 0; t < 4; ++t) {
         const int j = j0 + NSG * t;
         if (j < nblk) {
-          const int u = j >> 3, q = j & 7, e = L.uexp[u];
+          const int u = j >> 3, q = (j >> 1) & 3;
           const uint32_t* ha = SB.hA + (size_t)u * (INTER / 16) * 64;
-          v8f c[4];
+          const float sc = sc7[t];
+          v8f c[2];
 #pragma unroll
-          for (int ct = 0; ct < 4; ++ct) {
+          for (int ct = 0; ct < 2; ++ct) {
             c[ct] = v8f(0.f);
-            mm_rows_u<2>(c[ct], wb7[t][ct], ha, q * 2, lane);
+            mm_rows_u<4>(c[ct], wb7[t][ct], ha, q * 4, lane);
           }
           const int jn = j + 4 * NSG;
-          if (jn < nblk)
+          if (jn < nblk) {
+            sc7[t] = bsc(jn);
 #pragma unroll
-            for (int ct = 0; ct < 4; ++ct)
-              ld_rows<2>(wb7[t][ct], brow(jn, ct));
-          // the WG's 64 rows: one N block; K block q / 4
-          const float sc = P.w2_s[((size_t)e * KB_HID + n0 / QB) * (INTER / QB) + (q >> 2)];
-#pragma unroll
-          for (int ct = 0; ct < 4; ++ct)
-            acc[ct] += c[ct] * sc;
+            for (int ct = 0; ct < 2; ++ct)
+              ld_rows<4>(wb7[t][ct], brow(jn, ct));
+          }
+          if (j & 1) {  // (a uniform branch: indexing acc by p would move it to private memory)
+            acc[2] += c[0] * sc;
+            acc[3] += c[1] * sc;
+          } else {
+            acc[0] += c[0] * sc;
+            acc[1] += c[1] * sc;
+          }
         }
       }
     }
@@ -718,25 +755,15 @@ inline void tail_b(
   }
 }
 
-// PRT pieces of this WG: router (DT -> fp16, tile s>>1 = experts 16t.., chunk
+// PRT pieces of this WG: router (fp16 copy, tile s>>1 = experts 16t.., chunk
 // pair s&1 of the WG's 64 dims, 2 uint4 per chunk), shared gate|up (fp8, rows
 // s*16 + lane, the WG's 4 chunks)
 template <typename DT>
 inline void load_prt_b(const Ptrs& P, int wg, int s, int lane, sycl::uint4 (&prt_r)[4], sycl::uint4 (&prt_s)[4]) {
-  const e16* rr = P.router_w + (size_t)((s >> 1) * 16 + lane) * HID + wg * 64 + (s & 1) * 32;
+  const e16* rr = P.router_h + (size_t)((s >> 1) * 16 + lane) * HID + wg * 64 + (s & 1) * 32;
 #pragma unroll
   for (int t = 0; t < 4; ++t)
     prt_r[t] = *reinterpret_cast<const sycl::uint4*>(rr + t * 8);
-  if constexpr (!std::is_same_v<DT, half>) {  // the router DPAS takes fp16
-#pragma unroll
-    for (int t = 0; t < 4; ++t) {
-      sycl::vec<uint16_t, 8> w = sycl::bit_cast<sycl::vec<uint16_t, 8>>(prt_r[t]);
-#pragma unroll
-      for (int i = 0; i < 8; ++i)
-        w[i] = sycl::bit_cast<uint16_t>((half)f32<DT>(w[i]));
-      prt_r[t] = sycl::bit_cast<sycl::uint4>(w);
-    }
-  }
   ld_rows<4>(prt_s, P.sw13 + (size_t)(s * 16 + lane) * HID + wg * 64);
 }
 
@@ -803,6 +830,16 @@ inline void gdn_layer_b(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const 
   // ---- kernel start: S1 weights in flight, the rows' recurrent-state blocks
   // of this WG -> L2
   const int tile1 = s >> 2, ks1 = s & 3;  // S1: 8 row tiles x 4 K slices (512)
+  const int tz = s >> 3, kz = s & 7;
+  // block scales of the S1 and z pieces, loaded ahead of the weight stream
+  // (behind it they arrive with its last bytes and stall the first DPAS)
+  float s1c[4], szc[2];
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+    s1c[j] = P.qkvz_s[(size_t)((wg * 128 + tile1 * 16) / QB) * KB_HID + ks1 * 4 + j];
+#pragma unroll
+  for (int j = 0; j < 2; ++j)
+    szc[j] = P.qkvz_s[(size_t)((CONVD + h * DV + c * 64 + tz * 16) / QB) * KB_HID + kz * 2 + j];
   sycl::uint4 w1[32];
   ld_rows<32>(w1, P.qkvz_w + (size_t)(wg * 128 + tile1 * 16 + lane) * HID + ks1 * 512);
 #pragma unroll
@@ -825,18 +862,17 @@ inline void gdn_layer_b(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const 
   wg_bar(grp);
 
   // --- S1: q|k|v rows (128 per WG) -------------------------------------------
-  const int tz = s >> 3, kz = s & 7;
   sycl::uint4 zw[16], bw[16];
   {
     v8f cc = v8f(0.f);
-    mm_rows<32>(cc, w1, L.xa, ks1 * 32, lane, P.qkvz_s + (size_t)((wg * 128 + tile1 * 16) / QB) * KB_HID);
+    mm_rows_r<32>(cc, w1, L.xa, ks1 * 32, lane, s1c);
     // z rows of this WG (4 tiles x 8 K slices), b|a rows (2 tiles x 16 K
     // slices, 16-bit: two uint4 a chunk): in flight from here. Only head h's
     // column of each b|a tile is kept, so the other lanes feed zeros instead
     // of streaming all 32 rows into every WG.
     ld_rows<16>(zw, P.qkvz_w + (size_t)(CONVD + h * DV + c * 64 + tz * 16 + lane) * HID + kz * 256);
     if (lane == h)
-      ld_rows<16>(bw, reinterpret_cast<const uint8_t*>(P.ba_w + (size_t)((s >> 4) * 16 + h) * HID + (s & 15) * 128));
+      ld_rows<16>(bw, reinterpret_cast<const uint8_t*>(P.ba_h + (size_t)((s >> 4) * 16 + h) * HID + (s & 15) * 128));
     else
 #pragma unroll
       for (int t = 0; t < 16; ++t)
@@ -857,13 +893,13 @@ inline void gdn_layer_b(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const 
   signal(it, S.cnt + C_A * 16);
   {
     v8f cz = v8f(0.f), cb = v8f(0.f);
-    mm_rows<16>(cz, zw, L.xa, kz * 16, lane, P.qkvz_s + (size_t)((CONVD + h * DV + c * 64 + tz * 16) / QB) * KB_HID);
+    mm_rows_r<16>(cz, zw, L.xa, kz * 16, lane, szc);
 #pragma unroll
     for (int t = 0; t < 8; ++t)
       dpas_hf(
           cb,
           *reinterpret_cast<const v4u*>(L.xa + (((s & 15) * 8 + t) * 16 + lane) * 4),
-          cvt16_w16<DT>(bw[2 * t], bw[2 * t + 1]));
+          cvt16_w16<half>(bw[2 * t], bw[2 * t + 1]));
     wg_bar(grp);  // the S1 partials in L.red are consumed
     red_put(L.red, s, lane, cz);
     if (lane == h) {  // b (SGs 0..15) / a (SGs 16..31) of v head h
@@ -1307,12 +1343,16 @@ inline void attn_layer_b(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const
   // the input norm
   sycl::uint4 wq[16];
   const int qt = qrow(wg * 64 + (s >> 3) * 16);
+  float sq[2];  // block scales, loaded ahead of the weight stream
+#pragma unroll
+  for (int j = 0; j < 2; ++j)
+    sq[j] = P.qkv_s[(size_t)(qt / QB) * KB_HID + (s & 7) * 2 + j];
   ld_rows<16>(wq, P.qkv_w + (size_t)(qt + lane) * HID + (s & 7) * 256);
   input_norm_b<NB, DT>(it, P, L);
   wg_bar(grp);
   {
     v8f cc = v8f(0.f);
-    mm_rows<16>(cc, wq, L.xa, (s & 7) * 16, lane, P.qkv_s + (size_t)(qt / QB) * KB_HID);
+    mm_rows_r<16>(cc, wq, L.xa, (s & 7) * 16, lane, sq);
     red_put(L.red, s, lane, cc);
   }
   wg_bar(grp);
@@ -1351,9 +1391,14 @@ inline void attn_layer_b(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const
     sycl::uint4 wg4[32];
     const int t = s >> 2, ks = s & 3;
     const int gt = grow(wg * 80 + t * 16);
+    float sg4[4] = {0.f, 0.f, 0.f, 0.f};  // block scales, ahead of the weights
+    if (s < 20)
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        sg4[j] = P.qkv_s[(size_t)(gt / QB) * KB_HID + ks * 4 + j];
     if (s < 20) ld_rows<32>(wg4, P.qkv_w + (size_t)(gt + lane) * HID + ks * 512);
     v8f cc = v8f(0.f);
-    if (s < 20) mm_rows<32>(cc, wg4, L.xa, ks * 32, lane, P.qkv_s + (size_t)(gt / QB) * KB_HID);
+    if (s < 20) mm_rows_r<32>(cc, wg4, L.xa, ks * 32, lane, sg4);
     red_put(L.red, s, lane, cc);
   }
   wg_bar(grp);

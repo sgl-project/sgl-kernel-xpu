@@ -292,6 +292,16 @@ e16* t16(const at::Tensor& t, int64_t numel, const char* name, at::ScalarType dt
   return reinterpret_cast<e16*>(t.data_ptr());
 }
 
+// fp16 view of a checked 16-bit weight for the DPAS paths: the tensor itself
+// in an fp16 layer, else a copy rounded to fp16 once (the rounding the kernels
+// would otherwise apply on every call), kept with the layer
+const e16* half_copy(Layer& L, const at::Tensor& t, const e16* own) {
+  if (t.scalar_type() == at::kHalf) return own;
+  at::Tensor h = t.to(at::kHalf).contiguous();
+  L.keep.push_back(h);
+  return reinterpret_cast<const e16*>(h.data_ptr());
+}
+
 Layer& layer_of(int64_t layer, const at::Tensor& like) {
   auto it = g_layers.find(layer);
   TORCH_CHECK(it != g_layers.end(), "mono: layer ", layer, " not registered");
@@ -464,6 +474,7 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
   P.in_norm_w = t16(t[0], HID, "input_norm_w", dt);
   P.post_norm_w = t16(t[1], HID, "post_norm_w", dt);
   P.router_w = t16(t[2], (int64_t)NE * HID, "router_w", dt);
+  P.router_h = half_copy(L, t[2], P.router_w);
   P.sgate_w = t16(t[3], HID, "shared_gate_w", dt);
   const int64_t ok = attn ? NQ * HD : VD;
   P.out_w = w_nk(t[4], HID, ok, attn ? "o_proj" : "out_proj");
@@ -495,6 +506,7 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
     P.qkvz_w = w_nk(t[14], QKVZ, HID, "in_proj_qkvz");
     P.qkvz_s = scale_blk(L, t[15], QKVZ / QB, HID / QB, "qkvz scale");
     P.ba_w = t16(t[16], (int64_t)2 * NVH * HID, "in_proj_ba", dt);
+    P.ba_h = half_copy(L, t[16], P.ba_w);
     P.conv_w = t16(t[17], (int64_t)CONVD * 4, "conv1d", dt);
     TORCH_CHECK(t[18].scalar_type() == at::kFloat && t[18].numel() == NVH, "mono: A_log must be fp32 [16]");
     P.A_log = t[18].data_ptr<float>();

@@ -49,6 +49,15 @@ inline void gdn_layer_s(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const 
   // ---- kernel start: S1 weights in flight, the requests' initial
   // recurrent-state blocks of this WG -> L2
   const int tile1 = s >> 2, ks1 = s & 3;
+  const int tz = s >> 3, kz = s & 7;
+  // block scales of the S1 and z pieces, loaded ahead of the weight stream
+  float s1c[4], szc[2];
+#pragma unroll
+  for (int j = 0; j < 4; ++j)
+    s1c[j] = P.qkvz_s[(size_t)((wg * 128 + tile1 * 16) / QB) * KB_HID + ks1 * 4 + j];
+#pragma unroll
+  for (int j = 0; j < 2; ++j)
+    szc[j] = P.qkvz_s[(size_t)((CONVD + h * DV + c * 64 + tz * 16) / QB) * KB_HID + kz * 2 + j];
   sycl::uint4 w1[32];
   ld_rows<32>(w1, P.qkvz_w + (size_t)(wg * 128 + tile1 * 16 + lane) * HID + ks1 * 512);
 #pragma unroll
@@ -71,13 +80,12 @@ inline void gdn_layer_s(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const 
   wg_bar(grp);
 
   // --- S1: q|k|v rows (128 per WG), z, b|a: as the batched kernel ------------
-  const int tz = s >> 3, kz = s & 7;
   sycl::uint4 zw[16], bw[16];
   {
     v8f cc = v8f(0.f);
-    mm_rows<32>(cc, w1, L.xa, ks1 * 32, lane, P.qkvz_s + (size_t)((wg * 128 + tile1 * 16) / QB) * KB_HID);
+    mm_rows_r<32>(cc, w1, L.xa, ks1 * 32, lane, s1c);
     ld_rows<16>(zw, P.qkvz_w + (size_t)(CONVD + h * DV + c * 64 + tz * 16 + lane) * HID + kz * 256);
-    ld_rows<16>(bw, reinterpret_cast<const uint8_t*>(P.ba_w + (size_t)((s >> 4) * 16 + lane) * HID + (s & 15) * 128));
+    ld_rows<16>(bw, reinterpret_cast<const uint8_t*>(P.ba_h + (size_t)((s >> 4) * 16 + lane) * HID + (s & 15) * 128));
     red_put(L.red, s, lane, cc);
   }
   wg_bar(grp);
@@ -94,13 +102,13 @@ inline void gdn_layer_s(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const 
   signal(it, S.cnt + C_A * 16);
   {
     v8f cz = v8f(0.f), cb = v8f(0.f);
-    mm_rows<16>(cz, zw, L.xa, kz * 16, lane, P.qkvz_s + (size_t)((CONVD + h * DV + c * 64 + tz * 16) / QB) * KB_HID);
+    mm_rows_r<16>(cz, zw, L.xa, kz * 16, lane, szc);
 #pragma unroll
     for (int t = 0; t < 8; ++t)
       dpas_hf(
           cb,
           *reinterpret_cast<const v4u*>(L.xa + (((s & 15) * 8 + t) * 16 + lane) * 4),
-          cvt16_w16<DT>(bw[2 * t], bw[2 * t + 1]));
+          cvt16_w16<half>(bw[2 * t], bw[2 * t + 1]));
     wg_bar(grp);
     red_put(L.red, s, lane, cz);
     if (lane == h) {
@@ -316,12 +324,16 @@ inline void attn_layer_s(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const
   // the input norm
   sycl::uint4 wq[16];
   const int qt = qrow(wg * 64 + (s >> 3) * 16);
+  float sq[2];  // block scales, loaded ahead of the weight stream
+#pragma unroll
+  for (int j = 0; j < 2; ++j)
+    sq[j] = P.qkv_s[(size_t)(qt / QB) * KB_HID + (s & 7) * 2 + j];
   ld_rows<16>(wq, P.qkv_w + (size_t)(qt + lane) * HID + (s & 7) * 256);
   input_norm_b<NB, DT>(it, P, L);
   wg_bar(grp);
   {
     v8f cc = v8f(0.f);
-    mm_rows<16>(cc, wq, L.xa, (s & 7) * 16, lane, P.qkv_s + (size_t)(qt / QB) * KB_HID);
+    mm_rows_r<16>(cc, wq, L.xa, (s & 7) * 16, lane, sq);
     red_put(L.red, s, lane, cc);
   }
   wg_bar(grp);
@@ -360,9 +372,14 @@ inline void attn_layer_s(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const
     sycl::uint4 wg4[32];
     const int t = s >> 2, ks = s & 3;
     const int gt = grow(wg * 80 + t * 16);
+    float sg4[4] = {0.f, 0.f, 0.f, 0.f};  // block scales, ahead of the weights
+    if (s < 20)
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        sg4[j] = P.qkv_s[(size_t)(gt / QB) * KB_HID + ks * 4 + j];
     if (s < 20) ld_rows<32>(wg4, P.qkv_w + (size_t)(gt + lane) * HID + ks * 512);
     v8f cc = v8f(0.f);
-    if (s < 20) mm_rows<32>(cc, wg4, L.xa, ks * 32, lane, P.qkv_s + (size_t)(gt / QB) * KB_HID);
+    if (s < 20) mm_rows_r<32>(cc, wg4, L.xa, ks * 32, lane, sg4);
     red_put(L.red, s, lane, cc);
   }
   wg_bar(grp);

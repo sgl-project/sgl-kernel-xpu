@@ -102,6 +102,7 @@ suites = {
         # mono decode (Xe2 with 32 Xe cores; the TP2 file needs two such cards)
         TestFile("test_mono_decode.py", 240),
         TestFile("test_mono_decode_tp2.py", 240),
+        TestFile("test_monokernel_frontend.py", 10),
     ],
     # Nightly suite: exercises the wheel installed in the intel/sgl-kernel-xpu-dev
     # nightly image. Populate with longer-running or full-shape tests that are

@@ -66,7 +66,11 @@ class PeerRegion:
         mode = ops.mono_ipc_open(self.handle, infos[1 - rank], peer_fd)
         self.own = int(ops.mono_ipc_ptr(self.handle, False))
         self.peer = int(ops.mono_ipc_ptr(self.handle, True))
-        logger.info("XPU monokernel: P2P mailboxes for %d kernels (IPC import mode %d)", len(names), mode)
+        logger.info(
+            "XPU monokernel: P2P mailboxes for %d kernels (IPC import mode %d)",
+            len(names),
+            mode,
+        )
 
     def mailbox(self, name: str) -> tuple:
         """(own, peer) addresses of the mailbox of ``name``."""

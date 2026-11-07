@@ -37,7 +37,7 @@ def _worker(rank, path, conn, args):
     torch.xpu.set_device(rank)
     dev = f"xpu:{rank}"
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
-    nl = 128
+    nl = args.ncp * len(args.rows) * (1 + len(args.ctx))  # one mailbox per layer copy
     h = ops.mono_ipc_create(nl * ops.mono_mbox_bytes())
     info = ops.mono_ipc_export(h)
     conn.send(info)
@@ -52,7 +52,10 @@ def _worker(rank, path, conn, args):
     def case(attn, nb, ctx):
         gen = torch.Generator().manual_seed(rank + 1)
         if attn not in weights:
-            weights[attn] = [attn_tensors(gen, dev, dtype) if attn else gdn_tensors(gen, dev, dtype) for _ in range(args.ncp)]
+            weights[attn] = [
+                attn_tensors(gen, dev, dtype) if attn else gdn_tensors(gen, dev, dtype)
+                for _ in range(args.ncp)
+            ]
         layers = []
         for c in range(args.ncp):
             t = weights[attn][c]
@@ -64,7 +67,9 @@ def _worker(rank, path, conn, args):
                 kc, vc = kv_caches(gen, dev, (nb * npr + 1) * ps, dtype)
                 ops.mono_bind_caches(layer, [kc, vc], ps)
                 pt = (torch.arange(nb * npr, dtype=torch.int32) + 1).view(nb, npr)
-                loc = torch.tensor([int(pt[b, ctx // ps]) * ps + ctx % ps for b in range(nb)])
+                loc = torch.tensor(
+                    [int(pt[b, ctx // ps]) * ps + ctx % ps for b in range(nb)]
+                )
                 m = (
                     pt.to(dev),
                     torch.full((nb,), ctx + 1, dtype=torch.int32, device=dev),
@@ -77,7 +82,9 @@ def _worker(rank, path, conn, args):
                 m = (torch.arange(nb, dtype=torch.int32, device=dev) + 1, None, None)
                 keep = (t, conv, ssm)
             hs, rs = rows(nb, gen, dev, dtype)
-            layers.append((layer, keep, m, hs, rs, torch.empty_like(hs), torch.empty_like(rs)))
+            layers.append(
+                (layer, keep, m, hs, rs, torch.empty_like(hs), torch.empty_like(rs))
+            )
         pos = torch.full((nb,), ctx, dtype=torch.int64, device=dev)
 
         def run(n):
@@ -89,14 +96,24 @@ def _worker(rank, path, conn, args):
         torch.xpu.synchronize()
         times = []
         for _ in range(args.rounds):
-            e0, e1 = torch.xpu.Event(enable_timing=True), torch.xpu.Event(enable_timing=True)
+            e0, e1 = torch.xpu.Event(enable_timing=True), torch.xpu.Event(
+                enable_timing=True
+            )
             e0.record()
             run(args.iters)
             e1.record()
             torch.xpu.synchronize()
             times.append(e0.elapsed_time(e1) * 1000.0 / args.iters)
         times.sort()
-        out.append(("attn" if attn else "gdn", nb, ctx if attn else 0, times[len(times) // 2], times[0]))
+        out.append(
+            (
+                "attn" if attn else "gdn",
+                nb,
+                ctx if attn else 0,
+                times[len(times) // 2],
+                times[0],
+            )
+        )
 
     for nb in args.rows:
         case(False, nb, 0)
@@ -118,19 +135,32 @@ def main():
     ctx = mp.get_context("spawn")
     path = os.path.join(tempfile.mkdtemp(), "mono_bench.sock")
     c0, c1 = ctx.Pipe(), ctx.Pipe()
-    procs = [ctx.Process(target=_worker, args=(r, path, c[1], args)) for r, c in ((0, c0), (1, c1))]
+    procs = [
+        ctx.Process(target=_worker, args=(r, path, c[1], args))
+        for r, c in ((0, c0), (1, c1))
+    ]
     for pr in procs:
         pr.start()
     i0, i1 = c0[0].recv(), c1[0].recv()
     c0[0].send(i1)
     c1[0].send(i0)
-    r0, r1 = c0[0].recv(), c1[0].recv()
+    r = []
+    for c, pr in ((c0, procs[0]), (c1, procs[1])):
+        while not c[0].poll(1.0):
+            if not pr.is_alive():
+                raise SystemExit(f"worker {pr.name} exited with {pr.exitcode}")
+        r.append(c[0].recv())
+    r0, r1 = r
     for pr in procs:
         pr.join()
-    print(f"mono decode layer, {args.dtype}, device us per call (median / min of {args.rounds} rounds), rank0 | rank1")
+    print(
+        f"mono decode layer, {args.dtype}, device us per call (median / min of {args.rounds} rounds), rank0 | rank1"
+    )
     for a, b in zip(r0, r1):
         kind, nb, c, med, mn = a
-        print(f"{kind:5s} rows {nb}  ctx {c:6d}: {med:8.1f} / {mn:8.1f} | {b[3]:8.1f} / {b[4]:8.1f}")
+        print(
+            f"{kind:5s} rows {nb}  ctx {c:6d}: {med:8.1f} / {mn:8.1f} | {b[3]:8.1f} / {b[4]:8.1f}"
+        )
 
 
 if __name__ == "__main__":

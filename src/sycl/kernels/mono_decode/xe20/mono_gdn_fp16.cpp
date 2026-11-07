@@ -6,5 +6,6 @@
 #include "mono_layers_b.hpp"
 
 namespace sgl_mono {
-template __attribute__((visibility("default"))) void launch_gdn<half>(sycl::queue&, int, const Ptrs&, const Scratch&, const ScratchB&);
+template __attribute__((visibility("default"))) void
+launch_gdn<half>(sycl::queue&, int, const Ptrs&, const Scratch&, const ScratchB&);
 }  // namespace sgl_mono

@@ -18,15 +18,14 @@
 // - GatedDeltaNet: conv state [slots][4096][3 (+ draft tokens)] (channel
 //   major, taps innermost), recurrent state [slots][16][128 v][128 k] fp32.
 #pragma once
-#include <sycl/sycl.hpp>
-#include <sycl/ext/oneapi/bfloat16.hpp>
-#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
-#include <sycl/ext/intel/experimental/cache_control_properties.hpp>
-#include <sycl/ext/oneapi/experimental/clock.hpp>
-#include <sycl/ext/oneapi/experimental/prefetch.hpp>
-
 #include <cmath>
 #include <cstdint>
+#include <sycl/ext/intel/experimental/cache_control_properties.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#include <sycl/ext/oneapi/bfloat16.hpp>
+#include <sycl/ext/oneapi/experimental/clock.hpp>
+#include <sycl/ext/oneapi/experimental/prefetch.hpp>
+#include <sycl/sycl.hpp>
 #include <type_traits>
 
 namespace sgl_mono {
@@ -39,8 +38,8 @@ namespace intelex = sycl::ext::intel::experimental;
 
 constexpr int NWG = 32, WGS = 512, NSG = 32;
 constexpr int HID = 2048, NE = 256, TOPK = 8,
-              INTER = 256;  // per rank (TP2): expert / shared inter 512 / 2
-constexpr int QB = 128;     // fp8 block size (N and K)
+              INTER = 256;        // per rank (TP2): expert / shared inter 512 / 2
+constexpr int QB = 128;           // fp8 block size (N and K)
 constexpr int KB_HID = HID / QB;  // K blocks of a hidden-size row (16)
 constexpr float EPS = 1e-6f;
 // GDN (per rank): 8 k heads, 16 v heads, 128 dims
@@ -53,8 +52,8 @@ constexpr int GROWS = NQ * HD + 2 * HD;                           // gate + k + 
 constexpr float SM_SCALE = 0.0625f * 1.4426950408889634f, THETA = 1.0e7f;
 constexpr int GKV_MID = 2, GKV_ROWS = 2,
               GKV_CHUNKS = (GROWS - GKV_MID * NWG * NSG) / GKV_ROWS;  // 256
-constexpr int SPW = INTER / NWG;                                     // shared inter rows per WG (8)
-constexpr int SHR = 2 * INTER / NSG;  // shared gate|up rows per SG in the partial (16)
+constexpr int SPW = INTER / NWG;                                      // shared inter rows per WG (8)
+constexpr int SHR = 2 * INTER / NSG;                                  // shared gate|up rows per SG in the partial (16)
 // MTP fc (16-bit, the same full [2048][4096] on both ranks; each rank computes
 // half of the output rows)
 constexpr int MTP_FC_IN = 2 * HID, MTP_FC_OUT = HID / 2;
@@ -70,15 +69,35 @@ constexpr int MBT = EPOCH + 4, MBT2 = EPOCH + 16;
 // at registration and read only by a wait that is taking long
 constexpr int HEALTH_PTR = EPOCH + 28;
 // health words: [0] FAILED (sticky: a wait gave up), [1] waits that gave up,
-// [2] FAILED of the peer (written through P2P by a rank that gave up)
-enum { H_FAILED = 0, H_TIMEOUTS, H_PEER_FAILED, H_WORDS = 8 };
+// [2] FAILED of the peer (written through P2P by a rank that gave up), and of
+// the first wait that gave up: [3] the tag it waited for, [4] / [5] the word it
+// last read (low / high half), [6] the word's offset in the mailbox region (in
+// words from the region start), [7] the low half of the address of the
+// layer's counters (which layer); [8] / [9] the address of the host copy of
+// words 0 .. 7 (host memory, written once by the wait that marks the device
+// failed, for a host thread to poll), or 0
+enum {
+  H_FAILED = 0,
+  H_TIMEOUTS,
+  H_PEER_FAILED,
+  H_TAG,
+  H_SEEN_LO,
+  H_SEEN_HI,
+  H_SLOT,
+  H_LAYER,
+  H_HOST_LO,
+  H_HOST_HI,
+  H_WORDS = 16
+};
 // two words after the health pointer: the wait deadline in cycles of the
 // sub-group clock (~2.8 GHz), set per device (mono_set_deadline)
 constexpr int DEADLINE = EPOCH + 30;
 // two words: the address of the peer's health words (P2P mapping), or 0
 constexpr int PEER_HEALTH_PTR = EPOCH + 32;
+// two words: the address of this layer's mailbox region (for the health record)
+constexpr int MBOX_PTR = EPOCH + 34;
 constexpr int CNT_WORDS = EPOCH + 40;
-constexpr uint64_t WAIT_CYCLES_DEFAULT = 1ull << 35;  // ~12 s
+constexpr uint64_t WAIT_CYCLES_DEFAULT = 14000000000ull;  // 5 s
 
 // ----------------------------------------------------------------------------
 // The layer's 16-bit dtype DT (half or bf16): hidden states, norm / router /
@@ -143,8 +162,8 @@ struct Ptrs {
   const int* state_idx;  // [rows] state slot of each row (< 0: padding)
   // verify (SGLang scratch convention): the state after token t of request b
   // goes to intermediate slot inter_idx[b], token t
-  float* inter_ssm;   // [slots][T][16][128][128]
-  e16* inter_conv;    // [slots][T][4096][3]
+  float* inter_ssm;  // [slots][T][16][128][128]
+  e16* inter_conv;   // [slots][T][4096][3]
   int64_t inter_ssm_stride, inter_ssm_tstride, inter_conv_stride, inter_conv_tstride;
   const int* inter_idx;  // [requests]
   // ATTN
@@ -254,26 +273,27 @@ inline bool mb_match(uint64_t w, uint32_t tag) {
 inline uint32_t mb_val(uint64_t w) {
   return ((uint32_t)(w >> 32) << 16) | ((uint32_t)w & 0xffffu);
 }
-inline void mb_send(uint64_t* peer, float v, uint32_t tag) {
-  mb_ref(*peer).store(mb_word(sycl::bit_cast<uint32_t>(v), tag));
+// A read-modify-write, not a store: it completes at the peer card's memory, so
+// the word cannot linger in this card's cache (a store to the peer's memory may
+// stay there until evicted and miss the peer's wait).
+inline void mb_put(uint64_t* peer, uint64_t w) {
+  (void)mb_ref(*peer).exchange(w);
 }
-using h_ref = sycl::atomic_ref<
-    int,
-    sycl::memory_order::relaxed,
-    sycl::memory_scope::device,
-    sycl::access::address_space::global_space>;
-using hs_ref = sycl::atomic_ref<
-    int,
-    sycl::memory_order::relaxed,
-    sycl::memory_scope::system,
-    sycl::access::address_space::global_space>;
+inline void mb_send(uint64_t* peer, float v, uint32_t tag) {
+  mb_put(peer, mb_word(sycl::bit_cast<uint32_t>(v), tag));
+}
+using h_ref = sycl::
+    atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>;
+using hs_ref = sycl::
+    atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::system, sycl::access::address_space::global_space>;
 // The slow path of a mailbox wait (the first poll missed): polls until the
 // word matches, or gives up when this device already failed (health FAILED,
 // sticky: every later wait exits after a few hundred polls), when the peer
-// reported a failure, or after the deadline, recording the failure (and
-// telling the peer). False: gave up (w holds the last word).
+// reported a failure, or after the deadline. The wait that marks the device
+// failed records why, tells the peer and publishes the record to the host
+// copy. False: gave up.
 inline bool mb_wait_slow(const uint64_t* mine, uint32_t tag, uint64_t& w, const uint32_t* cnt) {
-  const uint64_t t0 = syclex::clock<syclex::clock_scope::sub_group>();
+  uint64_t t0 = syclex::clock<syclex::clock_scope::sub_group>();
   for (uint32_t n = 1;; ++n) {
     w = mb_ref(*const_cast<uint64_t*>(mine)).load();
     if (mb_match(w, tag)) return true;
@@ -281,25 +301,48 @@ inline bool mb_wait_slow(const uint64_t* mine, uint32_t tag, uint64_t& w, const 
       int* h = reinterpret_cast<int*>(*reinterpret_cast<const volatile uint64_t*>(cnt + HEALTH_PTR));
       if (h == nullptr) continue;  // not registered
       const uint64_t limit = *reinterpret_cast<const volatile uint64_t*>(cnt + DEADLINE);
-      const bool failed = h_ref(h[H_FAILED]).load() != 0 || hs_ref(h[H_PEER_FAILED]).load() != 0;
-      if (failed || syclex::clock<syclex::clock_scope::sub_group>() - t0 > (limit ? limit : WAIT_CYCLES_DEFAULT)) {
-        if (!failed) {
-          h_ref(h[H_FAILED]).store(1);
-          // the peer's health words (P2P), so its waits give up at once
-          int* ph = reinterpret_cast<int*>(*reinterpret_cast<const volatile uint64_t*>(cnt + PEER_HEALTH_PTR));
-          if (ph != nullptr) hs_ref(ph[H_PEER_FAILED]).store(1);
-        }
+      const bool peer_failed = hs_ref(h[H_PEER_FAILED]).load() != 0;
+      const bool failed = h_ref(h[H_FAILED]).load() != 0 || peer_failed;
+      // the sub-group clock is per hardware thread slot: a preempted and resumed
+      // thread may read an earlier value; restart the deadline then
+      const uint64_t now = syclex::clock<syclex::clock_scope::sub_group>();
+      if ((int64_t)(now - t0) < 0) t0 = now;
+      if (failed || now - t0 > (limit ? limit : WAIT_CYCLES_DEFAULT)) {
         h_ref(h[H_TIMEOUTS]).fetch_add(1);
+        if (h_ref(h[H_FAILED]).exchange(1) == 0) {  // this wait marks the device failed
+          if (!peer_failed) {                       // it timed out: record it and tell the peer
+            h_ref(h[H_TAG]).store((int)(tag & 0xffffu));
+            h_ref(h[H_SEEN_LO]).store((int)(uint32_t)w);
+            h_ref(h[H_SEEN_HI]).store((int)(uint32_t)(w >> 32));
+            const uint64_t* region =
+                reinterpret_cast<const uint64_t*>(*reinterpret_cast<const volatile uint64_t*>(cnt + MBOX_PTR));
+            h_ref(h[H_SLOT]).store(region ? (int)(mine - region) : -1);
+            h_ref(h[H_LAYER]).store((int)(uint32_t) reinterpret_cast<uintptr_t>(cnt));
+            // the peer's health words (P2P), so its waits give up at once
+            int* ph = reinterpret_cast<int*>(*reinterpret_cast<const volatile uint64_t*>(cnt + PEER_HEALTH_PTR));
+            if (ph != nullptr) hs_ref(ph[H_PEER_FAILED]).store(1);
+          }
+          int* host = reinterpret_cast<int*>(
+              (uint64_t)(uint32_t)h_ref(h[H_HOST_LO]).load() | ((uint64_t)(uint32_t)h_ref(h[H_HOST_HI]).load() << 32));
+          if (host != nullptr) {
+            for (int k = H_TIMEOUTS; k <= H_LAYER; ++k)
+              hs_ref(host[k]).store(h_ref(h[k]).load());
+            hs_ref(host[H_PEER_FAILED]).store(peer_failed ? 1 : 0);
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            hs_ref(host[H_FAILED]).store(1);
+          }
+        }
         return false;
       }
     }
   }
 }
-// waits for this call's word (tag) in own mailbox word `mine`; on a timeout the
-// value is garbage and the device's health records the failure
+// waits for this call's word (tag) in own mailbox word `mine`; on a give-up the
+// word reads as all ones, a NaN in each 16- or 32-bit value, so the outputs of
+// a failed step are NaN (and the device's health records the failure)
 inline uint64_t mb_wait(const uint64_t* mine, uint32_t tag, const uint32_t* cnt) {
   uint64_t w = mb_ref(*const_cast<uint64_t*>(mine)).load();
-  if (!mb_match(w, tag)) mb_wait_slow(mine, tag, w, cnt);
+  if (!mb_match(w, tag) && !mb_wait_slow(mine, tag, w, cnt)) w = ~0ull;
   return w;
 }
 inline float mb_recv(uint64_t* mine, uint32_t tag, const uint32_t* cnt) {
@@ -373,8 +416,8 @@ inline void load_scales(float (&sc)[KCH], const float* srow, int lane) {
 // sum over a K = KCH * 256 fp8 row (registers) . x (permuted SLM), the lanes'
 // chunks scaled by their K block, reduced over the sub-group: * 256 = output
 template <int KCH>
-inline float dot_row_regs(
-    sycl::sub_group sg, int lane, const sycl::uint4 (&w)[KCH], const uint32_t* xp, const float (&sc)[KCH]) {
+inline float
+dot_row_regs(sycl::sub_group sg, int lane, const sycl::uint4 (&w)[KCH], const uint32_t* xp, const float (&sc)[KCH]) {
   float sacc = 0.f;
 #pragma unroll
   for (int j = 0; j < KCH; ++j)
@@ -502,10 +545,10 @@ using v4u = hvec<unsigned int, 4>;
 using v2i = hvec<int, 2>;
 #endif
 #ifdef __SYCL_DEVICE_ONLY__
-extern "C" SYCL_EXTERNAL v8u
-__builtin_IB_subgroup_block_read_flat_transpose_u32_k8(intptr_t base, int width_m1, int height_m1, int pitch_m1, v2i xy);
-extern "C" SYCL_EXTERNAL v8u
-__builtin_IB_subgroup_block_read_flat_transform_u16_k16(intptr_t base, int width_m1, int height_m1, int pitch_m1, v2i xy);
+extern "C" SYCL_EXTERNAL v8u __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(
+    intptr_t base, int width_m1, int height_m1, int pitch_m1, v2i xy);
+extern "C" SYCL_EXTERNAL v8u __builtin_IB_subgroup_block_read_flat_transform_u16_k16(
+    intptr_t base, int width_m1, int height_m1, int pitch_m1, v2i xy);
 #endif
 // d[8 rows x 16 cols] (lane = column, element i = row i) += a[8 x 16 half] .
 // b[16 x 16 half]
@@ -564,7 +607,8 @@ inline v8u load_k_tile(const void* row0, int dw) {
 // V buffer (token pitch HD halves)
 inline v8u load_v_tile(const void* row0, int col) {
 #ifdef __SYCL_DEVICE_ONLY__
-  return __builtin_IB_subgroup_block_read_flat_transform_u16_k16((intptr_t)row0, 128 * 2 - 1, 15, HD * 2 - 1, v2i{col, 0});
+  return __builtin_IB_subgroup_block_read_flat_transform_u16_k16(
+      (intptr_t)row0, 128 * 2 - 1, 15, HD * 2 - 1, v2i{col, 0});
 #else
   (void)row0;
   (void)col;

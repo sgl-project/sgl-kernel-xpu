@@ -22,6 +22,7 @@ limitations under the License.
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUFunctions.h>
 #include <c10/xpu/XPUStream.h>
+#include <level_zero/ze_api.h>
 #include <sys/syscall.h>
 #include <torch/all.h>
 #include <unistd.h>
@@ -30,7 +31,6 @@ limitations under the License.
 #include <atomic>
 #include <cerrno>
 #include <cstring>
-#include <level_zero/ze_api.h>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -40,15 +40,19 @@ limitations under the License.
 #include <vector>
 
 #include "Utils.h"
-#include "kernels/mono_decode/xe20/mono_layers_b.hpp"
+#include "kernels/mono_decode/xe20/mono_layers_s.hpp"
+#include "kernels/mono_decode/xe20/mono_mtp.hpp"
 #include "sgl_kernel_ops.h"  // the ops, exported
 
 // the kernels are compiled in their own translation units (one per layer kind
 // and dtype)
 namespace sgl_mono {
-#define MONO_EXTERN_LAUNCHERS(DT)                                                                                 \
-  extern template void launch_gdn<DT>(sycl::queue&, int, const Ptrs&, const Scratch&, const ScratchB&);         \
-  extern template void launch_attn<DT>(sycl::queue&, int, const Ptrs&, const Scratch&, const ScratchB&);
+#define MONO_EXTERN_LAUNCHERS(DT)                                                                                    \
+  extern template void launch_gdn<DT>(sycl::queue&, int, const Ptrs&, const Scratch&, const ScratchB&);              \
+  extern template void launch_attn<DT>(sycl::queue&, int, const Ptrs&, const Scratch&, const ScratchB&);             \
+  extern template bool launch_gdn_verify<DT>(sycl::queue&, int, int, const Ptrs&, const Scratch&, const ScratchB&);  \
+  extern template bool launch_attn_verify<DT>(sycl::queue&, int, int, const Ptrs&, const Scratch&, const ScratchB&); \
+  extern template bool launch_mtp<DT>(sycl::queue&, int, const Ptrs&, const Scratch&, int);
 MONO_EXTERN_LAUNCHERS(half)
 MONO_EXTERN_LAUNCHERS(bf16)
 #undef MONO_EXTERN_LAUNCHERS
@@ -62,9 +66,9 @@ using sgl_mono::Ptrs;
 using sgl_mono::Scratch;
 using sgl_mono::ScratchB;
 
-#define ZE_CHECK(call)                                                                                     \
-  do {                                                                                                     \
-    ze_result_t _r = (call);                                                                               \
+#define ZE_CHECK(call)                                                                                        \
+  do {                                                                                                        \
+    ze_result_t _r = (call);                                                                                  \
     TORCH_CHECK(_r == ZE_RESULT_SUCCESS, #call " failed: ze_result 0x", std::hex, static_cast<uint32_t>(_r)); \
   } while (0)
 
@@ -132,24 +136,42 @@ Region& region(int64_t h) {
 constexpr double kClockHz = 2.8e9;
 std::atomic<uint64_t> g_deadline_cycles{sgl_mono::WAIT_CYCLES_DEFAULT};
 
-int* health_words(int device) {
+struct Health {
+  int* device = nullptr;  // health words (device memory)
+  int* host = nullptr;    // the host copy of words 0 .. 7 (host memory)
+};
+Health& health(int device) {
   static std::mutex mu;
-  static std::unordered_map<int, int*> words;
+  static std::unordered_map<int, Health> words;
   std::lock_guard<std::mutex> lk(mu);
-  int*& w = words[device];
-  if (!w) {
-    sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
-    w = sycl::malloc_device<int>(sgl_mono::H_WORDS, q);
-    q.memset(w, 0, sgl_mono::H_WORDS * sizeof(int)).wait();
+  Health& w = words[device];
+  if (!w.device) {
+    sycl::queue& q = c10::xpu::getCurrentXPUStream(device).queue();
+    w.host = sycl::malloc_host<int>(sgl_mono::H_WORDS, q);
+    TORCH_CHECK(w.host, "mono: host allocation of the health words failed");
+    std::memset(w.host, 0, sgl_mono::H_WORDS * sizeof(int));
+    int init[sgl_mono::H_WORDS] = {};
+    const uint64_t hp = reinterpret_cast<uint64_t>(w.host);
+    init[sgl_mono::H_HOST_LO] = (int)(uint32_t)hp;
+    init[sgl_mono::H_HOST_HI] = (int)(uint32_t)(hp >> 32);
+    w.device = sycl::malloc_device<int>(sgl_mono::H_WORDS, q);
+    q.memcpy(w.device, init, sizeof(init)).wait();
   }
   return w;
+}
+int* health_words(int device) {
+  return health(device).device;
 }
 
 // -----------------------------------------------------------------------------
 // layers
 struct Layer {
   bool attn = false;
+  bool mtp = false;  // MTP drafter prologue (mono_register_mtp)
+  int rank = 0;      // MTP: this rank's half of the fc output rows
   bool caches_bound = false;
+  int inter_tokens = 0;              // GatedDeltaNet: tokens a request of the bound verify scratch (0: none)
+  int64_t inter_rows = 0;            // and its rows (requests)
   at::ScalarType dtype = at::kHalf;  // fp16 or bf16: every 16-bit tensor
   Ptrs P{};
   Scratch S{};
@@ -171,6 +193,8 @@ void set_health(sycl::queue& q, const Layer& L) {
   const uint64_t dl = g_deadline_cycles.load();
   q.memcpy(L.S.cnt + sgl_mono::HEALTH_PTR, &h, sizeof(h)).wait();
   q.memcpy(L.S.cnt + sgl_mono::DEADLINE, &dl, sizeof(dl)).wait();
+  const uint64_t mb = reinterpret_cast<uint64_t>(L.S.mbox);
+  q.memcpy(L.S.cnt + sgl_mono::MBOX_PTR, &mb, sizeof(mb)).wait();
 }
 
 const char* dtype_name(at::ScalarType t) {
@@ -291,9 +315,13 @@ at::Tensor mono_health(int64_t device) {
   check_device("mono_health", device);
   const int d = device < 0 ? (int)c10::xpu::current_device() : (int)device;
   return torch::from_blob(
-      health_words(d),
-      {sgl_mono::H_WORDS},
-      torch::TensorOptions().dtype(torch::kInt32).device(torch::kXPU, d));
+      health_words(d), {sgl_mono::H_WORDS}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kXPU, d));
+}
+
+at::Tensor mono_health_host(int64_t device) {
+  check_device("mono_health_host", device);
+  const int d = device < 0 ? (int)c10::xpu::current_device() : (int)device;
+  return torch::from_blob(health(d).host, {sgl_mono::H_WORDS}, torch::TensorOptions().dtype(torch::kInt32));
 }
 
 void mono_set_deadline(double seconds) {
@@ -338,7 +366,8 @@ std::vector<int64_t> mono_ipc_export(int64_t h) {
     std::memcpy(&fd32, r.ipc.data, sizeof(fd32));
     fd = (uint64_t)fd32;
   }
-  std::vector<int64_t> out{(int64_t)getpid(), (int64_t)fd, (int64_t)(r.cookie & 0xffffffffu), (int64_t)(r.cookie >> 32)};
+  std::vector<int64_t> out{
+      (int64_t)getpid(), (int64_t)fd, (int64_t)(r.cookie & 0xffffffffu), (int64_t)(r.cookie >> 32)};
   uint32_t w[ZE_MAX_IPC_HANDLE_SIZE / 4];
   std::memcpy(w, r.ipc.data, sizeof(w));
   for (uint32_t v : w)
@@ -487,6 +516,13 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
       P.conv_stride = O.conv_stride;
       P.ssm_stride = O.ssm_stride;
       P.conv_ch = O.conv_ch;
+      P.inter_ssm = O.inter_ssm;
+      P.inter_ssm_stride = O.inter_ssm_stride;
+      P.inter_ssm_tstride = O.inter_ssm_tstride;
+      P.inter_conv = O.inter_conv;
+      P.inter_conv_stride = O.inter_conv_stride;
+      L.inter_tokens = it->second.inter_tokens;
+      L.inter_rows = it->second.inter_rows;
       L.caches_bound = true;
     }
   } else {
@@ -507,6 +543,40 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
   g_layers[layer] = std::move(L);
 }
 
+// Registers the MTP drafter prologue as kernel `layer` (its own scratch and
+// mailbox region): [fc [2048, 4096], pre_fc_norm_embedding [2048],
+// pre_fc_norm_hidden [2048]], all in the model's 16-bit dtype; `rank` (0 / 1)
+// picks this rank's half of the fc output rows.
+void mono_register_mtp(int64_t layer, int64_t mbox, int64_t peer, const std::vector<at::Tensor>& t, int64_t rank) {
+  using namespace sgl_mono;
+  check_device("mono_register_mtp");
+  TORCH_CHECK(t.size() == 3u, "mono: the MTP prologue takes [fc, pre_fc_norm_embedding, pre_fc_norm_hidden]");
+  TORCH_CHECK(rank == 0 || rank == 1, "mono: rank must be 0 or 1, got ", rank);
+  TORCH_CHECK(
+      t[0].dim() == 2 && t[0].size(0) == HID && t[0].size(1) == MTP_FC_IN && t[0].is_contiguous(),
+      "mono: MTP fc must be contiguous [2048, 4096] (the full weight on each rank), got ",
+      t[0].sizes());
+  Layer L;
+  L.mtp = true;
+  L.rank = (int)rank;
+  L.device = t[0].get_device();
+  const at::ScalarType dt = L.dtype = dtype16(t[0], "mtp fc");
+  L.P.fc_w = t16(t[0], (int64_t)HID * MTP_FC_IN, "mtp fc", dt);
+  L.P.in_norm_w = t16(t[1], HID, "pre_fc_norm_embedding", dt);
+  L.P.post_norm_w = t16(t[2], HID, "pre_fc_norm_hidden", dt);
+  sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+  auto it = g_layers.find(layer);
+  if (it != g_layers.end() && it->second.scratch) {  // re-registration: keep the scratch (mailbox tags)
+    L.scratch = it->second.scratch;
+  } else {
+    L.scratch = sycl::malloc_device(scratch_bytes(), q);
+    q.memset(L.scratch, 0, scratch_bytes()).wait();
+  }
+  L.S = scratch_carve(L.scratch, reinterpret_cast<uint64_t*>(mbox), reinterpret_cast<uint64_t*>(peer));
+  set_health(q, L);
+  g_layers[layer] = std::move(L);
+}
+
 // Binds layer `layer`'s caches (SGLang pools, used in place; checked): an
 // attention layer [k_cache, v_cache] ([slots, (1,) 256] each, the layer's
 // dtype) with `page_size` tokens a page; a GatedDeltaNet layer [conv_state
@@ -514,8 +584,9 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
 // pointers (no allocation, no wait): may run again whenever the pools move.
 void mono_bind_caches(int64_t layer, const std::vector<at::Tensor>& t, int64_t page_size) {
   using namespace sgl_mono;
-  TORCH_CHECK(t.size() == 2u, "mono: bind_caches takes 2 tensors");
+  TORCH_CHECK(t.size() == 2u || t.size() == 4u, "mono: bind_caches takes 2 tensors (or 4: with the verify scratch)");
   Layer& L = layer_of(layer, t[0]);
+  TORCH_CHECK(!L.mtp, "mono: kernel ", layer, " is an MTP prologue, it has no caches");
   const at::ScalarType dt = L.dtype;
   Ptrs& P = L.P;
   if (L.attn) {
@@ -571,11 +642,45 @@ void mono_bind_caches(int64_t layer, const std::vector<at::Tensor>& t, int64_t p
     P.conv_ch = (int)cs.size(2);
     P.ssm_cache = ss.data_ptr<float>();
     P.ssm_stride = ss.stride(0);
+    L.inter_tokens = 0;
+    L.inter_rows = 0;
+    if (t.size() == 4u) {  // verify scratch: intermediate_ssm, intermediate_conv_window
+      const at::Tensor& is = t[2];
+      const at::Tensor& ic = t[3];
+      const int64_t tok = is.dim() == 5 ? is.size(1) : 0;
+      TORCH_CHECK(
+          is.scalar_type() == at::kFloat && is.dim() == 5 && is.size(2) == NVH && is.size(3) == DV &&
+              is.size(4) == DK && is.stride(4) == 1 && is.stride(3) == DK && is.stride(2) == DV * DK &&
+              is.stride(1) == NVH * DV * DK,
+          "mono: intermediate ssm state must be [rows, T, 16, 128, 128] fp32, got ",
+          is.sizes(),
+          " ",
+          is.strides());
+      // SGLang's windows: a [rows][4096][T + 2] buffer viewed as [rows][T][4096][3]
+      TORCH_CHECK(
+          ic.scalar_type() == dt && ic.dim() == 4 && ic.size(1) == tok && ic.size(2) == CONVD && ic.size(3) == 3 &&
+              ic.stride(1) == 1 && ic.stride(3) == 1 && ic.stride(2) == tok + 2,
+          "mono: intermediate conv windows must be the [rows, T, 4096, 3] view of a [rows, 4096, T + 2] buffer "
+          "in the layer's dtype, got ",
+          ic.scalar_type(),
+          " ",
+          ic.sizes(),
+          " ",
+          ic.strides());
+      P.inter_ssm = is.data_ptr<float>();
+      P.inter_ssm_stride = is.stride(0);
+      P.inter_ssm_tstride = is.stride(1);
+      P.inter_conv = reinterpret_cast<e16*>(ic.data_ptr());
+      P.inter_conv_stride = ic.stride(0);
+      P.inter_idx = nullptr;  // a request's scratch row is its batch position
+      L.inter_tokens = (int)tok;
+      L.inter_rows = std::min(is.size(0), ic.size(0));
+    }
   }
   L.caches_bound = true;
 }
 
-// One decode step (one token a request, 1, 2, 4 or 8 rows) of layer `layer` on
+// One decode step (one token a request, 1, 2, 3, 4, 6 or 8 rows) of layer `layer` on
 // the current XPU stream. hidden / residual / hid_out / res_out: [rows, 2048]
 // in the layer's dtype; hid_out = MoE output (all-reduced), res_out = residual
 // after the mixer. attention: m0 page table [>= rows, n] int32 (page indices),
@@ -593,9 +698,14 @@ void mono_decode_layer(
     const std::optional<at::Tensor>& m2) {
   using namespace sgl_mono;
   Layer& L = layer_of(layer, hidden);
+  TORCH_CHECK(!L.mtp, "mono: kernel ", layer, " is an MTP prologue, not a decoder layer");
   TORCH_CHECK(L.caches_bound, "mono: layer ", layer, " has no caches bound");
   const int64_t nb = hidden.dim() == 2 ? hidden.size(0) : 1;
-  TORCH_CHECK(nb == 1 || nb == 2 || nb == 4 || nb == 8, "mono: batch of ", nb, " rows (supported: 1, 2, 4, 8)");
+  TORCH_CHECK(
+      nb == 1 || nb == 2 || nb == 3 || nb == 4 || nb == 6 || nb == 8,
+      "mono: batch of ",
+      nb,
+      " rows (supported: 1, 2, 3, 4, 6, 8)");
   Ptrs P = L.P;
   P.hs_in = t16(hidden, nb * HID, "hidden", L.dtype);
   P.res_in = t16(residual, nb * HID, "residual", L.dtype);
@@ -630,6 +740,100 @@ void mono_decode_layer(
     else
       launch_gdn<sycl::half>(q, (int)nb, P, L.S, L.SB);
   }
+}
+
+// MTP drafter prologue of kernel `layer` (mono_register_mtp): out = fc([
+// norm_e(embed); norm_h(hidden)]) for rows embed / hidden [rows, 2048] (the
+// model's dtype). False (nothing launched) for a row count without a kernel.
+bool mono_mtp_prologue(int64_t layer, const at::Tensor& embed, const at::Tensor& hidden, at::Tensor& out) {
+  using namespace sgl_mono;
+  Layer& L = layer_of(layer, embed);
+  TORCH_CHECK(L.mtp, "mono: kernel ", layer, " is not an MTP prologue");
+  const int64_t nb = embed.dim() == 2 ? embed.size(0) : 1;
+  TORCH_CHECK(hidden.size(0) >= nb && out.size(0) >= nb, "mono: MTP hidden / out smaller than the batch");
+  Ptrs P = L.P;
+  P.hs_in = t16(embed, nb * HID, "embed", L.dtype);
+  P.res_in = t16(hidden, nb * HID, "hidden", L.dtype);
+  P.hid_out = t16(out, nb * HID, "out", L.dtype);
+  sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+  return L.dtype == at::kBFloat16 ? launch_mtp<bf16>(q, (int)nb, P, L.S, L.rank)
+                                  : launch_mtp<sycl::half>(q, (int)nb, P, L.S, L.rank);
+}
+
+// Speculative-decoding verify step of layer `layer`: hidden holds requests x
+// `tokens` rows (request-major). attention: m0 page table [>= requests, n]
+// int32, m1 sequence lengths [>= requests] int32 (with the `tokens` new ones),
+// m2 out_cache_loc [rows] int64; GatedDeltaNet: m0 state slots [>= requests]
+// int32 (read, not written: the state after each token goes to the bound
+// verify scratch, row = batch position). Returns false (nothing launched) for a
+// shape without a kernel.
+bool mono_decode_layer_verify(
+    int64_t layer,
+    int64_t tokens,
+    const at::Tensor& hidden,
+    const at::Tensor& residual,
+    at::Tensor& hid_out,
+    at::Tensor& res_out,
+    const at::Tensor& positions,
+    const at::Tensor& m0,
+    const std::optional<at::Tensor>& m1,
+    const std::optional<at::Tensor>& m2) {
+  using namespace sgl_mono;
+  Layer& L = layer_of(layer, hidden);
+  TORCH_CHECK(!L.mtp, "mono: kernel ", layer, " is an MTP prologue, not a decoder layer");
+  TORCH_CHECK(L.caches_bound, "mono: layer ", layer, " has no caches bound");
+  const int64_t nb = hidden.dim() == 2 ? hidden.size(0) : 1;
+  TORCH_CHECK(tokens >= 2 && nb % tokens == 0, "mono: verify needs rows = requests x tokens, got ", nb, " x ", tokens);
+  const int64_t nrq = nb / tokens;
+  Ptrs P = L.P;
+  P.hs_in = t16(hidden, nb * HID, "hidden", L.dtype);
+  P.res_in = t16(residual, nb * HID, "residual", L.dtype);
+  P.hid_out = t16(hid_out, nb * HID, "hid_out", L.dtype);
+  P.res_out = t16(res_out, nb * HID, "res_out", L.dtype);
+  const bool bf = L.dtype == at::kBFloat16;
+  sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+  if (L.attn) {
+    TORCH_CHECK(m1.has_value() && m2.has_value(), "mono: attention layer needs seq_lens and out_cache_loc");
+    TORCH_CHECK(
+        m0.scalar_type() == at::kInt && m0.dim() == 2 && m0.stride(1) == 1 && m0.size(0) >= nrq,
+        "mono: page table must be int32 [>= requests, n]");
+    TORCH_CHECK(m1->scalar_type() == at::kInt && m1->numel() >= nrq, "mono: seq_lens must be int32 [>= requests]");
+    TORCH_CHECK(m2->scalar_type() == at::kLong && m2->numel() >= nb, "mono: out_cache_loc must be int64 [rows]");
+    TORCH_CHECK(
+        positions.scalar_type() == at::kLong && positions.size(-1) >= nb, "mono: positions must be int64 [rows]");
+    P.block_table = m0.data_ptr<int>();
+    P.bt_stride = (int)m0.stride(0);
+    P.seq_lens = m1->data_ptr<int>();
+    P.slot = m2->data_ptr<int64_t>();
+    P.pos = positions.data_ptr<int64_t>();
+    return bf ? launch_attn_verify<bf16>(q, (int)nb, (int)tokens, P, L.S, L.SB)
+              : launch_attn_verify<sycl::half>(q, (int)nb, (int)tokens, P, L.S, L.SB);
+  }
+  TORCH_CHECK(L.inter_tokens >= tokens, "mono: layer ", layer, " has no verify scratch for ", tokens, " tokens bound");
+  TORCH_CHECK(
+      nrq <= L.inter_rows,
+      "mono: layer ",
+      layer,
+      "'s verify scratch has ",
+      L.inter_rows,
+      " rows, the step ",
+      nrq,
+      " requests");
+  TORCH_CHECK(m0.scalar_type() == at::kInt && m0.numel() >= nrq, "mono: state indices must be int32 [>= requests]");
+  P.state_idx = m0.data_ptr<int>();
+  return bf ? launch_gdn_verify<bf16>(q, (int)nb, (int)tokens, P, L.S, L.SB)
+            : launch_gdn_verify<sycl::half>(q, (int)nb, (int)tokens, P, L.S, L.SB);
+}
+
+// Test / debug hook: layer `layer`'s counter words (int32 view, device
+// memory): the stage arrival counters, the epoch and the mailbox tags.
+at::Tensor mono_layer_counters(int64_t layer) {
+  auto it = g_layers.find(layer);
+  TORCH_CHECK(it != g_layers.end(), "mono: layer ", layer, " not registered");
+  return torch::from_blob(
+      it->second.S.cnt,
+      {sgl_mono::CNT_WORDS},
+      torch::TensorOptions().dtype(torch::kInt32).device(torch::kXPU, it->second.device));
 }
 
 // Test hook (fault injection): shifts layer `layer`'s mailbox tags on this rank

@@ -42,10 +42,12 @@ def mono_available(device: int = 0) -> bool:
 
 
 requires_mono = pytest.mark.skipif(
-    not mono_available(), reason="needs the mono decode kernels and an Xe2 GPU with 32 Xe cores"
+    not mono_available(),
+    reason="needs the mono decode kernels and an Xe2 GPU with 32 Xe cores",
 )
 requires_two_cards = pytest.mark.skipif(
-    not (mono_available(0) and mono_available(1)), reason="needs two Xe2 GPUs with 32 Xe cores"
+    not (mono_available(0) and mono_available(1)),
+    reason="needs two Xe2 GPUs with 32 Xe cores",
 )
 
 
@@ -75,7 +77,11 @@ def _bscale(shape, k, gen, device):
 
 
 def _w16(shape, gen, device, std=1.0, mean=0.0, dtype=torch.float16):
-    return (torch.randn(shape, generator=gen, dtype=torch.float32) * std + mean).to(dtype).to(device)
+    return (
+        (torch.randn(shape, generator=gen, dtype=torch.float32) * std + mean)
+        .to(dtype)
+        .to(device)
+    )
 
 
 def _lin(n, k, gen, device):
@@ -148,7 +154,10 @@ def kv_caches(gen, device, slots, dtype=torch.float16):
 
 def rows(n, gen, device, dtype=torch.float16):
     """n hidden rows and n residual rows."""
-    return (_w16((n, HID), gen, device, 1.0, dtype=dtype), _w16((n, HID), gen, device, 1.0, dtype=dtype))
+    return (
+        _w16((n, HID), gen, device, 1.0, dtype=dtype),
+        _w16((n, HID), gen, device, 1.0, dtype=dtype),
+    )
 
 
 def cos(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -169,7 +178,9 @@ def _r(x: torch.Tensor, dtype) -> torch.Tensor:
 
 def _gemma_rms(x, w, dtype):
     x = x.float()
-    return _r(x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + EPS) * (1 + w.float()), dtype)
+    return _r(
+        x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + EPS) * (1 + w.float()), dtype
+    )
 
 
 def _rope(x, pos):
@@ -233,7 +244,9 @@ def ref_gdn(t, conv, ssm, h, r, slots, dtype, ar):
         k = k / torch.sqrt(k.pow(2).sum(-1, keepdim=True) + 1e-6)
         bb, aa = ba[b, :NVH], ba[b, NVH:]
         beta = torch.sigmoid(bb)
-        g = torch.exp(-torch.exp(t[18].float()) * torch.nn.functional.softplus(aa + t[19].float()))
+        g = torch.exp(
+            -torch.exp(t[18].float()) * torch.nn.functional.softplus(aa + t[19].float())
+        )
         o = torch.empty(NVH, DV)
         st = ssm[sl].float().clone()
         for hh in range(NVH):
@@ -247,7 +260,12 @@ def ref_gdn(t, conv, ssm, h, r, slots, dtype, ar):
         ssm[sl] = st
         o = _r(o, dtype)
         z = qkvz[b, CONVD:].view(NVH, DV)
-        n = o * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + EPS) * t[20].float() * torch.nn.functional.silu(z)
+        n = (
+            o
+            * torch.rsqrt(o.pow(2).mean(-1, keepdim=True) + EPS)
+            * t[20].float()
+            * torch.nn.functional.silu(z)
+        )
         core.append(_r(n, dtype).flatten())
     return _moe_tail(t, torch.stack(core), res, dtype, ar)
 

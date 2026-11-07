@@ -18,6 +18,7 @@ import torch
 import torch.multiprocessing as mp
 from mono_decode_utils import (
     attn_tensors,
+    cos,
     exchange_fd,
     gdn_caches,
     gdn_tensors,
@@ -49,7 +50,7 @@ def _worker(rank, path, conn):
     ops = torch.ops.sgl_kernel
     torch.xpu.set_device(rank)
     dev = f"xpu:{rank}"
-    nl = 32
+    nl = 64
     h = ops.mono_ipc_create(nl * ops.mono_mbox_bytes())
     info = ops.mono_ipc_export(h)
     conn.send(info)
@@ -61,7 +62,7 @@ def _worker(rank, path, conn):
     slot = iter(range(nl))
     out = {}
 
-    def layer_case(name, attn, nb, swap=False, dtype=torch.float16, reps=1):
+    def layer_case(name, attn, nb, swap=False, dtype=torch.float16, reps=1, tokens=1):
         i = next(slot)
         seed = (2 if rank == 0 else 1) if swap else (1 if rank == 0 else 2)
         t = layer_tensors(attn, seed, dev, dtype)
@@ -70,17 +71,64 @@ def _worker(rank, path, conn):
             caches = kv_caches(gen, dev, nb * 4 * 64 + 64, dtype)
         else:
             caches = gdn_caches(gen, dev, nb + 1, dtype)
+            if tokens > 1:  # the verify scratch
+                iss = torch.zeros(
+                    (nb + 1, tokens, 16, 128, 128), dtype=torch.float32, device=dev
+                )
+                buf = torch.zeros((nb + 1, 4096, tokens + 2), dtype=dtype, device=dev)
+                caches = caches + (
+                    iss,
+                    buf.as_strided(
+                        (nb + 1, tokens, 4096, 3),
+                        (4096 * (tokens + 2), 1, tokens + 2, 1),
+                    ),
+                )
         ops.mono_register_layer(100 + i, attn, own + i * mb, peer + i * mb, t)
         ops.mono_bind_caches(100 + i, list(caches), 64)
         gen = torch.Generator().manual_seed(5)
         hs, rs = rows(nb, gen, dev, dtype)
         ho, ro = torch.empty_like(hs), torch.empty_like(rs)
         for _ in range(reps):
-            if attn:
+            if tokens > 1:
+                nrq = nb // tokens
+                if attn:
+                    ctx = 150
+                    pt = (
+                        torch.arange(nrq * 4, dtype=torch.int32, device=dev).view(
+                            nrq, 4
+                        )
+                        + 1
+                    )
+                    pos = torch.tensor(
+                        [ctx + j % tokens for j in range(nb)], device=dev
+                    )
+                    slots = torch.tensor(
+                        [
+                            (1 + b * 4) * 64 + ctx + j
+                            for b in range(nrq)
+                            for j in range(tokens)
+                        ],
+                        device=dev,
+                    )
+                    seq = torch.full(
+                        (nrq,), ctx + tokens, dtype=torch.int32, device=dev
+                    )
+                    assert ops.mono_decode_layer_verify(
+                        100 + i, tokens, hs, rs, ho, ro, pos, pt, seq, slots
+                    )
+                else:
+                    zero = torch.zeros(nb, dtype=torch.int64, device=dev)
+                    idx = torch.arange(nrq, dtype=torch.int32, device=dev) + 1
+                    assert ops.mono_decode_layer_verify(
+                        100 + i, tokens, hs, rs, ho, ro, zero, idx, None, None
+                    )
+            elif attn:
                 ctx = 150
                 pt = torch.arange(nb * 4, dtype=torch.int32, device=dev).view(nb, 4) + 1
                 pos = torch.full((nb,), ctx, dtype=torch.int64, device=dev)
-                slots = torch.tensor([(1 + b * 4) * 64 + ctx for b in range(nb)], device=dev)
+                slots = torch.tensor(
+                    [(1 + b * 4) * 64 + ctx for b in range(nb)], device=dev
+                )
                 seq = torch.full((nb,), ctx + 1, dtype=torch.int32, device=dev)
                 ops.mono_decode_layer(100 + i, hs, rs, ho, ro, pos, pt, seq, slots)
             else:
@@ -97,8 +145,36 @@ def _worker(rank, path, conn):
             layer_case(f"gdn8{sfx}_{s}", False, 8, swap=swap, dtype=dtype)
             layer_case(f"attn1{sfx}_{s}", True, 1, swap=swap, dtype=dtype)
             layer_case(f"attn4{sfx}_{s}", True, 4, swap=swap, dtype=dtype)
+        layer_case(f"gdn_v44_{s}", False, 4, swap=swap, tokens=4)
+        layer_case(f"attn_v44_{s}", True, 4, swap=swap, tokens=4)
+        layer_case(f"gdn_v82_{s}", False, 8, swap=swap, tokens=2, dtype=torch.bfloat16)
+        layer_case(f"attn_v63_{s}", True, 6, swap=swap, tokens=3, dtype=torch.bfloat16)
+        layer_case(f"gdn3_{s}", False, 3, swap=swap)
+        layer_case(f"attn6_{s}", True, 6, swap=swap)
     # many calls on one mailbox region (tags, torn words): the last outputs
     layer_case("gdn2_repeat", False, 2, reps=300)
+    layer_case("gdn_v44_repeat", False, 4, reps=100, tokens=4)
+
+    # MTP prologue: same weights and inputs on both ranks, each computes half
+    # of the fc rows; the gathered output is the full fc
+    def mtp_case(name, nb, dtype):
+        i = next(slot)
+        gen = torch.Generator().manual_seed(21 + nb)
+        fc = (torch.randn(2048, 4096, generator=gen) * 0.02).to(dtype).to(dev)
+        ne = (torch.randn(2048, generator=gen) * 0.1).to(dtype).to(dev)
+        nh = (torch.randn(2048, generator=gen) * 0.1).to(dtype).to(dev)
+        e = torch.randn(nb, 2048, generator=gen).to(dtype).to(dev)
+        hh = (torch.randn(nb, 2048, generator=gen) * 3).to(dtype).to(dev)
+        ops.mono_register_mtp(100 + i, own + i * mb, peer + i * mb, [fc, ne, nh], rank)
+        o = torch.empty_like(e)
+        for _ in range(3):
+            assert ops.mono_mtp_prologue(100 + i, e, hh, o)
+        torch.xpu.synchronize()
+        out[name] = (o.cpu(), fc.cpu(), ne.cpu(), nh.cpu(), e.cpu(), hh.cpu())
+
+    for nb in (1, 3, 8):
+        mtp_case(f"mtp{nb}", nb, torch.bfloat16)
+    mtp_case("mtp2_fp16", 2, torch.float16)
 
     # fail-stop: no wait gave up so far; then rank 1's tags skip ahead, so
     # neither rank ever sees the words it waits for: both give up within the
@@ -123,6 +199,8 @@ def _worker(rank, path, conn):
         torch.xpu.synchronize()
         times.append(time.monotonic() - t0)
     out["fault"] = (health.cpu().clone(), times)
+    out["fault_host"] = ops.mono_health_host(rank).clone()
+    out["fault_out"] = ho.cpu()
     buf = io.BytesIO()  # bytes: the process may exit before the tensors are
     torch.save(out, buf)  # read back from shared memory
     conn.send(buf.getvalue())
@@ -154,7 +232,22 @@ def pair():
     return _run_pair()
 
 
-CASES = ["gdn1", "gdn8", "attn1", "attn4", "gdn1_bf16", "gdn8_bf16", "attn1_bf16", "attn4_bf16"]
+CASES = [
+    "gdn1",
+    "gdn8",
+    "attn1",
+    "attn4",
+    "gdn1_bf16",
+    "gdn8_bf16",
+    "attn1_bf16",
+    "attn4_bf16",
+    "gdn_v44",
+    "attn_v44",
+    "gdn_v82",
+    "attn_v63",
+    "gdn3",
+    "attn6",
+]
 
 
 @requires_two_cards
@@ -180,6 +273,7 @@ def test_repeated_calls(pair):
     r0, r1 = pair
     assert torch.isfinite(r0["gdn2_repeat"][0].float()).all()
     assert torch.equal(r0["gdn2_repeat"][0], r1["gdn2_repeat"][0])
+    assert torch.equal(r0["gdn_v44_repeat"][0], r1["gdn_v44_repeat"][0])
 
 
 @requires_two_cards
@@ -193,4 +287,24 @@ def test_fail_stop(pair):
         assert int(health[0]) == 1 and int(health[1]) >= 1
         assert first < 30, f"the first call gave up after {first:.1f} s"
         assert second < 5, f"a call after the failure took {second:.1f} s"
+        # the host copy (for the fail-stop thread) and NaN outputs
+        host = r["fault_host"]
+        assert int(host[0]) == 1 and int(host[1]) >= 1
+        assert torch.isnan(r["fault_out"].float()).all()
 
+
+@requires_two_cards
+@pytest.mark.parametrize("case", ["mtp1", "mtp3", "mtp8", "mtp2_fp16"])
+def test_mtp_prologue_tp2(pair, case):
+    """The MTP prologue across two cards: both ranks hold the full fc output,
+    bitwise equal, and it matches the torch reference."""
+    from mono_decode_utils import _gemma_rms
+
+    r0, r1 = pair
+    o0, fc, ne, nh, e, h = r0[case]
+    assert torch.equal(o0, r1[case][0])
+    dtype = o0.dtype
+    z = torch.cat([_gemma_rms(e, ne, dtype), _gemma_rms(h, nh, dtype)], dim=-1)
+    ref = (z @ fc.float().t()).to(dtype)
+    for b in range(o0.shape[0]):
+        assert cos(o0[b], ref[b]) > 0.9999

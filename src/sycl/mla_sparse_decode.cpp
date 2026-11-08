@@ -160,7 +160,7 @@ SGL_KERNEL_EXPORT void flash_mla_sparse_decode(
   CHECK_DEVICE(k_cache);
   CHECK_INPUT(indices);
 
-  int page_size = k_cache.size(1);
+  [[maybe_unused]] int page_size = k_cache.size(1);
 
   c10::DeviceGuard guard(q.device());
 

@@ -218,6 +218,13 @@ macro(SYCL_WRAP_SRCS sycl_target generated_files)
   set(SYCL_include_dirs "${SYCL_INCLUDE_DIR}")
   list(APPEND SYCL_include_dirs "$<TARGET_PROPERTY:${sycl_target},INCLUDE_DIRECTORIES>")
 
+  # The genex above returns a flat list: CMake's SYSTEM marking (set by
+  # include_directories(SYSTEM ...) / target_include_directories(... SYSTEM ...))
+  # is not carried in INCLUDE_DIRECTORIES, so it would be lost here. Forward the
+  # third-party roots separately; run_sycl.cmake subtracts them from the -I list
+  # and re-emits them as -isystem.
+  set(SYCL_system_include_dirs "${SGL_SYSTEM_INCLUDE_DIRS}")
+
   set(SYCL_compile_definitions "$<TARGET_PROPERTY:${sycl_target},COMPILE_DEFINITIONS>")
 
   SYCL_GET_SOURCES_AND_OPTIONS(

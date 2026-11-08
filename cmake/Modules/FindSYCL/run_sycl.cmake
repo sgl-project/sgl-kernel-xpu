@@ -29,9 +29,21 @@ set(generated_file_internal "@generated_file@") # path
 set(SYCL_executable "@SYCL_EXECUTABLE@") # path
 set(SYCL_compile_flags @SYCL_COMPILE_FLAGS@) # list
 set(SYCL_include_dirs [==[@SYCL_include_dirs@]==]) # list
+set(SYCL_system_include_dirs [==[@SYCL_system_include_dirs@]==]) # list
 set(SYCL_compile_definitions [==[@SYCL_compile_definitions@]==]) # list
 
 list(REMOVE_DUPLICATES SYCL_INCLUDE_DIRS)
+
+# Third-party headers (sycl-tla/CuTe, torch, the SYCL runtime, Python) are
+# compiled with the same -Wall/-Wextra as first-party code and emit millions of
+# unactionable diagnostics, so demote them to -isystem. They must be dropped
+# from the -I list first: a directory keeps its *first* position in the search
+# chain, and -I entries are searched before -isystem ones, so a leftover -I
+# would win and the directory would stay non-system.
+if(SYCL_system_include_dirs)
+  list(REMOVE_DUPLICATES SYCL_system_include_dirs)
+  list(REMOVE_ITEM SYCL_include_dirs ${SYCL_system_include_dirs})
+endif()
 
 set(SYCL_host_compiler_flags "-fsycl-host-compiler-options=")
 set(SYCL_include_args)
@@ -44,6 +56,18 @@ foreach(dir ${SYCL_include_dirs})
   else()
     list(APPEND SYCL_include_args -I${dir})
     string(APPEND SYCL_host_compiler_flags "-I${dir} ")
+  endif()
+endforeach()
+
+# Joined form (-isystem<dir>, no space) so a single token survives the
+# whitespace split the driver applies to -fsycl-host-compiler-options.
+foreach(dir ${SYCL_system_include_dirs})
+  if(dir MATCHES " ")
+    list(APPEND SYCL_include_args "-isystem\"${dir}\"")
+    string(APPEND SYCL_host_compiler_flags "-isystem\"${dir}\" ")
+  else()
+    list(APPEND SYCL_include_args -isystem${dir})
+    string(APPEND SYCL_host_compiler_flags "-isystem${dir} ")
   endif()
 endforeach()
 

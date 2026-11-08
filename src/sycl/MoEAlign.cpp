@@ -320,8 +320,6 @@ SGL_KERNEL_EXPORT void moe_align_block_size(
     torch::Tensor num_tokens_post_pad,
     torch::Tensor cumsum_buffer,
     bool pad_sorted_token_ids) {
-  auto q = sycl::queue();
-
   int threads = 1024;
   threads = ((threads + sub_group_size - 1) / sub_group_size) * sub_group_size;
 
@@ -361,7 +359,8 @@ SGL_KERNEL_EXPORT void moe_align_block_size(
       sycl_kernel_submit(range.get_global_range(), range.get_local_range(), queue, kernel);
     } else {
       const size_t scan_size = next_pow2(num_experts);
-      const size_t shared_mem_size = (num_experts + (num_experts + 1) + scan_size + sub_group_size) * sizeof(int32_t);
+      [[maybe_unused]] const size_t shared_mem_size =
+          (num_experts + (num_experts + 1) + scan_size + sub_group_size) * sizeof(int32_t);
       using Kernel = MOEAlignBlockSizeFunctor<scalar_t>;
       Kernel kernel(
           topk_ids.data_ptr<scalar_t>(),
@@ -375,7 +374,7 @@ SGL_KERNEL_EXPORT void moe_align_block_size(
           pad_sorted_token_ids,
           scan_size);
       auto range = sycl::nd_range<1>(sycl::range<1>(threads), sycl::range<1>(threads));
-      auto local_range = range.get_local_range();
+      [[maybe_unused]] auto local_range = range.get_local_range();
       sycl_kernel_submit(range.get_global_range(), range.get_local_range(), queue, kernel);
 
       const int block_threads = std::min(256, (int)threads);

@@ -66,7 +66,10 @@ struct XeMlaIndividualTileScheduler {
 
   template <class ProblemShape, class TileShape>
   static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape, int num_kv_splits = -1) {
+      ProblemShape const& shape,
+      [[maybe_unused]] KernelHardwareInfo hw_info,
+      TileShape const& tile_shape,
+      int num_kv_splits = -1) {
     using namespace cute;
 
     // Ensure num_heads_q is at least 1 to avoid division by zero
@@ -142,7 +145,10 @@ struct XeMlaReduceSplitKScheduler {
 
   template <class ProblemShape, class TileShape>
   static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape, int num_kv_splits = -1) {
+      ProblemShape const& shape,
+      [[maybe_unused]] KernelHardwareInfo hw_info,
+      [[maybe_unused]] TileShape const& tile_shape,
+      int num_kv_splits = -1) {
     using namespace cute;
     // Grid: (seq_len_qo, num_heads_q, batch)
     dim3 grid(shape.seq_len_qo, shape.num_heads_q, shape.batch);

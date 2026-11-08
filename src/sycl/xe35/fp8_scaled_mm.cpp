@@ -29,6 +29,7 @@
  *
  **************************************************************************************************/
 
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 35
 
 // Must precede any CUTE header: turns silent invalid block-2D surface

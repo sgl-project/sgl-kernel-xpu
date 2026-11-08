@@ -29,6 +29,7 @@
  *
  **************************************************************************************************/
 
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 35
 
 #include <ATen/ATen.h>

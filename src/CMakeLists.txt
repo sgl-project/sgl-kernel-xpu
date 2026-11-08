@@ -7,7 +7,7 @@
 #   USE_FMHA -> flash attention (fwd / mha_fwd)
 #   USE_GDN  -> Gated DeltaNet attention kernels
 #   USE_MLA  -> MLA decode/prefill/sparse-decode kernels
-#   USE_QSA  -> Xe2 BF16 QSA sparse attention
+#   USE_QSA  -> QSA attention and MQA (Xe2 only) and indexer preparation (Xe2 and Xe3)
 #   USE_MLA_SPARSE_FUSED -> fused (single-pass) sparse-MLA-decode kernel (optimization track)
 #
 # Defaults are set in the option() declarations below. Each toggle can be set either as a CMake option
@@ -61,6 +61,15 @@ message(STATUS "USE_SYCL_JIT=${USE_SYCL_JIT}")
 if(USE_MOE)
     add_compile_definitions(USE_MOE)
 endif()
+# Value-level input checks (index ranges, monotonic seg_indptr, permutation
+# bijectivity, offset tables) each force a device -> host sync, which dominates
+# small decode ops, so they are compiled only into RelWithDebInfo builds:
+# SKBUILD_CMAKE_BUILD_TYPE=RelWithDebInfo pip install -e . --no-build-isolation -v
+# Shape / dtype checks are always on.
+if(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    add_compile_definitions(SGL_KERNEL_DEBUG_CHECKS)
+    message(STATUS "Value-level input checks: ON (${CMAKE_BUILD_TYPE})")
+endif()
 if(USE_FMHA)
     add_compile_definitions(USE_FMHA)
 endif()
@@ -68,7 +77,7 @@ if(USE_GDN)
     add_compile_definitions(USE_GDN)
 endif()
 if(USE_FMHA AND USE_SYCL_JIT)
-    # Route decode/prefill dispatch (flash_attention.cpp) through the runtime-JIT
+    # Route decode/prefill dispatch (flash_attentionXe20.cpp) through the runtime-JIT
     # path; the AOT FMHA instances are not generated (see include() guard below).
     add_compile_definitions(USE_FMHA_JIT)
 endif()
@@ -93,6 +102,10 @@ endif()
 if(USE_QSA AND DPCPP_SYCL_TARGET MATCHES "bmg")
     add_compile_definitions(USE_QSA)
 endif()
+# The QSA preparation kernels are plain SYCL and shared by Xe2 and Xe3.
+if(USE_QSA)
+    add_compile_definitions(USE_QSA_PREPARE)
+endif()
 if(USE_MLA_SPARSE_FUSED)
     add_compile_definitions(USE_MLA_SPARSE_FUSED)
 else()
@@ -105,12 +118,16 @@ file(GLOB_RECURSE device_cpp "sycl/*.cpp" "sycl/*.sycl")
 file(GLOB host_cpp "./*.cpp" "./*.cc")
 
 # Filter out source files belonging to disabled features BEFORE splitting them
-# into common/Xe20 buckets. The disabled base sources (flash_attention.cpp,
+# into common/Xe20 buckets. The disabled base sources (flash_attentionXe20.cpp,
 # mla_*.cpp) are non-Xe20 and would otherwise land in device_cpp_common, which
 # is never filtered; removing them from device_cpp up front is the only way to
 # keep them out of the build.
 if(NOT USE_FMHA)
-    list(FILTER device_cpp EXCLUDE REGEX "/flash_attention\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/flash_attentionXe[0-9]+\\.cpp$")
+elseif(DPCPP_SYCL_TARGET MATCHES "cri")
+    list(FILTER device_cpp EXCLUDE REGEX "/flash_attentionXe20\\.cpp$")
+else()
+    list(FILTER device_cpp EXCLUDE REGEX "/flash_attentionXe35\\.cpp$")
 endif()
 if(NOT USE_GDN)
     list(FILTER device_cpp EXCLUDE REGEX "/gdn_attention\\.cpp$")
@@ -123,6 +140,9 @@ endif()
 if(NOT USE_QSA OR NOT DPCPP_SYCL_TARGET MATCHES "bmg")
     list(FILTER device_cpp EXCLUDE REGEX "/QSASparseAttentionXe20\\.cpp$")
     list(FILTER device_cpp EXCLUDE REGEX "/QSAMqaXe20\\.cpp$")
+endif()
+if(NOT USE_QSA)
+    list(FILTER device_cpp EXCLUDE REGEX "/QSAPrepare\\.cpp$")
 endif()
 if(NOT USE_MOE)
     list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20|W8A16Xe20)|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")
@@ -151,16 +171,21 @@ foreach(file ${device_cpp})
 
 endforeach()
 
-include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraAFwdXe20.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraBFwdXe20.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/QKVLoraBFwdXe20.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/GateUpLoraBFwdXe20.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/ChunkedSgmvLoraShrinkFwdXe20.cmake)
-include(${CMAKE_CURRENT_SOURCE_DIR}/ChunkedSgmvLoraExpandFwdXe20.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraAFwd.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/SGEMMLoraBFwd.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/QKVLoraBFwd.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/GateUpLoraBFwd.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/ChunkedSgmvLoraShrinkFwd.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/ChunkedSgmvLoraExpandFwd.cmake)
 if(USE_FMHA)
-    if(NOT USE_SYCL_JIT)
+    if(NOT USE_SYCL_JIT AND NOT DPCPP_SYCL_TARGET MATCHES "cri")
         include(FMHADecodeXe20.cmake)
         include(FMHAPrefillXe20.cmake)
+    endif()
+    if(DPCPP_SYCL_TARGET MATCHES "cri")
+        # TODO: Add Xe35 attention JIT dispatch before disabling these AOT instances with USE_SYCL_JIT.
+        include(FMHADecodeXe35.cmake)
+        include(FMHAPrefillXe35.cmake)
     endif()
 endif()
 if(USE_MLA)

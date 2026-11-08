@@ -119,7 +119,7 @@ CUTE_DEVICE void gemm_TTS(
   Tensor cB = make_identity_tensor(B.shape());
 
   auto wg_tile = mma.tile_mnk();
-  auto wg_coord = make_coord(wg_m, wg_n, 0);
+  [[maybe_unused]] auto wg_coord = make_coord(wg_m, wg_n, 0);
 
   Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));  // (BLK_M,BLK_K,k)
   Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)
@@ -217,7 +217,7 @@ CUTE_DEVICE void gemm_STS(
   Tensor cB = make_identity_tensor(B.shape());
 
   auto wg_tile = mma.tile_mnk();
-  auto wg_coord = make_coord(wg_m, wg_n, 0);
+  [[maybe_unused]] auto wg_coord = make_coord(wg_m, wg_n, 0);
 
   Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)
 
@@ -300,7 +300,7 @@ CUTE_DEVICE void gemm_TSS(
   Tensor cA = make_identity_tensor(A.shape());
 
   auto wg_tile = mma.tile_mnk();
-  auto wg_coord = make_coord(wg_m, wg_n, 0);
+  [[maybe_unused]] auto wg_coord = make_coord(wg_m, wg_n, 0);
 
   Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));  // (BLK_M,BLK_K,k)
 
@@ -385,7 +385,7 @@ CUTE_DEVICE void gemm_TTS_k_multi(
   Tensor cB = make_identity_tensor(B.shape());
 
   auto wg_tile = mma.tile_mnk();
-  auto wg_coord = make_coord(wg_m, wg_n, 0);
+  [[maybe_unused]] auto wg_coord = make_coord(wg_m, wg_n, 0);
 
   Tensor gA = local_tile(cA, select<0, 2>(wg_tile), make_coord(wg_m, _));  // (BLK_M,BLK_K,k)
   Tensor gB = local_tile(cB, select<1, 2>(wg_tile), make_coord(wg_n, _));  // (BLK_N,BLK_K,k)

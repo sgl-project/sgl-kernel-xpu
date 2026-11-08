@@ -135,7 +135,7 @@ class XeMlaReduceSplitKV {
   static constexpr int SharedStorageSize = sizeof(SharedStorage);
 
  public:
-  static Params to_underlying_arguments(Arguments const& args, void* workspace) {
+  static Params to_underlying_arguments(Arguments const& args, [[maybe_unused]] void* workspace) {
     return {
         args.kernel,
         TileScheduler::to_underlying_arguments(args.kernel.shape, args.hw_info, TileShapeO{}, args.num_kv_splits)};

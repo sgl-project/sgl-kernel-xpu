@@ -62,7 +62,7 @@ inline uint8_t fp32_to_e4m3fn(float f) {
 }
 
 struct dim3 {
-  int x, y, z;
+  int x = 1, y = 1, z = 1;
 };
 
 template <typename T>

@@ -4,7 +4,7 @@
 
 #include "jit/jit_arch.h"
 #include "jit/sycl_template_jit.h"
-#include "sycl/kernels/flash_attention_v2/fmha_tile_dispatch.h"
+#include "sycl/kernels/flash_attention_v2/xe20/fmha_tile_dispatch.h"
 
 namespace sgl {
 namespace fmha_jit {
@@ -72,7 +72,7 @@ void* resolve_spec(const std::string& template_rel, jit::CompileSpec& spec, int 
     if (err) *err = "source template root not resolved";
     return nullptr;
   }
-  spec.template_path = cfg.src_root + "/sycl/kernels/flash_attention_v2/" + template_rel;
+  spec.template_path = cfg.src_root + "/sycl/kernels/flash_attention_v2/xe20/" + template_rel;
   const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_FMHA_JIT_ENTRY");
   spec.extra_flags = as.extra_flags;
   spec.target = as.target;

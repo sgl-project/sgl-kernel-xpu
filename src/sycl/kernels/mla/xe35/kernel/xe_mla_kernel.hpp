@@ -215,7 +215,8 @@ class XeMlaFwdKernel {
     return 0;
   }
 
-  static cutlass::Status initialize_workspace(Arguments const& args, void* workspace) {
+  static cutlass::Status
+  initialize_workspace([[maybe_unused]] Arguments const& args, [[maybe_unused]] void* workspace) {
     return Status::kSuccess;
   }
 
@@ -536,7 +537,8 @@ class XeMlaSplitKVKernel {
     return ws.total_bytes;
   }
 
-  static cutlass::Status initialize_workspace(Arguments const& args, void* workspace) {
+  static cutlass::Status
+  initialize_workspace([[maybe_unused]] Arguments const& args, [[maybe_unused]] void* workspace) {
     return Status::kSuccess;
   }
 

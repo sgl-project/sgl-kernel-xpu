@@ -52,7 +52,7 @@ void Xe20MoEGEMMMxfp4W4A16W4A16Launcher(
 
   using StrideA = Stride<int, _1>;
   using StrideB = Stride<int, _1>;
-  using StrideS = Stride<int, _1>;
+  using StrideS [[maybe_unused]] = Stride<int, _1>;
   using StrideD = Stride<int, _1>;
 
   using TensorA = decltype(make_dummy_tensor_bf16(ElementA{}, StrideA{}));

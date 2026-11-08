@@ -1,161 +1,128 @@
+"""MXFP4 dense scaled GEMM (`cutlass_scaled_fp4_mm`) on Intel XPU.
+
+The op implements the MX flavour of FP4 — E2M1 data with UE8M0 scales over
+blocks of 32 — because NVFP4 (block 16, E4M3 scales) has no Xe equivalent.
+"""
+
 import sys
 
 import pytest
 import torch
 import utils
-from sgl_kernel import cutlass_scaled_fp4_mm, scaled_fp4_quant
+from mxfp4_utils import MXFP4_BLOCK_SIZE, dequantize_mxfp4_2d, quantize_mxfp4_2d
+from sgl_kernel import cutlass_scaled_fp4_mm, sgl_per_token_group_quant_fp4
 
 device = utils.get_device()
 
-skip_condition = torch.cuda.is_available() and torch.cuda.get_device_capability() < (
-    10,
-    0,
-)
-
-DTYPES = [torch.float16, torch.bfloat16]
+DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 # m, n, k
-SHAPES = [(128, 128, 64), (128, 128, 128), (256, 128, 64), (128, 256, 128)]
-PAD_SHAPES = [(150, 128, 64), (128, 128, 96)]
+SHAPES = [
+    (128, 128, 128),
+    (128, 256, 192),
+    (256, 128, 128),
+    (256, 256, 256),
+]
+# Shapes the tile dispatch and the scale padding have to survive: M not a
+# multiple of the 4-element scale alignment, K not a multiple of the 64-wide
+# K tile, and a decode-sized M.
+PAD_SHAPES = [(150, 128, 128), (128, 128, 96), (1, 256, 128), (33, 128, 160)]
 SHAPES.extend(PAD_SHAPES)
 
-FLOAT4_E2M1_MAX = 6.0
-FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 
-kE2M1ToFloatArray = [
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-]
+def is_cri_device() -> bool:
+    try:
+        from sgl_kernel import is_xe3_arch
+
+        return is_xe3_arch()
+    except ImportError:
+        return False
 
 
-def e2m1_to_fp32(int4_value):
-    signBit = int4_value & 0x8
-    int4_absValue = int4_value & 0x7
-    float_result = kE2M1ToFloatArray[int4_absValue]
-    if signBit:
-        float_result = -float_result
-    return float_result
-
-
-def break_fp4_bytes(a, dtype):
-    assert a.dtype == torch.uint8
-    m, n = a.shape
-    a = a.flatten()
-    # Get upper 4 bits
-    highHalfByte = (a & 0xF0) >> 4
-    # Get lower 4 bits
-    lowHalfByte = a & 0x0F
-    fH = torch.tensor([e2m1_to_fp32(x) for x in highHalfByte]).to(a.device)
-    fL = torch.tensor([e2m1_to_fp32(x) for x in lowHalfByte]).to(a.device)
-    # [0xAB, 0xCD] -> [0xB, 0xA, 0xD, 0xC]
-    out = torch.stack((fL, fH), dim=-1).reshape(m, n * 2)
-    return out
-
-
-def convert_swizzled_to_linear(a_sf_swizzled: torch.Tensor, m, k, block_size):
-    sf_m, sf_k = a_sf_swizzled.shape
-    m_tiles = (m + 128 - 1) // 128
-    f = block_size * 4
-    k_tiles = (k + f - 1) // f
-    tmp = torch.reshape(a_sf_swizzled, (1, m_tiles, k_tiles, 32, 4, 4))
-    tmp = torch.permute(tmp, (0, 1, 4, 3, 2, 5))
-    out = tmp.reshape(m_tiles * 128, k_tiles * f // block_size)
-    return out[0:m, 0:k]
-
-
-def dequantize_to_dtype(
-    tensor_fp4, tensor_sf, global_scale, dtype, device, block_size=16
-):
-    """Dequantize the fp4 tensor back to high precision."""
-    # Two fp4 values are packed into one uint8.
-    assert tensor_fp4.dtype == torch.uint8
-    m, packed_k = tensor_fp4.shape
-    k = packed_k * 2
-    tensor_f32 = break_fp4_bytes(tensor_fp4, dtype)
-    tensor_f32 = tensor_f32.reshape(m, k // block_size, block_size)
-    tensor_sf = tensor_sf.view(torch.float8_e4m3fn)
-    tensor_sf = convert_swizzled_to_linear(tensor_sf, m, k, block_size)
-    tensor_sf_dtype = tensor_sf.to(torch.float32) / global_scale
-
-    # scale the tensor
-    out = (tensor_f32 * tensor_sf_dtype.unsqueeze(-1)).reshape(m, k)
-    return out
-
-
-def get_ref_results(
-    a_fp4,
-    b_fp4,
-    a_sf,
-    b_sf,
-    a_global_scale,
-    b_global_scale,
-    m,
-    n,
-    dtype,
-    block_size,
-    device,
-):
-    _, m_k = a_fp4.shape
-    _, n_k = b_fp4.shape
-    assert m_k == n_k
-    a_in_dtype = dequantize_to_dtype(
-        a_fp4, a_sf, a_global_scale, dtype=dtype, device=device, block_size=block_size
-    )
-    b_in_dtype = dequantize_to_dtype(
-        b_fp4, b_sf, b_global_scale, dtype=dtype, device=device, block_size=block_size
-    )
-    return torch.matmul(a_in_dtype, b_in_dtype.t())
-
-
-@pytest.mark.skipif(
-    skip_condition, reason="Nvfp4 Requires compute capability of 10 or above."
+pytestmark = pytest.mark.skipif(
+    not (device.type == "xpu" and is_cri_device()),
+    reason="cutlass_scaled_fp4_mm requires an Xe3 (CRI) XPU",
 )
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("shape", SHAPES)
+
+
+def dtype_id(dtype: torch.dtype) -> str:
+    return str(dtype).rsplit(".", 1)[-1]
+
+
+def quantize(x: torch.Tensor):
+    """Quantize to MXFP4 on CPU with the reference implementation."""
+    packed, scales = quantize_mxfp4_2d(x.float().cpu(), MXFP4_BLOCK_SIZE)
+    return packed.to(x.device), scales.to(x.device)
+
+
+def reference_mm(a_packed, a_scales, b_packed, b_scales, out_dtype, alpha):
+    a = dequantize_mxfp4_2d(
+        a_packed.cpu(), a_scales.cpu(), torch.float32, MXFP4_BLOCK_SIZE
+    )
+    b = dequantize_mxfp4_2d(
+        b_packed.cpu(), b_scales.cpu(), torch.float32, MXFP4_BLOCK_SIZE
+    )
+    return (alpha * torch.matmul(a, b.t())).to(out_dtype).to(a_packed.device)
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=dtype_id)
+@pytest.mark.parametrize("shape", SHAPES, ids=lambda s: "x".join(map(str, s)))
 @torch.inference_mode()
-def test_nvfp4_gemm(
-    dtype: torch.dtype,
-    shape: tuple[int, int],
-) -> None:
-    m, n, packed_k = shape
-    k = packed_k * 2
-    block_size = 16
-    a_dtype = torch.randn((m, k), dtype=dtype, device=device)
-    b_dtype = torch.randn((n, k), dtype=dtype, device=device)
+def test_mxfp4_gemm(dtype: torch.dtype, shape: tuple[int, int, int]) -> None:
+    torch.manual_seed(42)
+    m, n, k = shape
 
-    a_global_scale = (
-        (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.amax(a_dtype.flatten(), dim=-1)
-    ).to(torch.float32)
-    b_global_scale = (
-        (FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX) / torch.amax(b_dtype.flatten(), dim=-1)
-    ).to(torch.float32)
-    alpha = 1.0 / (a_global_scale * b_global_scale)
-    a_fp4, a_scale_interleaved = scaled_fp4_quant(a_dtype, a_global_scale)
-    b_fp4, b_scale_interleaved = scaled_fp4_quant(b_dtype, b_global_scale)
+    a_packed, a_scales = quantize(torch.randn((m, k), dtype=dtype, device=device))
+    b_packed, b_scales = quantize(torch.randn((n, k), dtype=dtype, device=device))
 
-    expected_out = get_ref_results(
-        a_fp4,
-        b_fp4,
-        a_scale_interleaved,
-        b_scale_interleaved,
-        a_global_scale,
-        b_global_scale,
-        m,
-        n,
-        dtype,
-        block_size,
-        device,
-    )
     out = cutlass_scaled_fp4_mm(
-        a_fp4, b_fp4, a_scale_interleaved, b_scale_interleaved, alpha, dtype
+        a_packed, b_packed, a_scales, b_scales, None, out_dtype=dtype
+    )
+    expected = reference_mm(a_packed, a_scales, b_packed, b_scales, dtype, 1.0)
+
+    # Both sides see identical dequantized operands, so the only error is the
+    # accumulation order; the magnitudes grow with K.
+    torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=dtype_id)
+@torch.inference_mode()
+def test_mxfp4_gemm_alpha(dtype: torch.dtype) -> None:
+    torch.manual_seed(42)
+    m, n, k = 256, 256, 128
+
+    a_packed, a_scales = quantize(torch.randn((m, k), dtype=dtype, device=device))
+    b_packed, b_scales = quantize(torch.randn((n, k), dtype=dtype, device=device))
+
+    alpha_value = 0.375
+    alpha = torch.tensor([alpha_value], dtype=torch.float32, device=device)
+    out = cutlass_scaled_fp4_mm(
+        a_packed, b_packed, a_scales, b_scales, alpha, out_dtype=dtype
+    )
+    expected = reference_mm(a_packed, a_scales, b_packed, b_scales, dtype, alpha_value)
+
+    torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=dtype_id)
+@torch.inference_mode()
+def test_mxfp4_gemm_with_xpu_quant(dtype: torch.dtype) -> None:
+    """The XPU quantizer's outputs feed the GEMM as-is, with no relayout."""
+    torch.manual_seed(42)
+    m, n, k = 150, 128, 128
+
+    a_packed, a_scales = sgl_per_token_group_quant_fp4(
+        torch.randn((m, k), dtype=dtype, device=device)
+    )
+    b_packed, b_scales = sgl_per_token_group_quant_fp4(
+        torch.randn((n, k), dtype=dtype, device=device)
     )
 
-    torch.testing.assert_close(out, expected_out.to(dtype=dtype), atol=1e-1, rtol=1e-1)
+    out = cutlass_scaled_fp4_mm(
+        a_packed, b_packed, a_scales, b_scales, None, out_dtype=dtype
+    )
+    expected = reference_mm(a_packed, a_scales, b_packed, b_scales, dtype, 1.0)
+
+    torch.testing.assert_close(out, expected, atol=1e-1, rtol=1e-1)
 
 
 if __name__ == "__main__":

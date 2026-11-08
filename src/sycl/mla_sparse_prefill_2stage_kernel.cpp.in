@@ -15,6 +15,7 @@
 // variant per file instead of both). The op (mla_sparse_prefill.cpp) dispatches dtype,
 // then D_QK, then B_H, then the runtime attn_sink flag, and calls the matching launcher
 // below.
+#undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET @SYCL_TARGET@
 
 #include "sycl/kernels/mla_sparse/@ARCH_TAG@/device/mla_sparse_prefill_2stage_types.hpp"

@@ -32,7 +32,7 @@ struct AWQDequantizeKernelFunctor : public __SYCL_KER_CONFIG_CONVENTION__ {
         K(K),
         group_size(group_size) {}
 
-  void sycl_ker_config_convention(sycl::handler& cgh) {}
+  void sycl_ker_config_convention([[maybe_unused]] sycl::handler& cgh) {}
 
   [[sycl::reqd_sub_group_size(SgSize)]] void operator()(sycl::nd_item<2> item) const {
     int col = item.get_global_id(1);
@@ -88,7 +88,7 @@ void dequantize_awq_sycl(
   sycl::range<2> local_range{GroupN, GroupK};
 
   // Launch the kernel
-  auto nd_range = sycl::nd_range<2>(global_range, local_range);
+  [[maybe_unused]] auto nd_range = sycl::nd_range<2>(global_range, local_range);
   auto kfn = AWQDequantizeKernelFunctor<T_out, T_scale, GroupK, GroupN, SgSize>(
       d_qweight, d_scales, d_qzeros, d_output, N, K, group_size);
   sycl_kernel_submit(global_range, local_range, q, kfn);

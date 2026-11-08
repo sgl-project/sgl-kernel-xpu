@@ -26,6 +26,12 @@ namespace jit {
 // package layout (via dladdr) plus environment overrides.
 struct JitConfig {
   std::vector<std::string> include_dirs;
+  // Third-party header roots (sycl-tla/CuTe, torch). Emitted as -isystem so the
+  // -Wall/-Wextra inherited from the AOT host flags does not bury a real
+  // diagnostic under millions of unactionable ones. Kept separate from
+  // `include_dirs` because a directory passed as -I anywhere on the command line
+  // keeps that earlier, non-system position in the search chain.
+  std::vector<std::string> system_include_dirs;
   std::vector<std::string> extra_flags;  // e.g. -DFOO, -fsycl-targets=...
   std::vector<std::string> link_flags;   // e.g. -L.../torch/lib -ltorch
   std::string cache_dir;                 // where compiled .so are cached

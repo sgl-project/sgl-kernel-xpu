@@ -1313,6 +1313,16 @@ _FP8_E4M3_MAX = 448.0
 _MXFP8_BLOCK_SIZE = 32
 
 
+def _gemm_out_dtype(out_dtype: torch.dtype) -> torch.dtype:
+    """Element type the grouped GEMM stores.
+
+    bf16 halves the D store and makes the following .to(out_dtype) a no-op. The
+    kernel has no fp16 epilogue instantiation, so fp16 callers keep fp32 and pay
+    the conversion pass.
+    """
+    return torch.bfloat16 if out_dtype == torch.bfloat16 else torch.float32
+
+
 def _per_token_group_quant_fp8(x: torch.Tensor, group_size: int = 128):
     """Per-token group quant along last dim. Returns (x_q fp8_e4m3, x_s fp32)."""
     assert x.shape[-1] % group_size == 0
@@ -1425,6 +1435,8 @@ def cutlass_fused_experts_fp8(
             f"w1_q shape {tuple(w1_q.shape)} incompatible with a.shape[1]={hidden_size}"
         )
 
+    # A no-op for sglang, whose weights are contiguous as (E, 2n, k): undoing its
+    # view lands back on the original layout and nothing is copied.
     if sglang_transposed:
         w1_q = w1_q.transpose(1, 2).contiguous()
         w2_q = w2_q.transpose(1, 2).contiguous()
@@ -1439,6 +1451,7 @@ def cutlass_fused_experts_fp8(
     del a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs
 
     out_dtype = a.dtype
+    gemm_dtype = _gemm_out_dtype(out_dtype)
     num_experts = w1_q.size(0)
     m = a.size(0)
     k = a.size(1)
@@ -1520,7 +1533,9 @@ def cutlass_fused_experts_fp8(
     else:
         rep_a_q, rep_a1_scales = _per_token_group_quant_fp8(rep_a, group_size=128)
 
-    c1 = torch.zeros((m * topk, n * 2), dtype=torch.float32, device=device)
+    # empty is safe: ElementC=void, so C is never read, and every row is fully written.
+    # Storing bf16 loses nothing here — the result is quantized to fp8 next anyway.
+    c1 = torch.empty((m * topk, n * 2), dtype=gemm_dtype, device=device)
 
     # Empty int64 sentinels select on-device pointer-table + scale-transpose.
     empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
@@ -1560,7 +1575,7 @@ def cutlass_fused_experts_fp8(
             intermediate, group_size=128
         )
 
-    c2 = torch.zeros((m * topk, k), dtype=torch.float32, device=device)
+    c2 = torch.empty((m * topk, k), dtype=gemm_dtype, device=device)
     fp8_blockwise_scaled_grouped_mm(
         c2,
         empty_ptrs,
@@ -1617,6 +1632,7 @@ def cutlass_fused_experts_mxfp4(
     assert a.dtype in (torch.half, torch.bfloat16), "Invalid input dtype"
 
     out_dtype = a.dtype
+    gemm_dtype = _gemm_out_dtype(out_dtype)
     num_experts = w1_q.size(0)
     m = a.size(0)
     k = a.size(1)
@@ -1660,7 +1676,8 @@ def cutlass_fused_experts_mxfp4(
         rep_a, group_size=_MXFP4_BLOCK_SIZE
     )
 
-    c1 = torch.zeros((m * topk, n * 2), dtype=torch.float32, device=device)
+    # empty is safe: ElementC=void, so C is never read, and every row is fully written.
+    c1 = torch.empty((m * topk, n * 2), dtype=gemm_dtype, device=device)
     # Empty sentinels -> on-device ptr-table + scale-transpose.
     empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
     workspace = torch.zeros((64 * 1024 * 1024,), dtype=torch.uint8, device=device)
@@ -1688,7 +1705,7 @@ def cutlass_fused_experts_mxfp4(
         intermediate, group_size=_MXFP4_BLOCK_SIZE
     )
 
-    c2 = torch.zeros((m * topk, k), dtype=torch.float32, device=device)
+    c2 = torch.empty((m * topk, k), dtype=gemm_dtype, device=device)
     mxfp4_blockwise_scaled_grouped_mm(
         c2,
         empty_ptrs,

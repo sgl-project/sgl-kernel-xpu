@@ -43,7 +43,7 @@ inline void apply_token_rotary_embedding(
 template <typename scalar_t, EmbeddingAlgorithm algo = EmbeddingAlgorithm::RotateHalf, bool has_cache_offset = true>
 struct RotaryEmbeddingBatched {
   void operator()(sycl::nd_item<1> item) const {
-    using accscalar = at::opmath_type<scalar_t>;
+    using accscalar [[maybe_unused]] = at::opmath_type<scalar_t>;
     int32_t token_id = item.get_group(0);
     int32_t start_idx = item.get_local_id(0);
     int64_t pos = positions_[token_id];
@@ -343,7 +343,7 @@ void rotary_embedding_2D_kernel_impl(
   auto queue = dpcppGetCurrentQueue();
   auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
   int64_t max_wg_size = dpcppMaxWorkGroupSize(dev_id);
-  int64_t max_group_num = dpcppMaxWorkItemsPerTile(dev_id) / max_wg_size;
+  [[maybe_unused]] int64_t max_group_num = dpcppMaxWorkItemsPerTile(dev_id) / max_wg_size;
   int64_t num_groups = num_tokens;
   int64_t num_eus = dpcppGpuEuCount(dev_id);
   int64_t group_size = std::min(max_wg_size, query.size(-1));

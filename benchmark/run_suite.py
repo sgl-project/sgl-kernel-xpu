@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import List
+from typing import Dict, List, Optional
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -101,6 +101,9 @@ suites = {
         # --- norm / rope / quant ---
         BenchFile("bench_merge_states_v2.py", tee_log="merge_states.py.log"),
         BenchFile("bench_mrope.py", tee_log="mrope.py.log"),
+        BenchFile("bench_indexer_rope_pack.py"),
+        BenchFile("bench_fused_q_indexer_rope_hadamard_fp4_quant.py"),
+        BenchFile("bench_fp4_paged_mqa_logits.py"),
         BenchFile("bench_swiglu_alpha_limit.py", tee_log="swiglu_alpha_limit.py.log"),
         BenchFile("bench_fused_qk_rope_with_cache.py"),
         BenchFile("bench_per_token_group_quant_mxfp4.py"),
@@ -142,6 +145,16 @@ suites = {
         # BenchFile("bench_jit_moe_align_block_size.py"),
         # BenchFile("bench_jit_per_token_group_quant_8bit_v2.py"),
         # BenchFile("bench_jit_activation.py"),
+        # --- Qwen4 ops ---
+        BenchFile("bench_qsa_mqa.py"),
+        BenchFile("bench_qsa_prepare.py"),
+        BenchFile("bench_qsa_sparse_attention.py"),
+        BenchFile("bench_grouped_gemma_rmsnorm.py"),
+        BenchFile("bench_qwen4_ple_gate.py"),
+        BenchFile("bench_qwen4_ngram_hash.py"),
+        BenchFile("bench_qwen4_short_conv.py"),
+        BenchFile("bench_qwen4_hyperconnection.py"),
+        BenchFile("bench_sigmoid_mul.py"),
     ],
 }
 
@@ -181,8 +194,15 @@ def auto_partition(files, rank, size):
     return [files[i] for i in partitions[rank]]
 
 
-def run_benchmark_files(files: List[BenchFile], timeout_per_file: float) -> int:
+def run_benchmark_files(
+    files: List[BenchFile],
+    timeout_per_file: float,
+    timeout_overrides: Optional[Dict[str, float]] = None,
+) -> int:
     """Run each benchmark, tee-ing combined output to its log file.
+
+    ``timeout_overrides`` maps a benchmark name to its own time limit, used
+    instead of ``timeout_per_file`` (the JIT nightly uses it for FMHA).
 
     Every benchmark runs even if an earlier one fails, so one broken kernel
     does not hide the results of everything after it; the failures are
@@ -203,6 +223,7 @@ def run_benchmark_files(files: List[BenchFile], timeout_per_file: float) -> int:
             flush=True,
         )
         start = time.perf_counter()
+        timeout = (timeout_overrides or {}).get(bench.name, timeout_per_file)
 
         try:
             proc = subprocess.run(
@@ -210,7 +231,7 @@ def run_benchmark_files(files: List[BenchFile], timeout_per_file: float) -> int:
                 cwd=BENCH_DIR,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                timeout=timeout_per_file,
+                timeout=timeout,
             )
             with open(log_path, "wb") as log_f:
                 log_f.write(proc.stdout)
@@ -226,7 +247,7 @@ def run_benchmark_files(files: List[BenchFile], timeout_per_file: float) -> int:
             with open(log_path, "wb") as log_f:
                 log_f.write(e.output or b"")
             print(
-                f"\nTIMEOUT: {bench.name} exceeded {timeout_per_file}s\n",
+                f"\nTIMEOUT: {bench.name} exceeded {timeout}s\n",
                 flush=True,
             )
             failed.append(bench.name)

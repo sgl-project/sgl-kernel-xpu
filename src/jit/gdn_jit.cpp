@@ -19,6 +19,7 @@ using ChunkFn = void (*)(
     void*,
     void*,
     void*,
+    void*,
     const void*,
     const void*,
     const void*,
@@ -81,6 +82,7 @@ ChunkFn resolve(bool is_half, int state_code, int arch, std::string* err) {
     spec.subs["STATE_T"] = state_type(state_code);
     const jit::ArchSpec as = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_GDN_JIT_ENTRY");
     spec.extra_flags = as.extra_flags;
+    spec.subs["SYCL_TARGET"] = as.sycl_target;
     spec.target = as.target;
     spec.entry_symbol = "sgl_gdn_chunk_entry";
     spec.name =
@@ -104,6 +106,7 @@ bool chunk_launch(
     void* A,
     void* w,
     void* u,
+    void* total_chunks,
     const void* b,
     const void* a,
     const void* A_log,
@@ -132,6 +135,7 @@ bool chunk_launch(
      A,
      w,
      u,
+     total_chunks,
      b,
      a,
      A_log,

@@ -68,8 +68,8 @@ namespace {
 ///   - num_heads: 16, 32, 64, 128
 ///   - page_size: 16, 32, 64, 128
 ///   - num_kv_splits: 1, 2, 4, 8, 16, 32, 48, 64, 96, 128
-/// TODO: find a same optimal kv_split formula (ref:src/sycl/flash_attention.cpp[get_num_splits]), when entire mla is
-/// optimized.
+/// TODO: find a same optimal kv_split formula (ref:src/sycl/flash_attentionXe20.cpp[get_num_splits]), when entire mla
+/// is optimized.
 int64_t set_split_kv(int64_t batch, int64_t num_heads_q, int64_t seq_len_kv, int64_t page_size) {
   int base_parallel = static_cast<int>(batch * num_heads_q);
   int total_pages = (static_cast<int>(seq_len_kv) + static_cast<int>(page_size) - 1) / static_cast<int>(page_size);

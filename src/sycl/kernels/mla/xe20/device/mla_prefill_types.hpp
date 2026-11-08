@@ -209,8 +209,8 @@ inline typename T::Fmla::Arguments args_from_options_prefill(
     int64_t max_seqlen_q,
     at::Tensor const& page_table,
     double sm_scale,
-    bool causal,
-    int64_t num_kv_splits) {
+    [[maybe_unused]] bool causal,
+    [[maybe_unused]] int64_t num_kv_splits) {
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = q_nope.device().index();
   hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);

@@ -263,7 +263,7 @@ struct MoEMainloopMxfp4W4A16<
 
     auto thr_copy_a = tiled_copy_a.get_slice(thr_id);
     auto thr_copy_b = tiled_copy_b.get_slice(thr_id);
-    auto thr_copy_d = tiled_copy_d.get_slice(thr_id);
+    [[maybe_unused]] auto thr_copy_d = tiled_copy_d.get_slice(thr_id);
     auto thr_mma = mma.get_slice(thr_id);
 
     auto tAgA = thr_copy_a.partition_S(gA);
@@ -386,7 +386,7 @@ struct MoEMainloopMxfp4W4A16<
 
     Tensor cA = make_identity_tensor(A.shape());
     Tensor cBp0 = make_identity_tensor(Bp0.shape());
-    Tensor cBp1 = make_identity_tensor(Bp1.shape());
+    [[maybe_unused]] Tensor cBp1 = make_identity_tensor(Bp1.shape());
     Tensor cC0 = make_identity_tensor(D.shape());
     Tensor cC1 = make_identity_tensor(D.shape());
 
@@ -416,7 +416,7 @@ struct MoEMainloopMxfp4W4A16<
     auto thr_copy_a = tiled_copy_a.get_slice(thr_id);
     auto thr_copy_b0 = tiled_copy_b0.get_slice(thr_id);
     auto thr_copy_b1 = tiled_copy_b1.get_slice(thr_id);
-    auto thr_copy_d = tiled_copy_d.get_slice(thr_id);
+    [[maybe_unused]] auto thr_copy_d = tiled_copy_d.get_slice(thr_id);
     auto thr_mma = mma.get_slice(thr_id);
 
     auto tAgA = thr_copy_a.partition_S(gA);
@@ -449,7 +449,7 @@ struct MoEMainloopMxfp4W4A16<
     SubgroupTensor tCrD_final_sg_tensor0 = make_subgroup_tensor(tCrD_final_tensor0, tCrC0.tv_layout());
     TD tCrD_final_frag1[tCrC1.size()];
     Tensor tCrD_final_tensor1 = make_tensor(make_rmem_ptr(tCrD_final_frag1), tCrC1.layout());
-    SubgroupTensor tCrD_final_sg_tensor1 = make_subgroup_tensor(tCrD_final_tensor1, tCrC1.tv_layout());
+    [[maybe_unused]] SubgroupTensor tCrD_final_sg_tensor1 = make_subgroup_tensor(tCrD_final_tensor1, tCrC1.tv_layout());
 
     Tensor tCgD = thr_mma.partition_C(gC0);
 

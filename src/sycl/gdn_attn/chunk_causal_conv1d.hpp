@@ -133,7 +133,7 @@ struct chunk_causal_conv1d_kernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const int k_dim = head_k_dim;
     const int v_dim = head_v_dim * num_v_heads / num_k_heads;
     const int z_dim = head_v_dim * num_v_heads / num_k_heads;
-    const int qkv_dim = q_dim + k_dim + v_dim;
+    [[maybe_unused]] const int qkv_dim = q_dim + k_dim + v_dim;
     const int qkvz_dim = q_dim + k_dim + v_dim + z_dim;
 
     int qkvz_elems_offset = k_head_id * qkvz_dim + qkv_dim_offset;
@@ -654,7 +654,7 @@ void kernel_launcher(
     const int& qkvz_elems,
     const int& conv_elems,
     const int& num_prefills,
-    const int& num_decodes,
+    [[maybe_unused]] const int& num_decodes,
     const bool fuse_l2norm) {
   using KERNEL_MAIN = chunk_causal_conv1d_kernel<T, Width, ReorderInput>;
   auto range_main = KERNEL_MAIN::get_nd_range(num_actual_tokens, num_k_heads, head_k_dim, num_v_heads, head_v_dim);

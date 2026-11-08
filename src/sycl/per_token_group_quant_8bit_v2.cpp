@@ -641,8 +641,8 @@ struct MaskedKernel : MainKernel<
 struct NaiveScheduler {
   static void compute_exec_config(
       int threads_per_subwarp,
-      int num_local_experts,
-      int hidden_dim_num_groups,
+      [[maybe_unused]] int num_local_experts,
+      [[maybe_unused]] int hidden_dim_num_groups,
       int num_groups,
       int& subwarps_per_block,
       dim3& grid,
@@ -673,7 +673,7 @@ struct MaskedLayoutScheduler {
       int threads_per_subwarp,
       int num_local_experts,
       int hidden_dim_num_groups,
-      int num_groups,
+      [[maybe_unused]] int num_groups,
       int& subwarps_per_block,
       dim3& grid,
       dim3& block) {

@@ -52,7 +52,10 @@ struct XeHcPreGemmSqrSumTileScheduler {
 
   template <class ProblemShape, class TileShape>
   static Params to_underlying_arguments(
-      ProblemShape const& shape, KernelHardwareInfo hw_info, TileShape const& tile_shape, int n_splits = 1) {
+      ProblemShape const& shape,
+      [[maybe_unused]] KernelHardwareInfo hw_info,
+      TileShape const& tile_shape,
+      int n_splits = 1) {
     using namespace cute;
 
     dim3 grid(

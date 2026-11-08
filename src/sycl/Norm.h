@@ -36,7 +36,7 @@ inline int max_workgroup_for_row(int device_max_wg, int plane_vecs, int batch, i
 
 inline std::tuple<int64_t, int64_t> _check_layer_norm_inputs(
     const torch::Tensor& input,
-    IntArrayRef normalized_shape,
+    [[maybe_unused]] IntArrayRef normalized_shape,
     std::optional<torch::Tensor>& weight /* optional */,
     std::optional<torch::Tensor>& bias /* optional */) {
   CHECK_LAST_DIM_CONTIGUOUS(input);
@@ -342,7 +342,7 @@ class NormConfig {
     workgroup_size = max_workgroup_size / block_row;
 
     // maximize the vec_size
-    size_t problem_size = Plane;
+    [[maybe_unused]] size_t problem_size = Plane;
     constexpr int float4_size = sizeof(float) * 4;
     max_vec_size = float4_size / element_size_bytes;
     while ((max_vec_size >> 1) * workgroup_num * workgroup_size >= Plane && (max_vec_size >> 1) >= 1) {

@@ -45,7 +45,7 @@
 
   Adding a new tile is a two-step change:
     1) Define a new option tag here.
-    2) Register (tag name, C++ type) in SGEMMLoraAFwdXe20.cmake.
+    2) Register (tag name, C++ type) in SGEMMLoraAFwd.cmake.
   The dtype dispatch in sgemm_lora_a_fwd.cpp then picks a tag per call.
 */
 

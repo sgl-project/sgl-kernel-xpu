@@ -96,3 +96,6 @@ agent-logs/
 .claude/transcripts/
 .claude/history.jsonl
 .claude/**/*.jsonl
+
+# NEO driver debug-settings dump, written into the cwd when PrintDebugSettings=1
+igdrcl_dumped.config

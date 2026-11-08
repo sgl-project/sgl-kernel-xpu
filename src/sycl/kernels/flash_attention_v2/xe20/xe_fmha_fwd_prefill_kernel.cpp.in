@@ -1,0 +1,265 @@
+/***************************************************************************************************
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ * list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from
+ * this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ **************************************************************************************************/
+// Auto-generated from xe_fmha_fwd_prefill_kernel.cpp.in
+// Template parameters: HEAD_DIM=@HEAD_DIM@, TILED_Q=@TILED_Q@, TILED_KV=@TILED_KV@, NUM_SG=@NUM_SG@, ELEM_TAG=@ELEM_TAG@
+#undef SYCL_INTEL_TARGET
+#define SYCL_INTEL_TARGET 20
+
+#if @ENABLE_SCORE_BLOCK2D@
+#define FMHA_PREFILL_ENABLE_SCORE_BLOCK2D 1
+#endif
+
+#include "sycl/kernels/flash_attention_v2/xe20/fmha_tile_dispatch.h"
+#include "sycl/kernels/flash_attention_v2/xe20/xe_fmha_fwd_prefill_runner.hpp"
+
+namespace prefill {
+
+template <>
+__attribute__((visibility("default"))) void FmhaPrefillRunner<@HEAD_DIM@, @ELEM_TYPE@>::operator()(const Arguments& params) const {
+  bool use_sink = (params.softmax_sink_ptr != nullptr);
+
+  constexpr auto kTile = sgl::fmha::prefill_paged_tile(@HEAD_DIM@);
+  using TileShapeQK = cute::Shape<cute::Int<kTile.tiled_q>, cute::Int<kTile.tiled_kv>, cute::_32>;
+  using TileShapePV = cute::Shape<cute::Int<kTile.tiled_q>, cute::_32, cute::Int<kTile.tiled_kv>>;
+  // Output-tile head extent from the shared tile table (512 chunks the head).
+  using TileShapeOutput = cute::Shape<cute::Int<kTile.tiled_q>, cute::Int<sgl::fmha::prefill_tiled_out(@HEAD_DIM@)>>;
+  using SubgroupLayoutQK =
+      cute::Layout<cute::Shape<cute::Int<kTile.num_sg>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+
+  // softmax_lse output is threaded as a template constexpr, so every mask
+  // combination that can emit it needs its own kernel instantiation. LSE is
+  // instantiated for no mask, causal and local; the sink path keeps the
+  // always-off LSE instantiations only (sink + LSE is not compiled).
+  // is_causal and is_local are mutually exclusive on the host, so the
+  // (Causal && LocalMask) corner is skipped rather than compiled dead.
+  if (params.return_softmax_lse) {
+    TORCH_CHECK(!use_sink, "return_softmax_lse is not supported with sink masking");
+    // The relative-attention (rel_bias) kernels are only instantiated with
+    // /*LSE=*/false, and they use their own tile shapes; fall through here would
+    // silently drop the bias, so reject the combination instead.
+    TORCH_CHECK(
+        params.rel_bias_ptr == nullptr, "return_softmax_lse is not supported with relative attention");
+    using Element = @ELEM_TYPE@;
+    if (params.is_causal) {
+      dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
+      FMHAConfig<
+          /*Causal=*/true,
+          /*LocalMask=*/false,
+          false,
+          Softcap,
+          /*LSE=*/true,
+          TileShapeQK,
+          TileShapePV,
+          TileShapeOutput,
+          SubgroupLayoutQK,
+          void,
+          /*HasRelBias=*/false,
+          2,
+          false,
+          Element,
+          Element,
+          Element,
+          Element>::run_paged(params);
+      });
+    } else {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+        dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
+        FMHAConfig<
+            /*Causal=*/false,
+            LocalMask,
+            false,
+            Softcap,
+            /*LSE=*/true,
+            TileShapeQK,
+            TileShapePV,
+            TileShapeOutput,
+            SubgroupLayoutQK,
+            void,
+            /*HasRelBias=*/false,
+            2,
+            false,
+            Element,
+            Element,
+            Element,
+            Element>::run_paged(params);
+        });
+      });
+    }
+    return;
+  }
+
+#if @HEAD_DIM@ == 64
+  AT_DISPATCH_BOOL_NO_RETURN(use_sink, Sink, {
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+
+          using Element = @ELEM_TYPE@;
+          dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+      constexpr bool Softcap = decltype(softcap_tag)::value;
+          FMHAConfig<
+              Causal,
+              LocalMask,
+              Sink,
+              Softcap,
+              /*LSE=*/false,
+              TileShapeQK,
+              TileShapePV,
+              TileShapeOutput,
+              SubgroupLayoutQK,
+              void,
+              false,
+              2,
+              false,
+              Element,
+              Element,
+              Element,
+                Element>::run_paged(params);
+          });
+      });
+    });
+  });
+#else
+  TORCH_CHECK(
+      !use_sink,
+      "sink is only supported for head_size == 64, got @HEAD_DIM@");
+#if @HEAD_DIM@ == 128
+  if (params.rel_bias_ptr != nullptr) {
+    TORCH_CHECK(params.dv == 128, "relative attention requires head_dim_v == 128");
+    TORCH_CHECK(!params.is_e4m3 && !params.is_e5m2, "relative attention does not support fp8 KV cache");
+    TORCH_CHECK(
+        params.rel_bias_head_stride == prefill::rel_bias_padded_cols(params.rel_bias_extent),
+        "relative attention expects a sheared bias with ",
+        prefill::rel_bias_padded_cols(params.rel_bias_extent),
+        " columns");
+    using RelTileShapeQK = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<prefill::kRelBiasKTile>, cute::_32>;
+    using RelTileShapePV = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::_32, cute::Int<32>>;
+    using RelTileShapeOutput = cute::Shape<cute::Int<prefill::kRelBiasQTile>, cute::Int<128>>;
+    using RelSubgroupLayoutQK =
+        cute::Layout<cute::Shape<cute::Int<16>, cute::_1, cute::_1>, cute::Stride<cute::_1, cute::_1, cute::_1>>;
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+      AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+        using Element = @ELEM_TYPE@;
+        // softcap+rel_bias is host-rejected (runner TORCH_CHECK); Softcap=false only.
+        constexpr bool Softcap = false;
+        FMHAConfig<
+            Causal,
+            LocalMask,
+            false,
+            Softcap,
+            /*LSE=*/false,
+            RelTileShapeQK,
+            RelTileShapePV,
+            RelTileShapeOutput,
+            RelSubgroupLayoutQK,
+            void,
+            true,
+            2,
+            false,
+            Element,
+            Element,
+            Element,
+            Element>::run_paged(params);
+      });
+    });
+    return;
+  }
+#else
+  TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention is only compiled for head_dim == 128");
+#endif
+  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+    AT_DISPATCH_BOOL_NO_RETURN(params.is_causal, Causal, {
+      using Element = @ELEM_TYPE@;
+      dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
+        constexpr bool Softcap = decltype(softcap_tag)::value;
+        if constexpr (Causal || LocalMask) {
+          // bidirectional_block_ids requires is_causal=false and no sliding
+          // window, so the causal/local paths never carry the mask; skip those
+          // instantiations (host-side checks enforce the precondition).
+          FMHAConfig<
+              Causal,
+              LocalMask,
+              false,
+              Softcap,
+              /*LSE=*/false,
+              TileShapeQK,
+              TileShapePV,
+              TileShapeOutput,
+              SubgroupLayoutQK,
+              void,
+              false,
+              2,
+              false,
+              Element,
+              Element,
+              Element,
+              Element,
+              /*HasBidirectionalBlock=*/false>::run_paged(params);
+        } else {
+          AT_DISPATCH_BOOL_NO_RETURN(params.block_id_ptr != nullptr, HasBidirectionalBlock, {
+            FMHAConfig<
+                Causal,
+                LocalMask,
+                false,
+                Softcap,
+                /*LSE=*/false,
+                TileShapeQK,
+                TileShapePV,
+                TileShapeOutput,
+                SubgroupLayoutQK,
+                void,
+                false,
+                2,
+                false,
+                Element,
+                Element,
+                Element,
+                Element,
+                HasBidirectionalBlock>::run_paged(params);
+          });
+        }
+      });
+    });
+  });
+#endif
+}
+
+template struct FmhaPrefillRunner<@HEAD_DIM@, @ELEM_TYPE@>;
+
+}  // namespace prefill
+
+#ifdef SGL_FMHA_JIT_ENTRY
+extern "C" __attribute__((visibility("default"))) void sgl_fmha_entry(const void* params) {
+  prefill::FmhaPrefillRunner<@HEAD_DIM@, @ELEM_TYPE@>{}(
+      *static_cast<const prefill::Arguments*>(params));
+}
+#endif

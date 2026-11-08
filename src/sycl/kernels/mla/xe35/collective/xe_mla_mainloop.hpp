@@ -210,7 +210,7 @@ struct XeMlaMainloop<
 
   // Get physical block index and intra-page tile index for paged KV cache
   CUTLASS_DEVICE
-  cute::tuple<int, int> get_physical_k_tile(int K, int seq_len_kv_cache, int batch_coord) {
+  cute::tuple<int, int> get_physical_k_tile(int K, [[maybe_unused]] int seq_len_kv_cache, int batch_coord) {
     int kv_start_coord = K * get<1>(TileShapeQK{});
     int logical_page_idx = kv_start_coord / params.page_size;
     int intra_page_tile_idx = (kv_start_coord % params.page_size) / get<1>(TileShapeQK{});

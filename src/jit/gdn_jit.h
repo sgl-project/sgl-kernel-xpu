@@ -25,6 +25,7 @@ bool chunk_launch(
     void* A,
     void* w,
     void* u,
+    void* total_chunks,
     const void* b,
     const void* a,
     const void* A_log,

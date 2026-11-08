@@ -117,7 +117,7 @@ struct LoraPermuteRows : public __SYCL_KER_CONFIG_CONVENTION__ {
     }
   }
 
-  void sycl_ker_config_convention(sycl::handler& cgh) const {}
+  void sycl_ker_config_convention([[maybe_unused]] sycl::handler& cgh) const {}
 };
 
 //----------------- Kernel launch --------------------//

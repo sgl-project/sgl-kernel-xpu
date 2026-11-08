@@ -1,5 +1,6 @@
 import functools
 
+import pytest
 import torch
 
 FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
@@ -34,6 +35,14 @@ def is_xe3_device() -> bool:
     from sgl_kernel.utils import is_xe3_arch
 
     return is_xe3_arch()
+
+
+# Marks tests whose shapes are large enough to risk OOM on smaller-memory
+# devices; they only run on CRI (Xe3). Keep small shapes in the regular tests so
+# they run on every device.
+cri_only_large_shapes = pytest.mark.skipif(
+    not is_xe3_device(), reason="large shapes only run on CRI (Xe3)"
+)
 
 
 def get_reference_device():

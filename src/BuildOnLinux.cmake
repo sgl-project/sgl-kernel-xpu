@@ -17,7 +17,7 @@ endif()
 
 # Runtime-JIT engine (pure host C++, depends only on libdl). Linked into the
 # SYCL libraries whose dispatch renders/compiles the *.cpp.in templates on
-# demand (flash_attention for FMHA, GroupGemmXe20 for MoE grouped GEMM).
+# demand (flash_attentionXe20 for FMHA, GroupGemmXe20 for MoE grouped GEMM).
 if(USE_SYCL_JIT)
   add_library(sgl_jit STATIC
     ${SGL_OPS_XPU_ROOT}/src/jit/sycl_template_jit.cpp
@@ -27,6 +27,8 @@ if(USE_SYCL_JIT)
     ${SGL_OPS_XPU_ROOT}/src/jit/mla_jit.cpp
     ${SGL_OPS_XPU_ROOT}/src/jit/gdn_jit.cpp)
   set_target_properties(sgl_jit PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  # Pure host C++, so it misses SYCL_HOST_FLAGS; apply the hardening set directly.
+  target_compile_options(sgl_jit PRIVATE ${SGL_SDL_WARNING_FLAGS} ${SGL_SDL_HARDENING_FLAGS})
   target_include_directories(sgl_jit PUBLIC ${SGL_OPS_XPU_ROOT}/src)
   # Feed the runtime-JIT compile the exact AOT flags: host flags (-fPIC,
   # -std=c++20, visibility, warnings) + kernel compile options + shared
@@ -36,9 +38,26 @@ if(USE_SYCL_JIT)
   # globally via add_compile_definitions (not part of SYCL_COMPILE_FLAGS) and
   # without it cutlass-sycl headers take the CUDA path and fail on
   # <cuda_runtime_api.h>. default_sycl_flags() drops the -fsycl-targets token so
-  # the per-arch JIT target wins.
+  # the per-arch JIT target wins. SGL_SDL_LINK_FLAGS is included because this is
+  # a single-shot compile *and* link, so the .so it emits needs the same NX /
+  # full-RELRO hardening as its AOT sibling.
+  #
+  # The AOT build hands SYCL_HOST_FLAGS to the host compiler only
+  # (-fsycl-host-compiler-options), but this single-shot compile applies every
+  # flag to the device pass too. -D_FORTIFY_SOURCE turns glibc memcpy/memset into
+  # __memcpy_chk/... calls that have no device definition, so the kernel .so
+  # builds but fails at program load with "Unresolved Symbol <__memcpy_chk>".
+  # Scope it to the host pass with -Xarch_host to keep parity with AOT.
+  set(_sgl_jit_host_flags)
+  foreach(_flag ${SYCL_HOST_FLAGS})
+    if(_flag MATCHES "^-D_FORTIFY_SOURCE")
+      list(APPEND _sgl_jit_host_flags -Xarch_host ${_flag})
+    else()
+      list(APPEND _sgl_jit_host_flags ${_flag})
+    endif()
+  endforeach()
   string(REPLACE ";" " " SGL_JIT_SYCL_FLAGS_VALUE
-    "-shared;${SYCL_HOST_FLAGS};${SYCL_COMPILE_FLAGS};${COMMON_DEVICE_LINK_FLAGS};-DCUTLASS_ENABLE_SYCL")
+    "-shared;${_sgl_jit_host_flags};${SYCL_COMPILE_FLAGS};${COMMON_DEVICE_LINK_FLAGS};${SGL_SDL_LINK_FLAGS};-DCUTLASS_ENABLE_SYCL")
   # AOT feeds the IGC/ocloc backend the -cl-* codegen options via `-Xs` at the
   # device-link step (SYCL_OFFLINE_COMPILER_CG_OPTIONS). The single-shot JIT must
   # pass the same options (e.g. correctly-rounded fp32 div/sqrt, >4GB buffers,
@@ -100,9 +119,8 @@ if(USE_GDN
 endif()
 
 # Dispatchers that call the runtime-JIT engine link the static JIT library.
-if(USE_FMHA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-flash_attention)
-  target_link_libraries(sgl-ops-sycl-flash_attention PRIVATE sgl_jit)
-endif()
+# (flash_attentionXe20 is an xe20 source; its JIT link lives in the xe20 block
+# below, after the target is created.)
 if(USE_MLA AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-mla_decode)
   target_link_libraries(sgl-ops-sycl-mla_decode PRIVATE sgl_jit)
 endif()
@@ -231,6 +249,18 @@ foreach(sycl_src ${ATen_XPU_SYCL_XE20})
   )
 endforeach()
 
+# The FMHA decode/prefill dispatch in flash_attentionXe20.cpp calls the runtime-JIT
+# engine. This must come after the xe20 loop above: `if(TARGET ...)` is evaluated
+# in order, so a check placed before the target exists is silently false and the
+# .so ships with undefined sgl::fmha_jit::* symbols (`import sgl_kernel` fails).
+if(USE_FMHA AND USE_SYCL_JIT)
+  if(NOT TARGET sgl-ops-sycl-flash_attentionXe20)
+    message(FATAL_ERROR
+        "USE_FMHA=ON and USE_SYCL_JIT=ON but target "
+        "sgl-ops-sycl-flash_attentionXe20 was not created; cannot link sgl_jit")
+  endif()
+  target_link_libraries(sgl-ops-sycl-flash_attentionXe20 PRIVATE sgl_jit)
+endif()
 # The bf16 grouped GEMM dispatch in GroupGemmXe20.cpp calls the runtime-JIT engine.
 if(USE_MOE AND USE_SYCL_JIT AND TARGET sgl-ops-sycl-GroupGemmXe20)
   target_link_libraries(sgl-ops-sycl-GroupGemmXe20 PRIVATE sgl_jit)
@@ -294,14 +324,16 @@ foreach(lib ${SGL_OPS_LIBRARIES})
   target_compile_options_if_supported(${lib} "-Wno-deprecated-copy")
   target_compile_options(${lib} PRIVATE ${TORCH_XPU_OPS_FLAGS})
 
-  target_include_directories(${lib} PUBLIC ${TORCH_XPU_OPS_INCLUDE_DIRS})
-  target_include_directories(${lib} PUBLIC ${ATen_XPU_INCLUDE_DIRS})
-  target_include_directories(${lib} PUBLIC ${SYCL_INCLUDE_DIR})
-  target_include_directories(${lib} PRIVATE ${Python3_INCLUDE_DIRS})
+  target_include_directories(${lib} SYSTEM PUBLIC ${TORCH_XPU_OPS_INCLUDE_DIRS})
+  target_include_directories(${lib} SYSTEM PUBLIC ${ATen_XPU_INCLUDE_DIRS})
+  target_include_directories(${lib} SYSTEM PUBLIC ${SYCL_INCLUDE_DIR})
+  target_include_directories(${lib} SYSTEM PRIVATE ${Python3_INCLUDE_DIRS})
   target_link_libraries(${lib} PRIVATE ${Python3_LIBRARIES})
 
-  target_include_directories(${lib} PRIVATE ${TORCH_INCLUDE_DIRS})
+  target_include_directories(${lib} SYSTEM PRIVATE ${TORCH_INCLUDE_DIRS})
   target_link_libraries(${lib} PRIVATE ${TORCH_LIBRARIES} c10 torch torch_cpu ${SYCL_LIBRARY})
 
   target_link_libraries(${lib} PUBLIC ${SYCL_LIBRARY})
+
+  target_link_options(${lib} PRIVATE ${SGL_SDL_LINK_FLAGS})
 endforeach()

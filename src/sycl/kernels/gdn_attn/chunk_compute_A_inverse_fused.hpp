@@ -32,7 +32,7 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
     const int num_k_heads,
     const int head_k_dim,
     const int num_v_heads,
-    const int head_v_dim) {
+    [[maybe_unused]] const int head_v_dim) {
   auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
   int local_id = item.get_local_linear_id();
   int local_range = item.get_local_range(2);
@@ -234,7 +234,7 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
 
     auto A_31_tensor =
         make_tensor(make_gmem_ptr(A_ptr_31), make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
-    auto A_31_tensor_T =
+    [[maybe_unused]] auto A_31_tensor_T =
         make_tensor(make_gmem_ptr(A_ptr_31), make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
     auto A_32_tensor =
         make_tensor(make_gmem_ptr(A_ptr_32), make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
@@ -247,11 +247,11 @@ CUTE_DEVICE void chunk_compute_A_inverse_fused_kernel(
 
     auto A_41_tensor =
         make_tensor(make_gmem_ptr(A_ptr_41), make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
-    auto A_41_tensor_T =
+    [[maybe_unused]] auto A_41_tensor_T =
         make_tensor(make_gmem_ptr(A_ptr_41), make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
     auto A_42_tensor =
         make_tensor(make_gmem_ptr(A_ptr_42), make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));
-    auto A_42_tensor_T =
+    [[maybe_unused]] auto A_42_tensor_T =
         make_tensor(make_gmem_ptr(A_ptr_42), make_layout(A_XX_tensor_shape, make_stride(_1{}, chunk_size)));
     auto A_43_tensor =
         make_tensor(make_gmem_ptr(A_ptr_43), make_layout(A_XX_tensor_shape, make_stride(chunk_size, _1{})));

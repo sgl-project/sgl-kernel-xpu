@@ -59,7 +59,7 @@ struct gelu_erf_mul_dpcpp_functor {
 template <typename scalar_t, typename func_t, int N>
 struct op_and_mul_functor {
   void operator()(sycl::nd_item<1> item) const {
-    using accscalar_t = at::opmath_type<scalar_t>;
+    using accscalar_t [[maybe_unused]] = at::opmath_type<scalar_t>;
     int64_t offset = item.get_local_linear_id();
     int64_t step = item.get_local_range(0);
     int64_t token_id = item.get_group(0);
@@ -70,7 +70,7 @@ struct op_and_mul_functor {
       auto mul_val = reinterpret_cast<aligned_vector_loop<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i + bound];
 #pragma unroll
       for (int i = 0; i < N; ++i) {
-        auto a = unary_val[i], b = mul_val[i];
+        [[maybe_unused]] auto a = unary_val[i], b = mul_val[i];
         unary_val[i] = fn(unary_val[i], mul_val[i]);
       }
       reinterpret_cast<aligned_vector_loop<scalar_t, N>*>(output_ptr)[token_id * bound + i] = unary_val;
@@ -93,7 +93,7 @@ struct op_and_mul_functor {
 
 template <typename T = float>
 void get_config(
-    const at::Tensor& input,
+    [[maybe_unused]] const at::Tensor& input,
     const at::Tensor& out,
     int64_t& numel,
     int64_t& dim,

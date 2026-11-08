@@ -1202,6 +1202,13 @@ void topk_transform(
     int64_t page_size,
     std::optional<at::Tensor> out_raw_indices_opt);
 
+at::Tensor topk_among_blocks(
+    const at::Tensor& scores,
+    const at::Tensor& lengths,
+    const at::Tensor& blocks,
+    int64_t topk,
+    int64_t block_size);
+
 void topk_transform_paged(
     const at::Tensor& scores,
     const at::Tensor& seq_lens,

@@ -1,10 +1,12 @@
 #include <ATen/ATen.h>
+#include <c10/core/DeviceGuard.h>
 #include <c10/xpu/XPUStream.h>
 #include <torch/all.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <sycl/sycl.hpp>
 
@@ -624,6 +626,96 @@ struct TopKTransformPagedKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 };
 
+struct TopKAmongBlocksKernel {
+  const float* scores;
+  const int64_t* lengths;
+  const int64_t* blocks;
+  int64_t* output;
+  int64_t score_row_stride;
+  int64_t score_col_stride;
+  int64_t width;
+  int block_count;
+  int block_size;
+  int topk;
+
+  bool candidate(int64_t row, int index, int64_t& position, uint32_t& key) const {
+    const int64_t block = blocks[row * block_count + index / block_size];
+    if (block < 0 || block > (width - 1) / block_size) return false;
+    position = block * block_size + index % block_size;
+    if (position >= width || position >= lengths[row]) return false;
+    const float score = scores[row * score_row_stride + position * score_col_stride];
+    if (score == -std::numeric_limits<float>::infinity()) return false;
+    key = sycl::isnan(score) ? 0xffffffffu : convert_to_uint32(score);
+    return true;
+  }
+
+  [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
+    const int64_t row = item.get_group(0);
+    const int tid = item.get_local_id(0);
+    const int candidates = block_count * block_size;
+    auto group = item.get_group();
+    int32_t* hist = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2 * kHistStride]>(group);
+    int32_t* state = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[5]>(group);
+    if (tid == 0) {
+      state[0] = 0;
+      state[1] = topk;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    for (int round = 0; round < 4; ++round) {
+      if (tid < kRadix + 1) {
+        hist[tid] = 0;
+        hist[kHistStride + tid] = 0;
+      }
+      item.barrier(sycl::access::fence_space::local_space);
+      const uint32_t prefix = sycl::bit_cast<uint32_t>(state[0]);
+      for (int index = tid; index < candidates; index += kThreadsPerBlock) {
+        int64_t position;
+        uint32_t key;
+        if (candidate(row, index, position, key) && (round == 0 || (key >> (32 - round * 8)) == prefix)) {
+          LocalAtomic(hist[(key >> (24 - round * 8)) & 0xffu]).fetch_add(1);
+        }
+      }
+      item.barrier(sycl::access::fence_space::local_space);
+      run_cumsum(item, hist);
+      if (tid == 0) {
+        if (round == 0) {
+          state[1] = sycl::min(topk, hist[0]);
+          state[2] = state[1];
+        }
+        if (state[1] > 0) {
+          int bin = kRadix - 1;
+          while (bin > 0 && hist[bin] < state[1]) --bin;
+          state[0] = sycl::bit_cast<int32_t>((prefix << 8) | static_cast<uint32_t>(bin));
+          state[1] -= hist[bin + 1];
+        }
+      }
+      item.barrier(sycl::access::fence_space::local_space);
+      if (round == 0) {
+        for (int index = state[2] + tid; index < topk; index += kThreadsPerBlock) output[row * topk + index] = -1;
+        if (state[2] == 0) return;
+      }
+    }
+    if (tid == 0) state[3] = state[4] = 0;
+    item.barrier(sycl::access::fence_space::local_space);
+    const uint32_t threshold = sycl::bit_cast<uint32_t>(state[0]);
+    const int iterations = (candidates + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+      const int index = iteration * kThreadsPerBlock + tid;
+      int64_t position = 0;
+      uint32_t key = 0;
+      const bool valid = index < candidates && candidate(row, index, position, key);
+      const int greater = valid && key > threshold;
+      const int equal = valid && key == threshold;
+      const int greater_pos = wg_reserve(item, state[3], greater);
+      const int equal_pos = wg_reserve(item, state[4], equal);
+      if (greater || (equal && equal_pos < state[1])) {
+        const int output_index = greater ? greater_pos : state[2] - state[1] + equal_pos;
+        output[row * topk + output_index] = position;
+      }
+    }
+  }
+};
+
 struct TopKTransformRaggedKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   const float* score;
   const int32_t* seq_lens;
@@ -891,6 +983,50 @@ SGL_KERNEL_EXPORT void topk_transform(
       static_cast<double>(out_page_indices.numel()) * static_cast<double>(out_page_indices.element_size());
   ::sglkernel::report_kernel_perf("topk_transform", profiling_queue, timer, bytes, flops);
 #endif
+}
+
+SGL_KERNEL_EXPORT at::Tensor topk_among_blocks(
+  const at::Tensor& scores,
+  const at::Tensor& lengths,
+  const at::Tensor& blocks,
+  int64_t topk,
+  int64_t block_size) {
+  CHECK_DEVICE(scores);
+  CHECK_DEVICE(lengths);
+  CHECK_DEVICE(blocks);
+  TORCH_CHECK(scores.device() == lengths.device() && scores.device() == blocks.device(), "inputs must share a device");
+  TORCH_CHECK(scores.dim() == 2 && scores.scalar_type() == at::kFloat, "scores must be float32 [rows, width]");
+  TORCH_CHECK(lengths.dim() == 1 && lengths.size(0) == scores.size(0) && lengths.is_contiguous() &&
+          lengths.scalar_type() == at::kLong,
+        "lengths must be contiguous int64 [rows]");
+  TORCH_CHECK(blocks.dim() == 2 && blocks.size(0) == scores.size(0) && blocks.is_contiguous() &&
+          blocks.scalar_type() == at::kLong,
+        "blocks must be contiguous int64 [rows, block_count]");
+  TORCH_CHECK(topk >= 0 && topk <= std::numeric_limits<int>::max(), "invalid topk");
+  TORCH_CHECK(block_size > 0 && block_size <= std::numeric_limits<int>::max(), "invalid block_size");
+  TORCH_CHECK(blocks.size(1) <= std::numeric_limits<int>::max() / block_size, "too many candidate positions");
+  const c10::DeviceGuard guard(scores.device());
+  auto output = at::empty({scores.size(0), topk}, scores.options().dtype(at::kLong));
+  if (scores.size(0) == 0 || topk == 0) return output;
+  if (scores.size(1) == 0 || blocks.size(1) == 0) return output.fill_(-1);
+  TopKAmongBlocksKernel kernel{
+    scores.data_ptr<float>(),
+    lengths.data_ptr<int64_t>(),
+    blocks.data_ptr<int64_t>(),
+    output.data_ptr<int64_t>(),
+    scores.stride(0),
+    scores.stride(1),
+    scores.size(1),
+    static_cast<int>(blocks.size(1)),
+    static_cast<int>(block_size),
+    static_cast<int>(topk)};
+  auto& queue = c10::xpu::getCurrentXPUStream().queue();
+  sycl_kernel_submit(
+    sycl::range<1>(static_cast<size_t>(scores.size(0)) * kThreadsPerBlock),
+    sycl::range<1>(kThreadsPerBlock),
+    queue,
+    kernel);
+  return output;
 }
 
 SGL_KERNEL_EXPORT void topk_transform_paged(

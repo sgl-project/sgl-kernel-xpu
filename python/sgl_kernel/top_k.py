@@ -101,6 +101,24 @@ def topk_transform(
     )
 
 
+def topk_among_blocks(
+    scores: torch.Tensor,
+    lengths: torch.Tensor,
+    blocks: torch.Tensor,
+    topk: int,
+    block_size: int,
+) -> torch.Tensor:
+    if scores.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise TypeError("scores must be float32, float16, or bfloat16")
+    return torch.ops.sgl_kernel.topk_among_blocks(
+        scores.float(),
+        lengths.to(torch.int64).contiguous(),
+        blocks.to(torch.int64).contiguous(),
+        topk,
+        block_size,
+    )
+
+
 def topk_transform_paged(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,

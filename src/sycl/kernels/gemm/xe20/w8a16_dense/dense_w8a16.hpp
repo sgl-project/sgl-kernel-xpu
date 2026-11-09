@@ -386,7 +386,7 @@ run(sycl::queue& q,
   // while M*N <= 256*512 (the prefill tile loop cannot fill the device for small N).
   const bool use_dec = M <= 64 || (M <= 128 && N <= 2048) || (long)M * N <= 131072L;
   if (use_dec) {
-    // tuned on B65 (side harness, TP=2/TP=4 shapes): BN=16 (more WGs/streams), BK=64
+    // Measured on B65 with the Qwen3.6-35B-A3B TP=2/TP=4 shapes: BN=16 (more WGs/streams), BK=64
     // (full 64-B cache-line rows per block-2D load), ~320 SGs per launch.
 #define DW8_DEC(MT_, BN_, BK_)                   \
   {                                              \
@@ -402,7 +402,7 @@ run(sycl::queue& q,
     else if (M <= 32)
       DW8_DEC(32, 16, 32)
     else if (blk)
-      DW8_DEC(32, 16, 32)  // block MT=64 needs a second 64-row accumulator (IGC retry); use 2 M tiles of 32
+      DW8_DEC(32, 16, 32)  // block MT=64 would need a second 64-row accumulator (register spill); use 2 M tiles of 32
     else
       launch_decode<64, 16, 32, false>(q, p);
 #undef DW8_DEC

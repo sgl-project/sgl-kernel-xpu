@@ -785,10 +785,8 @@ SGL_KERNEL_EXPORT void causal_conv1d_fwd(
   timer.start();
 #endif
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "causal_conv1d_fwd", [&]() {
-        launch_causal_conv1d_fwd<scalar_t>(params, block_t, time_blocks);
-      });
+  AT_DISPATCH_FLOATING_TYPES_V2(
+      input_type, "causal_conv1d_fwd", [&]() { launch_causal_conv1d_fwd<scalar_t>(params, block_t, time_blocks); });
   // Honor the in-place contract; no-op if `out` already aliases `x`.
   if (needs_tiling_fix) {
     x.copy_(out);
@@ -875,23 +873,22 @@ SGL_KERNEL_EXPORT void causal_conv1d_update(
   if (seqlen == 1 && !cache_seqlens_.has_value() && conv_state_len == width - 1) {
     // Token-parallel design: faster via vectorized loads/stores.
     auto queue = c10::xpu::getCurrentXPUStream().queue();
-    AT_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "causal_conv1d_update", [&]() {
-          launch_causal_conv1d_update_token_parallel<scalar_t>(
-              queue,
-              out,
-              x,
-              weight,
-              bias_,
-              conv_state,
-              conv_state_indices_,
-              silu_activation,
-              pad_slot_id,
-              batch_size,
-              dim,
-              conv_state_len,
-              width);
-        });
+    AT_DISPATCH_FLOATING_TYPES_V2(input_type, "causal_conv1d_update", [&]() {
+      launch_causal_conv1d_update_token_parallel<scalar_t>(
+          queue,
+          out,
+          x,
+          weight,
+          bias_,
+          conv_state,
+          conv_state_indices_,
+          silu_activation,
+          pad_slot_id,
+          batch_size,
+          dim,
+          conv_state_len,
+          width);
+    });
     return;
   }
 
@@ -912,10 +909,8 @@ SGL_KERNEL_EXPORT void causal_conv1d_update(
   timer.start();
 #endif
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "causal_conv1d_update", [&]() {
-        launch_causal_conv1d_update<scalar_t>(params);
-      });
+  AT_DISPATCH_FLOATING_TYPES_V2(
+      input_type, "causal_conv1d_update", [&]() { launch_causal_conv1d_update<scalar_t>(params); });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const double flops = 2.0 * static_cast<double>(batch_size) * static_cast<double>(seqlen) * static_cast<double>(dim) *
@@ -1177,26 +1172,25 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
     }
   }
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_type, "causal_conv1d_update_verify", [&]() {
-        launch_causal_conv1d_update_verify<scalar_t>(
-            queue,
-            out,
-            x,
-            weight,
-            bias_,
-            conv_state,
-            intermediate_conv_window,
-            intermediate_state_indices,
-            cache_indices_,
-            parent_idx,
-            silu_activation,
-            pad_slot_id,
-            batch_size,
-            dim,
-            cache_steps,
-            width);
-      });
+  AT_DISPATCH_FLOATING_TYPES_V2(input_type, "causal_conv1d_update_verify", [&]() {
+    launch_causal_conv1d_update_verify<scalar_t>(
+        queue,
+        out,
+        x,
+        weight,
+        bias_,
+        conv_state,
+        intermediate_conv_window,
+        intermediate_state_indices,
+        cache_indices_,
+        parent_idx,
+        silu_activation,
+        pad_slot_id,
+        batch_size,
+        dim,
+        cache_steps,
+        width);
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const double flops = 2.0 * static_cast<double>(batch_size) * static_cast<double>(cache_steps) *

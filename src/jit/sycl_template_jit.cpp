@@ -136,6 +136,7 @@ Caches& caches() {
 }  // namespace
 
 const std::string& default_sycl_target() {
+  // Environment settings are cached on first use; set them before process startup.
   static const std::string target = [] {
     // Default AOT target is Battlemage (Xe20). Override with
     // SGLANG_SYCL_AOT_TARGETS (same knob as the Python JIT path); e.g. "spir64"
@@ -419,6 +420,7 @@ void* get_or_compile(const CompileSpec& spec, const JitConfig& config, std::stri
 }
 
 const JitConfig& default_config() {
+  // Environment settings are cached on first use; set them before process startup.
   static JitConfig cfg = [] {
     JitConfig c;
 

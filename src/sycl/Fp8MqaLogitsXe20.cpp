@@ -295,6 +295,7 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
     // Chunk over the batch dimension so peak temporary memory is bounded by a
     // fixed budget, mirroring the batch-slicing done for the FMHA prefill score workspace.
     constexpr int64_t kDefaultChunkBudgetBytes = 512LL * 1024 * 1024;  // 512 MiB
+    // Environment settings are cached on first use; set them before process startup.
     static const int64_t chunk_budget_bytes = [] {
       if (const char* env = std::getenv("SGL_KERNEL_FP8_PAGED_MQA_CHUNK_MB")) {
         int64_t mb = std::atoll(env);
@@ -308,7 +309,9 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_paged_mqa_logits(
                               static_cast<int64_t>(msl) * sizeof(float);
     int chunk_b = static_cast<int>(std::max<int64_t>(1, chunk_budget_bytes / std::max<int64_t>(per_batch_bytes, 1)));
     chunk_b = std::min(chunk_b, B);
-    if (std::getenv("SGL_KERNEL_FP8_PAGED_MQA_VERBOSE") != nullptr) {
+    // Environment settings are cached on first use; set them before process startup.
+    static const bool verbose = std::getenv("SGL_KERNEL_FP8_PAGED_MQA_VERBOSE") != nullptr;
+    if (verbose) {
       TORCH_WARN_ONCE(
           "fp8_paged_mqa_logits: B=",
           B,

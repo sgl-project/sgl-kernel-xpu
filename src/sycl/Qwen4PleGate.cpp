@@ -132,7 +132,7 @@ void launch(const Kernel& kernel, int64_t rows, int64_t hidden) {
 void check_bf16_xpu(const torch::Tensor& t, const char* name) {
   CHECK_INPUT(t);
   TORCH_CHECK(t.scalar_type() == at::kBFloat16, name, " must be bfloat16, got ", t.scalar_type());
-  TORCH_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % ALIGN_BYTES == 0, name, " must be 16-byte aligned");
+  CHECK_ALIGNMENT(ALIGN_BYTES, t);
 }
 
 }  // namespace

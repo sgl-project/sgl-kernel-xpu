@@ -1144,9 +1144,9 @@ SGL_KERNEL_EXPORT void grouped_gemma_rmsnorm(
   TORCH_CHECK(
       weight.device() == input.device() && output.device() == input.device(),
       "input, weight and output must be on the same device");
-  for (const auto* t : {&input, &weight, &output}) {
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0, "tensors must be 16-byte aligned");
-  }
+  CHECK_ALIGNMENT(16, input);
+  CHECK_ALIGNMENT(16, weight);
+  CHECK_ALIGNMENT(16, output);
 
   if (input.numel() == 0) {
     return;

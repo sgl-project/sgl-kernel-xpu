@@ -82,6 +82,38 @@ def test_fp8_linear(m, n, k, scale_kind):
     _check(fp8_linear(x, w_fp8, scale), x.float() @ w_dq.t())
 
 
+# Shapes that reach specific kernel paths (see dense_w8a16::run):
+#   M in (16, 32]: the M <= 32 decode tile, launch_decode<32, 16, 32>, non-block and block;
+#   N = 576 (N % 128 != 0): prefill tiles with a partial last N tile (64x128 at M = 1000,
+#     256x256 / 128x256 at M = 4096) and the block-scale row clamp; decode at small M;
+#   K = 2112 (K % 128 != 0, K % 64 == 0): per-tensor and per-channel scales.
+EDGE_CASES = (
+    [
+        (m, 2048, 2048, s)
+        for m in (17, 24, 32)
+        for s in ("per_tensor", "per_channel", "block")
+    ]
+    + [
+        (m, 576, 2048, s)
+        for m in (1, 16, 64, 1000, 4096)
+        for s in ("per_tensor", "per_channel", "block")
+    ]
+    + [
+        (m, 2048, 2112, s)
+        for m in (1, 16, 32, 64, 1000, 4096)
+        for s in ("per_tensor", "per_channel")
+    ]
+)
+
+
+@pytest.mark.arch("xe20")
+@pytest.mark.parametrize("m,n,k,scale_kind", EDGE_CASES)
+def test_fp8_linear_edge_shapes(m, n, k, scale_kind):
+    assert fp8_linear_supported(n, k, block_scale=scale_kind == "block")
+    x, w_fp8, scale, w_dq = _problem(m, n, k, scale_kind)
+    _check(fp8_linear(x, w_fp8, scale), x.float() @ w_dq.t())
+
+
 @pytest.mark.arch("xe20")
 @pytest.mark.parametrize("scale_kind", ["per_tensor", "per_channel", "block"])
 def test_fp8_linear_bias_and_out(scale_kind):

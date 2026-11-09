@@ -485,6 +485,80 @@ def test_attn_verify_vs_reference(nb, tokens, lc, dtype):
 
 
 @requires_mono
+@pytest.mark.parametrize("nb,tokens", VERIFY_SHAPES)
+@pytest.mark.parametrize("dtype", [F16, BF16])
+def test_draft_extend_step(nb, tokens, dtype):
+    """The MTP drafter's draft extend step: the prologue on requests x tokens
+    rows, then the drafter layer's verify kernel (zero residual; it writes the
+    drafter's K / V of every row and attends causally). The layer's rows are
+    checked against the reference one row at a time, fed the prologue's output."""
+    nreq = nb // tokens
+    gen = torch.Generator().manual_seed(500 + nb * 10 + tokens)
+    ps = 64
+    lc = [70 + 4100 * (b % 2) + 13 * b for b in range(nreq)]
+    npr = (max(lc) + tokens + ps - 1) // ps + 1
+    pt = (torch.randperm(nreq * npr, generator=gen).to(torch.int32) + 1).view(nreq, npr)
+    slot = torch.tensor(
+        [
+            int(pt[b, (lc[b] + i) // ps]) * ps + (lc[b] + i) % ps
+            for b in range(nreq)
+            for i in range(tokens)
+        ]
+    )
+    pos = torch.tensor([lc[b] + i for b in range(nreq) for i in range(tokens)])
+    t = attn_tensors(gen, DEVICE, dtype)
+    kc, vc = kv_caches(gen, DEVICE, (nreq * npr + 1) * ps, dtype)
+    kc_ref, vc_ref = kc.cpu(), vc.cpu()
+    fc = (torch.randn(2048, 4096, generator=gen) * 0.02).to(dtype).to(DEVICE)
+    ne = (torch.randn(2048, generator=gen) * 0.1).to(dtype).to(DEVICE)
+    nh = (torch.randn(2048, generator=gen) * 0.1).to(dtype).to(DEVICE)
+    e = torch.randn(nb, 2048, generator=gen).to(dtype).to(DEVICE)
+    hs = (torch.randn(nb, 2048, generator=gen) * 3).to(dtype).to(DEVICE)
+    pro, mb = next(_ids), mailbox(DEVICE)
+    _ops().mono_register_mtp(pro, addr(mb), addr(mb), [fc, ne, nh], 0)
+    layer, _mb = _register(True, t, [kc, vc], ps)
+    x = torch.empty_like(e)
+    assert _ops().mono_mtp_prologue(pro, e, hs, x)
+    ho, ro = torch.empty_like(x), torch.empty_like(x)
+    zeros = torch.zeros_like(x)
+    seq = torch.tensor([c + tokens for c in lc], dtype=torch.int32)
+    assert _ops().mono_decode_layer_verify(
+        layer,
+        tokens,
+        x,
+        zeros,
+        ho,
+        ro,
+        pos.to(DEVICE),
+        pt.to(DEVICE),
+        seq.to(DEVICE),
+        slot.to(DEVICE),
+    )
+    torch.xpu.synchronize()
+    tc, xc = cpu(t), x.cpu()
+    for b in range(nreq):
+        for i in range(tokens):
+            row = b * tokens + i
+            ref = ref_attn(
+                tc,
+                kc_ref,
+                vc_ref,
+                xc[row : row + 1],
+                torch.zeros_like(xc[row : row + 1]),
+                pt[b : b + 1],
+                torch.tensor([lc[b] + i + 1]),
+                slot[row : row + 1],
+                pos[row : row + 1],
+                ps,
+                dtype,
+                loopback_ar_fp16,
+            )
+            _compare(ho[row : row + 1], ro[row : row + 1], ref, 1)
+    _check(kc[slot].cpu(), kc_ref[slot], 0.9999, "new k rows")
+    _check(vc[slot].cpu(), vc_ref[slot], 0.9999, "new v rows")
+
+
+@requires_mono
 @pytest.mark.parametrize("dtype", [F16, BF16])
 @pytest.mark.parametrize("nb", [3, 6])
 def test_decode_3_and_6_rows(nb, dtype):

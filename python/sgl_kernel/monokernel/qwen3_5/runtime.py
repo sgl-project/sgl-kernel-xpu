@@ -208,8 +208,11 @@ class MonoQwen35MTP:
     """The built monokernels of the MTP drafter on this rank: a draft decode
     step (one token a request) runs the prologue kernel (the two Gemma norms
     and the fc), the draft decoder layer's attention kernel, then the model's
-    final norm and logits processor. The target's runtime owns the fail-stop
-    watch and the memory budget of the device."""
+    final norm and logits processor. The draft extend step (the target's
+    verified positions, tokens a request) runs the same prologue on all its rows
+    and the layer's verify kernel (it writes the drafter's K / V of every row and
+    attends causally). The target's runtime owns the fail-stop watch and the
+    memory budget of the device."""
 
     PROLOGUE, LAYER = 7100, 7101  # kernel ids (the target's are 7000 + layer)
 
@@ -246,6 +249,7 @@ class MonoQwen35MTP:
                 "XPU monokernel: a rank could not register the MTP drafter (see its log)"
             )
         self.bound = None
+        self.seen = set()  # the (mode, rows) steps this forward has run, logged once
         logger.info(
             "XPU monokernel: MTP drafter (prologue + attention layer), %s",
             model.fc.weight.dtype,
@@ -270,6 +274,15 @@ class MonoQwen35MTP:
         backend = get_attn_backend()
         self._bind(backend)
         rows = plan.key.rows
+        if (plan.key.forward_mode, rows) not in self.seen:  # captured or eager
+            self.seen.add((plan.key.forward_mode, rows))
+            logger.info(
+                "XPU monokernel: MTP drafter runs a %s step of %d rows (%d x %d)",
+                plan.key.forward_mode,
+                rows,
+                plan.key.batch_size,
+                plan.key.tokens_per_request,
+            )
         fmd = getattr(backend, "full_attn_backend", backend).forward_metadata
         lm = language_model(self.model)
         embed = lm.embed_tokens(input_ids[:rows])
@@ -280,17 +293,36 @@ class MonoQwen35MTP:
         )
         assert ok, f"no MTP prologue kernel for {rows} rows"
         out, res = torch.empty_like(x), torch.empty_like(x)
-        ops.mono_decode_layer(
-            self.LAYER,
-            x,
-            torch.zeros_like(x),
-            out,
-            res,
-            positions,
-            fmd.page_table,
-            fmd.cache_seqlens_int32,
-            forward_batch.out_cache_loc,
-        )
+        if plan.key.forward_mode == "draft_extend":
+            # seq_lens already counts the extend rows, as a verify step's do
+            ok = ops.mono_decode_layer_verify(
+                self.LAYER,
+                plan.key.tokens_per_request,
+                x,
+                torch.zeros_like(x),
+                out,
+                res,
+                positions,
+                fmd.page_table,
+                fmd.cache_seqlens_int32,
+                forward_batch.out_cache_loc,
+            )
+            assert ok, (
+                f"no verify kernel for {rows} rows x "
+                f"{plan.key.tokens_per_request} tokens (draft extend)"
+            )
+        else:
+            ops.mono_decode_layer(
+                self.LAYER,
+                x,
+                torch.zeros_like(x),
+                out,
+                res,
+                positions,
+                fmd.page_table,
+                fmd.cache_seqlens_int32,
+                forward_batch.out_cache_loc,
+            )
         hidden, _ = lm.norm(out, res)
         return self.model.logits_processor(
             input_ids, hidden, self.model.lm_head, forward_batch

@@ -40,7 +40,14 @@ cuda_path = f"/usr/local/cuda/targets/{SYSTEM_ARCH}-linux/lib/libcudart.so.12"
 if os.path.exists(cuda_path):
     ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)
 
-from sgl_kernel import common_ops
+# Multi-architecture wheels ship one backend per arch (_xe20/_xe35) and choose
+# at import time; single-architecture builds keep common_ops at the package root.
+try:
+    from sgl_kernel import common_ops
+except ImportError:
+    from sgl_kernel._arch import load_backend
+
+    common_ops = load_backend()
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     flash_mla_decode,

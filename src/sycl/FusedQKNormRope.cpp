@@ -664,7 +664,7 @@ struct FusedQKNormRopeCacheKernel {
   const scalar_t* q_weight_ptr;
   const scalar_t* k_weight_ptr;
   const cache_t* cos_sin_cache_ptr;  // [max_position, kRopeDim]
-  const IdType* positions;         // [num_tokens]
+  const IdType* positions;           // [num_tokens]
   int64_t rope_dim;
   int64_t rotary_lanes;
   int64_t half_rotary_lanes;
@@ -1982,7 +1982,9 @@ SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
   TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q and k must have the same dtype");
   TORCH_CHECK(q_weight.scalar_type() == q.scalar_type(), "q_weight dtype must match q dtype");
   TORCH_CHECK(k_weight.scalar_type() == k.scalar_type(), "k_weight dtype must match k dtype");
-  TORCH_CHECK(cos_sin_cache.scalar_type() == at::ScalarType::Float || cos_sin_cache.scalar_type() == at::ScalarType::BFloat16, "cos_sin_cache must be float32 or bfloat16");
+  TORCH_CHECK(
+      cos_sin_cache.scalar_type() == at::ScalarType::Float || cos_sin_cache.scalar_type() == at::ScalarType::BFloat16,
+      "cos_sin_cache must be float32 or bfloat16");
 
   CHECK_DEVICE(q);
   // Only the last dimension (head_dim) needs to be contiguous; q/k may be

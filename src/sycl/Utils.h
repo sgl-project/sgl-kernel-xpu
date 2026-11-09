@@ -4,6 +4,7 @@
 #include <ATen/xpu/XPUContext.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <iterator>
 #include <stdexcept>
 #include <type_traits>
@@ -19,6 +20,10 @@
 #define CHECK_LAST_DIM_CONTIGUOUS(x) \
   TORCH_CHECK((x).dim() > 0 && (x).stride(-1) == 1, #x " must be contiguous at last dimension")
 #define CHECK_DIM(d, x) TORCH_CHECK((x).dim() == (d), #x " must be a " #d "D tensor")
+
+// CHECK_ALIGNMENT(positive byte constant, tensor): checks the base pointer only.
+#define CHECK_ALIGNMENT(bytes, x) \
+  TORCH_CHECK(reinterpret_cast<std::uintptr_t>((x).data_ptr()) % (bytes) == 0, #x " must be ", (bytes), "-byte aligned")
 
 #define CHECK_DTYPE(dtype, x) \
   TORCH_CHECK((x).scalar_type() == (dtype), #x " must have dtype ", (dtype), ", got ", (x).scalar_type())
@@ -360,61 +365,45 @@ static inline int64_t dpcppLocalMemSize(DeviceId dev_id = dpcppGetDeviceIdOfCurr
 template <typename T>
 uint32_t dpcppPrefVectorWidth(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
   auto* dev_prop = at::xpu::getDeviceProperties(dev_id);
-  if (std::is_same<T, char>::value) {
+  if constexpr (std::is_same_v<T, char>) {
     return dev_prop->preferred_vector_width_char;
-  }
-  if (std::is_same<T, short>::value) {
+  } else if constexpr (std::is_same_v<T, short>) {
     return dev_prop->preferred_vector_width_short;
-  }
-  if (std::is_same<T, int>::value) {
+  } else if constexpr (std::is_same_v<T, int>) {
     return dev_prop->preferred_vector_width_int;
-  }
-  if (std::is_same<T, int64_t>::value) {
+  } else if constexpr (std::is_same_v<T, int64_t>) {
     return dev_prop->preferred_vector_width_long;
-  }
-  if (std::is_same<T, float>::value) {
+  } else if constexpr (std::is_same_v<T, float>) {
     return dev_prop->preferred_vector_width_float;
-  }
-  if (std::is_same<T, double>::value) {
+  } else if constexpr (std::is_same_v<T, double>) {
     return dev_prop->preferred_vector_width_double;
-  }
-  if (std::is_same<T, sycl::half>::value) {
+  } else if constexpr (std::is_same_v<T, sycl::half>) {
     return dev_prop->preferred_vector_width_half;
+  } else {
+    throw std::invalid_argument("Invalid data type to fetch preferred vector width!");
   }
-  throw std::invalid_argument("Invalid data type to fetch preferred vector width!");
 }
 
 template <typename T>
 uint32_t dpcppNativeVectorWidth(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
   auto* dev_prop = at::xpu::getDeviceProperties(dev_id);
-  if (std::is_same<T, char>::value) {
+  if constexpr (std::is_same_v<T, char>) {
     return dev_prop->native_vector_width_char;
-  }
-  if (std::is_same<T, short>::value) {
+  } else if constexpr (std::is_same_v<T, short>) {
     return dev_prop->native_vector_width_short;
-  }
-  if (std::is_same<T, int>::value) {
+  } else if constexpr (std::is_same_v<T, int>) {
     return dev_prop->native_vector_width_int;
-  }
-  if (std::is_same<T, int64_t>::value) {
+  } else if constexpr (std::is_same_v<T, int64_t>) {
     return dev_prop->native_vector_width_long;
-  }
-  if (std::is_same<T, float>::value) {
+  } else if constexpr (std::is_same_v<T, float>) {
     return dev_prop->native_vector_width_float;
-  }
-  if (std::is_same<T, double>::value) {
+  } else if constexpr (std::is_same_v<T, double>) {
     return dev_prop->native_vector_width_double;
-  }
-  if (std::is_same<T, sycl::half>::value) {
+  } else if constexpr (std::is_same_v<T, sycl::half>) {
     return dev_prop->native_vector_width_half;
+  } else {
+    throw std::invalid_argument("Invalid data type to fetch native vector width!");
   }
-  throw std::invalid_argument("Invalid data type to fetch native vector width!");
-}
-
-template <typename Func, typename... Args>
-int get_min(Func limit_func, int X, Args*... args) {
-  X = std::min({X, limit_func(X, args)...});
-  return X;
 }
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
@@ -430,20 +419,6 @@ inline T safe_recip(T x) {
   const T inv = sycl::native::recip(safe_d);
   return sycl::select(T(0), inv, nz);
 }
-
-inline int nextPowerOf2(uint32_t a) {
-  if (a <= 1) return 1;
-  return 1 << (32 - __builtin_clz(a - 1));
-};
-inline int round_up_headdim(int head_size) {
-  if (head_size <= 64) return 64;
-  if (head_size <= 96) return 96;
-  if (head_size <= 128) return 128;
-  if (head_size <= 192) return 192;
-  if (head_size <= 256) return 256;
-  if (head_size <= 512) return 512;
-  return 512;
-};
 
 template <typename scalar_t, int vec_size>
 struct alignas(sizeof(scalar_t) * vec_size) aligned_vec {

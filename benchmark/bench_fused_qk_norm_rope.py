@@ -422,12 +422,14 @@ def logical_cache_bytes_per_call(
 
 CACHE_CONFIGS = [
     (False, 3, 1, 4, 2, 64, 32, False, "bf16", "int32", "fp32"),
+    (False, 4, 1, 6, 2, 96, 96, False, "bf16", "int32", "fp32"),
     (False, 5, 1, 8, 4, 128, 64, True, "fp16", "int64", "fp32"),
     (True, 2, 4, 16, 4, 128, 128, False, "bf16", "int32", "fp32"),
     (True, 1, 8, 32, 8, 256, 128, True, "fp16", "int64", "fp32"),
     # bf16 cos_sin_cache coverage (fused_inplace_qknorm_rope-only feature):
     # one 3D, one 4D config.
     (False, 3, 1, 4, 2, 64, 32, False, "bf16", "int32", "bf16"),
+    (False, 4, 1, 6, 2, 96, 96, False, "bf16", "int32", "bf16"),
     (True, 2, 4, 16, 4, 128, 128, False, "bf16", "int32", "bf16"),
 ]
 

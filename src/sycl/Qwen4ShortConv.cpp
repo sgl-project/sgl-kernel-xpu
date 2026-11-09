@@ -353,10 +353,7 @@ SGL_KERNEL_EXPORT void qwen4_verify_conv(
 
   auto q = c10::xpu::getCurrentXPUStream().queue();
   const auto inter_dtype = has_intermediate ? intermediate->scalar_type() : at::kBFloat16;
-  TORCH_CHECK(
-      state.scalar_type() == at::kBFloat16 || state.scalar_type() == at::kFloat,
-      "state must be bfloat16 or float32, got ",
-      state.scalar_type());
+  CHECK_DTYPES(state, at::kBFloat16, at::kFloat);
   SGL_DISPATCH_BOOL2(state.scalar_type() == at::kBFloat16, STATE_BF16, inter_dtype == at::kBFloat16, INTER_BF16, [&] {
     using StateT = std::conditional_t<STATE_BF16, bf16, float>;
     using InterT = std::conditional_t<INTER_BF16, bf16, float>;

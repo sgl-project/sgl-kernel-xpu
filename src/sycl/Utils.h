@@ -46,10 +46,22 @@
   }()
 
 template <typename T>
-using sycl_type_t = std::conditional_t<
-    std::is_same_v<T, at::Half>,
-    sycl::half,
-    std::conditional_t<std::is_same_v<T, at::BFloat16>, sycl::ext::oneapi::bfloat16, T>>;
+struct sycl_type {
+  using type = T;
+};
+
+template <>
+struct sycl_type<at::Half> {
+  using type = sycl::half;
+};
+
+template <>
+struct sycl_type<at::BFloat16> {
+  using type = sycl::ext::oneapi::bfloat16;
+};
+
+template <typename T>
+using sycl_type_t = typename sycl_type<T>::type;
 
 #define SYCL_DISPATCH_BODY(...)                  \
   AT_WRAP([&] {                                  \

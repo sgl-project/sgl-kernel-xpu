@@ -33,6 +33,7 @@
 #include <torch/all.h>
 
 #include <cmath>
+#include <limits>
 #include <sycl/sycl.hpp>
 
 #include "SGLKernelPerf.h"
@@ -67,21 +68,6 @@ constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 // Use SYCL native vector type for efficient loading
 template <typename T, uint32_t N>
 using vec_t = sycl::vec<T, N>;
-
-template <typename T>
-struct DtypeInfo;
-
-template <>
-struct DtypeInfo<int8_t> {
-  static constexpr float MIN = -128;
-  static constexpr float MAX = 127;
-};
-
-template <>
-struct DtypeInfo<c10::Float8_e4m3fn> {
-  static constexpr float MIN = -448;
-  static constexpr float MAX = 448;
-};
 
 struct dim3 {
   int x, y, z;
@@ -126,7 +112,6 @@ struct MainKernel {
         num_tokens_per_expert(num_tokens_per_expert) {}
 
   using float2 = sycl::vec<float, 2>;
-  using dst_dtype_info = DtypeInfo<DST_DTYPE>;
   using scale_element_t = std::conditional_t<SCALE_UE8M0, uint8_t, float>;
   static_assert(sizeof(scale_packed_t) % sizeof(scale_element_t) == 0);
   using fp8x2_storage_t = uint16_t;
@@ -172,14 +157,15 @@ struct MainKernel {
 
   // Copied and modified from DeepEP
   inline void calculate_fp8_scales(float amax, float& scale, float& scale_inv) const {
-    constexpr float MAX_8BIT_INV = 1.0f / dst_dtype_info::MAX;
+    const float max_8bit = static_cast<float>(std::numeric_limits<DST_DTYPE>::max());
+    const float MAX_8BIT_INV = 1.0f / max_8bit;
     if constexpr (SCALE_UE8M0) {
       auto exp_scale_inv = fast_log2_ceil(amax * MAX_8BIT_INV);
       scale = fast_pow2(-exp_scale_inv);
       scale_inv = fast_pow2(exp_scale_inv);
     } else {
       scale_inv = amax * MAX_8BIT_INV;
-      scale = dst_dtype_info::MAX / amax;
+      scale = max_8bit / amax;
     }
   }
 
@@ -890,16 +876,16 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit_v2(
     constexpr uint32_t VEC_NUM_BYTES_SEL = use_fast ? VEC_NUM_BYTES_FAST : VEC_NUM_BYTES_DEFAULT;          \
     TORCH_CHECK(THREADS_PER_SUBWARP* VEC_NUM_BYTES_SEL == group_size * sizeof(T));                         \
                                                                                                            \
-    using dst_dtype_info = DtypeInfo<DST_DTYPE>;                                                           \
-    CHECK_EQ(dst_dtype_info::MIN, min_8bit);                                                               \
-    CHECK_EQ(dst_dtype_info::MAX, max_8bit);                                                               \
+    CHECK_EQ(static_cast<float>(std::numeric_limits<DST_DTYPE>::lowest()), min_8bit);                      \
+    CHECK_EQ(static_cast<float>(std::numeric_limits<DST_DTYPE>::max()), max_8bit);                         \
                                                                                                            \
     if (is_column_major) {                                                                                 \
       if (scale_ue8m0) {                                                                                   \
         if (fuse_silu_and_mul) {                                                                           \
-          if (masked_layout) {                                                                             \
+          SGL_DISPATCH_BOOL(masked_layout, MASKED_LAYOUT, [&] {                                            \
+            using Scheduler = std::conditional_t<MASKED_LAYOUT, MaskedLayoutScheduler, NaiveScheduler>;    \
             LAUNCH_KERNEL_INNER(                                                                           \
-                MaskedLayoutScheduler,                                                                     \
+                Scheduler,                                                                                 \
                 GROUP_SIZE,                                                                                \
                 THREADS_PER_SUBWARP,                                                                       \
                 T,                                                                                         \
@@ -911,21 +897,7 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit_v2(
                 uint32_t,                                                                                  \
                 SUB_GROUP_SIZE_SEL,                                                                        \
                 VEC_NUM_BYTES_SEL);                                                                        \
-          } else {                                                                                         \
-            LAUNCH_KERNEL_INNER(                                                                           \
-                NaiveScheduler,                                                                            \
-                GROUP_SIZE,                                                                                \
-                THREADS_PER_SUBWARP,                                                                       \
-                T,                                                                                         \
-                DST_DTYPE,                                                                                 \
-                uint32_t,                                                                                  \
-                true,                                                                                      \
-                true,                                                                                      \
-                true,                                                                                      \
-                uint32_t,                                                                                  \
-                SUB_GROUP_SIZE_SEL,                                                                        \
-                VEC_NUM_BYTES_SEL);                                                                        \
-          }                                                                                                \
+          });                                                                                              \
         } else {                                                                                           \
           LAUNCH_KERNEL_INNER(                                                                             \
               NaiveScheduler,                                                                              \
@@ -1011,16 +983,16 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit_v2(
   SYCL_DISPATCH_FLOATING_TYPES_V1(input.scalar_type(), "sgl_per_token_group_quant_8bit_v2", [&]() {
     if (dst_type == at::ScalarType::Char) {
       LAUNCH_KERNEL_OUTER(scalar_t, int8_t);
-      return true;
     } else if (dst_type == at::ScalarType::Float8_e4m3fn) {
       LAUNCH_KERNEL_OUTER(scalar_t, c10::Float8_e4m3fn);
-      return true;
+    } else {
+      TORCH_CHECK(false, "Unsupported output_q dtype: ", dst_type);
     }
-    return false;
   });
 
 #undef LAUNCH_KERNEL
 #undef LAUNCH_KERNEL_INNER
+#undef LAUNCH_KERNEL_OUTER
 }
 
 }  // namespace at::native::xpu

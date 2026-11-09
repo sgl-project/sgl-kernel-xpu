@@ -12,11 +12,13 @@
 //   [ceil(N/128), K/128]. Accumulation fp32 throughout.
 //
 // Kernel family (M-bucketed dispatch ladder):
-//   * DECODE (M <= 16): skinny DPAS GEMM. One work-group = one BN-column N tile x
+//   * DECODE (M <= 64; also M <= 128 when N <= 2048, and any M with M * N <= 131072):
+//     skinny DPAS GEMM, M tiles of MT = 8 / 16 / 32 / 64 rows (block scales: at most
+//     32, larger M runs several M tiles). One work-group = one BN-column N tile x
 //     all of K; its KS sub-groups split K (contiguous K ranges, whole 128-groups in
 //     block mode). Per sub-group: FP8 weight block [BN x BK] via a U8 block-2D load
 //     (prefetched DPF k-steps ahead), FP8 -> bf16 in registers (CuTe reorder),
-//     x block [MT x BK] (M padded to 8/16 by the 2D load's out-of-bounds zero fill),
+//     x block [MT x BK] (M padded to MT by the 2D load's out-of-bounds zero fill),
 //     XE_DPAS 8x16x16 bf16 -> fp32. The KS fp32 partial tiles are reduced in SLM
 //     (one barrier, fixed order -> deterministic, no atomics), then sub-group 0 applies
 //     scale/bias and stores bf16 with a block-2D store (rows >= M are clipped).

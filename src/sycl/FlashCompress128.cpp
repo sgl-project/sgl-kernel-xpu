@@ -312,8 +312,7 @@ SGL_KERNEL_EXPORT void flash_compress128_decode(
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "flash_compress128_decode", queue);
 #endif
 
   using input_t = float;
@@ -348,7 +347,7 @@ SGL_KERNEL_EXPORT void flash_compress128_decode(
       static_cast<double>(batch_size) * 128.0 * static_cast<double>(elem_size) *
           static_cast<double>(kv_buffer.element_size()) +
       static_cast<double>(batch_size) * static_cast<double>(head_dim) * static_cast<double>(kv_output.element_size());
-  ::sglkernel::report_kernel_perf("flash_compress128_decode", queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }
 
@@ -388,8 +387,7 @@ SGL_KERNEL_EXPORT void flash_compress128_prefill(
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "flash_compress128_prefill", queue);
 #endif
 
   using input_t = float;
@@ -443,7 +441,7 @@ SGL_KERNEL_EXPORT void flash_compress128_prefill(
       static_cast<double>(kv_input.numel()) * static_cast<double>(kv_input.element_size()) +
       static_cast<double>(kv_output.numel()) * static_cast<double>(kv_output.element_size()) +
       static_cast<double>(num_write) * static_cast<double>(elem_size) * static_cast<double>(kv_buffer.element_size());
-  ::sglkernel::report_kernel_perf("flash_compress128_prefill", queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }
 

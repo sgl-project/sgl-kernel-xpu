@@ -494,8 +494,6 @@ SGL_KERNEL_EXPORT void prepare_moe_input(
 #endif
 
   AT_DISPATCH_INDEX_TYPES(topk_ids.scalar_type(), "prepare_moe_input", [&] {
-    using index_t = index_t;
-
     auto options_type = torch::TensorOptions().dtype(topk_ids.dtype()).device(topk_ids.device());
     torch::Tensor atomic_buffer = torch::empty(num_experts + 1, options_type);
 
@@ -1069,56 +1067,26 @@ SGL_KERNEL_EXPORT void apply_shuffle_mul_sum(
   timer.start();
 #endif
 
-  SYCL_DISPATCH_FLOATING_TYPES_V3(input.scalar_type(), "apply_shuffle_mul_sum", [&]() {
-    using input_t = scalar_t;
-    if (factors.has_value()) {
-      SYCL_DISPATCH_FLOATING_TYPES_V3(factors.value().scalar_type(), "factors dispatch", [&]() {
-        using factors_t = scalar_t;
-        if (use_routed_scaling) {
-          apply_shuffle_mul_sum_impl<input_t, factors_t, true>(
-              reinterpret_cast<input_t*>(input.data_ptr()),
-              reinterpret_cast<input_t*>(output.data_ptr()),
-              reinterpret_cast<int32_t*>(permutation.data_ptr()),
-              reinterpret_cast<factors_t*>(factors->data_ptr()),
-              output.size(0),
-              output.size(1),
-              topk,
-              routed_scaling_factor);
-        } else {
-          apply_shuffle_mul_sum_impl<input_t, factors_t, false>(
-              reinterpret_cast<input_t*>(input.data_ptr()),
-              reinterpret_cast<input_t*>(output.data_ptr()),
-              reinterpret_cast<int32_t*>(permutation.data_ptr()),
-              reinterpret_cast<factors_t*>(factors->data_ptr()),
-              output.size(0),
-              output.size(1),
-              topk,
-              routed_scaling_factor);
-        }
+  AT_DISPATCH_FLOATING_TYPES_V2(input.scalar_type(), "apply_shuffle_mul_sum", [&] {
+    using input_t = sycl_type_t<scalar_t>;
+    const auto factors_dtype = factors.has_value() ? factors->scalar_type() : input.scalar_type();
+
+    AT_DISPATCH_WEIGHT_TYPES(scalar_t, factors_dtype, "apply_shuffle_mul_sum factors", [&] {
+      using factors_t = sycl_type_t<weight_t>;
+      const auto* factors_ptr = factors.has_value() ? reinterpret_cast<const factors_t*>(factors->data_ptr()) : nullptr;
+
+      SGL_DISPATCH_BOOL(use_routed_scaling, APPLY_ROUTED_SCALING, [&] {
+        apply_shuffle_mul_sum_impl<input_t, factors_t, APPLY_ROUTED_SCALING>(
+            reinterpret_cast<const input_t*>(input.data_ptr()),
+            reinterpret_cast<input_t*>(output.data_ptr()),
+            permutation.data_ptr<int32_t>(),
+            factors_ptr,
+            output.size(0),
+            output.size(1),
+            topk,
+            routed_scaling_factor);
       });
-    } else {
-      if (use_routed_scaling) {
-        apply_shuffle_mul_sum_impl<input_t, input_t, true>(
-            reinterpret_cast<input_t*>(input.data_ptr()),
-            reinterpret_cast<input_t*>(output.data_ptr()),
-            reinterpret_cast<int32_t*>(permutation.data_ptr()),
-            nullptr,
-            output.size(0),
-            output.size(1),
-            topk,
-            routed_scaling_factor);
-      } else {
-        apply_shuffle_mul_sum_impl<input_t, input_t, false>(
-            reinterpret_cast<input_t*>(input.data_ptr()),
-            reinterpret_cast<input_t*>(output.data_ptr()),
-            reinterpret_cast<int32_t*>(permutation.data_ptr()),
-            nullptr,
-            output.size(0),
-            output.size(1),
-            topk,
-            routed_scaling_factor);
-      }
-    }
+    });
   });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)

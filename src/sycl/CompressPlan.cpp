@@ -424,8 +424,7 @@ SGL_KERNEL_EXPORT torch::Tensor plan_compress_decode(
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "plan_compress_decode", queue);
 #endif
 
   queue.submit([&](sycl::handler& cgh) {
@@ -450,7 +449,7 @@ SGL_KERNEL_EXPORT torch::Tensor plan_compress_decode(
   const double flops = 10.0 * static_cast<double>(batch_size);
   const double bytes = static_cast<double>(seq_lens.numel()) * 8.0 +
                        static_cast<double>(req_pool_indices.numel()) * 8.0 + static_cast<double>(output.numel()) * 1.0;
-  ::sglkernel::report_kernel_perf("plan_compress_decode", queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 
   return output;
@@ -526,14 +525,13 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
   auto plan_c = torch::empty({num_q_tokens_u32, static_cast<int64_t>(sizeof(CompressPlan))}, options_u8);
   auto plan_w = torch::empty({num_q_tokens_u32, static_cast<int64_t>(sizeof(WritePlan))}, options_u8);
 
+  auto queue = c10::xpu::getCurrentXPUStream().queue();
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "plan_compress_prefill", queue);
 #endif
   constexpr int32_t kMaxMTPDraftTokens = 4;
   const int32_t mtp_pad = std::min(ring_size_i32 - compress_ratio_i32, kMaxMTPDraftTokens);
 
-  auto queue = c10::xpu::getCurrentXPUStream().queue();
   queue.submit([&](sycl::handler& cgh) {
     sycl::local_accessor<uint32_t, 1> counter_c_local(sycl::range<1>(1), cgh);
     sycl::local_accessor<uint32_t, 1> counter_w_local(sycl::range<1>(1), cgh);
@@ -600,8 +598,7 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> plan_compress_prefill
   const double bytes = static_cast<double>(seq_lens_xpu.numel()) * 8.0 +
                        static_cast<double>(extend_lens_xpu.numel()) * 8.0 + static_cast<double>(plan_c.numel()) * 1.0 +
                        static_cast<double>(plan_w.numel()) * 1.0;
-  auto queue_end = c10::xpu::getCurrentXPUStream().queue();
-  ::sglkernel::report_kernel_perf("plan_compress_prefill", queue_end, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 
   return {plan_c, plan_w};

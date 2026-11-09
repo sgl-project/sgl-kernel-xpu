@@ -703,8 +703,7 @@ SGL_KERNEL_EXPORT void minimax_decode_topk(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "minimax_decode_topk", profiling_queue);
 #endif
 
   AT_DISPATCH_INDEX_TYPES(seq_lens_c.scalar_type(), "minimax_decode_topk", [&] {
@@ -717,7 +716,7 @@ SGL_KERNEL_EXPORT void minimax_decode_topk(
   const double bytes = static_cast<double>(score.numel()) * static_cast<double>(score.element_size()) +
                        static_cast<double>(seq_lens.numel()) * static_cast<double>(seq_lens.element_size()) +
                        static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
-  ::sglkernel::report_kernel_perf("minimax_decode_topk", profiling_queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }
 
@@ -775,8 +774,7 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_ta
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "minimax_decode_topk_page_table", profiling_queue);
 #endif
   const auto stride = static_cast<int32_t>(r2t_stride);
   const auto kv_len = static_cast<int32_t>(max_kv_len);
@@ -812,7 +810,7 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_ta
                        static_cast<double>(slot_ids.numel()) * static_cast<double>(slot_ids.element_size()) +
                        static_cast<double>(page_table.numel()) * static_cast<double>(page_table.element_size()) +
                        static_cast<double>(real_seq_lens.numel()) * static_cast<double>(real_seq_lens.element_size());
-  ::sglkernel::report_kernel_perf("minimax_decode_topk_page_table", profiling_queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 
   return {page_table, real_seq_lens};

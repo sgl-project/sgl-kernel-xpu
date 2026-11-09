@@ -770,8 +770,7 @@ SGL_KERNEL_EXPORT void causal_conv1d_fwd(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "causal_conv1d_fwd", profiling_queue);
 #endif
 
   AT_DISPATCH_FLOATING_TYPES_V2(
@@ -788,7 +787,7 @@ SGL_KERNEL_EXPORT void causal_conv1d_fwd(
   const double bytes = static_cast<double>(x.numel()) * static_cast<double>(x.element_size()) +
                        static_cast<double>(weight.numel()) * static_cast<double>(weight.element_size()) +
                        static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
-  ::sglkernel::report_kernel_perf("causal_conv1d_fwd", profiling_queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }
 
@@ -883,8 +882,7 @@ SGL_KERNEL_EXPORT void causal_conv1d_update(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "causal_conv1d_update", profiling_queue);
 #endif
 
   AT_DISPATCH_FLOATING_TYPES_V2(
@@ -897,7 +895,7 @@ SGL_KERNEL_EXPORT void causal_conv1d_update(
                        static_cast<double>(weight.numel()) * static_cast<double>(weight.element_size()) +
                        static_cast<double>(conv_state.numel()) * static_cast<double>(conv_state.element_size()) +
                        static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
-  ::sglkernel::report_kernel_perf("causal_conv1d_update", profiling_queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }
 
@@ -1107,8 +1105,7 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "causal_conv1d_update_verify", profiling_queue);
 #endif
 
   if (has_tree) {
@@ -1165,7 +1162,7 @@ SGL_KERNEL_EXPORT at::Tensor causal_conv1d_update_verify(
                        static_cast<double>(weight.numel()) * static_cast<double>(weight.element_size()) +
                        static_cast<double>(conv_state.numel()) * static_cast<double>(conv_state.element_size()) +
                        static_cast<double>(out.numel()) * static_cast<double>(out.element_size());
-  ::sglkernel::report_kernel_perf("causal_conv1d_update_verify", profiling_queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
   return out;
 }

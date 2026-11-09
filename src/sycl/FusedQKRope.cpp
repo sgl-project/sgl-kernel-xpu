@@ -356,8 +356,7 @@ SGL_KERNEL_EXPORT void fused_qk_rope(
   bool interleave = !is_neox;
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "fused_qk_rope", queue);
 #endif
 
 #define FUSED_QK_ROPE_LAUNCH_ARGS                                                                                  \
@@ -410,7 +409,7 @@ SGL_KERNEL_EXPORT void fused_qk_rope(
                            (static_cast<double>(num_heads_q) + static_cast<double>(num_heads_k)) *
                            static_cast<double>(head_dim) * qkv_elem +
                        2.0 * static_cast<double>(head_dim) * w_elem;
-  ::sglkernel::report_kernel_perf("fused_qk_rope", queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }
 
@@ -564,8 +563,7 @@ SGL_KERNEL_EXPORT void fused_qk_rope_with_cos_sin_cache_inplace(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = dpcppGetCurrentQueue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "fused_qk_rope_with_cos_sin_cache_inplace", profiling_queue);
 #endif
 
 #define LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, CACHE_T, POS_T)                            \
@@ -620,7 +618,7 @@ SGL_KERNEL_EXPORT void fused_qk_rope_with_cos_sin_cache_inplace(
                        2.0 * static_cast<double>(num_tokens) * static_cast<double>(num_k_heads) *
                            static_cast<double>(rope_dim) * k_elem +
                        static_cast<double>(num_tokens) * static_cast<double>(rope_dim) * cs_elem;
-  ::sglkernel::report_kernel_perf("fused_qk_rope_with_cos_sin_cache_inplace", profiling_queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }
 

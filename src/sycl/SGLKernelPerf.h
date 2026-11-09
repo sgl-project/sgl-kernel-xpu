@@ -30,25 +30,26 @@
 // target submit is the last queue operation in its scope (GPU_Clock::stop() ---
 // invoked inside seconds() --- records the queue's last event at destruction).
 //
-// For entry points that submit multiple kernels or do post-submit queue work,
-// keep the explicit report_kernel_perf() call right after the relevant submit
-// so the timing bracket stays tight. Those sites use per-submit `#if` blocks:
+// For explicit timing boundaries, pair BEGIN/END once using a named handle.
+// BEGIN does not report at scope exit; END reports at its call site. Use the
+// actual launch queue, which must outlive the handle. Keep formulas and both
+// calls under `#if` so non-profiling builds do no profiling-only work.
 //
 //   #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-//     auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-//     GPU_Clock timer;
-//     timer.start();
+//     SGL_KERNEL_PERF_BEGIN(first_perf, "first_op", queue);
 //   #endif
 //     <first submit>
 //   #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-//     ::sglkernel::report_kernel_perf("first_op", profiling_queue, timer,
-//                                     bytes_a, flops_a);
-//     timer.start();
+//     const double bytes_a = ...;
+//     const double flops_a = ...;
+//     SGL_KERNEL_PERF_END(first_perf, bytes_a, flops_a);
+//     SGL_KERNEL_PERF_BEGIN(second_perf, "second_op", queue);
 //   #endif
 //     <second submit>
 //   #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-//     ::sglkernel::report_kernel_perf("second_op", profiling_queue, timer,
-//                                     bytes_b, flops_b);
+//     const double bytes_b = ...;
+//     const double flops_b = ...;
+//     SGL_KERNEL_PERF_END(second_perf, bytes_b, flops_b);
 //   #endif
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
@@ -62,12 +63,9 @@ namespace sglkernel {
 
 // Report per-kernel perf: prefer GPU_Clock (SYCL event elapsed time in CUTLASS's
 // EventManager) when non-zero; otherwise fall back to host wall-clock time
-// measured across queue.wait(). The fallback makes the perf line meaningful for
-// any kernel whose SYCL events are not captured by EventManager -- e.g. raw
-// q.submit() call sites that don't go through the sycl_kernel_submit() /
-// common.h::launch<> helpers -- so the reporting is generic: every instrumented
-// kernel prints a real number without needing custom event wiring at its launch
-// site.
+// measured across queue.wait(). This fallback measures only the remaining wait,
+// not the full launch interval, for events not captured by EventManager (e.g.
+// raw q.submit() calls). Reporting synchronizes the queue in profiling builds.
 inline void
 report_kernel_perf(const char* op_name, ::sycl::queue& queue, GPU_Clock& timer, double bytes, double flops) {
   const auto host_start = std::chrono::high_resolution_clock::now();
@@ -100,6 +98,24 @@ report_kernel_perf(const char* op_name, ::sycl::queue& queue, GPU_Clock& timer, 
   }
 }
 
+// Explicit timer: report only when finish() is called, not at scope exit.
+struct KernelPerfTimer {
+  const char* op_name;
+  ::sycl::queue& queue;
+  GPU_Clock timer;
+
+  KernelPerfTimer(const char* op, ::sycl::queue& q) : op_name(op), queue(q) {
+    timer.start();
+  }
+
+  void finish(double bytes, double flops) {
+    report_kernel_perf(op_name, queue, timer, bytes, flops);
+  }
+
+  KernelPerfTimer(const KernelPerfTimer&) = delete;
+  KernelPerfTimer& operator=(const KernelPerfTimer&) = delete;
+};
+
 // RAII scope: start a GPU_Clock at construction, call report_kernel_perf() at
 // destruction. The captured queue reference must outlive the scope. See the
 // header comment for when to prefer this over the explicit two-call pattern.
@@ -131,6 +147,8 @@ struct KernelPerfScope {
 #define SGL_PERF_CAT(a, b) SGL_PERF_CAT_(a, b)
 #define SGL_KERNEL_PERF_SCOPE(op, queue, bytes, flops) \
   ::sglkernel::KernelPerfScope SGL_PERF_CAT(sgl_perf_scope_, __LINE__)((op), (queue), (bytes), (flops))
+#define SGL_KERNEL_PERF_BEGIN(handle, op, queue) ::sglkernel::KernelPerfTimer handle((op), (queue))
+#define SGL_KERNEL_PERF_END(handle, bytes, flops) (handle).finish((bytes), (flops))
 
 #else  // !CUTLASS_SYCL_PROFILING_ENABLED
 
@@ -139,5 +157,7 @@ struct KernelPerfScope {
 // evaluates each cast then discards the result; the compiler drops the whole
 // thing.
 #define SGL_KERNEL_PERF_SCOPE(op, queue, bytes, flops) ((void)(op), (void)&(queue), (void)(bytes), (void)(flops))
+#define SGL_KERNEL_PERF_BEGIN(handle, op, queue) ((void)0)
+#define SGL_KERNEL_PERF_END(handle, bytes, flops) ((void)0)
 
 #endif  // CUTLASS_SYCL_PROFILING_ENABLED

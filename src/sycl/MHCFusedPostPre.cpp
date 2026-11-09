@@ -411,8 +411,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "mhc_fused_post_pre", profiling_queue);
 #endif
 
   if (num_tokens > kSmallBatchThreshold) {
@@ -462,7 +461,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> SGL_KERNEL_EXPORT mhc
     const double flops = post_flops + pre_flops + sinkhorn_flops;
     const double bytes = 3.0 * static_cast<double>(x.numel()) * static_cast<double>(x.element_size()) +
                          3.0 * static_cast<double>(residual.numel()) * static_cast<double>(residual.element_size());
-    ::sglkernel::report_kernel_perf("mhc_fused_post_pre", profiling_queue, timer, bytes, flops);
+    SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
     return {residual_cur, post_mix_cur.unsqueeze(-1), comb_mix_cur, layer_input_cur};
   }

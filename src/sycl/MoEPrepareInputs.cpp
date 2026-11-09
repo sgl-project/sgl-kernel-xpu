@@ -911,7 +911,7 @@ SGL_KERNEL_EXPORT void scatter_tokens_to_experts(
   if (input_tensor.scalar_type() == at::ScalarType::Float8_e4m3fn) {
     scatter_tokens_to_experts_impl<c10::Float8_e4m3fn>(input_tensor, src2dst_map, output_tensor);
   } else {
-    SYCL_DISPATCH_FLOATING_TYPES_V3(input_tensor.scalar_type(), "scatter_tokens_to_experts_impl", [&]() {
+    SYCL_DISPATCH_FLOATING_TYPES_V2(input_tensor.scalar_type(), "scatter_tokens_to_experts_impl", [&]() {
       scatter_tokens_to_experts_impl<scalar_t>(input_tensor, src2dst_map, output_tensor);
     });
   }

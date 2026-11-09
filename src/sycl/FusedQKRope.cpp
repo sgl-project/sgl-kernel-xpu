@@ -378,31 +378,21 @@ SGL_KERNEL_EXPORT void fused_qk_rope(
     }                                                                                       \
   } while (0)
 
-  switch (head_dim) {
-    case 64:
-      if (interleave) {
-        LAUNCH_QK_ROPE_KERNEL(64, true);
-      } else {
-        LAUNCH_QK_ROPE_KERNEL(64, false);
-      }
-      break;
-    case 128:
-      if (interleave) {
-        LAUNCH_QK_ROPE_KERNEL(128, true);
-      } else {
-        LAUNCH_QK_ROPE_KERNEL(128, false);
-      }
-      break;
-    case 256:
-      if (interleave) {
-        LAUNCH_QK_ROPE_KERNEL(256, true);
-      } else {
-        LAUNCH_QK_ROPE_KERNEL(256, false);
-      }
-      break;
-    default:
-      TORCH_CHECK(false, "Unsupported head dimension for fused_qk_rope: ", head_dim);
-  }
+  SGL_DISPATCH_BOOL(interleave, INTERLEAVE, [&] {
+    switch (head_dim) {
+      case 64:
+        LAUNCH_QK_ROPE_KERNEL(64, INTERLEAVE);
+        break;
+      case 128:
+        LAUNCH_QK_ROPE_KERNEL(128, INTERLEAVE);
+        break;
+      case 256:
+        LAUNCH_QK_ROPE_KERNEL(256, INTERLEAVE);
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported head dimension for fused_qk_rope: ", head_dim);
+    }
+  });
 
 #undef LAUNCH_QK_ROPE_KERNEL
 #undef FUSED_QK_ROPE_LAUNCH_ARGS

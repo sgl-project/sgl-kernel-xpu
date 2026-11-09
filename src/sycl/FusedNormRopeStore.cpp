@@ -616,7 +616,7 @@ SGL_KERNEL_EXPORT void fused_norm_rope_store(
   SGL_KERNEL_PERF_SCOPE("fused_norm_rope_store", queue, bytes, flops);
 #endif
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input.scalar_type(), "fused_norm_rope_store", [&]() {
+  AT_DISPATCH_FLOATING_TYPES_V2(input.scalar_type(), "fused_norm_rope_store", [&]() {
     using input_t = scalar_t;
 
     if (head_dim == kIndexerHeadDim) {

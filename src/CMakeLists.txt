@@ -9,6 +9,7 @@
 #   USE_MLA  -> MLA decode/prefill/sparse-decode kernels
 #   USE_QSA  -> QSA attention and MQA (Xe2 only) and indexer preparation (Xe2 and Xe3)
 #   USE_MLA_SPARSE_FUSED -> fused (single-pass) sparse-MLA-decode kernel (optimization track)
+#   USE_MONO_DECODE -> mono decode layer kernels for Qwen3.5 / Qwen3.6 MoE at TP2 (Xe2 only)
 #
 # Defaults are set in the option() declarations below. Each toggle can be set either as a CMake option
 # (-DUSE_MOE=OFF) or, for convenience with `pip install`, via an environment
@@ -26,13 +27,14 @@ option(USE_QSA "Build Xe2 BF16 QSA sparse attention" ON)
 # OFF also pins the runtime dispatch to the 2-stage path (see below) so the fused
 # launchers are never referenced.
 option(USE_MLA_SPARSE_FUSED "Build the fused (single-pass) sparse MLA decode kernel (optimization track)" OFF)
+option(USE_MONO_DECODE "Build the Xe2 mono decode layer kernels (Qwen3.5 / Qwen3.6 MoE, TP2)" ON)
 # Master runtime-JIT switch (opt-in, default OFF). When ON, kernels that support
 # runtime codegen (currently FMHA decode/prefill) are compiled on demand via
 # src/jit instead of being instantiated ahead of time. Enable with USE_SYCL_JIT=ON
 # (or 1 / On) as a CMake option or environment variable.
 option(USE_SYCL_JIT "Enable runtime-JIT kernels (opt-in; drops their AOT .so instances)" OFF)
 
-foreach(_toggle USE_MOE USE_FMHA USE_GDN USE_MLA USE_QSA USE_MLA_SPARSE_FUSED USE_SYCL_JIT)
+foreach(_toggle USE_MOE USE_FMHA USE_GDN USE_MLA USE_QSA USE_MLA_SPARSE_FUSED USE_MONO_DECODE USE_SYCL_JIT)
     if(DEFINED ENV{${_toggle}} AND NOT "$ENV{${_toggle}}" STREQUAL "")
         # Normalize the env value so 1 / On / ON / on / true / yes all enable and
         # 0 / Off / OFF / false / no disable, independent of CMake's if(<string>)
@@ -56,6 +58,7 @@ message(STATUS "USE_GDN=${USE_GDN}")
 message(STATUS "USE_MLA=${USE_MLA}")
 message(STATUS "USE_QSA=${USE_QSA}")
 message(STATUS "USE_MLA_SPARSE_FUSED=${USE_MLA_SPARSE_FUSED}")
+message(STATUS "USE_MONO_DECODE=${USE_MONO_DECODE}")
 message(STATUS "USE_SYCL_JIT=${USE_SYCL_JIT}")
 
 if(USE_MOE)
@@ -98,6 +101,11 @@ if(USE_FMHA AND USE_SYCL_JIT)
 endif()
 if(USE_MLA)
     add_compile_definitions(USE_MLA)
+endif()
+# The mono decode kernels are Xe2 code (DPAS shapes, 2D block loads, 256-GRF
+# resident work-groups).
+if(USE_MONO_DECODE AND DPCPP_SYCL_TARGET MATCHES "bmg")
+    add_compile_definitions(USE_MONO_DECODE)
 endif()
 if(USE_QSA AND DPCPP_SYCL_TARGET MATCHES "bmg")
     add_compile_definitions(USE_QSA)
@@ -143,6 +151,10 @@ if(NOT USE_QSA OR NOT DPCPP_SYCL_TARGET MATCHES "bmg")
 endif()
 if(NOT USE_QSA)
     list(FILTER device_cpp EXCLUDE REGEX "/QSAPrepare\\.cpp$")
+endif()
+if(NOT USE_MONO_DECODE OR NOT DPCPP_SYCL_TARGET MATCHES "bmg")
+    list(FILTER device_cpp EXCLUDE REGEX "/MonoDecodeXe20\\.cpp$")
+    list(FILTER device_cpp EXCLUDE REGEX "/kernels/mono_decode/")
 endif()
 if(NOT USE_MOE)
     list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20|W8A16Xe20)|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")

@@ -21,6 +21,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.entry-points."sglang.srt.plugins"]
+xpu_monokernel = "sgl_kernel.monokernel.plugin:register"
+
 [project.urls]
 "Homepage" = "https://github.com/sgl-project/sgl-kernel-xpu"
 "Bug Tracker" = "https://github.com/sgl-project/sgl-kernel-xpu/issues"

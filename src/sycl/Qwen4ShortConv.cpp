@@ -227,15 +227,11 @@ SGL_KERNEL_EXPORT void qwen4_short_conv_state(
     torch::Tensor& conv_input, torch::Tensor& state, torch::Tensor& state_indices, torch::Tensor& x) {
   CHECK_INPUT(3, conv_input);
   CHECK_INPUT(3, state);
-  CHECK_INPUT(1, state_indices);
+  CHECK_INPUT(1, at::kLong, state_indices);
   CHECK_INPUT(2, x);
-  TORCH_CHECK(
-      state.scalar_type() == at::kBFloat16 || state.scalar_type() == at::kHalf,
-      "state must be bfloat16 or float16, got ",
-      state.scalar_type());
+  CHECK_DTYPES(state, at::kBFloat16, at::kHalf);
   TORCH_CHECK(x.scalar_type() == state.scalar_type(), "x must have the same dtype as state");
   TORCH_CHECK(conv_input.scalar_type() == state.scalar_type(), "conv_input must have the same dtype as state");
-  TORCH_CHECK(state_indices.scalar_type() == at::kLong, "state_indices must be int64");
   const int64_t channels = state.size(1);
   const int64_t state_len = state.size(2);
   TORCH_CHECK(state_len > 0 && state_len <= MAX_STATE_LEN, "state length must be in [1, ", MAX_STATE_LEN, "]");
@@ -290,13 +286,12 @@ SGL_KERNEL_EXPORT void qwen4_verify_conv(
     int64_t width,
     int64_t dilation) {
   CHECK_INPUT(output);
-  CHECK_INPUT(2, x);
+  CHECK_INPUT(2, at::kBFloat16, x);
   CHECK_INPUT(residual);
   CHECK_INPUT(3, at::kBFloat16, weight);
   CHECK_INPUT(valid);
   CHECK_DEVICE(state);
   CHECK_DEVICE(state_indices);
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16, "x must be a 2-D bfloat16 tensor");
   CHECK_DIM(3, state);
   CHECK_SHAPE(state, state.size(0), x.size(1), state.size(2));
   CHECK_DIM(1, state_indices);
@@ -308,9 +303,8 @@ SGL_KERNEL_EXPORT void qwen4_verify_conv(
   CHECK_SHAPE(x, requests * width, channels);
   TORCH_CHECK(valid.scalar_type() == at::kBool, "valid must be a bool tensor of shape [R * W]");
   CHECK_SHAPE(valid, x.size(0));
-  TORCH_CHECK(
-      residual.scalar_type() == at::kBFloat16 && residual.sizes() == x.sizes(),
-      "residual must be bfloat16 with shape [R * W, C]");
+  CHECK_DTYPE(at::kBFloat16, residual);
+  CHECK_SAME_SHAPE(residual, x);
   CHECK_DTYPE(at::kBFloat16, output);
   CHECK_SAME_SHAPE(output, x);
   CHECK_SHAPE(weight, channels, 1, weight.size(2));

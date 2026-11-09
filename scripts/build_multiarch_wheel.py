@@ -191,8 +191,16 @@ def main() -> None:
         log(f"single-architecture build, nothing to merge: {wheels[0]}")
         final = wheels[0]
     else:
+        # A merged wheel left over from an earlier version would make the lookup
+        # below ambiguous, so clear this package's old wheels (never the inputs).
+        pattern = wheels[0].name.split("-", 1)[0] + "-*.whl"
+        inputs = {w.resolve() for w in wheels}
+        for stale in args.out_dir.glob(pattern):
+            if stale.resolve() not in inputs:
+                log(f"removing stale wheel {stale}")
+                stale.unlink()
         run([sys.executable, str(MERGE_SCRIPT), str(args.out_dir), *map(str, wheels)])
-        merged = sorted(args.out_dir.glob("*.whl"))
+        merged = sorted(args.out_dir.glob(pattern))
         if len(merged) != 1:
             sys.exit(
                 f"error: expected one merged wheel in {args.out_dir}, "

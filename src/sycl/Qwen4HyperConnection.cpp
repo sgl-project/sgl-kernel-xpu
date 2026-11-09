@@ -214,20 +214,6 @@ int pick_vec(int64_t inner, std::initializer_list<const at::Tensor*> tensors, in
   return 1;
 }
 
-bool can_vectorize(int64_t inner, std::initializer_list<const at::Tensor*> tensors) {
-  return pick_vec(inner, tensors) == VEC_SIZE;
-}
-
-void check_bf16_xpu(const at::Tensor& t, const char* name) {
-  CHECK_INPUT(t);
-  TORCH_CHECK(t.scalar_type() == at::kBFloat16, name, " must be bfloat16");
-}
-
-// An output may alias an input exactly (in place) but must not partially overlap it.
-void check_no_partial_overlap(const at::Tensor& output, const at::Tensor& input) {
-  at::assert_no_partial_overlap(output, input);
-}
-
 void check_no_overlap(const at::Tensor& output, std::initializer_list<const at::Tensor*> inputs) {
   for (const at::Tensor* t : inputs)
     at::assert_no_overlap(output, *t);
@@ -246,10 +232,8 @@ T* as_mut(at::Tensor& t) {
 // Returns the optional [tokens, hc] injection pointer after validating it.
 const bf16* injection_ptr(const std::optional<at::Tensor>& injection, int64_t tokens, int64_t hc) {
   if (!injection.has_value()) return nullptr;
-  check_bf16_xpu(*injection, "injection");
-  TORCH_CHECK(
-      injection->dim() == 2 && injection->size(0) == tokens && injection->size(1) == hc,
-      "injection must be [tokens, hc_count]");
+  CHECK_INPUT(2, at::kBFloat16, injection.value());
+  CHECK_SHAPE(injection.value(), tokens, hc);
   return as<bf16>(*injection);
 }
 
@@ -450,11 +434,13 @@ bool launch_combine_norm_vec(sycl::queue& q, const CombineNormArgs& args) {
 namespace at::native::xpu {
 
 SGL_KERNEL_EXPORT void qwen4_hc_silu(torch::Tensor& output, const torch::Tensor& input, int64_t hc_count) {
-  check_bf16_xpu(input, "input");
-  check_bf16_xpu(output, "output");
+  CHECK_INPUT(input);
+  CHECK_DTYPE(at::kBFloat16, input);
+  CHECK_INPUT(output);
+  CHECK_DTYPE(at::kBFloat16, output);
   CHECK_SAME_SHAPE(output, input);
   TORCH_CHECK(hc_count > 0, "hc_count must be positive");
-  check_no_partial_overlap(output, input);
+  at::assert_no_partial_overlap(output, input);
   const int64_t n = input.numel();
   if (n == 0) return;
   TORCH_CHECK(n <= MAX_ID, "qwen4_hc_silu: input too large: ", input.sizes());
@@ -472,10 +458,9 @@ SGL_KERNEL_EXPORT void qwen4_hc_silu(torch::Tensor& output, const torch::Tensor&
 
 SGL_KERNEL_EXPORT void
 qwen4_hc_gate_mix(torch::Tensor& output, const torch::Tensor& input, const torch::Tensor& gate, int64_t hc_count) {
-  check_bf16_xpu(input, "input");
-  check_bf16_xpu(gate, "gate");
-  check_bf16_xpu(output, "output");
-  CHECK_DIM(2, input);
+  CHECK_INPUT(2, at::kBFloat16, input);
+  CHECK_INPUT(2, at::kBFloat16, gate);
+  CHECK_INPUT(2, at::kBFloat16, output);
   CHECK_SAME_SHAPE(gate, input);
   TORCH_CHECK(hc_count > 0 && input.size(1) % hc_count == 0, "HC * hidden must be divisible by hc_count");
   const int64_t rows = input.size(0), hidden = input.size(1) / hc_count;
@@ -510,16 +495,15 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine(
     const torch::Tensor& block_output,
     const std::optional<torch::Tensor>& injection,
     int64_t hc_count) {
-  check_bf16_xpu(residual, "residual");
-  check_bf16_xpu(block_output, "block_output");
-  check_bf16_xpu(output, "output");
-  CHECK_DIM(2, residual);
+  CHECK_INPUT(2, at::kBFloat16, residual);
+  CHECK_INPUT(2, at::kBFloat16, block_output);
+  CHECK_INPUT(2, at::kBFloat16, output);
   TORCH_CHECK(hc_count > 0 && residual.size(1) % hc_count == 0, "HC * hidden must be divisible by hc_count");
   const int64_t rows = residual.size(0), hidden = residual.size(1) / hc_count;
   CHECK_SHAPE(block_output, rows, hidden);
   CHECK_SAME_SHAPE(output, residual);
   const bf16* injection_data = injection_ptr(injection, rows, hc_count);
-  check_no_partial_overlap(output, residual);
+  at::assert_no_partial_overlap(output, residual);
   check_no_overlap(output, {&block_output});
   if (injection_data != nullptr) check_no_overlap(output, {&*injection});
   if (rows == 0 || hidden == 0) return;
@@ -556,12 +540,12 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine_norm(
     const torch::Tensor& weight,
     double eps,
     int64_t hc_count) {
-  check_bf16_xpu(residual, "residual");
-  check_bf16_xpu(block_output, "block_output");
-  check_bf16_xpu(weight, "weight");
-  check_bf16_xpu(combined, "combined");
-  check_bf16_xpu(normalized, "normalized");
-  CHECK_DIM(2, residual);
+  CHECK_INPUT(2, at::kBFloat16, residual);
+  CHECK_INPUT(2, at::kBFloat16, block_output);
+  CHECK_INPUT(weight);
+  CHECK_DTYPE(at::kBFloat16, weight);
+  CHECK_INPUT(2, at::kBFloat16, combined);
+  CHECK_INPUT(2, at::kBFloat16, normalized);
   TORCH_CHECK(hc_count > 0 && residual.size(1) % hc_count == 0, "HC * hidden must be divisible by hc_count");
   const int64_t tokens = residual.size(0), hidden = residual.size(1) / hc_count;
   CHECK_SHAPE(block_output, tokens, hidden);
@@ -571,7 +555,7 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine_norm(
   CHECK_SAME_SHAPE(combined, residual);
   CHECK_SAME_SHAPE(normalized, residual);
   const bf16* injection_data = injection_ptr(injection, tokens, hc_count);
-  check_no_partial_overlap(combined, residual);
+  at::assert_no_partial_overlap(combined, residual);
   check_no_overlap(combined, {&block_output, &weight});
   check_no_overlap(normalized, {&residual, &block_output, &combined, &weight});
   if (injection_data != nullptr) {
@@ -589,7 +573,7 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine_norm(
   // Both kernels must compute the same combine weight as qwen4_hc_combine.
   const float inv_hc = 1.0f / static_cast<float>(hc_count);
   const float inv_hidden = 1.0f / static_cast<float>(hidden);
-  if (can_vectorize(hidden, {&residual, &block_output, &weight, &combined, &normalized})) {
+  if (pick_vec(hidden, {&residual, &block_output, &weight, &combined, &normalized}) == VEC_SIZE) {
     const CombineNormArgs args{
         as<bf16x8>(residual),
         as<bf16x8>(block_output),

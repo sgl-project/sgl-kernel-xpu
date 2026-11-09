@@ -445,21 +445,6 @@ inline int round_up_headdim(int head_size) {
   return 512;
 };
 
-template <typename T>
-struct DtypeInfo;
-
-template <>
-struct DtypeInfo<int8_t> {
-  static constexpr float MIN = -128;
-  static constexpr float MAX = 127;
-};
-
-template <>
-struct DtypeInfo<c10::Float8_e4m3fn> {
-  static constexpr float MIN = -448;
-  static constexpr float MAX = 448;
-};
-
 template <typename scalar_t, int vec_size>
 struct alignas(sizeof(scalar_t) * vec_size) aligned_vec {
   scalar_t val[vec_size];

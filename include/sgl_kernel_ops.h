@@ -632,6 +632,16 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype);
+// Xe2 dense weight-only FP8 (W8A16) GEMM: output = input @ dequant(weight).T (+ bias).
+// input bf16 [M, K], weight float8_e4m3fn [N, K], output bf16 [M, N], bias float32 [N].
+// weight_scale is float32: one element (per-tensor), [N] (per-channel), or
+// [ceil(N/128), K/128] (128x128 block).
+void fp8_w8a16_mm_xe20(
+    torch::Tensor& output,
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& weight_scale,
+    const std::optional<at::Tensor>& bias);
 void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
@@ -817,10 +827,8 @@ void moe_grouped_mm_nt_xe20_w4a16(
 
 // W8A16 grouped GEMM. Activations are BF16, weights are 8-bit (FP8 E4M3),
 // and weight_scales is 1D [E] / 2D [E, 1] / [E, 2] for float32 per-expert scalar scales,
-// 2D [E, N] for float32 per-output-channel scales,
 // 3D [E, ceil(N/128), K/128] for 128x128 float32 block scales, or
 // 3D [E, N, K/32] uint8/float8_e8m0fnu for MXFP8 (1x32 UE8M0) block scales.
-// n_experts must be 1 (dense GEMM) or a multiple of 8.
 void moe_grouped_mm_nt_xe20_w8a16(
     torch::Tensor& output,
     const torch::Tensor& activations,

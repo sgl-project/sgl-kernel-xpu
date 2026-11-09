@@ -10,7 +10,7 @@
 #                   rowwise torch._scaled_mm: the online FP8 dense path the XPU
 #                   backend runs without a weight-only kernel.
 #
-# Shapes are the dense projections of Qwen3.6-35B-A3B at TP=2 and Llama-3.1-8B at TP=1,
+# Shapes are the dense projections of Qwen3.6-35B-A3B at TP=2 and TP=4 and Llama-3.1-8B at TP=1,
 # at decode (small M) and prefill (large M) token counts.
 import argparse
 
@@ -24,6 +24,7 @@ FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 # (N, K)
 WEIGHT_SHAPES = {
     "Qwen3.6-35B-A3B-TP2": [(4608, 2048), (2048, 2048), (6144, 2048), (512, 2048)],
+    "Qwen3.6-35B-A3B-TP4": [(2560, 2048), (2048, 1024), (3072, 2048), (256, 2048)],
     "Llama-3.1-8B": [(6144, 4096), (4096, 4096), (28672, 4096), (4096, 14336)],
 }
 M_VALUES = [1, 4, 16, 64, 256, 1024, 4096]

@@ -64,8 +64,12 @@ def fp8_linear_supported(
         return False
     if n is None or k is None:
         return True
-    # moe_grouped_mm_nt_xe20_w8a16; block scales also need whole K blocks.
-    return n % 64 == 0 and k % (_FP8_BLOCK if block_scale else 32) == 0
+    # fp8_w8a16_mm_xe20 steps K by 64; block scales also need whole K blocks.
+    return n % 64 == 0 and k % (_FP8_BLOCK if block_scale else 64) == 0
+
+
+def _aligned64(t: torch.Tensor) -> bool:
+    return t.data_ptr() % 64 == 0
 
 
 def fp8_linear(
@@ -78,19 +82,20 @@ def fp8_linear(
     """Weight-only FP8 (W8A16) dense linear on BMG (Xe2):
     ``out = input @ dequant(weight).T + bias``.
 
-    Runs the Xe2 W8A16 grouped GEMM with a single expert, so activations stay in
-    bfloat16. Check the device and shape with ``fp8_linear_supported`` first.
+    Runs the Xe2 dense W8A16 GEMM: weights are dequantized in registers, so
+    activations stay in bfloat16. Check the device and shape with
+    ``fp8_linear_supported`` first.
 
     Args:
         input: [M, K] bfloat16 activations.
-        weight: [N, K] float8_e4m3fn weights, contiguous.
+        weight: [N, K] float8_e4m3fn weights, contiguous and 64-byte aligned.
         weight_scale: float32 weight scales: one per-tensor value (any shape with
             a single element), 1D [N] per-channel scales, or 2D
             [ceil(N / 128), K / 128] 128x128 block scales.
         bias: optional [N].
         out: optional [M, N] bfloat16 output buffer.
     """
-    assert is_xe2_arch(), "fp8_linear runs the BMG (Xe2) W8A16 grouped GEMM"
+    assert is_xe2_arch(), "fp8_linear runs the BMG (Xe2) dense W8A16 GEMM"
     assert input.dtype == torch.bfloat16, "fp8_linear takes bfloat16 activations"
     m = input.shape[0]
     n = weight.shape[0]
@@ -98,24 +103,23 @@ def fp8_linear(
         out = torch.empty((m, n), dtype=torch.bfloat16, device=input.device)
     if m == 0:
         return out
+    # The kernel reads and writes with block-2D accesses, which need 64-byte
+    # aligned base addresses; views at an offset take a copy.
+    input = input.contiguous()
+    if not _aligned64(input):
+        input = input.clone()
     if weight_scale.numel() == 1:
         weight_scale = weight_scale.reshape(1)
-    elif weight_scale.dim() == 1:
-        assert weight_scale.shape[0] == n, "per-channel weight_scale must be [N]"
-        weight_scale = weight_scale.view(1, n)
-    else:
-        weight_scale = weight_scale.unsqueeze(0)
     if bias is not None:
-        bias = bias.to(torch.float32).view(1, n)
-    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
-        out,
-        input,
-        weight.unsqueeze(0),
-        weight_scale,
-        bias,
-        torch.full((1,), m, dtype=torch.int32, device=input.device),
-        1,
+        bias = bias.to(torch.float32).contiguous()
+    dst = (
+        out
+        if out.is_contiguous() and _aligned64(out)
+        else torch.empty_like(out, memory_format=torch.contiguous_format)
     )
+    torch.ops.sgl_kernel.fp8_w8a16_mm_xe20(dst, input, weight, weight_scale, bias)
+    if dst is not out:
+        out.copy_(dst)
     return out
 
 

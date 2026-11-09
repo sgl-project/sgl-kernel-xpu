@@ -591,37 +591,25 @@ SGL_KERNEL_EXPORT void hc_pre_big_fuse(
   SGL_KERNEL_PERF_SCOPE("hc_pre_big_fuse", q, bytes, flops);
 #endif
 
-#define LAUNCH_HC_PRE_FUSE(VEC_SIZE)     \
-  case VEC_SIZE: {                       \
-    launch_hc_pre_fuse_kernel<VEC_SIZE>( \
-        q,                               \
-        gemm_out_mul,                    \
-        gemm_out_sqrsum,                 \
-        hc_scale,                        \
-        hc_base,                         \
-        residual_flat,                   \
-        post_mix,                        \
-        comb_mix,                        \
-        layer_input,                     \
-        T,                               \
-        hidden_size,                     \
-        n_splits,                        \
-        rms_eps,                         \
-        hc_pre_eps,                      \
-        hc_sinkhorn_eps,                 \
-        hc_post_mult_value,              \
-        norm_weight,                     \
-        norm_eps);                       \
-    break;                               \
-  }
-
-  switch (vec_size) {
-    LAUNCH_HC_PRE_FUSE(8);
-    LAUNCH_HC_PRE_FUSE(4);
-    LAUNCH_HC_PRE_FUSE(2);
-    default:
-      TORCH_CHECK(false, "Unsupported vec_size: ", vec_size);
-  }
-
-#undef LAUNCH_HC_PRE_FUSE
+  SGL_DISPATCH_VEC_SIZE_SET(vec_size, (2, 4, 8), [&] {
+    launch_hc_pre_fuse_kernel<VEC_SIZE>(
+        q,
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        residual_flat,
+        post_mix,
+        comb_mix,
+        layer_input,
+        T,
+        hidden_size,
+        n_splits,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        norm_weight,
+        norm_eps);
+  });
 }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ATen/Dispatch_v2.h>
 #include <ATen/xpu/XPUContext.h>
 
 #include <algorithm>
@@ -23,22 +24,122 @@
   CHECK_DEVICE(x);                         \
   CHECK_LAST_DIM_CONTIGUOUS(x)
 
-#define DISPATCH_CASE_INTEGRAL_TYPES(...)              \
-  AT_DISPATCH_CASE(at::ScalarType::Byte, __VA_ARGS__)  \
-  AT_DISPATCH_CASE(at::ScalarType::Char, __VA_ARGS__)  \
-  AT_DISPATCH_CASE(at::ScalarType::Short, __VA_ARGS__) \
-  AT_DISPATCH_CASE(at::ScalarType::Int, __VA_ARGS__)   \
-  AT_DISPATCH_CASE(at::ScalarType::Long, __VA_ARGS__)
+// Use AT_DISPATCH_* for ATen/c10 types; SYCL_DISPATCH_* only when kernel
+// operations require SYCL types (e.g. sycl::vec), not merely because it runs on XPU.
+// Project helper: FP32/FP16/BF16, no Double, no SYCL type mapping.
+#define AT_DISPATCH_FLOATING_TYPES_V2(TYPE, NAME, ...) \
+  AT_DISPATCH_V2(TYPE, NAME, AT_WRAP(__VA_ARGS__), at::kFloat, at::kHalf, at::kBFloat16)
 
-#define DISPATCH_INTEGRAL_TYPES(TYPE, NAME, ...) \
-  AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_INTEGRAL_TYPES(__VA_ARGS__))
+// INPUT_T is an ATen/c10 type; weight_t is INPUT_T or float, not an independent dtype dispatch.
+// Other weight dtypes throw. TYPE is evaluated once; callback returns stay inside this expression.
+#define AT_DISPATCH_WEIGHT_TYPES(INPUT_T, TYPE, NAME, ...)                                                            \
+  [&]() -> decltype(auto) {                                                                                           \
+    const auto _weight_type = TYPE;                                                                                   \
+    if (_weight_type == c10::CppTypeToScalarType<INPUT_T>::value) {                                                   \
+      using weight_t = INPUT_T;                                                                                       \
+      return (__VA_ARGS__)();                                                                                         \
+    }                                                                                                                 \
+    TORCH_CHECK(                                                                                                      \
+        _weight_type == at::kFloat, NAME, ": weight dtype must match input dtype or be float32, got ", _weight_type); \
+    using weight_t = float;                                                                                           \
+    return (__VA_ARGS__)();                                                                                           \
+  }()
 
-#define DISPATCH_CASE_FLOAT_TYPES(...)                 \
-  AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__) \
-  AT_DISPATCH_CASE(at::ScalarType::Half, __VA_ARGS__)  \
-  AT_DISPATCH_CASE(at::ScalarType::BFloat16, __VA_ARGS__)
+template <typename T>
+struct sycl_type {
+  using type = T;
+};
 
-#define DISPATCH_FLOAT_TYPES(TYPE, NAME, ...) AT_DISPATCH_SWITCH(TYPE, NAME, DISPATCH_CASE_FLOAT_TYPES(__VA_ARGS__))
+template <>
+struct sycl_type<at::Half> {
+  using type = sycl::half;
+};
+
+template <>
+struct sycl_type<at::BFloat16> {
+  using type = sycl::ext::oneapi::bfloat16;
+};
+
+template <typename T>
+using sycl_type_t = typename sycl_type<T>::type;
+
+#define SYCL_DISPATCH_BODY(...)                  \
+  AT_WRAP([&] {                                  \
+    using sycl_scalar_t = sycl_type_t<scalar_t>; \
+    return [&] {                                 \
+      using scalar_t = sycl_scalar_t;            \
+      return (__VA_ARGS__)();                    \
+    }();                                         \
+  })
+
+// FP16/BF16.
+#define SYCL_DISPATCH_FLOATING_TYPES_V1(TYPE, NAME, ...) \
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(TYPE, NAME, SYCL_DISPATCH_BODY(__VA_ARGS__))
+
+// FP32/FP16/BF16.
+#define SYCL_DISPATCH_FLOATING_TYPES_V2(TYPE, NAME, ...) \
+  AT_DISPATCH_FLOATING_TYPES_V2(TYPE, NAME, SYCL_DISPATCH_BODY(__VA_ARGS__))
+
+// FP64/FP32/FP16/BF16.
+#define SYCL_DISPATCH_FLOATING_TYPES_V3(TYPE, NAME, ...) \
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, TYPE, NAME, SYCL_DISPATCH_BODY(__VA_ARGS__))
+
+#define SGL_DISPATCH_BOOL(BOOL_V, BOOL_NAME, ...)        \
+  [&]() -> decltype(auto) {                              \
+    if (BOOL_V) {                                        \
+      [[maybe_unused]] constexpr bool BOOL_NAME = true;  \
+      return (__VA_ARGS__)();                            \
+    } else {                                             \
+      [[maybe_unused]] constexpr bool BOOL_NAME = false; \
+      return (__VA_ARGS__)();                            \
+    }                                                    \
+  }()
+
+#define SGL_DISPATCH_BOOL2(BOOL_V1, BOOL_NAME1, BOOL_V2, BOOL_NAME2, ...) \
+  SGL_DISPATCH_BOOL(                                                      \
+      BOOL_V1, BOOL_NAME1, [&]() -> decltype(auto) { return SGL_DISPATCH_BOOL(BOOL_V2, BOOL_NAME2, __VA_ARGS__); })
+
+#define SGL_DISPATCH_BOOL3(BOOL_V1, BOOL_NAME1, BOOL_V2, BOOL_NAME2, BOOL_V3, BOOL_NAME3, ...) \
+  SGL_DISPATCH_BOOL(BOOL_V1, BOOL_NAME1, [&]() -> decltype(auto) {                             \
+    return SGL_DISPATCH_BOOL2(BOOL_V2, BOOL_NAME2, BOOL_V3, BOOL_NAME3, __VA_ARGS__);          \
+  })
+
+// Expand only the supplied widths (one to five), e.g. (1, 2, 4, 8).
+#define SGL_DISPATCH_VEC_SIZE_CASE(SIZE, ...) \
+  case SIZE: {                                \
+    constexpr uint32_t VEC_SIZE = SIZE;       \
+    return (__VA_ARGS__)();                   \
+  }
+
+#define SGL_VEC_SIZE_CASES_1(BODY, A) SGL_DISPATCH_VEC_SIZE_CASE(A, BODY)
+#define SGL_VEC_SIZE_CASES_2(BODY, A, ...) SGL_DISPATCH_VEC_SIZE_CASE(A, BODY) SGL_VEC_SIZE_CASES_1(BODY, __VA_ARGS__)
+#define SGL_VEC_SIZE_CASES_3(BODY, A, ...) SGL_DISPATCH_VEC_SIZE_CASE(A, BODY) SGL_VEC_SIZE_CASES_2(BODY, __VA_ARGS__)
+#define SGL_VEC_SIZE_CASES_4(BODY, A, ...) SGL_DISPATCH_VEC_SIZE_CASE(A, BODY) SGL_VEC_SIZE_CASES_3(BODY, __VA_ARGS__)
+#define SGL_VEC_SIZE_CASES_5(BODY, A, ...) SGL_DISPATCH_VEC_SIZE_CASE(A, BODY) SGL_VEC_SIZE_CASES_4(BODY, __VA_ARGS__)
+#define SGL_VEC_SIZE_SELECT(_1, _2, _3, _4, _5, CASES, ...) CASES
+#define SGL_VEC_SIZE_UNPACK(...) __VA_ARGS__
+#define SGL_VEC_SIZE_CASES(BODY, ...) \
+  SGL_VEC_SIZE_SELECT(                \
+      __VA_ARGS__,                    \
+      SGL_VEC_SIZE_CASES_5,           \
+      SGL_VEC_SIZE_CASES_4,           \
+      SGL_VEC_SIZE_CASES_3,           \
+      SGL_VEC_SIZE_CASES_2,           \
+      SGL_VEC_SIZE_CASES_1)           \
+  (BODY, __VA_ARGS__)
+
+#define SGL_DISPATCH_VEC_SIZE_SET(SIZE, SIZES, ...)                 \
+  [&] {                                                             \
+    const auto _vec_size = SIZE;                                    \
+    switch (_vec_size) {                                            \
+      SGL_VEC_SIZE_CASES((__VA_ARGS__), SGL_VEC_SIZE_UNPACK SIZES)  \
+      default:                                                      \
+        TORCH_CHECK(false, "Unsupported vector size: ", _vec_size); \
+    }                                                               \
+  }()
+
+// Default widths: 1/2/4/8/16. Other widths throw.
+#define SGL_DISPATCH_VEC_SIZE(SIZE, ...) SGL_DISPATCH_VEC_SIZE_SET(SIZE, (1, 2, 4, 8, 16), __VA_ARGS__)
 
 #define CUTLASS_CHECK(status)                                                       \
   {                                                                                 \
@@ -289,93 +390,6 @@ inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_
   TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
 
 #define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
-
-#define PRIVATE_CASE_TYPE(enum_type, type, ...) \
-  case enum_type: {                             \
-    using scalar_t = type;                      \
-    return __VA_ARGS__();                       \
-  }
-
-#define SYCL_DISPATCH_FLOATING_TYPES(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)                             \
-  {                                                                                                         \
-    const auto& the_type = TYPE;                                                                            \
-    at::ScalarType _st = ::detail::scalar_type(the_type);                                                   \
-    switch (_st) {                                                                                          \
-      PRIVATE_CASE_TYPE(at::ScalarType::Double, double, __VA_ARGS__)                                        \
-      PRIVATE_CASE_TYPE(at::ScalarType::Float, float, __VA_ARGS__)                                          \
-      PRIVATE_CASE_TYPE(SCALARTYPE1, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE1>::t), __VA_ARGS__) \
-      PRIVATE_CASE_TYPE(SCALARTYPE2, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE2>::t), __VA_ARGS__) \
-      default:                                                                                              \
-        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                                     \
-    }                                                                                                       \
-  }
-
-#define PRIVATE_CASE_TYPE_OUTPLACE(enum_type, type, ...) \
-  case enum_type: {                                      \
-    using scalar_t = type;                               \
-    __VA_ARGS__();                                       \
-    break;                                               \
-  }
-
-#define PRIVATE_CASE_WEIGHT_TYPE(enum_type, type, ...) \
-  case enum_type: {                                    \
-    using weight_t = type;                             \
-    __VA_ARGS__();                                     \
-    break;                                             \
-  }
-
-#define SYCL_DISPATCH_WEIGHT_TYPES(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)                                      \
-  {                                                                                                                \
-    const auto& the_weight_type = TYPE;                                                                            \
-    at::ScalarType _wt = ::detail::scalar_type(the_weight_type);                                                   \
-    switch (_wt) {                                                                                                 \
-      PRIVATE_CASE_WEIGHT_TYPE(at::ScalarType::Double, double, __VA_ARGS__)                                        \
-      PRIVATE_CASE_WEIGHT_TYPE(at::ScalarType::Float, float, __VA_ARGS__)                                          \
-      PRIVATE_CASE_WEIGHT_TYPE(SCALARTYPE1, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE1>::t), __VA_ARGS__) \
-      PRIVATE_CASE_WEIGHT_TYPE(SCALARTYPE2, decltype(c10::impl::ScalarTypeToCPPType<SCALARTYPE2>::t), __VA_ARGS__) \
-      default:                                                                                                     \
-        AT_ERROR(#NAME, " not implemented for weight type '", toString(TYPE), "'");                                \
-    }                                                                                                              \
-  }
-
-#define SYCL_DISPATCH_FLOATING_TYPES_AND2(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)    \
-  {                                                                                     \
-    const auto& the_type = TYPE;                                                        \
-    at::ScalarType _st = ::detail::scalar_type(the_type);                               \
-    switch (_st) {                                                                      \
-      PRIVATE_CASE_TYPE_OUTPLACE(at::ScalarType::Double, double, __VA_ARGS__)           \
-      PRIVATE_CASE_TYPE_OUTPLACE(at::ScalarType::Float, float, __VA_ARGS__)             \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE1, sycl::ext::oneapi::bfloat16, __VA_ARGS__) \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE2, sycl::half, __VA_ARGS__)                  \
-      default:                                                                          \
-        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                 \
-    }                                                                                   \
-  }
-
-#define SYCL_DISPATCH_ONLY_FLOATING16_TYPES(SCALARTYPE1, SCALARTYPE2, TYPE, NAME, ...)  \
-  {                                                                                     \
-    const auto& the_type = TYPE;                                                        \
-    at::ScalarType _st = ::detail::scalar_type(the_type);                               \
-    switch (_st) {                                                                      \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE1, sycl::ext::oneapi::bfloat16, __VA_ARGS__) \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE2, sycl::half, __VA_ARGS__)                  \
-      default:                                                                          \
-        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                 \
-    }                                                                                   \
-  }
-
-#define SYCL_DISPATCH_FLOATING_TYPES_AND3(SCALARTYPE1, SCALARTYPE2, SCALARTYPE3, TYPE, NAME, ...) \
-  {                                                                                               \
-    const auto& the_type = TYPE;                                                                  \
-    at::ScalarType _st = ::detail::scalar_type(the_type);                                         \
-    switch (_st) {                                                                                \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE1, float, __VA_ARGS__)                                 \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE2, sycl::ext::oneapi::bfloat16, __VA_ARGS__)           \
-      PRIVATE_CASE_TYPE_OUTPLACE(SCALARTYPE3, sycl::half, __VA_ARGS__)                            \
-      default:                                                                                    \
-        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                           \
-    }                                                                                             \
-  }
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {

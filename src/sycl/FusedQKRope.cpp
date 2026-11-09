@@ -366,39 +366,33 @@ SGL_KERNEL_EXPORT void fused_qk_rope(
       position_ids.data_ptr<int>(), static_cast<float>(factor), static_cast<float>(low), static_cast<float>(high), \
       static_cast<float>(attention_factor), static_cast<int>(rotary_dim), queue
 
-#define LAUNCH_QK_ROPE_KERNEL(HEAD_DIM, INTERLEAVE)                                                                \
-  AT_DISPATCH_SWITCH(                                                                                              \
-      qkv.scalar_type(), "fused_qk_rope", DISPATCH_CASE_FLOAT_TYPES(([&] {                                         \
-        launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, scalar_t>(FUSED_QK_ROPE_LAUNCH_ARGS);                          \
-      })) AT_DISPATCH_CASE(at::ScalarType::Float8_e4m3fn, ([&] {                                                   \
-                             launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, float_e4m3_t>(FUSED_QK_ROPE_LAUNCH_ARGS); \
-                           })))
+// FP8 uses CUTLASS storage; FP32/FP16/BF16 use ATen types.
+#define LAUNCH_QK_ROPE_KERNEL(HEAD_DIM, INTERLEAVE)                                         \
+  do {                                                                                      \
+    if (qkv.scalar_type() == at::ScalarType::Float8_e4m3fn) {                               \
+      launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, float_e4m3_t>(FUSED_QK_ROPE_LAUNCH_ARGS); \
+    } else {                                                                                \
+      AT_DISPATCH_FLOATING_TYPES_V2(qkv.scalar_type(), "fused_qk_rope", [&] {               \
+        launchFusedQKRopeImpl<HEAD_DIM, INTERLEAVE, scalar_t>(FUSED_QK_ROPE_LAUNCH_ARGS);   \
+      });                                                                                   \
+    }                                                                                       \
+  } while (0)
 
-  switch (head_dim) {
-    case 64:
-      if (interleave) {
-        LAUNCH_QK_ROPE_KERNEL(64, true);
-      } else {
-        LAUNCH_QK_ROPE_KERNEL(64, false);
-      }
-      break;
-    case 128:
-      if (interleave) {
-        LAUNCH_QK_ROPE_KERNEL(128, true);
-      } else {
-        LAUNCH_QK_ROPE_KERNEL(128, false);
-      }
-      break;
-    case 256:
-      if (interleave) {
-        LAUNCH_QK_ROPE_KERNEL(256, true);
-      } else {
-        LAUNCH_QK_ROPE_KERNEL(256, false);
-      }
-      break;
-    default:
-      TORCH_CHECK(false, "Unsupported head dimension for fused_qk_rope: ", head_dim);
-  }
+  SGL_DISPATCH_BOOL(interleave, INTERLEAVE, [&] {
+    switch (head_dim) {
+      case 64:
+        LAUNCH_QK_ROPE_KERNEL(64, INTERLEAVE);
+        break;
+      case 128:
+        LAUNCH_QK_ROPE_KERNEL(128, INTERLEAVE);
+        break;
+      case 256:
+        LAUNCH_QK_ROPE_KERNEL(256, INTERLEAVE);
+        break;
+      default:
+        TORCH_CHECK(false, "Unsupported head dimension for fused_qk_rope: ", head_dim);
+    }
+  });
 
 #undef LAUNCH_QK_ROPE_KERNEL
 #undef FUSED_QK_ROPE_LAUNCH_ARGS
@@ -596,38 +590,18 @@ SGL_KERNEL_EXPORT void fused_qk_rope_with_cos_sin_cache_inplace(
       TORCH_CHECK(false, "Unsupported rope_dim: ", rope_dim);                        \
   }
 
-// Select cos/sin cache dtype: sglang keeps the cache in fp32 on XPU for RoPE
-// numerical parity with CUDA. A cache matching the query dtype (bf16/half) is
-// also accepted for backward compatibility. The rotation math is fp32 either way.
-#define DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(IS_NEOX, POS_T) \
-  if (cos_sin_cache.scalar_type() == at::kFloat) {         \
-    LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, float, POS_T);       \
-  } else {                                                 \
-    LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, scalar_t, POS_T);    \
-  }
-
-#define DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(POS_T)   \
-  if (is_neox) {                                      \
-    DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(true, POS_T);  \
-  } else {                                            \
-    DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE(false, POS_T); \
-  }
-
-  SYCL_DISPATCH_FLOATING_TYPES(
-      at::ScalarType::Half,
-      at::ScalarType::BFloat16,
-      query.scalar_type(),
-      "fused_qk_rope_with_cos_sin_cache_inplace",
-      [&]() {
-        if (positions.scalar_type() == at::kInt) {
-          DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(int32_t);
-        } else {
-          DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT(int64_t);
-        }
+  // Cache is FP32 for CUDA parity, or matches query dtype for backward compatibility.
+  AT_DISPATCH_FLOATING_TYPES_V2(query.scalar_type(), "fused_qk_rope_with_cos_sin_cache_inplace", [&]() {
+    AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "fused_qk_rope_with_cos_sin_cache_inplace", [&] {
+      SGL_DISPATCH_BOOL(is_neox, IS_NEOX, [&] {
+        AT_DISPATCH_WEIGHT_TYPES(scalar_t, cos_sin_cache.scalar_type(), "rope cache", [&] {
+          using cache_t = weight_t;
+          LAUNCH_ROPE_CACHE_KERNEL(IS_NEOX, cache_t, index_t);
+        });
       });
+    });
+  });
 
-#undef DISPATCH_ROPE_CACHE_KERNEL_BY_LAYOUT
-#undef DISPATCH_ROPE_CACHE_BY_CACHE_DTYPE
 #undef LAUNCH_ROPE_CACHE_KERNEL
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)

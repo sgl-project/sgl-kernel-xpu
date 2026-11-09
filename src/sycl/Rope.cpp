@@ -352,7 +352,7 @@ void rotary_embedding_2D_kernel_impl(
     group_size = std::min<int64_t>(std::min<int64_t>(num_heads * rot_dim / 2, 512), max_wg_size);
   }
 
-  SYCL_DISPATCH_FLOATING_TYPES(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "rotary_embedding_2D_kernel_impl", [=]() {
         auto cgf = DPCPP_Q_CGF(cgh) {
           if (is_neox) {
@@ -427,27 +427,26 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_3D_kernel_impl(
   TORCH_CHECK(cos_sin_cache.sizes()[1] == head_size, "Rotary dim doesn't match query head_size");
   TORCH_CHECK(cos_sin_cache.sizes()[1] == k_shape[2], "Rotary dim doesn't match key head_size");
   int64_t* offsets_ptr = nullptr;
-  SYCL_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::BFloat16, at::ScalarType::Half, query.scalar_type(), "rotary_embedding_3D_kernel_impl", [&]() {
-        DSRotaryEmbedding::launch_rotary_embedding<scalar_t>(
-            reinterpret_cast<int64_t*>(positions.data_ptr()),
-            reinterpret_cast<scalar_t*>(query.data_ptr()),
-            reinterpret_cast<scalar_t*>(key.data_ptr()),
-            reinterpret_cast<int64_t*>(offsets_ptr),
-            reinterpret_cast<scalar_t*>(cos_sin_cache.data_ptr()),
-            reinterpret_cast<scalar_t*>(query_out.data_ptr()),
-            reinterpret_cast<scalar_t*>(key_out.data_ptr()),
-            batch,
-            q_num_head,
-            k_num_head,
-            head_size,
-            rotary_dim,
-            is_neox_style,
-            q_num_head_d,
-            q_batch_d,
-            k_num_head_d,
-            k_batch_d);
-      });
+  SYCL_DISPATCH_FLOATING_TYPES_V3(query.scalar_type(), "rotary_embedding_3D_kernel_impl", [&]() {
+    DSRotaryEmbedding::launch_rotary_embedding<scalar_t>(
+        reinterpret_cast<int64_t*>(positions.data_ptr()),
+        reinterpret_cast<scalar_t*>(query.data_ptr()),
+        reinterpret_cast<scalar_t*>(key.data_ptr()),
+        reinterpret_cast<int64_t*>(offsets_ptr),
+        reinterpret_cast<scalar_t*>(cos_sin_cache.data_ptr()),
+        reinterpret_cast<scalar_t*>(query_out.data_ptr()),
+        reinterpret_cast<scalar_t*>(key_out.data_ptr()),
+        batch,
+        q_num_head,
+        k_num_head,
+        head_size,
+        rotary_dim,
+        is_neox_style,
+        q_num_head_d,
+        q_batch_d,
+        k_num_head_d,
+        k_batch_d);
+  });
 
   return {query_out, key_out};
 }

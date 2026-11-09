@@ -219,28 +219,6 @@ struct VerifyConvKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 };
 
-template <typename F>
-void dispatch_bf16_or_float(at::ScalarType dtype, const char* name, F&& f) {
-  if (dtype == at::kBFloat16) {
-    f(bf16{});
-  } else if (dtype == at::kFloat) {
-    f(float{});
-  } else {
-    TORCH_CHECK(false, name, " must be bfloat16 or float32, got ", dtype);
-  }
-}
-
-template <typename F>
-void dispatch_index(at::ScalarType dtype, F&& f) {
-  if (dtype == at::kInt) {
-    f(int32_t{});
-  } else if (dtype == at::kLong) {
-    f(int64_t{});
-  } else {
-    TORCH_CHECK(false, "state_indices must be int32 or int64, got ", dtype);
-  }
-}
-
 }  // namespace
 
 namespace at::native::xpu {
@@ -396,38 +374,39 @@ SGL_KERNEL_EXPORT void qwen4_verify_conv(
 
   auto q = c10::xpu::getCurrentXPUStream().queue();
   const auto inter_dtype = has_intermediate ? intermediate->scalar_type() : at::kBFloat16;
-  dispatch_bf16_or_float(state.scalar_type(), "state", [&](auto state_tag) {
-    using StateT = decltype(state_tag);
-    dispatch_index(state_indices.scalar_type(), [&](auto index_tag) {
-      using IdxT = decltype(index_tag);
-      dispatch_bf16_or_float(inter_dtype, "intermediate", [&](auto inter_tag) {
-        using InterT = decltype(inter_tag);
-        VerifyConvKernel<StateT, IdxT, InterT> kernel{
-            {},
-            reinterpret_cast<const bf16*>(x.data_ptr()),
-            reinterpret_cast<const bf16*>(residual.data_ptr()),
-            reinterpret_cast<const bf16*>(weight.data_ptr()),
-            reinterpret_cast<const StateT*>(state.data_ptr()),
-            reinterpret_cast<const IdxT*>(state_indices.data_ptr()),
-            valid.data_ptr<bool>(),
-            reinterpret_cast<bf16*>(output.data_ptr()),
-            has_intermediate ? reinterpret_cast<InterT*>(intermediate->data_ptr()) : nullptr,
-            {state.stride(0), state.stride(1), state.stride(2)},
-            state_indices.stride(0),
-            {0, 0, 0, 0},
-            channels,
-            static_cast<int>(width),
-            static_cast<int>(state_len),
-            static_cast<int>(kernel_size),
-            static_cast<int>(dilation),
-            {}};
-        if (has_intermediate) {
-          for (int d = 0; d < 4; ++d) {
-            kernel.inter_stride[d] = intermediate->stride(d);
-          }
+  TORCH_CHECK(
+      state.scalar_type() == at::kBFloat16 || state.scalar_type() == at::kFloat,
+      "state must be bfloat16 or float32, got ",
+      state.scalar_type());
+  SGL_DISPATCH_BOOL2(state.scalar_type() == at::kBFloat16, STATE_BF16, inter_dtype == at::kBFloat16, INTER_BF16, [&] {
+    using StateT = std::conditional_t<STATE_BF16, bf16, float>;
+    using InterT = std::conditional_t<INTER_BF16, bf16, float>;
+    AT_DISPATCH_INDEX_TYPES(state_indices.scalar_type(), "qwen4_verify_conv indices", [&] {
+      VerifyConvKernel<StateT, index_t, InterT> kernel{
+          {},
+          reinterpret_cast<const bf16*>(x.data_ptr()),
+          reinterpret_cast<const bf16*>(residual.data_ptr()),
+          reinterpret_cast<const bf16*>(weight.data_ptr()),
+          reinterpret_cast<const StateT*>(state.data_ptr()),
+          reinterpret_cast<const index_t*>(state_indices.data_ptr()),
+          valid.data_ptr<bool>(),
+          reinterpret_cast<bf16*>(output.data_ptr()),
+          has_intermediate ? reinterpret_cast<InterT*>(intermediate->data_ptr()) : nullptr,
+          {state.stride(0), state.stride(1), state.stride(2)},
+          state_indices.stride(0),
+          {0, 0, 0, 0},
+          channels,
+          static_cast<int>(width),
+          static_cast<int>(state_len),
+          static_cast<int>(kernel_size),
+          static_cast<int>(dilation),
+          {}};
+      if (has_intermediate) {
+        for (int d = 0; d < 4; ++d) {
+          kernel.inter_stride[d] = intermediate->stride(d);
         }
-        sycl_kernel_submit(sycl::range<2>(requests, channel_blocks * WG_SIZE), sycl::range<2>(1, WG_SIZE), q, kernel);
-      });
+      }
+      sycl_kernel_submit(sycl::range<2>(requests, channel_blocks * WG_SIZE), sycl::range<2>(1, WG_SIZE), q, kernel);
     });
   });
 }

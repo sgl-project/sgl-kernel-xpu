@@ -34,7 +34,9 @@ def fused_scale_residual_norm_scale_shift(
     ``gate`` is ``(1, 1, hidden)``, or ``(1, num_frames, 1, hidden)`` with
     ``num_frames`` dividing ``seq_len``, or the int ``1``. ``scale`` and ``shift``
     are ``(hidden,)`` or single elements. ``weight`` and ``bias`` are ``(hidden,)``
-    and independently optional. Returns ``(out, residual_output)``.
+    and independently optional. Tensor gate, weight, bias, scale, and shift must
+    share one dtype: the dtype of ``x`` or float32.
+    Returns ``(out, residual_output)``.
     """
     if x.device.type != "xpu" or x.dtype not in _SUPPORTED_DTYPES:
         raise ValueError(
@@ -94,10 +96,10 @@ def fused_scale_residual_norm_scale_shift(
         for p in (gate, shift, scale, weight, bias)
         if isinstance(p, torch.Tensor)
     }
-    if len(param_dtypes) != 1 or shift.dtype not in _SUPPORTED_DTYPES:
+    if len(param_dtypes) != 1 or shift.dtype not in (x.dtype, torch.float32):
         raise ValueError(
-            "gate/weight/bias/scale/shift must share one float32, float16 or "
-            f"bfloat16 dtype, got {param_dtypes}"
+            "gate/weight/bias/scale/shift must share one dtype matching x "
+            f"({x.dtype}) or float32, got {param_dtypes}"
         )
 
     return torch.ops.sgl_kernel.fused_scale_residual_norm_scale_shift(

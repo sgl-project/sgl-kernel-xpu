@@ -331,7 +331,7 @@ SGL_KERNEL_EXPORT void flash_compress128_decode(
 
   using input_t = float;
   using output_t = float;
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress128Decode", [&]() {
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress128Decode", [&]() {
     queue.submit([&](sycl::handler& cgh) {
       // Shared memory: 3 sections × [kTokenGroups × kTileDim] floats.
       const size_t kSmemElems = static_cast<size_t>(3 * kTokenGroups * kTileDim);
@@ -422,7 +422,7 @@ SGL_KERNEL_EXPORT void flash_compress128_prefill(
 
   using input_t = float;
   using output_t = float;
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress128Prefill", [&]() {
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, kv_buffer.scalar_type(), "FlashCompress128Prefill", [&]() {
     if (num_compress > 0) {
       queue.submit([&](sycl::handler& cgh) {
         // Shared memory: 3 sections × [kTokenGroups × kTileDim] floats.

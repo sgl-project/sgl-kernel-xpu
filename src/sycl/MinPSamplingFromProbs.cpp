@@ -16,50 +16,6 @@
 #include "comm/Sampling.h"
 #include "sgl_kernel_export.h"
 
-template <typename T>
-struct ToSyclElementType {
-  using type = T;
-};
-
-template <>
-struct ToSyclElementType<at::Half> {
-  using type = sycl::half;
-};
-
-template <>
-struct ToSyclElementType<at::BFloat16> {
-  using type = sycl::ext::oneapi::bfloat16;
-};
-
-#define DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE_VAR, ...) \
-  switch (vec_size) {                                       \
-    case 16: {                                              \
-      constexpr uint32_t VEC_SIZE_VAR = 16;                 \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-    case 8: {                                               \
-      constexpr uint32_t VEC_SIZE_VAR = 8;                  \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-    case 4: {                                               \
-      constexpr uint32_t VEC_SIZE_VAR = 4;                  \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-    case 2: {                                               \
-      constexpr uint32_t VEC_SIZE_VAR = 2;                  \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-    default: {                                              \
-      constexpr uint32_t VEC_SIZE_VAR = 1;                  \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-  }
-
 //----------------- min-p rejection sampling --------------------//
 // One work-group processes one request row.
 
@@ -182,7 +138,6 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 };
 
-template <typename TensorDType>
 void launch_min_p_sampling(
     const at::Tensor& probs,
     int32_t* output,
@@ -195,19 +150,17 @@ void launch_min_p_sampling(
     uint64_t philox_offset,
     bool deterministic,
     sycl::queue& queue) {
-  using KernelDType = typename ToSyclElementType<TensorDType>::type;
-
-  const KernelDType* probs_ptr = reinterpret_cast<const KernelDType*>(probs.data_ptr<TensorDType>());
+  const float* probs_ptr = probs.data_ptr<float>();
 
   const int local_size = kMinPWgSize;
   const int global_size = batch_size * local_size;
 
-  const uint32_t preferred_vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(KernelDType));
+  const uint32_t preferred_vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(float));
   const uint32_t vec_size = std::gcd(preferred_vec_size, vocab_size);
 
-  DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE, {
-    AT_DISPATCH_BOOL_NO_RETURN(deterministic, DETERMINISTIC, {
-      auto kernel = MinPSamplingKernel<KernelDType, VEC_SIZE, DETERMINISTIC>(
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+    SGL_DISPATCH_BOOL(deterministic, DETERMINISTIC, [&] {
+      auto kernel = MinPSamplingKernel<float, VEC_SIZE, DETERMINISTIC>(
           probs_ptr,
           output,
           maybe_indices,
@@ -286,7 +239,7 @@ SGL_KERNEL_EXPORT void min_p_sampling_from_probs(
   SGL_KERNEL_PERF_SCOPE("min_p_sampling", queue, bytes, flops);
 #endif
 
-  launch_min_p_sampling<float>(
+  launch_min_p_sampling(
       probs,
       output.data_ptr<int32_t>(),
       indices_ptr,

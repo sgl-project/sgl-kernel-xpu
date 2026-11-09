@@ -1008,17 +1008,16 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit_v2(
   }                                                 \
   while (0)
 
-  SYCL_DISPATCH_ONLY_FLOATING16_TYPES(
-      at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "sgl_per_token_group_quant_8bit_v2", [&]() {
-        if (dst_type == at::ScalarType::Char) {
-          LAUNCH_KERNEL_OUTER(scalar_t, int8_t);
-          return true;
-        } else if (dst_type == at::ScalarType::Float8_e4m3fn) {
-          LAUNCH_KERNEL_OUTER(scalar_t, c10::Float8_e4m3fn);
-          return true;
-        }
-        return false;
-      });
+  SYCL_DISPATCH_FLOATING_TYPES_V1(input.scalar_type(), "sgl_per_token_group_quant_8bit_v2", [&]() {
+    if (dst_type == at::ScalarType::Char) {
+      LAUNCH_KERNEL_OUTER(scalar_t, int8_t);
+      return true;
+    } else if (dst_type == at::ScalarType::Float8_e4m3fn) {
+      LAUNCH_KERNEL_OUTER(scalar_t, c10::Float8_e4m3fn);
+      return true;
+    }
+    return false;
+  });
 
 #undef LAUNCH_KERNEL
 #undef LAUNCH_KERNEL_INNER

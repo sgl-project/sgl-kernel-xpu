@@ -20,14 +20,6 @@ namespace at::native::xpu {
 
 namespace {
 
-// FLOATING_TYPES_AND2 binds scalar_t to the SYCL types but WEIGHT_TYPES binds weight_t
-// to the c10 ones; map them so T and P convert identically inside the kernel.
-template <typename T>
-using srnss_sycl_t = std::conditional_t<
-    std::is_same_v<T, at::Half>,
-    ::sycl::half,
-    std::conditional_t<std::is_same_v<T, at::BFloat16>, ::sycl::ext::oneapi::bfloat16, T>>;
-
 // Global access is vectorized through vec_t, as in per_tensor_quant_fp8.cpp and
 // TopKRenormProbs.cpp, but by dereferencing a vec_t pointer rather than vec_t::load/store:
 // the member functions scalarize, measured 119 vs 392 GB/s for bf16 at S=32760 H=5120.
@@ -250,44 +242,29 @@ template <typename T, typename P>
 void launch(::sycl::queue& queue, const LaunchArgs& a) {
   if (a.num_rows <= 0 || a.hidden <= 0) return;
 
-#define SRNSS_SUBMIT(VEC_SIZE)                                 \
-  sycl_kernel_submit(                                          \
-      static_cast<size_t>(a.num_rows) * kSrnssThreadsPerBlock, \
-      kSrnssThreadsPerBlock,                                   \
-      queue,                                                   \
-      ScaleResidualNormScaleShiftKernel<T, P, VEC_SIZE>(       \
-          static_cast<T*>(a.residual_out),                     \
-          static_cast<T*>(a.out),                              \
-          static_cast<const T*>(a.residual),                   \
-          static_cast<const T*>(a.x),                          \
-          static_cast<const P*>(a.gate),                       \
-          static_cast<const P*>(a.weight),                     \
-          static_cast<const P*>(a.bias),                       \
-          static_cast<const P*>(a.scale),                      \
-          static_cast<const P*>(a.shift),                      \
-          static_cast<uint32_t>(a.num_rows),                   \
-          static_cast<uint32_t>(a.hidden),                     \
-          static_cast<uint32_t>(a.gate_row_div),               \
-          static_cast<uint32_t>(a.gate_row_stride),            \
-          a.scale_is_vec != 0,                                 \
-          a.shift_is_vec != 0,                                 \
-          a.eps))
-
-  switch (a.vec_size) {
-    case 8:
-      SRNSS_SUBMIT(8);
-      break;
-    case 4:
-      SRNSS_SUBMIT(4);
-      break;
-    case 2:
-      SRNSS_SUBMIT(2);
-      break;
-    default:
-      SRNSS_SUBMIT(1);
-      break;
-  }
-#undef SRNSS_SUBMIT
+  SGL_DISPATCH_VEC_SIZE_SET(a.vec_size, (1, 2, 4, 8), [&] {
+    sycl_kernel_submit(
+        static_cast<size_t>(a.num_rows) * kSrnssThreadsPerBlock,
+        kSrnssThreadsPerBlock,
+        queue,
+        ScaleResidualNormScaleShiftKernel<T, P, VEC_SIZE>(
+            static_cast<T*>(a.residual_out),
+            static_cast<T*>(a.out),
+            static_cast<const T*>(a.residual),
+            static_cast<const T*>(a.x),
+            static_cast<const P*>(a.gate),
+            static_cast<const P*>(a.weight),
+            static_cast<const P*>(a.bias),
+            static_cast<const P*>(a.scale),
+            static_cast<const P*>(a.shift),
+            static_cast<uint32_t>(a.num_rows),
+            static_cast<uint32_t>(a.hidden),
+            static_cast<uint32_t>(a.gate_row_div),
+            static_cast<uint32_t>(a.gate_row_stride),
+            a.scale_is_vec != 0,
+            a.shift_is_vec != 0,
+            a.eps));
+  });
 }
 
 void check_param(const torch::Tensor& t, at::ScalarType param_dtype, const char* name) {
@@ -430,15 +407,13 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto& queue = stream.queue();
-  SYCL_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::BFloat16, at::ScalarType::Half, x.scalar_type(), "fused_scale_residual_norm_scale_shift", [&]() {
-        SYCL_DISPATCH_WEIGHT_TYPES(
-            at::ScalarType::Half,
-            at::ScalarType::BFloat16,
-            param_dtype,
-            "fused_scale_residual_norm_scale_shift",
-            [&]() { launch<scalar_t, srnss_sycl_t<weight_t>>(queue, args); });
-      });
+  AT_DISPATCH_FLOATING_TYPES_V2(x.scalar_type(), "fused_scale_residual_norm_scale_shift", [&] {
+    using input_t = sycl_type_t<scalar_t>;
+    AT_DISPATCH_WEIGHT_TYPES(scalar_t, param_dtype, "fused_scale_residual_norm_scale_shift params", [&] {
+      using param_t = sycl_type_t<weight_t>;
+      launch<input_t, param_t>(queue, args);
+    });
+  });
 
   return {out, residual_output};
 }

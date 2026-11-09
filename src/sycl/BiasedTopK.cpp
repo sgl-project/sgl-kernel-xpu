@@ -503,7 +503,7 @@ SGL_KERNEL_EXPORT void biased_topk(
 #endif
 
   if (scoring_func == static_cast<int64_t>(ScoringFunc::kSigmoid)) {
-    DISPATCH_FLOAT_TYPES(input.scalar_type(), "biased_topk_kernel", [&] {
+    AT_DISPATCH_FLOATING_TYPES_V2(input.scalar_type(), "biased_topk_kernel", [&] {
       launch_biased_topk<scalar_t, ScoringFunc::kSigmoid>(
           input,
           bias,
@@ -517,7 +517,7 @@ SGL_KERNEL_EXPORT void biased_topk(
           queue);
     });
   } else {
-    DISPATCH_FLOAT_TYPES(input.scalar_type(), "biased_topk_kernel", [&] {
+    AT_DISPATCH_FLOATING_TYPES_V2(input.scalar_type(), "biased_topk_kernel", [&] {
       launch_biased_topk<scalar_t, ScoringFunc::kSqrtSoftplus>(
           input,
           bias,

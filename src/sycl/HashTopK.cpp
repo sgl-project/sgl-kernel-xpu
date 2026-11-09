@@ -184,7 +184,7 @@ SGL_KERNEL_EXPORT void hash_topk(
   SGL_KERNEL_PERF_SCOPE("hash_topk", queue, bytes, flops);
 #endif
 
-  DISPATCH_FLOAT_TYPES(router_logits.scalar_type(), "hash_topk_xpu", [&] {
+  AT_DISPATCH_FLOATING_TYPES_V2(router_logits.scalar_type(), "hash_topk_xpu", [&] {
     launch_hash_topk<scalar_t>(
         queue,
         router_logits.data_ptr<scalar_t>(),

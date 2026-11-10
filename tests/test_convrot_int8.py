@@ -18,7 +18,6 @@ def reference_rotate_quantize(x):
     rotated = rotated.reshape_as(x)
     scale = (rotated.abs().amax(-1).float() / 127).clamp_min(1e-30)
     math_scale = scale.to(x.dtype)
-    math_scale = torch.where(math_scale == 0, torch.finfo(x.dtype).tiny, math_scale)
     q = (rotated / math_scale[:, None]).round().clamp(-128, 127).to(torch.int8)
     return q, scale
 

@@ -20,6 +20,15 @@
 
 namespace {
 
+// Measured rotation specializations; other supported widths use the generic path.
+constexpr int kQuantNarrowK = 1792;
+constexpr int kQuantMediumK = 3584;
+constexpr int kQuantWideK = 5376;
+// Grouped traversal was validated for this bandwidth-heavy shape, not arbitrary N/K.
+constexpr int kGroupedGemmN = 7168;
+constexpr int kGroupedGemmK = kQuantWideK;
+constexpr int kGroupedGemmMinM = 16384;
+
 void check_tensor(const at::Tensor& tensor, const at::Device& device, at::ScalarType dtype, const char* name) {
   TORCH_CHECK(tensor.device() == device && tensor.is_xpu(), name, " must be on the input XPU device");
   TORCH_CHECK(tensor.scalar_type() == dtype, name, " has incorrect dtype");
@@ -113,6 +122,7 @@ struct ConvRotQuantKernel {
     if (item.get_local_id(0) == 0) {
       scales[row] = scale;
     }
+    // Match comfy-kitchen: divide in BF16, but return the unrounded FP32 scale for dequantization.
     const float math_scale = static_cast<float>(static_cast<at::BFloat16>(scale));
     if constexpr (FixedK) {
 #pragma unroll
@@ -291,6 +301,7 @@ convrot_rotate_quantize(const at::Tensor& input, int64_t group_size) {
   const int64_t k = input.size(1);
   TORCH_CHECK(k > 0 && k <= 8192 && k % 256 == 0, "K must be a multiple of 256 in [256, 8192]");
   c10::DeviceGuard guard(input.device());
+  // The SYCL rotation is portable, but its launch configuration is currently validated only on BMG.
   TORCH_CHECK(is_bmg(), "ConvRot INT8 currently supports BMG (Xe2) devices only");
   auto output = at::empty(input.sizes(), input.options().dtype(at::kChar));
   auto scales = at::empty({input.size(0)}, input.options().dtype(at::kFloat));
@@ -309,12 +320,12 @@ convrot_rotate_quantize(const at::Tensor& input, int64_t group_size) {
                 values});
       });
     };
-    if (k == 1792) {
-      launch.template operator()<1792, 256>();
-    } else if (k == 3584) {
-      launch.template operator()<3584, 256>();
-    } else if (k == 5376) {
-      launch.template operator()<5376, 512>();
+    if (k == kQuantNarrowK) {
+      launch.template operator()<kQuantNarrowK, 256>();
+    } else if (k == kQuantMediumK) {
+      launch.template operator()<kQuantMediumK, 256>();
+    } else if (k == kQuantWideK) {
+      launch.template operator()<kQuantWideK, 512>();
     } else {
       launch.template operator()<0>();
     }
@@ -380,7 +391,7 @@ SGL_KERNEL_EXPORT at::Tensor convrot_int8_linear_prequant(
     TORCH_CHECK(
         status == cutlass::Status::kSuccess, "ConvRot INT8 GEMM launch failed: ", cutlassGetStatusString(status));
   };
-  if (n == 7168 && k == 5376 && m >= 16384) {
+  if (n == kGroupedGemmN && k == kGroupedGemmK && m >= kGroupedGemmMinM) {
     launch.template operator()<GroupedGemm>();
   } else {
     launch.template operator()<Gemm>();

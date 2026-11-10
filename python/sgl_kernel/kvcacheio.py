@@ -49,8 +49,16 @@ def transfer_kv_per_layer(
     item_size: int,
     block_quota: int = _DEFAULT_BLOCK_QUOTA,
     sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+    src_row_stride: int = 0,
+    dst_row_stride: int = 0,
 ) -> None:
-    """Single-layer lf→lf transfer for K and V."""
+    """Single-layer lf→lf transfer for K and V.
+
+    ``src_row_stride`` / ``dst_row_stride`` are the byte distances between
+    consecutive token rows of the source / destination; 0 (the default) means
+    packed rows (``item_size``). A non-zero stride must be ``>= item_size`` and a
+    multiple of 8, e.g. for strided unified-memory pool views.
+    """
     torch.ops.sgl_kernel.transfer_kv_per_layer.default(
         src_k,
         dst_k,
@@ -61,6 +69,8 @@ def transfer_kv_per_layer(
         item_size,
         block_quota,
         sgs_per_wg,
+        src_row_stride,
+        dst_row_stride,
     )
 
 
@@ -72,8 +82,16 @@ def transfer_kv_per_layer_mla(
     item_size: int,
     block_quota: int = _DEFAULT_BLOCK_QUOTA,
     sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+    src_row_stride: int = 0,
+    dst_row_stride: int = 0,
 ) -> None:
-    """Single-layer lf→lf transfer, MLA (K only)."""
+    """Single-layer lf→lf transfer, MLA (K only).
+
+    ``src_row_stride`` / ``dst_row_stride`` are the byte distances between
+    consecutive token rows of the source / destination; 0 (the default) means
+    packed rows (``item_size``). A non-zero stride must be ``>= item_size`` and a
+    multiple of 8, e.g. for strided unified-memory pool views.
+    """
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla.default(
         src,
         dst,
@@ -82,6 +100,8 @@ def transfer_kv_per_layer_mla(
         item_size,
         block_quota,
         sgs_per_wg,
+        src_row_stride,
+        dst_row_stride,
     )
 
 
@@ -96,11 +116,18 @@ def transfer_kv_all_layer(
     num_layers: int,
     block_quota: int = _DEFAULT_BLOCK_QUOTA,
     sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+    src_row_stride: int = 0,
+    dst_row_stride: int = 0,
 ) -> None:
     """All-layer lf_tbl→lf_tbl transfer for K and V.
 
     src_k_layers / dst_k_layers are uint64 tensors of data_ptr() values,
     one per layer.
+
+    ``src_row_stride`` / ``dst_row_stride`` are the byte distances between
+    consecutive token rows of the source / destination; 0 (the default) means
+    packed rows (``item_size``). A non-zero stride must be ``>= item_size`` and a
+    multiple of 8, e.g. for strided unified-memory pool views.
     """
     torch.ops.sgl_kernel.transfer_kv_all_layer.default(
         src_k_layers,
@@ -113,6 +140,8 @@ def transfer_kv_all_layer(
         num_layers,
         block_quota,
         sgs_per_wg,
+        src_row_stride,
+        dst_row_stride,
     )
 
 
@@ -125,8 +154,16 @@ def transfer_kv_all_layer_mla(
     num_layers: int,
     block_quota: int = _DEFAULT_BLOCK_QUOTA,
     sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+    src_row_stride: int = 0,
+    dst_row_stride: int = 0,
 ) -> None:
-    """All-layer lf_tbl→lf_tbl transfer, MLA (K only)."""
+    """All-layer lf_tbl→lf_tbl transfer, MLA (K only).
+
+    ``src_row_stride`` / ``dst_row_stride`` are the byte distances between
+    consecutive token rows of the source / destination; 0 (the default) means
+    packed rows (``item_size``). A non-zero stride must be ``>= item_size`` and a
+    multiple of 8, e.g. for strided unified-memory pool views.
+    """
     torch.ops.sgl_kernel.transfer_kv_all_layer_mla.default(
         src_layers,
         dst_layers,
@@ -136,6 +173,8 @@ def transfer_kv_all_layer_mla(
         num_layers,
         block_quota,
         sgs_per_wg,
+        src_row_stride,
+        dst_row_stride,
     )
 
 
@@ -153,8 +192,17 @@ def transfer_kv_all_layer_lf_ph(
     head_num: int,
     block_quota: int = _DEFAULT_BLOCK_QUOTA,
     sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+    src_row_stride: int = 0,
+    dst_row_stride: int = 0,
 ) -> None:
-    """All-layer lf_tbl → page-head transfer for K and V."""
+    """All-layer lf_tbl → page-head transfer for K and V.
+
+    ``src_row_stride`` is the byte distance between consecutive token rows of
+    the lf source; 0 (the default) means packed rows (``item_size``). A
+    non-zero stride must be ``>= item_size`` and a multiple of 8.
+    ``dst_row_stride`` must stay 0: the page-head side is addressed by its
+    layout_dim.
+    """
     torch.ops.sgl_kernel.transfer_kv_all_layer_lf_ph.default(
         src_k_layers,
         dst_k,
@@ -169,6 +217,8 @@ def transfer_kv_all_layer_lf_ph(
         head_num,
         block_quota,
         sgs_per_wg,
+        src_row_stride,
+        dst_row_stride,
     )
 
 
@@ -186,8 +236,17 @@ def transfer_kv_per_layer_ph_lf(
     head_num: int,
     block_quota: int = _DEFAULT_BLOCK_QUOTA,
     sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+    src_row_stride: int = 0,
+    dst_row_stride: int = 0,
 ) -> None:
-    """Single-layer page-head → lf transfer for K and V."""
+    """Single-layer page-head → lf transfer for K and V.
+
+    ``dst_row_stride`` is the byte distance between consecutive token rows of
+    the lf destination; 0 (the default) means packed rows (``item_size``). A
+    non-zero stride must be ``>= item_size`` and a multiple of 8.
+    ``src_row_stride`` must stay 0: the page-head side is addressed by its
+    layout_dim.
+    """
     torch.ops.sgl_kernel.transfer_kv_per_layer_ph_lf.default(
         src_k,
         dst_k,
@@ -202,6 +261,8 @@ def transfer_kv_per_layer_ph_lf(
         head_num,
         block_quota,
         sgs_per_wg,
+        src_row_stride,
+        dst_row_stride,
     )
 
 
@@ -217,8 +278,17 @@ def transfer_kv_per_layer_pf_lf(
     src_layout_dim: int,
     block_quota: int = _DEFAULT_BLOCK_QUOTA,
     sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+    src_row_stride: int = 0,
+    dst_row_stride: int = 0,
 ) -> None:
-    """Single-layer page-first → lf transfer for K and V."""
+    """Single-layer page-first → lf transfer for K and V.
+
+    ``dst_row_stride`` is the byte distance between consecutive token rows of
+    the lf destination; 0 (the default) means packed rows (``item_size``). A
+    non-zero stride must be ``>= item_size`` and a multiple of 8.
+    ``src_row_stride`` must stay 0: the page-first side is addressed by its
+    layout_dim.
+    """
     torch.ops.sgl_kernel.transfer_kv_per_layer_pf_lf.default(
         src_k,
         dst_k,
@@ -231,6 +301,8 @@ def transfer_kv_per_layer_pf_lf(
         src_layout_dim,
         block_quota,
         sgs_per_wg,
+        src_row_stride,
+        dst_row_stride,
     )
 
 
@@ -246,8 +318,17 @@ def transfer_kv_all_layer_lf_pf(
     num_layers: int,
     block_quota: int = _DEFAULT_BLOCK_QUOTA,
     sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+    src_row_stride: int = 0,
+    dst_row_stride: int = 0,
 ) -> None:
-    """All-layers lf → page-first transfer for K and V."""
+    """All-layers lf → page-first transfer for K and V.
+
+    ``src_row_stride`` is the byte distance between consecutive token rows of
+    the lf source; 0 (the default) means packed rows (``item_size``). A
+    non-zero stride must be ``>= item_size`` and a multiple of 8.
+    ``dst_row_stride`` must stay 0: the page-first side is addressed by its
+    layout_dim.
+    """
     torch.ops.sgl_kernel.transfer_kv_all_layer_lf_pf.default(
         src_k_layers,
         dst_k,
@@ -260,6 +341,8 @@ def transfer_kv_all_layer_lf_pf(
         num_layers,
         block_quota,
         sgs_per_wg,
+        src_row_stride,
+        dst_row_stride,
     )
 
 
@@ -273,8 +356,17 @@ def transfer_kv_per_layer_mla_pf_lf(
     src_layout_dim: int,
     block_quota: int = _DEFAULT_BLOCK_QUOTA,
     sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+    src_row_stride: int = 0,
+    dst_row_stride: int = 0,
 ) -> None:
-    """Single-layer page-first → lf transfer for K only (MLA)."""
+    """Single-layer page-first → lf transfer for K only (MLA).
+
+    ``dst_row_stride`` is the byte distance between consecutive token rows of
+    the lf destination; 0 (the default) means packed rows (``item_size``). A
+    non-zero stride must be ``>= item_size`` and a multiple of 8.
+    ``src_row_stride`` must stay 0: the page-first side is addressed by its
+    layout_dim.
+    """
     torch.ops.sgl_kernel.transfer_kv_per_layer_mla_pf_lf.default(
         src,
         dst,
@@ -285,6 +377,8 @@ def transfer_kv_per_layer_mla_pf_lf(
         src_layout_dim,
         block_quota,
         sgs_per_wg,
+        src_row_stride,
+        dst_row_stride,
     )
 
 
@@ -298,8 +392,17 @@ def transfer_kv_all_layer_mla_lf_pf(
     num_layers: int,
     block_quota: int = _DEFAULT_BLOCK_QUOTA,
     sgs_per_wg: int = _DEFAULT_SGS_PER_WG,
+    src_row_stride: int = 0,
+    dst_row_stride: int = 0,
 ) -> None:
-    """All-layers lf → page-first transfer for K only (MLA)."""
+    """All-layers lf → page-first transfer for K only (MLA).
+
+    ``src_row_stride`` is the byte distance between consecutive token rows of
+    the lf source; 0 (the default) means packed rows (``item_size``). A
+    non-zero stride must be ``>= item_size`` and a multiple of 8.
+    ``dst_row_stride`` must stay 0: the page-first side is addressed by its
+    layout_dim.
+    """
     torch.ops.sgl_kernel.transfer_kv_all_layer_mla_lf_pf.default(
         src_layers,
         dst,
@@ -310,6 +413,8 @@ def transfer_kv_all_layer_mla_lf_pf(
         num_layers,
         block_quota,
         sgs_per_wg,
+        src_row_stride,
+        dst_row_stride,
     )
 
 

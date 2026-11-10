@@ -14,9 +14,8 @@ from sgl_kernel.kvcacheio import (
     transfer_kv_per_layer_mla,
     transfer_kv_per_layer_mla_pf_lf,
     transfer_kv_per_layer_pf_lf,
+    transfer_kv_per_layer_ph_lf,
 )
-
-from sglang.srt.utils import is_hip
 
 device = utils.get_device()
 
@@ -71,20 +70,23 @@ def ref_copy_with_indices_page_head(
     head_num,
     lf_to_ph=False,
 ):
+    """Reference for the page-head layout, as one indexed copy.
+
+    ph pool is [num_pages, head_num, page_size, num_layers, head_dim];
+    lf pool is [num_layers, num_tokens, head_num, head_dim]. Both sides of the
+    copy are [len(indices), head_num, head_dim], so all heads move at once
+    (head_num is implied by the pool shapes).
+    """
+    src_idx = src_indices.to(src_pool.device)
+    dst_idx = dst_indices.to(dst_pool.device)
     if lf_to_ph:
-        for head_id in range(head_num):
-            for i in range(0, len(src_indices)):
-                dst_pool[dst_indices[i] // page_size][head_id][
-                    dst_indices[i] % page_size
-                ][layer_id] = src_pool[layer_id][src_indices[i]][head_id].to(
-                    dst_pool.device
-                )
+        dst_pool[dst_idx // page_size, :, dst_idx % page_size, layer_id] = src_pool[
+            layer_id
+        ][src_idx].to(dst_pool.device)
     else:
-        for head_id in range(head_num):
-            for i in range(0, len(src_indices)):
-                dst_pool[layer_id][dst_indices[i]][head_id] = src_pool[
-                    src_indices[i] // page_size
-                ][head_id][src_indices[i] % page_size][layer_id].to(dst_pool.device)
+        dst_pool[layer_id][dst_idx] = src_pool[
+            src_idx // page_size, :, src_idx % page_size, layer_id
+        ].to(dst_pool.device)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -538,7 +540,6 @@ def test_transfer_kv_pf_direct(
     torch.set_default_dtype(original_dtype)
 
 
-@pytest.mark.skipif(is_hip(), reason="HIP is not supported for this test")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_items_to_transfer", [256, 1024])
 @pytest.mark.parametrize("page_size", [16, 64, 128])
@@ -872,6 +873,596 @@ def test_transfer_kv_pf_kernel(
             torch.testing.assert_close(dst_k_kernel, dst_k_ref)
             torch.testing.assert_close(dst_v_kernel, dst_v_ref)
     torch.set_default_dtype(original_dtype)
+
+
+def _strided_lf_pool(num_layers, num_tokens, item_size, row_stride_mult, fill):
+    """lf [layers, tokens, item] view whose rows sit row_stride_mult rows apart.
+
+    Returns (view, backing); the gap rows of `backing` stay zero so a stride bug
+    that writes past a row shows up as a non-zero gap.
+    """
+    backing = torch.zeros(num_layers, num_tokens, row_stride_mult, item_size).to(device)
+    view = backing[:, :, 0, :]
+    if fill:
+        view.copy_(torch.randn(num_layers, num_tokens, item_size).to(device))
+    return view, backing
+
+
+def _assert_gaps_untouched(backing):
+    gaps = backing[:, :, 1:, :]
+    torch.testing.assert_close(gaps, torch.zeros_like(gaps))
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("row_stride_mult", [2, 3])
+@pytest.mark.parametrize("is_mla", [False, True])
+@pytest.mark.parametrize("lf_to_pf", [False, True])
+def test_transfer_kv_pf_kernel_strided_device_rows(
+    dtype: torch.dtype, row_stride_mult: int, is_mla: bool, lf_to_pf: bool
+):
+    """Page-first transfers whose lf (device) rows are strided, as in a unified-memory pool.
+
+    The lf side steps by src/dst_row_stride; the pf side keeps layout_dim.
+    """
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    torch.manual_seed(42)
+
+    num_layers, num_tokens, item_size, num_items = 4, 4096, 256, 512
+    layer_idx_to_test = 1
+    item_bytes = item_size * dtype.itemsize
+    layout_dim_bytes = item_size * num_layers * dtype.itemsize
+    row_stride = row_stride_mult * item_bytes
+    perm = torch.randperm(num_tokens, dtype=torch.int64)
+    src_indices = perm[:num_items].to(device)
+    dst_indices = perm[num_items : 2 * num_items].to(device)
+    num_kv = 1 if is_mla else 2
+
+    def make_lf_tbl(pool):
+        return torch.tensor(
+            [pool[i].data_ptr() for i in range(num_layers)],
+            dtype=torch.uint64,
+            device=device,
+        )
+
+    if lf_to_pf:
+        srcs = [
+            _strided_lf_pool(num_layers, num_tokens, item_size, row_stride_mult, True)[
+                0
+            ]
+            for _ in range(num_kv)
+        ]
+        dsts = [torch.zeros(num_tokens, num_layers, item_size).to(device) for _ in srcs]
+        refs = [torch.zeros_like(d) for d in dsts]
+        if is_mla:
+            transfer_kv_all_layer_mla_lf_pf(
+                make_lf_tbl(srcs[0]),
+                dsts[0],
+                src_indices,
+                dst_indices,
+                item_bytes,
+                layout_dim_bytes,
+                num_layers,
+                src_row_stride=row_stride,
+            )
+        else:
+            transfer_kv_all_layer_lf_pf(
+                make_lf_tbl(srcs[0]),
+                dsts[0],
+                make_lf_tbl(srcs[1]),
+                dsts[1],
+                src_indices,
+                dst_indices,
+                item_bytes,
+                layout_dim_bytes,
+                num_layers,
+                src_row_stride=row_stride,
+            )
+        for src, ref in zip(srcs, refs):
+            for i in range(num_layers):
+                ref_copy_with_indices_pf(
+                    src, ref, src_indices, dst_indices, i, pf_to_lf=False
+                )
+        torch.accelerator.synchronize()
+        for dst, ref in zip(dsts, refs):
+            torch.testing.assert_close(dst, ref)
+    else:
+        srcs = [
+            torch.randn(num_tokens, num_layers, item_size).to(device)
+            for _ in range(num_kv)
+        ]
+        dst_pools = [
+            _strided_lf_pool(num_layers, num_tokens, item_size, row_stride_mult, False)
+            for _ in srcs
+        ]
+        refs = [torch.zeros(num_layers, num_tokens, item_size).to(device) for _ in srcs]
+        dsts = [view[layer_idx_to_test] for view, _ in dst_pools]
+        if is_mla:
+            transfer_kv_per_layer_mla_pf_lf(
+                srcs[0],
+                dsts[0],
+                src_indices,
+                dst_indices,
+                layer_idx_to_test,
+                item_bytes,
+                layout_dim_bytes,
+                dst_row_stride=row_stride,
+            )
+        else:
+            transfer_kv_per_layer_pf_lf(
+                srcs[0],
+                dsts[0],
+                srcs[1],
+                dsts[1],
+                src_indices,
+                dst_indices,
+                layer_idx_to_test,
+                item_bytes,
+                layout_dim_bytes,
+                dst_row_stride=row_stride,
+            )
+        for src, ref in zip(srcs, refs):
+            ref_copy_with_indices_pf(
+                src, ref, src_indices, dst_indices, layer_idx_to_test
+            )
+        torch.accelerator.synchronize()
+        for (view, backing), ref in zip(dst_pools, refs):
+            torch.testing.assert_close(view, ref)
+            _assert_gaps_untouched(backing)
+    torch.set_default_dtype(original_dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("is_mla", [False, True])
+@pytest.mark.parametrize("all_layers", [False, True])
+@pytest.mark.parametrize("strided_side", ["src", "dst"])
+def test_transfer_kv_lf_strided_rows(
+    dtype: torch.dtype, is_mla: bool, all_layers: bool, strided_side: str
+):
+    """lf→lf transfers with one side's rows strided by src/dst_row_stride."""
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    torch.manual_seed(42)
+
+    num_layers, num_tokens, item_size, num_items = 4, 4096, 256, 512
+    row_stride_mult = 2
+    item_bytes = item_size * dtype.itemsize
+    stride_kw = {f"{strided_side}_row_stride": row_stride_mult * item_bytes}
+    perm = torch.randperm(num_tokens, dtype=torch.int64)
+    src_indices = perm[:num_items].to(device)
+    dst_indices = perm[num_items : 2 * num_items].to(device)
+    num_kv = 1 if is_mla else 2
+
+    def pool(strided, fill):
+        if strided:
+            return _strided_lf_pool(
+                num_layers, num_tokens, item_size, row_stride_mult, fill
+            )
+        view = torch.zeros(num_layers, num_tokens, item_size).to(device)
+        if fill:
+            view.copy_(torch.randn_like(view))
+        return view, None
+
+    srcs = [pool(strided_side == "src", True)[0] for _ in range(num_kv)]
+    dst_pools = [pool(strided_side == "dst", False) for _ in range(num_kv)]
+    dsts = [view for view, _ in dst_pools]
+    refs = [
+        torch.zeros(num_layers, num_tokens, item_size).to(device) for _ in range(num_kv)
+    ]
+    layers = range(num_layers) if all_layers else [0]
+
+    def tbl(view):
+        return torch.tensor(
+            [view[i].data_ptr() for i in range(num_layers)],
+            dtype=torch.uint64,
+            device=device,
+        )
+
+    if all_layers and is_mla:
+        transfer_kv_all_layer_mla(
+            tbl(srcs[0]),
+            tbl(dsts[0]),
+            src_indices,
+            dst_indices,
+            item_bytes,
+            num_layers,
+            **stride_kw,
+        )
+    elif all_layers:
+        transfer_kv_all_layer(
+            tbl(srcs[0]),
+            tbl(dsts[0]),
+            tbl(srcs[1]),
+            tbl(dsts[1]),
+            src_indices,
+            dst_indices,
+            item_bytes,
+            num_layers,
+            **stride_kw,
+        )
+    elif is_mla:
+        transfer_kv_per_layer_mla(
+            srcs[0][0], dsts[0][0], src_indices, dst_indices, item_bytes, **stride_kw
+        )
+    else:
+        transfer_kv_per_layer(
+            srcs[0][0],
+            dsts[0][0],
+            srcs[1][0],
+            dsts[1][0],
+            src_indices,
+            dst_indices,
+            item_bytes,
+            **stride_kw,
+        )
+    for src, ref in zip(srcs, refs):
+        for i in layers:
+            ref_copy_with_indices(src[i], ref[i], src_indices, dst_indices)
+    torch.accelerator.synchronize()
+    for (dst, backing), ref in zip(dst_pools, refs):
+        torch.testing.assert_close(dst, ref)
+        if backing is not None:
+            _assert_gaps_untouched(backing)
+    torch.set_default_dtype(original_dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("all_layers", [False, True])
+def test_transfer_kv_lf_strided_rows_both_sides(dtype: torch.dtype, all_layers: bool):
+    """lf→lf with both sides strided by different amounts (src x2, dst x3)."""
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    torch.manual_seed(42)
+
+    num_layers, num_tokens, item_size, num_items = 4, 4096, 256, 512
+    item_bytes = item_size * dtype.itemsize
+    perm = torch.randperm(num_tokens, dtype=torch.int64)
+    src_indices = perm[:num_items].to(device)
+    dst_indices = perm[num_items : 2 * num_items].to(device)
+
+    srcs = [
+        _strided_lf_pool(num_layers, num_tokens, item_size, 2, True)[0]
+        for _ in range(2)
+    ]
+    dst_pools = [
+        _strided_lf_pool(num_layers, num_tokens, item_size, 3, False) for _ in range(2)
+    ]
+    dsts = [view for view, _ in dst_pools]
+    refs = [torch.zeros(num_layers, num_tokens, item_size).to(device) for _ in range(2)]
+    strides = dict(src_row_stride=2 * item_bytes, dst_row_stride=3 * item_bytes)
+
+    def tbl(view):
+        return torch.tensor(
+            [view[i].data_ptr() for i in range(num_layers)],
+            dtype=torch.uint64,
+            device=device,
+        )
+
+    if all_layers:
+        transfer_kv_all_layer(
+            tbl(srcs[0]),
+            tbl(dsts[0]),
+            tbl(srcs[1]),
+            tbl(dsts[1]),
+            src_indices,
+            dst_indices,
+            item_bytes,
+            num_layers,
+            **strides,
+        )
+    else:
+        transfer_kv_per_layer(
+            srcs[0][0],
+            dsts[0][0],
+            srcs[1][0],
+            dsts[1][0],
+            src_indices,
+            dst_indices,
+            item_bytes,
+            **strides,
+        )
+    for src, ref in zip(srcs, refs):
+        for i in range(num_layers) if all_layers else [0]:
+            ref_copy_with_indices(src[i], ref[i], src_indices, dst_indices)
+    torch.accelerator.synchronize()
+    for (dst, backing), ref in zip(dst_pools, refs):
+        torch.testing.assert_close(dst, ref)
+        _assert_gaps_untouched(backing)
+    torch.set_default_dtype(original_dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("lf_to_ph", [False, True])
+def test_transfer_kv_page_head_strided_device_rows(dtype: torch.dtype, lf_to_ph: bool):
+    """Page-head transfers whose lf (device) rows are strided; the ph side keeps layout_dim."""
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    torch.manual_seed(42)
+
+    num_layers, num_tokens, item_size, head_num, page_size = 4, 1024, 1024, 8, 16
+    num_pages_to_transfer, row_stride_mult = 4, 2
+    head_dim = item_size // head_num
+    num_pages = num_tokens // page_size
+    item_bytes = item_size * dtype.itemsize
+    layout_dim_bytes = item_size * num_layers * dtype.itemsize
+    row_stride = row_stride_mult * item_bytes
+    layer_idx_to_test = 1
+
+    pages = torch.randperm(num_pages, dtype=torch.int64)
+
+    def tokens(ps):
+        return torch.cat([torch.arange(p * page_size, (p + 1) * page_size) for p in ps])
+
+    src_indices = tokens(pages[:num_pages_to_transfer])
+    dst_indices = tokens(pages[num_pages_to_transfer : 2 * num_pages_to_transfer])
+    ph_shape = (num_pages, head_num, page_size, num_layers, head_dim)
+
+    if lf_to_ph:
+        srcs = [
+            _strided_lf_pool(num_layers, num_tokens, item_size, row_stride_mult, True)[
+                0
+            ].unflatten(-1, (head_num, head_dim))
+            for _ in range(2)
+        ]
+        dsts = [torch.zeros(ph_shape).pin_memory() for _ in range(2)]
+        refs = [torch.zeros(ph_shape) for _ in range(2)]
+        tbls = [
+            torch.tensor(
+                [src[i].data_ptr() for i in range(num_layers)],
+                dtype=torch.uint64,
+                device=device,
+            )
+            for src in srcs
+        ]
+        transfer_kv_all_layer_lf_ph(
+            tbls[0],
+            dsts[0],
+            tbls[1],
+            dsts[1],
+            src_indices.to(device),
+            dst_indices.to(device),
+            item_bytes,
+            layout_dim_bytes,
+            num_layers,
+            page_size,
+            head_num,
+            src_row_stride=row_stride,
+        )
+        for src, ref in zip(srcs, refs):
+            for i in range(num_layers):
+                ref_copy_with_indices_page_head(
+                    src.cpu(),
+                    ref,
+                    src_indices,
+                    dst_indices,
+                    page_size,
+                    i,
+                    head_num,
+                    lf_to_ph=True,
+                )
+        torch.accelerator.synchronize()
+        for dst, ref in zip(dsts, refs):
+            torch.testing.assert_close(dst, ref)
+    else:
+        srcs = [torch.randn(ph_shape).pin_memory() for _ in range(2)]
+        dst_pools = [
+            _strided_lf_pool(num_layers, num_tokens, item_size, row_stride_mult, False)
+            for _ in range(2)
+        ]
+        views = [view.unflatten(-1, (head_num, head_dim)) for view, _ in dst_pools]
+        refs = [
+            torch.zeros(num_layers, num_tokens, head_num, head_dim) for _ in range(2)
+        ]
+        transfer_kv_per_layer_ph_lf(
+            srcs[0],
+            views[0][layer_idx_to_test],
+            srcs[1],
+            views[1][layer_idx_to_test],
+            src_indices.to(device),
+            dst_indices.to(device),
+            layer_idx_to_test,
+            item_bytes,
+            layout_dim_bytes,
+            page_size,
+            head_num,
+            dst_row_stride=row_stride,
+        )
+        for src, ref in zip(srcs, refs):
+            ref_copy_with_indices_page_head(
+                src,
+                ref,
+                src_indices,
+                dst_indices,
+                page_size,
+                layer_idx_to_test,
+                head_num,
+                lf_to_ph=False,
+            )
+        torch.accelerator.synchronize()
+        for view, (_, backing), ref in zip(views, dst_pools, refs):
+            torch.testing.assert_close(view.cpu(), ref)
+            _assert_gaps_untouched(backing)
+    torch.set_default_dtype(original_dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_transfer_kv_direct_strided_device_rows(dtype: torch.dtype):
+    """The Python copy_ direct pf ops follow tensor strides, so strided lf views just work."""
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(dtype)
+    torch.manual_seed(42)
+
+    num_layers, num_tokens, item_size, page_size, num_pages_to_transfer = (
+        4,
+        1024,
+        256,
+        16,
+        8,
+    )
+    num_pages = num_tokens // page_size
+    pages = torch.randperm(num_pages, dtype=torch.int64)
+
+    def tokens(ps):
+        return torch.cat([torch.arange(p * page_size, (p + 1) * page_size) for p in ps])
+
+    src_indices = tokens(pages[:num_pages_to_transfer])
+    dst_indices = tokens(pages[num_pages_to_transfer : 2 * num_pages_to_transfer])
+    pf_shape = (num_pages, num_layers, page_size, item_size)
+
+    # lf (strided device) -> pf (host), all layers
+    lf = [
+        _strided_lf_pool(num_layers, num_tokens, item_size, 2, True)[0]
+        for _ in range(2)
+    ]
+    pf = [torch.zeros(pf_shape).pin_memory() for _ in range(2)]
+    transfer_kv_all_layer_direct_lf_pf(
+        [lf[0][i] for i in range(num_layers)] + [lf[1][i] for i in range(num_layers)],
+        pf,
+        src_indices,
+        dst_indices,
+        page_size,
+    )
+    torch.accelerator.synchronize()
+    for src, dst in zip(lf, pf):
+        flat = dst.permute(1, 0, 2, 3).reshape(num_layers, num_tokens, item_size)
+        torch.testing.assert_close(
+            flat[:, dst_indices], src[:, src_indices.to(device)].cpu()
+        )
+
+    # pf (host) -> lf (strided device), one layer
+    layer_id = 1
+    dst_pools = [
+        _strided_lf_pool(num_layers, num_tokens, item_size, 2, False) for _ in range(2)
+    ]
+    transfer_kv_per_layer_direct_pf_lf(
+        pf,
+        [dst_pools[0][0][layer_id], dst_pools[1][0][layer_id]],
+        dst_indices,
+        src_indices,
+        layer_id,
+        page_size,
+    )
+    torch.accelerator.synchronize()
+    for src, (view, backing) in zip(lf, dst_pools):
+        idx = src_indices.to(device)
+        ref = torch.zeros_like(src)
+        ref[layer_id][idx] = src[layer_id][idx]
+        torch.testing.assert_close(view, ref)
+        _assert_gaps_untouched(backing)
+    torch.set_default_dtype(original_dtype)
+
+
+def test_transfer_kv_pf_ph_side_row_stride_rejected():
+    """A row stride on the pf/ph side would be ignored, so it is rejected."""
+    dtype = torch.bfloat16
+    num_layers, num_tokens, item_size, head_num, page_size = 2, 64, 256, 8, 16
+    item_bytes = item_size * dtype.itemsize
+    layout_dim = item_bytes * num_layers
+    idx = torch.arange(page_size, dtype=torch.int64, device=device)
+    lf = torch.zeros(num_layers, num_tokens, item_size, dtype=dtype, device=device)
+    tbl = torch.tensor(
+        [lf[i].data_ptr() for i in range(num_layers)], dtype=torch.uint64, device=device
+    )
+    pf = torch.zeros(num_tokens, num_layers, item_size, dtype=dtype, device=device)
+    ph = torch.zeros(
+        num_tokens // page_size,
+        head_num,
+        page_size,
+        num_layers,
+        item_size // head_num,
+        dtype=dtype,
+        device=device,
+    )
+    bad = 2 * item_bytes
+    calls = {
+        "dst_row_stride": [
+            lambda: transfer_kv_all_layer_lf_pf(
+                tbl,
+                pf,
+                tbl,
+                pf,
+                idx,
+                idx,
+                item_bytes,
+                layout_dim,
+                num_layers,
+                dst_row_stride=bad,
+            ),
+            lambda: transfer_kv_all_layer_mla_lf_pf(
+                tbl,
+                pf,
+                idx,
+                idx,
+                item_bytes,
+                layout_dim,
+                num_layers,
+                dst_row_stride=bad,
+            ),
+            lambda: transfer_kv_all_layer_lf_ph(
+                tbl,
+                ph,
+                tbl,
+                ph,
+                idx,
+                idx,
+                item_bytes,
+                layout_dim,
+                num_layers,
+                page_size,
+                head_num,
+                dst_row_stride=bad,
+            ),
+        ],
+        "src_row_stride": [
+            lambda: transfer_kv_per_layer_pf_lf(
+                pf,
+                lf[0],
+                pf,
+                lf[0],
+                idx,
+                idx,
+                0,
+                item_bytes,
+                layout_dim,
+                src_row_stride=bad,
+            ),
+            lambda: transfer_kv_per_layer_mla_pf_lf(
+                pf, lf[0], idx, idx, 0, item_bytes, layout_dim, src_row_stride=bad
+            ),
+            lambda: transfer_kv_per_layer_ph_lf(
+                ph,
+                lf[0],
+                ph,
+                lf[0],
+                idx,
+                idx,
+                0,
+                item_bytes,
+                layout_dim,
+                page_size,
+                head_num,
+                src_row_stride=bad,
+            ),
+        ],
+    }
+    for name, fns in calls.items():
+        for fn in fns:
+            with pytest.raises(RuntimeError, match=f"{name} must be 0"):
+                fn()
+
+
+def test_transfer_kv_invalid_row_stride():
+    """A row stride must be 0 (packed) or an 8-byte multiple no smaller than item_size."""
+    item_size = 256
+    item_bytes = item_size * torch.bfloat16.itemsize
+    src = torch.randn(64, item_size, dtype=torch.bfloat16).to(device)
+    dst = torch.zeros_like(src)
+    idx = torch.arange(8, dtype=torch.int64, device=device)
+    for bad in (item_bytes - 8, item_bytes + 4):
+        with pytest.raises(RuntimeError, match="row_stride"):
+            transfer_kv_per_layer_mla(
+                src, dst, idx, idx, item_bytes, src_row_stride=bad
+            )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

@@ -265,21 +265,21 @@ jobs:
     runs-on: emr-sglang-build
     env:
       # Keep in step with Dockerfile.xpu_kernel.
-      BASE_IMAGE: ubuntu:24.04
-      INTEL_OMIX_VERSION: 0.5.0
+      DLE_IMAGE: intel/deep-learning-essentials:2026.1.3-devel-ubuntu24.04
+      INTEL_OMIX_VERSION: 0.4.1
       TORCH_VERSION: 2.14.0
       UV_VERSION: 0.12.18
       CONTAINER: ci_sglkernel_xpu_cri
     steps:
       - name: Reclaim workspace
         # The container builds as root; a cancelled run can leave root-owned files behind.
-        run: docker run --rm -v "${GITHUB_WORKSPACE}:/ws" --entrypoint chown "${BASE_IMAGE}" -R "$(id -u):$(id -g)" /ws || true
+        run: docker run --rm -v "${GITHUB_WORKSPACE}:/ws" --entrypoint chown "${DLE_IMAGE}" -R "$(id -u):$(id -g)" /ws || true
 
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Start container
-        run: docker run -dt --name "${CONTAINER}" -v "${GITHUB_WORKSPACE}:/src" -w /src -e INTEL_OMIX_VERSION -e TORCH_VERSION -e UV_VERSION "${BASE_IMAGE}"
+        run: docker run -dt --name "${CONTAINER}" -v "${GITHUB_WORKSPACE}:/src" -w /src -e INTEL_OMIX_VERSION -e TORCH_VERSION -e UV_VERSION "${DLE_IMAGE}"
 
       - name: Install toolchain
         # Same driver stack and torch as Dockerfile.xpu_kernel; ocloc is needed for the Xe3P AOT link.
@@ -289,13 +289,15 @@ jobs:
           set -euxo pipefail
           export DEBIAN_FRONTEND=noninteractive
           apt-get update
-          apt-get install -y curl ca-certificates gpg git
+          apt-get install -y curl ca-certificates gpg
+          rm -f /etc/apt/sources.list.d/kobuk-team-ubuntu-intel-graphics-*.sources
           curl -fsSL https://repositories.intel.com/gpu/intel-graphics.key | \
             gpg --yes --dearmor --output /usr/share/keyrings/intel-graphics.gpg
           echo "deb [arch=amd64 signed-by=/usr/share/keyrings/intel-graphics.gpg] https://repositories.intel.com/gpu/ubuntu noble/intel-omix/${INTEL_OMIX_VERSION} unified" \
             > /etc/apt/sources.list.d/intel-gpu-noble.list
           apt-get update -o APT::Update::Error-Mode=any
-          apt-get install -y intel-omix-dev
+          apt-get install -y intel-gpu-compute intel-metrics-discovery clinfo
+          apt-get install -y intel-media-va-driver-non-free libmfx-gen1 libvpl2 libvpl-tools libva-glx2 va-driver-all vainfo
           ocloc ids cri || echo "warning: ocloc does not list cri"
 
           curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | UV_NO_MODIFY_PATH=1 sh

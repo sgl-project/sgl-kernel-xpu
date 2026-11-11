@@ -297,7 +297,7 @@ void sgl_per_token_group_quant_fp4(
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
 void biased_topk(
     const at::Tensor& input,
-    const at::Tensor& bias,
+    const std::optional<at::Tensor>& bias,
     at::Tensor& output,
     at::Tensor& indices,
     int64_t topk,

@@ -755,15 +755,32 @@ inline void tail_b(
   }
 }
 
-// PRT pieces of this WG: router (fp16 copy, tile s>>1 = experts 16t.., chunk
+// 8 bf16 -> 8 fp16 (the same rounding as a host-side bf16 -> fp16 conversion)
+inline sycl::uint4 bf16x8_to_half(sycl::uint4 v) {
+  sycl::uint4 r;
+#pragma unroll
+  for (int q = 0; q < 4; ++q) {
+    const uint32_t w = v[q];
+    const sycl::half lo = static_cast<sycl::half>(sycl::bit_cast<float>(w << 16));
+    const sycl::half hi = static_cast<sycl::half>(sycl::bit_cast<float>(w & 0xffff0000u));
+    r[q] = (uint32_t)sycl::bit_cast<uint16_t>(lo) | ((uint32_t)sycl::bit_cast<uint16_t>(hi) << 16);
+  }
+  return r;
+}
+
+// PRT pieces of this WG: router (fp16 values, tile s>>1 = experts 16t.., chunk
 // pair s&1 of the WG's 64 dims, 2 uint4 per chunk), shared gate|up (fp8, rows
 // s*16 + lane, the WG's 4 chunks)
 template <typename DT>
 inline void load_prt_b(const Ptrs& P, int wg, int s, int lane, sycl::uint4 (&prt_r)[4], sycl::uint4 (&prt_s)[4]) {
-  const e16* rr = P.router_h + (size_t)((s >> 1) * 16 + lane) * HID + wg * 64 + (s & 1) * 32;
+  // the router weight is read in the model's dtype (no fp16 copy); a bf16 one is
+  // rounded to fp16 here, for the fp16 DPAS
+  const e16* rr = P.router_w + (size_t)((s >> 1) * 16 + lane) * HID + wg * 64 + (s & 1) * 32;
 #pragma unroll
-  for (int t = 0; t < 4; ++t)
+  for (int t = 0; t < 4; ++t) {
     prt_r[t] = *reinterpret_cast<const sycl::uint4*>(rr + t * 8);
+    if constexpr (std::is_same_v<DT, bf16>) prt_r[t] = bf16x8_to_half(prt_r[t]);
+  }
   ld_rows<4>(prt_s, P.sw13 + (size_t)(s * 16 + lane) * HID + wg * 64);
 }
 

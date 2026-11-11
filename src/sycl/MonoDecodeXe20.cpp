@@ -176,8 +176,9 @@ struct Layer {
   Ptrs P{};
   Scratch S{};
   ScratchB SB{};
-  void* scratch = nullptr;
-  void* scratch_b = nullptr;
+  void* scratch = nullptr;    // shared by the layers of a device (shared_scratch), or the MTP prologue's own
+  void* scratch_b = nullptr;  // shared (shared_scratch)
+  void* cnt_mem = nullptr;    // this layer's counters and mailbox tags (CNT_WORDS words)
   int device = -1;
   std::vector<at::Tensor> keep;  // fp32 copies of 16-bit scales
 };
@@ -185,6 +186,32 @@ std::unordered_map<int64_t, Layer> g_layers;
 // batched attention chunk partials, one buffer per device shared by all
 // attention layers (they run one at a time on the device's queue)
 std::unordered_map<int, void*> g_attn_part;
+
+// The layers' intermediates (scratch, scratch_b) are one pair of buffers per
+// device shared by all layers: the layers' kernels run one at a time on the
+// device's queue, and each kernel writes an intermediate before it reads it.
+// Only the counters (stage arrival counts, epoch, mailbox tags) are the layer's
+// own: they carry state from one step to the next (zero when allocated).
+struct SharedScratch {
+  void* scratch = nullptr;
+  void* scratch_b = nullptr;
+};
+std::unordered_map<int, SharedScratch> g_shared_scratch;
+SharedScratch& shared_scratch(int device, sycl::queue& q) {
+  SharedScratch& sh = g_shared_scratch[device];
+  if (!sh.scratch) {
+    sh.scratch = sycl::malloc_device(sgl_mono::scratch_bytes(), q);
+    TORCH_CHECK(sh.scratch, "mono: device allocation of the scratch failed");
+    q.memset(sh.scratch, 0, sgl_mono::scratch_bytes()).wait();
+    sh.scratch_b = sycl::malloc_device(sgl_mono::scratch_b_bytes(), q);
+    TORCH_CHECK(sh.scratch_b, "mono: device allocation of the batched scratch failed");
+    q.memset(sh.scratch_b, 0, sgl_mono::scratch_b_bytes()).wait();
+  }
+  return sh;
+}
+constexpr size_t cnt_bytes() {
+  return (sgl_mono::CNT_WORDS * 4 + 255) & ~size_t(255);
+}
 
 // the device's health words and the wait deadline, for the slow path of the
 // layer's mailbox waits
@@ -474,7 +501,6 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
   P.in_norm_w = t16(t[0], HID, "input_norm_w", dt);
   P.post_norm_w = t16(t[1], HID, "post_norm_w", dt);
   P.router_w = t16(t[2], (int64_t)NE * HID, "router_w", dt);
-  P.router_h = half_copy(L, t[2], P.router_w);
   P.sgate_w = t16(t[3], HID, "shared_gate_w", dt);
   const int64_t ok = attn ? NQ * HD : VD;
   P.out_w = w_nk(t[4], HID, ok, attn ? "o_proj" : "out_proj");
@@ -515,9 +541,11 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
   }
   sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
   auto it = g_layers.find(layer);
-  if (it != g_layers.end() && it->second.scratch) {  // re-registration: keep the scratch (mailbox tags)
-    L.scratch = it->second.scratch;
-    L.scratch_b = it->second.scratch_b;
+  if (it != g_layers.end() && it->second.cnt_mem) {  // re-registration: keep the counters (mailbox tags)
+    L.cnt_mem = it->second.cnt_mem;
+    SharedScratch& sh = shared_scratch(L.device, q);
+    L.scratch = sh.scratch;
+    L.scratch_b = sh.scratch_b;
     if (it->second.caches_bound && it->second.attn == attn) {  // and the cache binding
       Ptrs& O = it->second.P;
       P.kc = O.kc;
@@ -538,10 +566,12 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
       L.caches_bound = true;
     }
   } else {
-    L.scratch = sycl::malloc_device(scratch_bytes(), q);
-    q.memset(L.scratch, 0, scratch_bytes()).wait();
-    L.scratch_b = sycl::malloc_device(scratch_b_bytes(), q);
-    q.memset(L.scratch_b, 0, scratch_b_bytes()).wait();
+    SharedScratch& sh = shared_scratch(L.device, q);
+    L.scratch = sh.scratch;
+    L.scratch_b = sh.scratch_b;
+    L.cnt_mem = sycl::malloc_device(cnt_bytes(), q);
+    TORCH_CHECK(L.cnt_mem, "mono: device allocation of the layer counters failed");
+    q.memset(L.cnt_mem, 0, cnt_bytes()).wait();
   }
   L.SB = scratch_b_carve(L.scratch_b);
   if (attn) {
@@ -551,6 +581,7 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
     L.SB.pa_ml = reinterpret_cast<float*>(static_cast<char*>(pa) + (size_t)APASS * APAIRS * NQ * HD * 2);
   }
   L.S = scratch_carve(L.scratch, reinterpret_cast<uint64_t*>(mbox), reinterpret_cast<uint64_t*>(peer));
+  L.S.cnt = static_cast<uint32_t*>(L.cnt_mem);  // the layer's own counters, not the shared scratch's
   set_health(q, L);
   g_layers[layer] = std::move(L);
 }

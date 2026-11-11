@@ -8,6 +8,7 @@ from sgl_kernel import (
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
+    topk_among_blocks,
     topk_transform,
     topk_transform_paged,
     topk_transform_ragged,
@@ -632,6 +633,71 @@ def test_topk_transform(
         topk,
         seq_len,
         max_permit_error=5,
+    )
+
+
+def _topk_among_blocks_reference(
+    scores: torch.Tensor,
+    lengths: torch.Tensor,
+    blocks: torch.Tensor,
+    topk: int,
+    block_size: int,
+) -> torch.Tensor:
+    batch_size, width = scores.shape
+    result = torch.full(
+        (batch_size, topk), -1, dtype=torch.int64, device=scores.device
+    )
+    lengths_cpu = lengths.cpu().tolist()
+    blocks_cpu = blocks.cpu().tolist()
+    for row in range(batch_size):
+        positions = [
+            block * block_size + offset
+            for block in blocks_cpu[row]
+            if 0 <= block <= (width - 1) // block_size
+            for offset in range(block_size)
+            if block * block_size + offset < min(width, lengths_cpu[row])
+        ]
+        if not positions:
+            continue
+        candidate_positions = torch.tensor(positions, device=scores.device)
+        candidate_scores = scores[row, candidate_positions].float()
+        valid = candidate_scores != float("-inf")
+        candidate_positions = candidate_positions[valid]
+        candidate_scores = candidate_scores[valid]
+        selected_count = min(topk, candidate_positions.numel())
+        if selected_count:
+            selected = torch.topk(
+                candidate_scores, selected_count, sorted=False
+            ).indices
+            result[row, :selected_count] = candidate_positions[selected]
+    return result
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("topk", [5, 16])
+@torch.inference_mode()
+def test_topk_among_blocks(dtype: torch.dtype, topk: int) -> None:
+    torch.manual_seed(42)
+    block_size = 4
+    width = 17
+    scores_storage = torch.randn(4, width * 2, dtype=dtype, device="xpu")
+    scores = scores_storage[:, ::2]
+    scores[0, 13] = float("-inf")
+    scores[2, :4] = float("-inf")
+    lengths = torch.tensor([17, 10, 4, 0], dtype=torch.int64, device="xpu")
+    blocks = torch.tensor(
+        [[3, 0, 2], [1, 3, -1], [0, 2, -1], [-1, -2, 99]],
+        dtype=torch.int64,
+        device="xpu",
+    )
+
+    actual = topk_among_blocks(scores, lengths, blocks, topk, block_size)
+    expected = _topk_among_blocks_reference(
+        scores, lengths, blocks, topk, block_size
+    )
+    torch.testing.assert_close(
+        torch.sort(actual, dim=-1).values,
+        torch.sort(expected, dim=-1).values,
     )
 
     if with_raw:

@@ -9,6 +9,7 @@
 #pragma once
 
 #include "../common/block_2d_copy_d.hpp"
+#include "../common/expert_locate.hpp"
 #include "../common/xe_gemm.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -35,7 +36,8 @@ template <
     typename TensorD,
     typename TiledMMA,
     bool WeightScalePerExpert = false,
-    bool WeightScaleBlocked = false>
+    bool WeightScaleBlocked = false,
+    bool OneTilePerGroup = false>
 class W8A16Kernel {
  public:
   using ElementA = cutlass::bfloat16_t;
@@ -95,6 +97,93 @@ class W8A16Kernel {
         make_gmem_ptr<ElementD>(ptr_D + pre_rows * N), make_layout(make_shape(M, N), make_stride(N, _1{})));
   }
 
+  // One (m_coord, n_coord) tile of expert `expert_id`, whose M rows start at row `pre_rows`.
+  CUTLASS_DEVICE void
+  run_tile(Params const& params, int thr_id, int expert_id, int pre_rows, int M, int m_coord, int n_coord) {
+    auto N = params.N;
+    auto K = params.K;
+    auto mma = params.mma;
+    const bool is_mxfp8 = (params.scale_mode == static_cast<int32_t>(ScaleMode::BlockMXFP8));
+    const int64_t K_scale = is_mxfp8 ? (K / 32) : (K / FP8_GROUP_SIZE_K);
+    int64_t scale_n = WeightScalePerExpert ? params.scale_mode : (is_mxfp8 ? N : (N + 127) / 128);
+
+    int ld_b = params.ld_b;
+    int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(N) * static_cast<int64_t>(ld_b);
+    int64_t S_offset = static_cast<int64_t>(expert_id) * scale_n * (WeightScalePerExpert ? 1 : K_scale);
+
+    uint8_t* ptr_A_curr_batch = const_cast<uint8_t*>(params.Activations) + pre_rows * K * sizeof(ElementA);
+    uint8_t* ptr_B_curr_batch = const_cast<uint8_t*>(params.PackedWeights) + B_offset;
+    const void* ptr_S_curr_batch =
+        is_mxfp8 ? static_cast<const void*>(static_cast<const uint8_t*>(params.WeightScales) + S_offset)
+                 : static_cast<const void*>(static_cast<const float*>(params.WeightScales) + S_offset);
+    const float* ptr_Bias_curr_batch =
+        params.Bias == nullptr ? nullptr : params.Bias + static_cast<int64_t>(expert_id) * N;
+
+    auto A_tensor = make_A_tensor(ptr_A_curr_batch, M, K);
+    auto B_tensor = make_B_tensors(ptr_B_curr_batch, N, K, ld_b);
+    auto D_tensor = make_D_tensors(params.Outputs, pre_rows, M, N);
+
+    auto tile_coord = make_coord(m_coord, n_coord, _, 0);
+    if constexpr (WeightScalePerExpert) {
+      if (params.scale_mode == static_cast<int32_t>(ScaleMode::ScalarSingle)) {
+        moe_xe20::xe_gemm<void, void, void>(
+            A_tensor,
+            B_tensor,
+            static_cast<const float*>(ptr_S_curr_batch),
+            ptr_Bias_curr_batch,
+            D_tensor,
+            tile_coord,
+            mma);
+      } else {
+        CollectiveMainloop mainloop;
+        mainloop(
+            A_tensor,
+            B_tensor,
+            ptr_S_curr_batch,
+            scale_n,
+            D_tensor,
+            tile_coord,
+            mma,
+            thr_id,
+            ptr_Bias_curr_batch,
+            N,
+            params.scale_mode);
+      }
+    } else {
+      CollectiveMainloop mainloop;
+      mainloop(
+          A_tensor,
+          B_tensor,
+          ptr_S_curr_batch,
+          K_scale,
+          D_tensor,
+          tile_coord,
+          mma,
+          thr_id,
+          ptr_Bias_curr_batch,
+          N,
+          params.scale_mode);
+    }
+  }
+
+  // Decode-sized launches give every work-group at most one tile; locate its expert in parallel
+  // instead of walking the experts serially (see moe_xe20::locate_m_tile).
+  CUTLASS_DEVICE void run_single_tile(Params const& params, sycl::nd_item<3> item, int group_id, int n_tiles) {
+    moe_xe20::TileExpert te;
+    const int m_tile = group_id / n_tiles;
+    if (moe_xe20::locate_m_tile<size<0>(TileShape{}), 16>(
+            item.get_sub_group(), params.M_per_group, params.num_experts, m_tile, te)) {
+      run_tile(
+          params,
+          int32_t(item.get_local_linear_id()),
+          te.expert_id,
+          te.rows_before,
+          te.rows,
+          m_tile - te.m_tiles_before,
+          group_id % n_tiles);
+    }
+  }
+
   CUTLASS_DEVICE void operator()(Params const& params, sycl::nd_item<3> item, int32_t* slm_mem) {
     auto N = params.N;
     auto K = params.K;
@@ -112,6 +201,12 @@ class W8A16Kernel {
     int group_m_id = (group_id * wg_tile_n) / N_pad;
     int group_range = item.get_group_range(1);
     int32_t thr_id = int32_t(item.get_local_linear_id());
+
+    // The launcher picks OneTilePerGroup only when no work-group can get a second tile.
+    if constexpr (OneTilePerGroup) {
+      run_single_tile(params, item, group_id, N_pad / wg_tile_n);
+      return;
+    }
 
     const bool is_mxfp8 = (params.scale_mode == static_cast<int32_t>(ScaleMode::BlockMXFP8));
     const int64_t K_scale = is_mxfp8 ? (K / 32) : (K / FP8_GROUP_SIZE_K);

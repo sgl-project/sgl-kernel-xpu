@@ -626,8 +626,9 @@ struct TopKTransformPagedKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 };
 
+template <typename score_t>
 struct TopKAmongBlocksKernel {
-  const float* scores;
+  const score_t* scores;
   const int64_t* lengths;
   const int64_t* blocks;
   int64_t* output;
@@ -643,7 +644,7 @@ struct TopKAmongBlocksKernel {
     if (block < 0 || block > (width - 1) / block_size) return false;
     position = block * block_size + index % block_size;
     if (position >= width || position >= lengths[row]) return false;
-    const float score = scores[row * score_row_stride + position * score_col_stride];
+    const float score = static_cast<float>(scores[row * score_row_stride + position * score_col_stride]);
     if (score == -std::numeric_limits<float>::infinity()) return false;
     key = sycl::isnan(score) ? 0xffffffffu : convert_to_uint32(score);
     return true;
@@ -996,42 +997,45 @@ SGL_KERNEL_EXPORT void topk_transform(
 SGL_KERNEL_EXPORT at::Tensor topk_among_blocks(
     const at::Tensor& scores, const at::Tensor& lengths, const at::Tensor& blocks, int64_t topk, int64_t block_size) {
   CHECK_DEVICE(scores);
-  CHECK_DEVICE(lengths);
-  CHECK_DEVICE(blocks);
+  CHECK_DIM(2, scores);
   TORCH_CHECK(scores.device() == lengths.device() && scores.device() == blocks.device(), "inputs must share a device");
-  TORCH_CHECK(scores.dim() == 2 && scores.scalar_type() == at::kFloat, "scores must be float32 [rows, width]");
   TORCH_CHECK(
-      lengths.dim() == 1 && lengths.size(0) == scores.size(0) && lengths.is_contiguous() &&
-          lengths.scalar_type() == at::kLong,
-      "lengths must be contiguous int64 [rows]");
-  TORCH_CHECK(
-      blocks.dim() == 2 && blocks.size(0) == scores.size(0) && blocks.is_contiguous() &&
-          blocks.scalar_type() == at::kLong,
-      "blocks must be contiguous int64 [rows, block_count]");
-  TORCH_CHECK(topk >= 0 && topk <= std::numeric_limits<int>::max(), "invalid topk");
+      scores.scalar_type() == at::kFloat || scores.scalar_type() == at::kHalf || scores.scalar_type() == at::kBFloat16,
+      "scores must be float32, float16, or bfloat16");
+  CHECK_INPUT(lengths);
+  CHECK_SHAPE(lengths, scores.size(0));
+  CHECK_INPUT(blocks);
+  CHECK_DIM(2, blocks);
+  TORCH_CHECK(blocks.size(0) == scores.size(0), "blocks.size(0) must equal scores.size(0)");
+  const auto lengths_i64 = lengths.to(at::kLong);
+  const auto blocks_i64 = blocks.to(at::kLong);
+  const int64_t max_loop_extent = std::numeric_limits<int>::max() - (kThreadsPerBlock - 1);
+  TORCH_CHECK(topk >= 0 && topk <= max_loop_extent, "invalid topk");
   TORCH_CHECK(block_size > 0 && block_size <= std::numeric_limits<int>::max(), "invalid block_size");
-  TORCH_CHECK(blocks.size(1) <= std::numeric_limits<int>::max() / block_size, "too many candidate positions");
+  TORCH_CHECK(blocks.size(1) <= max_loop_extent / block_size, "too many candidate positions");
   const c10::DeviceGuard guard(scores.device());
   auto output = at::empty({scores.size(0), topk}, scores.options().dtype(at::kLong));
   if (scores.size(0) == 0 || topk == 0) return output;
   if (scores.size(1) == 0 || blocks.size(1) == 0) return output.fill_(-1);
-  TopKAmongBlocksKernel kernel{
-      scores.data_ptr<float>(),
-      lengths.data_ptr<int64_t>(),
-      blocks.data_ptr<int64_t>(),
-      output.data_ptr<int64_t>(),
-      scores.stride(0),
-      scores.stride(1),
-      scores.size(1),
-      static_cast<int>(blocks.size(1)),
-      static_cast<int>(block_size),
-      static_cast<int>(topk)};
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
-  sycl_kernel_submit(
-      sycl::range<1>(static_cast<size_t>(scores.size(0)) * kThreadsPerBlock),
-      sycl::range<1>(kThreadsPerBlock),
-      queue,
-      kernel);
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, scores.scalar_type(), "topk_among_blocks", [&] {
+    TopKAmongBlocksKernel<scalar_t> kernel{
+        scores.data_ptr<scalar_t>(),
+        lengths_i64.data_ptr<int64_t>(),
+        blocks_i64.data_ptr<int64_t>(),
+        output.data_ptr<int64_t>(),
+        scores.stride(0),
+        scores.stride(1),
+        scores.size(1),
+        static_cast<int>(blocks.size(1)),
+        static_cast<int>(block_size),
+        static_cast<int>(topk)};
+    sycl_kernel_submit(
+        sycl::range<1>(static_cast<size_t>(scores.size(0)) * kThreadsPerBlock),
+        sycl::range<1>(kThreadsPerBlock),
+        queue,
+        kernel);
+  });
   return output;
 }
 

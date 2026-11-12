@@ -672,22 +672,50 @@ def _topk_among_blocks_reference(
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("topk", [5, 16])
+@pytest.mark.parametrize(
+    ("block_size", "block_count", "topk", "batch_size"),
+    [
+        (4, 3, 5, 4),
+        (4, 3, 16, 4),
+        (8, 32, 512, 132),
+        (8, 64, 512, 132),
+        (8, 128, 512, 132),
+        (8, 128, 1024, 132),
+    ],
+)
 @torch.inference_mode()
-def test_topk_among_blocks(dtype: torch.dtype, topk: int) -> None:
+def test_topk_among_blocks(
+    dtype: torch.dtype, block_size: int, block_count: int, topk: int, batch_size: int
+) -> None:
     torch.manual_seed(42)
-    block_size = 4
-    width = 17
-    scores_storage = torch.randn(4, width * 2, dtype=dtype, device="xpu")
+    width = 17 if block_size == 4 else block_count * block_size
+    scores_storage = torch.randn(batch_size, width * 2, dtype=dtype, device="xpu")
     scores = scores_storage[:, ::2]
-    scores[0, 13] = float("-inf")
-    scores[2, :4] = float("-inf")
-    lengths = torch.tensor([17, 10, 4, 0], dtype=torch.int64, device="xpu")
-    blocks = torch.tensor(
-        [[3, 0, 2], [1, 3, -1], [0, 2, -1], [-1, -2, 99]],
-        dtype=torch.int64,
-        device="xpu",
-    )
+    if block_size == 4:
+        scores[0, 13] = float("-inf")
+        scores[2, :4] = float("-inf")
+        lengths = torch.tensor([17, 10, 4, 0], dtype=torch.int64, device="xpu")
+        blocks = torch.tensor(
+            [[3, 0, 2], [1, 3, -1], [0, 2, -1], [-1, -2, 99]],
+            dtype=torch.int64,
+            device="xpu",
+        )
+    else:
+        scores[::7, 0] = float("-inf")
+        lengths = torch.full((batch_size,), width, dtype=torch.int64, device="xpu")
+        lengths[::4] = width // 2
+        lengths[3::4] = width // 4
+        blocks = (
+            torch.arange(block_count, dtype=torch.int64, device="xpu")
+            .expand(batch_size, -1)
+            .contiguous()
+        )
+        blocks[1::4, -1] = -1
+        blocks[2::4, block_count // 2 :] = -1
+
+    lengths = lengths.to(torch.int32).contiguous()
+    blocks = blocks.to(torch.int32).contiguous()
+    assert lengths.is_contiguous() and blocks.is_contiguous()
 
     actual = topk_among_blocks(scores, lengths, blocks, topk, block_size)
     expected = _topk_among_blocks_reference(scores, lengths, blocks, topk, block_size)
@@ -695,6 +723,47 @@ def test_topk_among_blocks(dtype: torch.dtype, topk: int) -> None:
         torch.sort(actual, dim=-1).values,
         torch.sort(expected, dim=-1).values,
     )
+
+    tied_storage = torch.zeros((1, width * 2), dtype=dtype, device="xpu")
+    tied_scores = tied_storage[:, ::2]
+    tied_scores[0, 0] = float("nan")
+    tied_lengths = torch.tensor([width], dtype=torch.int64, device="xpu")
+    tied_blocks = torch.arange(block_count, dtype=torch.int64, device="xpu").unsqueeze(
+        0
+    )
+    tied_actual = topk_among_blocks(
+        tied_scores, tied_lengths, tied_blocks, topk, block_size
+    )[0]
+    tied_actual = tied_actual[tied_actual >= 0]
+    expected_count = min(topk, min(width, block_count * block_size))
+    assert tied_actual.numel() == expected_count
+    assert tied_actual.unique().numel() == expected_count
+    assert (tied_actual == 0).any()
+    selected_scores = tied_scores[0, tied_actual]
+    selected_nan = torch.isnan(selected_scores)
+    assert selected_nan.sum().item() == 1
+    assert (selected_scores[~selected_nan] == 0).all()
+
+    if dtype == torch.float32 and block_size == 4 and topk == 5:
+        with pytest.raises(
+            RuntimeError, match="scores must be float32, float16, or bfloat16"
+        ):
+            topk_among_blocks(scores.to(torch.int32), lengths, blocks, topk, block_size)
+        lengths_storage = torch.empty((batch_size, 2), dtype=torch.int32, device="xpu")
+        lengths_storage[:, 0] = lengths
+        with pytest.raises(RuntimeError, match="lengths must be contiguous"):
+            topk_among_blocks(scores, lengths_storage[:, 0], blocks, topk, block_size)
+        blocks_storage = torch.empty(
+            (batch_size, block_count * 2), dtype=torch.int32, device="xpu"
+        )
+        blocks_storage[:, ::2] = blocks
+        with pytest.raises(RuntimeError, match="blocks must be contiguous"):
+            topk_among_blocks(scores, lengths, blocks_storage[:, ::2], topk, block_size)
+        int_max = torch.iinfo(torch.int32).max
+        with pytest.raises(RuntimeError, match="invalid topk"):
+            topk_among_blocks(scores, lengths, blocks, int_max, block_size)
+        with pytest.raises(RuntimeError, match="too many candidate positions"):
+            topk_among_blocks(scores[:1], lengths[:1], blocks[:1, :1], 1, int_max)
 
 
 # (bs, length) rows all satisfy length <= topk for every topk in {512, 1024, 2048},

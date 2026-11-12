@@ -108,12 +108,10 @@ def topk_among_blocks(
     topk: int,
     block_size: int,
 ) -> torch.Tensor:
-    if scores.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-        raise TypeError("scores must be float32, float16, or bfloat16")
     return torch.ops.sgl_kernel.topk_among_blocks(
-        scores.float(),
-        lengths.to(torch.int64).contiguous(),
-        blocks.to(torch.int64).contiguous(),
+        scores,
+        lengths,
+        blocks,
         topk,
         block_size,
     )

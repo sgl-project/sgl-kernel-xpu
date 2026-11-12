@@ -5,7 +5,6 @@ import torch
 import triton
 from sgl_kernel import topk_among_blocks
 
-
 DTYPES = {
     "float32": torch.float32,
     "float16": torch.float16,
@@ -31,9 +30,7 @@ def run_benchmarks(args: argparse.Namespace) -> None:
     if not torch.xpu.is_available():
         raise RuntimeError("XPU is required for bench_topk_among_blocks.py")
 
-    print(
-        "batch,width,block_count,block_size,topk,dtype,kernel_us,torch_us,speedup"
-    )
+    print("batch,width,block_count,block_size,topk,dtype,kernel_us,torch_us,speedup")
     for batch_size, width, block_count, topk, dtype_name in itertools.product(
         args.batch_sizes, args.widths, args.block_counts, args.topks, args.dtypes
     ):
@@ -50,17 +47,13 @@ def run_benchmarks(args: argparse.Namespace) -> None:
         blocks = torch.stack(
             [torch.randperm(total_blocks)[:block_count] for _ in range(batch_size)]
         ).to(device="xpu", dtype=torch.int64)
-        lengths = torch.full(
-            (batch_size,), width, dtype=torch.int64, device="xpu"
-        )
+        lengths = torch.full((batch_size,), width, dtype=torch.int64, device="xpu")
 
         def run_kernel() -> torch.Tensor:
             return topk_among_blocks(scores, lengths, blocks, topk, args.block_size)
 
         def run_torch() -> torch.Tensor:
-            return _torch_topk_among_blocks(
-                scores, blocks, topk, args.block_size
-            )
+            return _torch_topk_among_blocks(scores, blocks, topk, args.block_size)
 
         kernel_result = run_kernel()
         torch_result = run_torch()
@@ -94,9 +87,7 @@ if __name__ == "__main__":
     parser.add_argument("--block-counts", nargs="+", type=int, default=[8, 32])
     parser.add_argument("--block-size", type=int, default=64)
     parser.add_argument("--topks", nargs="+", type=int, default=[32, 128])
-    parser.add_argument(
-        "--dtypes", nargs="+", choices=DTYPES, default=["float32"]
-    )
+    parser.add_argument("--dtypes", nargs="+", choices=DTYPES, default=["float32"])
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--rep", type=int, default=100)
     run_benchmarks(parser.parse_args())

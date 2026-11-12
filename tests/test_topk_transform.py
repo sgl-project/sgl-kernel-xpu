@@ -644,9 +644,7 @@ def _topk_among_blocks_reference(
     block_size: int,
 ) -> torch.Tensor:
     batch_size, width = scores.shape
-    result = torch.full(
-        (batch_size, topk), -1, dtype=torch.int64, device=scores.device
-    )
+    result = torch.full((batch_size, topk), -1, dtype=torch.int64, device=scores.device)
     lengths_cpu = lengths.cpu().tolist()
     blocks_cpu = blocks.cpu().tolist()
     for row in range(batch_size):
@@ -692,24 +690,11 @@ def test_topk_among_blocks(dtype: torch.dtype, topk: int) -> None:
     )
 
     actual = topk_among_blocks(scores, lengths, blocks, topk, block_size)
-    expected = _topk_among_blocks_reference(
-        scores, lengths, blocks, topk, block_size
-    )
+    expected = _topk_among_blocks_reference(scores, lengths, blocks, topk, block_size)
     torch.testing.assert_close(
         torch.sort(actual, dim=-1).values,
         torch.sort(expected, dim=-1).values,
     )
-
-    if with_raw:
-        assert_equal(
-            score,
-            torch.sort(ref_raw, dim=-1).values,
-            torch.sort(out_raw, dim=-1).values,
-            bs,
-            topk,
-            seq_len,
-            max_permit_error=5,
-        )
 
 
 # (bs, length) rows all satisfy length <= topk for every topk in {512, 1024, 2048},

@@ -667,7 +667,8 @@ struct TopKAmongBlocksKernel {
         hist[kHistStride + tid] = 0;
       }
       item.barrier(sycl::access::fence_space::local_space);
-      const uint32_t prefix = sycl::bit_cast<uint32_t>(state[0]);
+      const int32_t prefix_state = sycl::group_broadcast(group, tid == 0 ? state[0] : 0, 0);
+      const uint32_t prefix = sycl::bit_cast<uint32_t>(prefix_state);
       for (int index = tid; index < candidates; index += kThreadsPerBlock) {
         int64_t position;
         uint32_t key;
@@ -684,20 +685,27 @@ struct TopKAmongBlocksKernel {
         }
         if (state[1] > 0) {
           int bin = kRadix - 1;
-          while (bin > 0 && hist[bin] < state[1]) --bin;
+          while (bin > 0 && hist[bin] < state[1])
+            --bin;
           state[0] = sycl::bit_cast<int32_t>((prefix << 8) | static_cast<uint32_t>(bin));
           state[1] -= hist[bin + 1];
         }
       }
       item.barrier(sycl::access::fence_space::local_space);
       if (round == 0) {
-        for (int index = state[2] + tid; index < topk; index += kThreadsPerBlock) output[row * topk + index] = -1;
-        if (state[2] == 0) return;
+        const int32_t selected_count = sycl::group_broadcast(group, tid == 0 ? state[2] : 0, 0);
+        for (int index = selected_count + tid; index < topk; index += kThreadsPerBlock)
+          output[row * topk + index] = -1;
+        item.barrier(sycl::access::fence_space::global_and_local);
+        if (selected_count == 0) return;
       }
     }
     if (tid == 0) state[3] = state[4] = 0;
     item.barrier(sycl::access::fence_space::local_space);
-    const uint32_t threshold = sycl::bit_cast<uint32_t>(state[0]);
+    const int32_t threshold_state = sycl::group_broadcast(group, tid == 0 ? state[0] : 0, 0);
+    const int32_t selected_count = sycl::group_broadcast(group, tid == 0 ? state[2] : 0, 0);
+    const int32_t threshold_count = sycl::group_broadcast(group, tid == 0 ? state[1] : 0, 0);
+    const uint32_t threshold = sycl::bit_cast<uint32_t>(threshold_state);
     const int iterations = (candidates + kThreadsPerBlock - 1) / kThreadsPerBlock;
     for (int iteration = 0; iteration < iterations; ++iteration) {
       const int index = iteration * kThreadsPerBlock + tid;
@@ -708,8 +716,8 @@ struct TopKAmongBlocksKernel {
       const int equal = valid && key == threshold;
       const int greater_pos = wg_reserve(item, state[3], greater);
       const int equal_pos = wg_reserve(item, state[4], equal);
-      if (greater || (equal && equal_pos < state[1])) {
-        const int output_index = greater ? greater_pos : state[2] - state[1] + equal_pos;
+      if (greater || (equal && equal_pos < threshold_count)) {
+        const int output_index = greater ? greater_pos : selected_count - threshold_count + equal_pos;
         output[row * topk + output_index] = position;
       }
     }
@@ -986,22 +994,20 @@ SGL_KERNEL_EXPORT void topk_transform(
 }
 
 SGL_KERNEL_EXPORT at::Tensor topk_among_blocks(
-  const at::Tensor& scores,
-  const at::Tensor& lengths,
-  const at::Tensor& blocks,
-  int64_t topk,
-  int64_t block_size) {
+    const at::Tensor& scores, const at::Tensor& lengths, const at::Tensor& blocks, int64_t topk, int64_t block_size) {
   CHECK_DEVICE(scores);
   CHECK_DEVICE(lengths);
   CHECK_DEVICE(blocks);
   TORCH_CHECK(scores.device() == lengths.device() && scores.device() == blocks.device(), "inputs must share a device");
   TORCH_CHECK(scores.dim() == 2 && scores.scalar_type() == at::kFloat, "scores must be float32 [rows, width]");
-  TORCH_CHECK(lengths.dim() == 1 && lengths.size(0) == scores.size(0) && lengths.is_contiguous() &&
+  TORCH_CHECK(
+      lengths.dim() == 1 && lengths.size(0) == scores.size(0) && lengths.is_contiguous() &&
           lengths.scalar_type() == at::kLong,
-        "lengths must be contiguous int64 [rows]");
-  TORCH_CHECK(blocks.dim() == 2 && blocks.size(0) == scores.size(0) && blocks.is_contiguous() &&
+      "lengths must be contiguous int64 [rows]");
+  TORCH_CHECK(
+      blocks.dim() == 2 && blocks.size(0) == scores.size(0) && blocks.is_contiguous() &&
           blocks.scalar_type() == at::kLong,
-        "blocks must be contiguous int64 [rows, block_count]");
+      "blocks must be contiguous int64 [rows, block_count]");
   TORCH_CHECK(topk >= 0 && topk <= std::numeric_limits<int>::max(), "invalid topk");
   TORCH_CHECK(block_size > 0 && block_size <= std::numeric_limits<int>::max(), "invalid block_size");
   TORCH_CHECK(blocks.size(1) <= std::numeric_limits<int>::max() / block_size, "too many candidate positions");
@@ -1010,22 +1016,22 @@ SGL_KERNEL_EXPORT at::Tensor topk_among_blocks(
   if (scores.size(0) == 0 || topk == 0) return output;
   if (scores.size(1) == 0 || blocks.size(1) == 0) return output.fill_(-1);
   TopKAmongBlocksKernel kernel{
-    scores.data_ptr<float>(),
-    lengths.data_ptr<int64_t>(),
-    blocks.data_ptr<int64_t>(),
-    output.data_ptr<int64_t>(),
-    scores.stride(0),
-    scores.stride(1),
-    scores.size(1),
-    static_cast<int>(blocks.size(1)),
-    static_cast<int>(block_size),
-    static_cast<int>(topk)};
+      scores.data_ptr<float>(),
+      lengths.data_ptr<int64_t>(),
+      blocks.data_ptr<int64_t>(),
+      output.data_ptr<int64_t>(),
+      scores.stride(0),
+      scores.stride(1),
+      scores.size(1),
+      static_cast<int>(blocks.size(1)),
+      static_cast<int>(block_size),
+      static_cast<int>(topk)};
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
   sycl_kernel_submit(
-    sycl::range<1>(static_cast<size_t>(scores.size(0)) * kThreadsPerBlock),
-    sycl::range<1>(kThreadsPerBlock),
-    queue,
-    kernel);
+      sycl::range<1>(static_cast<size_t>(scores.size(0)) * kThreadsPerBlock),
+      sycl::range<1>(kThreadsPerBlock),
+      queue,
+      kernel);
   return output;
 }
 

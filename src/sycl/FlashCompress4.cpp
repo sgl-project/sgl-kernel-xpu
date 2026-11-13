@@ -290,33 +290,21 @@ struct FlashCompress4WriteKernel {
 
 SGL_KERNEL_EXPORT void flash_compress4_decode(
     torch::Tensor kv_buffer, torch::Tensor kv_input, torch::Tensor kv_output, torch::Tensor ape, torch::Tensor plan_d) {
-  CHECK_INPUT(kv_buffer);
-  CHECK_DIM(3, kv_buffer);
-  CHECK_INPUT(kv_input);
-  CHECK_DIM(2, kv_input);
-  CHECK_INPUT(kv_output);
-  CHECK_DIM(2, kv_output);
-  CHECK_INPUT(ape);
-  CHECK_DIM(2, ape);
-  CHECK_INPUT(plan_d);
-  CHECK_DIM(2, plan_d);
-  CHECK_EQ(plan_d.dtype(), torch::kUInt8);
-  CHECK_EQ(kv_input.dtype(), torch::kFloat);
-  CHECK_EQ(kv_input.dtype(), kv_output.dtype());
-  CHECK_EQ(kv_input.dtype(), ape.dtype());
+  CHECK_INPUT(3, kv_buffer);
+  CHECK_INPUT(2, torch::kFloat, kv_input);
+  CHECK_INPUT(2, torch::kFloat, kv_output);
+  CHECK_INPUT(2, torch::kFloat, ape);
+  CHECK_INPUT(2, torch::kUInt8, plan_d);
 
   const int64_t batch_size = kv_input.size(0);
   const int64_t elem_size = kv_input.size(1);
   const int64_t head_dim = kv_output.size(1);
   TORCH_CHECK(head_dim % kTileDim == 0, "flash_compress4_decode requires head_dim divisible by ", kTileDim);
   TORCH_CHECK(elem_size == 4 * head_dim, "kv_input last dim must be 4 * head_dim");
-  TORCH_CHECK(
-      kv_buffer.size(1) == 4 && kv_buffer.size(2) == elem_size, "kv_buffer shape must be [num_pages, 4, 4*head_dim]");
-  TORCH_CHECK(kv_output.size(0) == batch_size, "kv_output batch must match kv_input batch");
-  TORCH_CHECK(ape.size(0) == 8 && ape.size(1) == head_dim, "ape shape must be [8, head_dim]");
-  TORCH_CHECK(
-      plan_d.size(0) == batch_size && plan_d.size(1) == static_cast<int64_t>(sizeof(DecodePlan)),
-      "plan_d shape must be [B, 16]");
+  CHECK_SHAPE(kv_buffer, kv_buffer.size(0), 4, elem_size);
+  CHECK_SHAPE(kv_output, batch_size, head_dim);
+  CHECK_SHAPE(ape, 8, head_dim);
+  CHECK_SHAPE(plan_d, batch_size, static_cast<int64_t>(sizeof(DecodePlan)));
 
   if (batch_size == 0) {
     return;
@@ -327,8 +315,7 @@ SGL_KERNEL_EXPORT void flash_compress4_decode(
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "flash_compress4_decode", queue);
 #endif
 
   using input_t = float;
@@ -360,7 +347,7 @@ SGL_KERNEL_EXPORT void flash_compress4_decode(
                        static_cast<double>(batch_size) * 4.0 * static_cast<double>(elem_size) *
                            static_cast<double>(kv_buffer.element_size()) +
                        static_cast<double>(kv_output.numel()) * static_cast<double>(kv_output.element_size());
-  ::sglkernel::report_kernel_perf("flash_compress4_decode", queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }
 
@@ -371,23 +358,12 @@ SGL_KERNEL_EXPORT void flash_compress4_prefill(
     torch::Tensor ape,
     torch::Tensor plan_c,
     torch::Tensor plan_w) {
-  CHECK_INPUT(kv_buffer);
-  CHECK_DIM(3, kv_buffer);
-  CHECK_INPUT(kv_input);
-  CHECK_DIM(2, kv_input);
-  CHECK_INPUT(kv_output);
-  CHECK_DIM(2, kv_output);
-  CHECK_INPUT(ape);
-  CHECK_DIM(2, ape);
-  CHECK_INPUT(plan_c);
-  CHECK_DIM(2, plan_c);
-  CHECK_EQ(plan_c.dtype(), torch::kUInt8);
-  CHECK_INPUT(plan_w);
-  CHECK_DIM(2, plan_w);
-  CHECK_EQ(plan_w.dtype(), torch::kUInt8);
-  CHECK_EQ(kv_input.dtype(), torch::kFloat);
-  CHECK_EQ(kv_input.dtype(), kv_output.dtype());
-  CHECK_EQ(kv_input.dtype(), ape.dtype());
+  CHECK_INPUT(3, kv_buffer);
+  CHECK_INPUT(2, torch::kFloat, kv_input);
+  CHECK_INPUT(2, torch::kFloat, kv_output);
+  CHECK_INPUT(2, torch::kFloat, ape);
+  CHECK_INPUT(2, torch::kUInt8, plan_c);
+  CHECK_INPUT(2, torch::kUInt8, plan_w);
 
   const int64_t num_compress = plan_c.size(0);
   const int64_t num_write = plan_w.size(0);
@@ -396,13 +372,11 @@ SGL_KERNEL_EXPORT void flash_compress4_prefill(
   const int64_t head_dim = kv_output.size(1);
   TORCH_CHECK(head_dim % kTileDim == 0, "flash_compress4_prefill requires head_dim divisible by ", kTileDim);
   TORCH_CHECK(elem_size == 4 * head_dim, "kv_input last dim must be 4 * head_dim");
-  TORCH_CHECK(
-      kv_buffer.size(1) == 4 && kv_buffer.size(2) == elem_size, "kv_buffer shape must be [num_pages, 4, 4*head_dim]");
-  TORCH_CHECK(ape.size(0) == 8 && ape.size(1) == head_dim, "ape shape must be [8, head_dim]");
-  TORCH_CHECK(
-      plan_c.size(1) == static_cast<int64_t>(sizeof(CompressPlan)), "plan_c row size must be sizeof(CompressPlan)");
-  TORCH_CHECK(plan_w.size(1) == static_cast<int64_t>(sizeof(WritePlan)), "plan_w row size must be sizeof(WritePlan)");
-  TORCH_CHECK(kv_output.size(0) == num_compress, "kv_output rows must match num compress plans");
+  CHECK_SHAPE(kv_buffer, kv_buffer.size(0), 4, elem_size);
+  CHECK_SHAPE(ape, 8, head_dim);
+  CHECK_SHAPE(plan_c, num_compress, static_cast<int64_t>(sizeof(CompressPlan)));
+  CHECK_SHAPE(plan_w, num_write, static_cast<int64_t>(sizeof(WritePlan)));
+  CHECK_SHAPE(kv_output, num_compress, head_dim);
   TORCH_CHECK(num_q_tokens >= num_write, "invalid prefill plan: num_q < num_w");
 
   if (num_compress == 0 && num_write == 0) {
@@ -414,8 +388,7 @@ SGL_KERNEL_EXPORT void flash_compress4_prefill(
   auto queue = c10::xpu::getCurrentXPUStream().queue();
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "flash_compress4_prefill", queue);
 #endif
 
   using input_t = float;
@@ -468,7 +441,7 @@ SGL_KERNEL_EXPORT void flash_compress4_prefill(
       static_cast<double>(kv_input.numel()) * static_cast<double>(kv_input.element_size()) +
       static_cast<double>(kv_output.numel()) * static_cast<double>(kv_output.element_size()) +
       static_cast<double>(num_write) * static_cast<double>(elem_size) * static_cast<double>(kv_buffer.element_size());
-  ::sglkernel::report_kernel_perf("flash_compress4_prefill", queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }
 

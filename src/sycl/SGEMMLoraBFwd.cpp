@@ -91,21 +91,13 @@ SGL_KERNEL_EXPORT void sgemm_lora_b_fwd(
     const std::optional<torch::Tensor>&
         base_output  // [num_tokens, output_dim] optional; this can be the base model's output for a fused add operation
 ) {
-  CHECK_INPUT(input_x);
-  CHECK_INPUT(weights);
-  CHECK_INPUT(seg_indptr);
-  CHECK_INPUT(weight_indices);
-  CHECK_INPUT(lora_ranks);
-  CHECK_INPUT(scalings);
-  CHECK_INPUT(output);
-
-  TORCH_CHECK(input_x.dim() == 2, "input_x must be a 2D tensor");
-  TORCH_CHECK(weights.dim() == 3, "weights must be a 3D tensor");
-  TORCH_CHECK(seg_indptr.dim() == 1, "seg_indptr must be a 1D tensor");
-  TORCH_CHECK(weight_indices.dim() == 1, "weight_indices must be a 1D tensor");
-  TORCH_CHECK(lora_ranks.dim() == 1, "lora_ranks must be a 1D tensor");
-  TORCH_CHECK(scalings.dim() == 1, "scalings must be a 1D tensor");
-  TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
+  CHECK_INPUT(2, input_x);
+  CHECK_INPUT(3, weights);
+  CHECK_INPUT(1, seg_indptr);
+  CHECK_INPUT(1, weight_indices);
+  CHECK_INPUT(1, lora_ranks);
+  CHECK_INPUT(1, scalings);
+  CHECK_INPUT(2, output);
 
   const int64_t num_loras_i64 = weights.size(0);
   const int64_t max_rank_i64 = weights.size(2);

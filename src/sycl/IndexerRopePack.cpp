@@ -366,21 +366,15 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> index_q_rope_pa
     const at::Tensor& positions,
     const at::Tensor& head_weights,
     double weight_scale) {
-  CHECK_INPUT(input);
-  CHECK_INPUT(freqs_cis);
-  CHECK_INPUT(positions);
-  CHECK_INPUT(head_weights);
-  TORCH_CHECK(input.dim() == 3 && input.size(2) == kHeadDim, "input must be [tokens, heads, 128]");
-  TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be bfloat16");
-  TORCH_CHECK(freqs_cis.dim() == 2 && freqs_cis.size(1) == kRopeDim, "freqs_cis must be [max_pos, 64]");
-  TORCH_CHECK(freqs_cis.scalar_type() == at::kFloat, "freqs_cis must be float32");
-  TORCH_CHECK(positions.dim() == 1 && positions.size(0) == input.size(0), "positions must be [tokens]");
-  TORCH_CHECK(
-      positions.scalar_type() == at::kInt || positions.scalar_type() == at::kLong, "positions must be int32 or int64");
-  TORCH_CHECK(
-      head_weights.dim() == 2 && head_weights.size(0) == input.size(0) && head_weights.size(1) == input.size(1),
-      "head_weights must be [tokens, heads]");
-  TORCH_CHECK(head_weights.scalar_type() == at::kBFloat16, "head_weights must be bfloat16");
+  CHECK_INPUT(3, at::kBFloat16, input);
+  CHECK_INPUT(2, at::kFloat, freqs_cis);
+  CHECK_INPUT(1, positions);
+  CHECK_DTYPES(positions, at::kInt, at::kLong);
+  CHECK_INPUT(2, at::kBFloat16, head_weights);
+  CHECK_SHAPE(input, input.size(0), input.size(1), kHeadDim);
+  CHECK_SHAPE(freqs_cis, freqs_cis.size(0), kRopeDim);
+  CHECK_SHAPE(positions, input.size(0));
+  CHECK_SHAPE(head_weights, input.size(0), input.size(1));
 
   const int64_t num_rows = input.size(0) * input.size(1);
   auto payload = at::empty({num_rows, kPackedDim}, input.options().dtype(at::kChar).requires_grad(false));
@@ -388,11 +382,9 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, at::Tensor, at::Tensor> index_q_rope_pa
   auto weights_out = at::empty({input.size(0), input.size(1)}, input.options().dtype(at::kFloat).requires_grad(false));
 
   const float scale_value = static_cast<float>(weight_scale);
-  if (positions.scalar_type() == at::kInt) {
-    launch_index_q<int32_t>(input, freqs_cis, positions, head_weights, payload, scale, weights_out, scale_value);
-  } else {
-    launch_index_q<int64_t>(input, freqs_cis, positions, head_weights, payload, scale, weights_out, scale_value);
-  }
+  AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "index_q_rope_pack_weights", [&] {
+    launch_index_q<index_t>(input, freqs_cis, positions, head_weights, payload, scale, weights_out, scale_value);
+  });
   return {payload, scale, weights_out};
 }
 
@@ -405,47 +397,29 @@ SGL_KERNEL_EXPORT void index_k_norm_rope_pack_store(
     const at::Tensor& loc,
     at::Tensor& cache,
     int64_t ratio) {
-  CHECK_INPUT(input);
-  CHECK_INPUT(norm_weight);
-  CHECK_INPUT(freqs_cis);
-  CHECK_INPUT(positions);
-  CHECK_INPUT(loc);
-  CHECK_INPUT(cache);
-  TORCH_CHECK(input.dim() == 2 && input.size(1) == kHeadDim, "input must be [tokens, 128]");
-  TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be bfloat16");
-  TORCH_CHECK(norm_weight.dim() == 1 && norm_weight.size(0) == kHeadDim, "norm_weight must be [128]");
-  TORCH_CHECK(
-      norm_weight.scalar_type() == at::kBFloat16 || norm_weight.scalar_type() == at::kFloat,
-      "norm_weight must be bfloat16 or float32");
-  TORCH_CHECK(freqs_cis.dim() == 2 && freqs_cis.size(1) == kRopeDim, "freqs_cis must be [max_pos, 64]");
-  TORCH_CHECK(freqs_cis.scalar_type() == at::kFloat, "freqs_cis must be float32");
-  TORCH_CHECK(positions.dim() == 1 && positions.size(0) == input.size(0), "positions must be [tokens]");
-  TORCH_CHECK(
-      positions.scalar_type() == at::kInt || positions.scalar_type() == at::kLong, "positions must be int32 or int64");
-  TORCH_CHECK(loc.dim() == 1 && loc.size(0) == input.size(0), "loc must be [tokens]");
-  TORCH_CHECK(loc.scalar_type() == at::kLong, "loc must be int64");
-  TORCH_CHECK(cache.dim() == 2 && cache.scalar_type() == at::kByte, "cache must be 2-D uint8");
+  CHECK_INPUT(2, at::kBFloat16, input);
+  CHECK_INPUT(1, norm_weight);
+  CHECK_DTYPES(norm_weight, at::kBFloat16, at::kFloat);
+  CHECK_INPUT(2, at::kFloat, freqs_cis);
+  CHECK_INPUT(1, positions);
+  CHECK_DTYPES(positions, at::kInt, at::kLong);
+  CHECK_INPUT(1, at::kLong, loc);
+  CHECK_INPUT(2, at::kByte, cache);
+  CHECK_SHAPE(input, input.size(0), kHeadDim);
+  CHECK_SHAPE(norm_weight, kHeadDim);
+  CHECK_SHAPE(freqs_cis, freqs_cis.size(0), kRopeDim);
+  CHECK_SHAPE(positions, input.size(0));
+  CHECK_SHAPE(loc, input.size(0));
   TORCH_CHECK(cache.size(1) % kSlotBytes == 0, "cache row size must be divisible by 68");
   TORCH_CHECK(ratio > 0 && (ratio & (ratio - 1)) == 0, "ratio must be a positive power of two");
   TORCH_CHECK(eps > 0.0, "eps must be positive");
   const int64_t page_size = cache.size(1) / kSlotBytes;
   TORCH_CHECK(page_size > 0, "cache page size must be positive");
 
-  if (positions.scalar_type() == at::kInt) {  // positions is int32.
-    if (norm_weight.scalar_type() == at::kBFloat16) {
-      launch_index_k<bf16_t, int32_t>(
+  AT_DISPATCH_INDEX_TYPES(positions.scalar_type(), "index_k_norm_rope_pack_store", [&] {
+    AT_DISPATCH_WEIGHT_TYPES(at::BFloat16, norm_weight.scalar_type(), "index_k_norm_rope_pack_store", [&] {
+      launch_index_k<sycl_type_t<weight_t>, index_t>(
           input, norm_weight, freqs_cis, positions, loc, cache, ratio, page_size, static_cast<float>(eps));
-    } else {
-      launch_index_k<float, int32_t>(
-          input, norm_weight, freqs_cis, positions, loc, cache, ratio, page_size, static_cast<float>(eps));
-    }
-  } else {  // positions is int64.
-    if (norm_weight.scalar_type() == at::kBFloat16) {
-      launch_index_k<bf16_t, int64_t>(
-          input, norm_weight, freqs_cis, positions, loc, cache, ratio, page_size, static_cast<float>(eps));
-    } else {
-      launch_index_k<float, int64_t>(
-          input, norm_weight, freqs_cis, positions, loc, cache, ratio, page_size, static_cast<float>(eps));
-    }
-  }
+    });
+  });
 }

@@ -75,38 +75,20 @@ struct StoreCacheKernel {
 
 SGL_KERNEL_EXPORT void
 store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices) {
-  CHECK_DEVICE(k);
-  CHECK_DEVICE(v);
-  CHECK_DEVICE(k_cache);
-  CHECK_DEVICE(v_cache);
-  CHECK_DEVICE(indices);
-
   // k/v may be non-contiguous across rows (e.g. a per-head slice of a wider
   // [num_tokens, n_heads, head_dim] tensor): only the inner row must be
   // contiguous so the 16-byte vectorized copy is valid. The dense cache buffers
   // and indices are still required fully contiguous.
-  CHECK_CONTIGUOUS(k_cache);
-  CHECK_CONTIGUOUS(v_cache);
-  CHECK_CONTIGUOUS(indices);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, k);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(2, k.scalar_type(), v);
+  CHECK_INPUT(2, k.scalar_type(), k_cache);
+  CHECK_INPUT(2, k.scalar_type(), v_cache);
+  CHECK_INPUT(1, at::kLong, indices);
 
-  TORCH_CHECK(k.dim() == 2, "k must be 2D [num_tokens, row_dim]");
-  TORCH_CHECK(v.dim() == 2, "v must be 2D [num_tokens, row_dim]");
-  TORCH_CHECK(k_cache.dim() == 2, "k_cache must be 2D [cache_size, row_dim]");
-  TORCH_CHECK(v_cache.dim() == 2, "v_cache must be 2D [cache_size, row_dim]");
-  TORCH_CHECK(indices.dim() == 1, "indices must be 1D [num_tokens]");
-
-  TORCH_CHECK(k.stride(1) == 1, "k rows must be contiguous (k.stride(1) == 1)");
-  TORCH_CHECK(v.stride(1) == 1, "v rows must be contiguous (v.stride(1) == 1)");
-
-  TORCH_CHECK(v.sizes() == k.sizes(), "v shape must match k shape");
-  TORCH_CHECK(v_cache.sizes() == k_cache.sizes(), "v_cache shape must match k_cache shape");
+  CHECK_SAME_SHAPE(k, v);
+  CHECK_SAME_SHAPE(k_cache, v_cache);
   TORCH_CHECK(k.size(1) == k_cache.size(1), "k row_dim must match k_cache row_dim");
   TORCH_CHECK(indices.size(0) == k.size(0), "indices length must match num_tokens");
-
-  TORCH_CHECK(indices.scalar_type() == at::kLong, "indices must be int64");
-  TORCH_CHECK(k.dtype() == v.dtype(), "k and v must have the same dtype");
-  TORCH_CHECK(k.dtype() == k_cache.dtype(), "k and k_cache must have the same dtype");
-  TORCH_CHECK(k.dtype() == v_cache.dtype(), "k and v_cache must have the same dtype");
 
   int64_t num_tokens = k.size(0);
   int64_t row_dim = k.size(1);

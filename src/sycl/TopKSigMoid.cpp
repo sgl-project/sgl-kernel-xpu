@@ -563,13 +563,12 @@ SGL_KERNEL_EXPORT void topk_sigmoid(
     const c10::optional<at::Tensor>& correction_bias,
     double routed_scaling_factor,
     int64_t num_fused_shared_experts) {
-  auto shape = gating_output.sizes().vec();
-  TORCH_CHECK(shape.size() == 2, "gating_output must be 2D");
-  int64_t n_tokens = shape[0];
-  int64_t n_experts = shape[1];
+  CHECK_DIM(2, gating_output);
+  int64_t n_tokens = gating_output.size(0);
+  int64_t n_experts = gating_output.size(1);
   TORCH_CHECK(n_experts <= 512, "n_experts only support up to 512, got ", n_experts);
-  TORCH_CHECK(topk_weights.scalar_type() == at::kFloat, "topk_weights should be Float");
-  TORCH_CHECK(topk_indices.scalar_type() == at::kInt, "topk_indices should be Int");
+  CHECK_DTYPE(at::kFloat, topk_weights);
+  CHECK_DTYPE(at::kInt, topk_indices);
 
   int64_t n_topk = topk_weights.size(1);
   TORCH_CHECK(
@@ -594,8 +593,8 @@ SGL_KERNEL_EXPORT void topk_sigmoid(
   const float* bias_ptr = nullptr;
   if (correction_bias.has_value()) {
     const auto& bias = correction_bias.value();
-    TORCH_CHECK(bias.dim() == 1 && bias.size(0) == n_experts, "correction_bias must be 1D [num_experts]");
-    TORCH_CHECK(bias.scalar_type() == at::kFloat, "correction_bias must be float32");
+    CHECK_SHAPE(bias, n_experts);
+    CHECK_DTYPE(at::kFloat, bias);
     bias_ptr = bias.data_ptr<float>();
   }
 

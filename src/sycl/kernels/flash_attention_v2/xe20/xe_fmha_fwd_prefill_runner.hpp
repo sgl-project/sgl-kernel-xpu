@@ -489,6 +489,7 @@ struct PrefillRunner {
           "ScoreBlock2D requires positive batch, query heads, and Q/K sequence lengths");
       q_tiles = cute::ceil_div(params.seqlen_q, int(get<0>(typename FMHAPrefillKernel::TileShapeQK{})));
       query_tile_slice = q_tiles;
+      // Environment settings are cached on first use; set them before process startup.
       static const int cap_mb = [] {
         if (const char* env = std::getenv("FMHA_SCORE_WS_CAP_MB")) {
           return std::atoi(env);
@@ -563,7 +564,9 @@ struct PrefillRunner {
     }();
     const size_t workspace_size = FMHAPrefillKernel::get_workspace_size(workspace_shape);
     if constexpr (CollectiveMainloop::ScoreBlock2D) {
-      if (std::getenv("FMHA_SCORE_WS_VERBOSE") != nullptr) {
+      // Environment settings are cached on first use; set them before process startup.
+      static const bool verbose = std::getenv("FMHA_SCORE_WS_VERBOSE") != nullptr;
+      if (verbose) {
         std::fprintf(
             stderr,
             "[fmha] score workspace: batch=%d batch_slice=%d slices=%d query_head_slice=%d query_tile_slice=%d "

@@ -60,17 +60,14 @@ void launch(
     const torch::Tensor& output,
     const torch::Tensor& input,
     const torch::Tensor& gate,
-    int64_t rows,
-    int64_t hidden,
     int64_t head_dim,
-    int64_t gate_stride_row,
     int64_t gate_stride_head) {
-  const int64_t vecs_per_row = hidden / V;
+  const int64_t vecs_per_row = input.size(1) / V;
   const int64_t wg_size = std::min<int64_t>(WG_SIZE, (vecs_per_row + SG_SIZE - 1) / SG_SIZE * SG_SIZE);
   const int64_t col_groups = (vecs_per_row + wg_size - 1) / wg_size;
   auto q = c10::xpu::getCurrentXPUStream().queue();
   sycl_kernel_submit(
-      sycl::range<2>(rows, col_groups * wg_size),
+      sycl::range<2>(input.size(0), col_groups * wg_size),
       sycl::range<2>(1, wg_size),
       q,
       SigmoidMulKernel<T, V>{
@@ -79,35 +76,8 @@ void launch(
           reinterpret_cast<T*>(output.data_ptr()),
           static_cast<uint32_t>(vecs_per_row),
           static_cast<uint32_t>(head_dim),
-          gate_stride_row,
+          gate.stride(0),
           gate_stride_head});
-}
-
-template <typename T>
-void dispatch_vec(
-    const torch::Tensor& output,
-    const torch::Tensor& input,
-    const torch::Tensor& gate,
-    int64_t rows,
-    int64_t hidden,
-    int64_t head_dim,
-    int64_t gate_stride_row,
-    int64_t gate_stride_head) {
-  // Widest vector first: 16-byte, then 8-byte, then scalar for odd head dims or misaligned views.
-  constexpr int V = VEC_BYTES / sizeof(T);
-  auto usable = [&](int vec) {
-    const size_t bytes = vec * sizeof(T);
-    auto aligned = [&](const torch::Tensor& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % bytes == 0; };
-    return head_dim % vec == 0 && gate_stride_row % vec == 0 && gate_stride_head % vec == 0 && aligned(output) &&
-           aligned(input) && aligned(gate);
-  };
-  if (usable(V)) {
-    launch<T, V>(output, input, gate, rows, hidden, head_dim, gate_stride_row, gate_stride_head);
-  } else if (usable(V / 2)) {
-    launch<T, V / 2>(output, input, gate, rows, hidden, head_dim, gate_stride_row, gate_stride_head);
-  } else {
-    launch<T, 1>(output, input, gate, rows, hidden, head_dim, gate_stride_row, gate_stride_head);
-  }
 }
 
 }  // namespace
@@ -118,14 +88,10 @@ namespace at::native::xpu {
 // The gate may be strided (e.g. a chunk of a q/gate projection); its last dim must be contiguous.
 SGL_KERNEL_EXPORT void fused_sigmoid_mul(torch::Tensor& output, torch::Tensor& input, torch::Tensor& gate) {
   CHECK_INPUT(output);
-  CHECK_INPUT(input);
+  CHECK_INPUT(2, input);
   CHECK_DEVICE(gate);
-  TORCH_CHECK(input.dim() == 2, "input must have shape [N, H]");
-  TORCH_CHECK(output.sizes() == input.sizes(), "output must match input's shape");
-  TORCH_CHECK(
-      input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
-      "input must be bfloat16 or float16, got ",
-      input.scalar_type());
+  CHECK_SAME_SHAPE(output, input);
+  CHECK_DTYPES(input, at::kBFloat16, at::kHalf);
   TORCH_CHECK(
       output.scalar_type() == input.scalar_type() && gate.scalar_type() == input.scalar_type(),
       "input, gate and output must have the same dtype");
@@ -133,35 +99,41 @@ SGL_KERNEL_EXPORT void fused_sigmoid_mul(torch::Tensor& output, torch::Tensor& i
       gate.device() == input.device() && output.device() == input.device(),
       "input, gate and output must be on the same device");
   const int64_t rows = input.size(0), hidden = input.size(1);
-  TORCH_CHECK(gate.size(0) == rows, "gate must have the same number of rows as input");
-  TORCH_CHECK(gate.stride(-1) == 1, "gate must be contiguous in the last dim");
+  CHECK_LAST_DIM_CONTIGUOUS(gate);
   int64_t head_dim, gate_stride_head;
   if (gate.dim() == 2) {
-    TORCH_CHECK(gate.size(1) == hidden, "gate must have shape [N, H]");
+    CHECK_SHAPE(gate, rows, hidden);
     head_dim = hidden;
     gate_stride_head = 0;
   } else {
-    TORCH_CHECK(gate.dim() == 3 && gate.size(1) * gate.size(2) == hidden, "gate must have shape [N, heads, head_dim]");
+    CHECK_DIM(3, gate);
+    CHECK_SHAPE(gate, rows, gate.size(1), gate.size(2));
+    TORCH_CHECK(gate.size(1) * gate.size(2) == hidden, "gate heads * head_dim must equal hidden");
     head_dim = gate.size(2);
     gate_stride_head = gate.stride(1);
   }
   at::assert_no_partial_overlap(output, input);
   TORCH_CHECK(
-      !output.is_alias_of(gate) || at::get_overlap_status(output, gate) != at::MemOverlapStatus::TooHard,
-      "output and gate must not share storage when overlap cannot be determined");
-  at::assert_no_overlap(output, gate);
+      !output.is_alias_of(gate) || at::get_overlap_status(output, gate) == at::MemOverlapStatus::No,
+      "output and gate must not overlap or share storage when overlap cannot be determined");
   if (rows == 0 || hidden == 0) {
     return;
   }
   TORCH_CHECK(rows <= MAX_ROWS && hidden <= MAX_HIDDEN, "fused_sigmoid_mul: input too large: ", input.sizes());
 
   c10::DeviceGuard guard(input.device());
-  if (input.scalar_type() == at::kBFloat16) {
-    dispatch_vec<sycl::ext::oneapi::bfloat16>(
-        output, input, gate, rows, hidden, head_dim, gate.stride(0), gate_stride_head);
-  } else {
-    dispatch_vec<sycl::half>(output, input, gate, rows, hidden, head_dim, gate.stride(0), gate_stride_head);
-  }
+  SYCL_DISPATCH_FLOATING_TYPES_V1(input.scalar_type(), "fused_sigmoid_mul", [&] {
+    constexpr int V = VEC_BYTES / sizeof(scalar_t);
+    auto usable = [&](int vec) {
+      const size_t bytes = vec * sizeof(scalar_t);
+      auto aligned = [&](const torch::Tensor& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % bytes == 0; };
+      return head_dim % vec == 0 && gate.stride(0) % vec == 0 && gate_stride_head % vec == 0 && aligned(output) &&
+             aligned(input) && aligned(gate);
+    };
+    const int vec_size = usable(V) ? V : usable(V / 2) ? V / 2 : 1;
+    SGL_DISPATCH_VEC_SIZE_SET(
+        vec_size, (1, 4, 8), [&] { ::launch<scalar_t, VEC_SIZE>(output, input, gate, head_dim, gate_stride_head); });
+  });
 }
 
 }  // namespace at::native::xpu

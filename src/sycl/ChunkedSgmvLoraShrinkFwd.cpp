@@ -113,19 +113,12 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_fwd(
     const torch::Tensor& lora_ranks,                 // [num_loras,]
     const std::optional<torch::Tensor>& permutation  // [num_tokens,] logical -> physical (optional)
 ) {
-  CHECK_INPUT(x);
-  CHECK_INPUT(weights);
-  CHECK_INPUT(seg_indptr);
-  CHECK_INPUT(weight_indices);
-  CHECK_INPUT(lora_ranks);
-  CHECK_INPUT(output);
-
-  TORCH_CHECK(x.dim() == 2, "x must be a 2D tensor");
-  TORCH_CHECK(weights.dim() == 3, "weights must be a 3D tensor");
-  TORCH_CHECK(seg_indptr.dim() == 1, "seg_indptr must be a 1D tensor");
-  TORCH_CHECK(weight_indices.dim() == 1, "weight_indices must be a 1D tensor");
-  TORCH_CHECK(lora_ranks.dim() == 1, "lora_ranks must be a 1D tensor");
-  TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
+  CHECK_INPUT(2, x);
+  CHECK_INPUT(3, weights);
+  CHECK_INPUT(1, seg_indptr);
+  CHECK_INPUT(1, weight_indices);
+  CHECK_INPUT(1, lora_ranks);
+  CHECK_INPUT(2, output);
 
   TORCH_CHECK(num_slices > 0, "num_slices must be > 0");
   TORCH_CHECK(weights.size(1) % num_slices == 0, "weights.size(1) must be divisible by num_slices");
@@ -188,8 +181,7 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_shrink_fwd(
   torch::Tensor perm_i64;
   if (permutation.has_value()) {
     const auto& perm = permutation.value();
-    CHECK_INPUT(perm);
-    TORCH_CHECK(perm.dim() == 1, "permutation must be a 1D tensor");
+    CHECK_INPUT(1, perm);
     TORCH_CHECK(perm.numel() == num_tokens_i64, "permutation.numel() must equal x.size(0)");
     lora_debug_checks::check_permutation(perm, num_tokens_i64);
     perm_i64 = perm.scalar_type() == torch::kInt64 ? perm : perm.to(torch::kInt64);

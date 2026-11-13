@@ -233,10 +233,10 @@ void check_common(
   check_tensor(cache, anchor, at::kFloat, "cos_sin_cache");
   check_tensor(axis, anchor, at::kInt, "axis_map");
   check_tensor(weight, anchor, at::kBFloat16, "weight");
-  TORCH_CHECK(
-      cache.dim() == 2 && cache.size(1) == rotary && cache.size(0) > 0 && axis.dim() == 1 &&
-          axis.size(0) == rotary / 2 && weight.dim() == 1 && weight.size(0) == dim,
-      "QSA prep invalid cos_sin_cache, axis_map or weight shape");
+  CHECK_DIM(2, cache);
+  CHECK_SHAPE(cache, cache.size(0), rotary);
+  TORCH_CHECK(cache.size(0) > 0, "QSA prep requires non-empty cos_sin_cache");
+  CHECK_SHAPE(axis, rotary / 2);
 }
 
 Rope rope_args(const at::Tensor& cache, const at::Tensor& axis, int64_t rotary, bool neox) {
@@ -265,7 +265,8 @@ SGL_KERNEL_EXPORT at::Tensor qsa_index_q_norm_rope_store(
     bool is_neox_style,
     std::optional<int64_t> q_heads_padded,
     std::optional<at::ScalarType> out_dtype) {
-  TORCH_CHECK(qk.dim() == 2 && weight.dim() == 1, "QSA query prep requires qk [tokens, (heads+1)*dim]");
+  CHECK_DIM(2, qk);
+  CHECK_DIM(1, weight);
   const auto dtype = out_dtype.value_or(at::kBFloat16);
   TORCH_CHECK(
       dtype == at::kBFloat16 || dtype == at::kFloat8_e4m3fn,
@@ -285,13 +286,15 @@ SGL_KERNEL_EXPORT at::Tensor qsa_index_q_norm_rope_store(
           (positions.dim() == 1 || positions.size(0) == 1 || positions.size(0) == 3) && positions.size(-1) == tokens &&
           positions.stride(-1) == 1,
       "QSA query prep requires int64 positions [tokens] or [1|3, tokens] with contiguous token axis");
+  CHECK_DIM(2, key_state_buffer);
   TORCH_CHECK(
       num_q_heads > 0 && padded >= num_q_heads && padded <= std::numeric_limits<int>::max() &&
-          tokens <= std::numeric_limits<int>::max() && qk.size(1) == (num_q_heads + 1) * dim &&
-          cache_loc.numel() == tokens && key_state_buffer.dim() == 2 && key_state_buffer.size(1) == dim &&
-          rope_position_buffer.dim() == 2 && rope_position_buffer.size(0) == key_state_buffer.size(0) &&
-          rope_position_buffer.size(1) == 3 && key_state_buffer.size(0) <= std::numeric_limits<int>::max(),
+          tokens <= std::numeric_limits<int>::max() && key_state_buffer.size(0) <= std::numeric_limits<int>::max(),
       "QSA query prep invalid head count or buffer shapes");
+  CHECK_SHAPE(qk, tokens, (num_q_heads + 1) * dim);
+  CHECK_SHAPE(key_state_buffer, key_state_buffer.size(0), dim);
+  CHECK_SHAPE(rope_position_buffer, key_state_buffer.size(0), 3);
+  TORCH_CHECK(cache_loc.numel() == tokens, "cache_loc must have one entry per token");
   c10::DeviceGuard guard(qk.device());
   auto out = at::empty({tokens, padded, dim}, qk.options().dtype(dtype));
   if (!tokens) return out;
@@ -340,7 +343,8 @@ SGL_KERNEL_EXPORT void qsa_index_k_compress_store(
     int64_t rotary_dim,
     double eps,
     bool is_neox_style) {
-  TORCH_CHECK(key_state_buffer.dim() == 2 && weight.dim() == 1, "QSA compression requires state [slots, dim]");
+  CHECK_DIM(2, key_state_buffer);
+  CHECK_DIM(1, weight);
   const int64_t dim = weight.size(0);
   check_common(key_state_buffer, cos_sin_cache, axis_map, weight, dim, rotary_dim, eps);
   check_tensor(group_locs, key_state_buffer, at::kInt, "group_locs");
@@ -351,16 +355,18 @@ SGL_KERNEL_EXPORT void qsa_index_k_compress_store(
           (compressed_k_buffer.scalar_type() == at::kBFloat16 ||
            compressed_k_buffer.scalar_type() == at::kFloat8_e4m3fn),
       "compressed_k_buffer must be XPU BF16 or float8_e4m3fn");
-  CHECK_INPUT(compressed_k_buffer);
+  CHECK_INPUT(2, compressed_k_buffer);
+  CHECK_DIM(2, group_locs);
   TORCH_CHECK(
-      compress_ratio > 0 && compress_ratio <= 16 && group_locs.dim() == 2 && group_locs.size(1) == compress_ratio &&
-          write_locs.dim() == 1 && write_locs.size(0) == group_locs.size(0) && key_state_buffer.size(1) == dim &&
-          rope_position_buffer.dim() == 2 && rope_position_buffer.size(0) == key_state_buffer.size(0) &&
-          rope_position_buffer.size(1) == 3 && compressed_k_buffer.dim() == 2 && compressed_k_buffer.size(1) == dim &&
-          group_locs.size(0) <= std::numeric_limits<int>::max() &&
+      compress_ratio > 0 && compress_ratio <= 16 && group_locs.size(0) <= std::numeric_limits<int>::max() &&
           key_state_buffer.size(0) <= std::numeric_limits<int>::max() &&
           compressed_k_buffer.size(0) <= std::numeric_limits<int>::max(),
       "QSA compression invalid ratio or buffer shapes");
+  CHECK_SHAPE(group_locs, group_locs.size(0), compress_ratio);
+  CHECK_SHAPE(write_locs, group_locs.size(0));
+  CHECK_SHAPE(key_state_buffer, key_state_buffer.size(0), dim);
+  CHECK_SHAPE(rope_position_buffer, key_state_buffer.size(0), 3);
+  CHECK_SHAPE(compressed_k_buffer, compressed_k_buffer.size(0), dim);
   if (!group_locs.size(0)) return;
   c10::DeviceGuard guard(key_state_buffer.device());
   const size_t groups = group_locs.size(0);

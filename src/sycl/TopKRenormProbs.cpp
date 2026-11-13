@@ -286,22 +286,14 @@ SGL_KERNEL_EXPORT void top_k_renorm_probs(
     at::Tensor& renorm_probs,
     const std::optional<at::Tensor>& maybe_top_k_arr,
     int64_t top_k_val) {
-  CHECK_INPUT(probs);
-  CHECK_INPUT(renorm_probs);
-  TORCH_CHECK(probs.dim() == 2, "probs must be a 2D tensor [batch_size, vocab_size]");
-  TORCH_CHECK(renorm_probs.dim() == 2, "renorm_probs must be a 2D tensor [batch_size, vocab_size]");
-  TORCH_CHECK(probs.sizes() == renorm_probs.sizes(), "Input tensors must have the same shape");
-  TORCH_CHECK(probs.scalar_type() == renorm_probs.scalar_type(), "Input tensors must have the same dtype");
-  TORCH_CHECK(
-      probs.scalar_type() == torch::kFloat32 || probs.scalar_type() == torch::kHalf ||
-          probs.scalar_type() == torch::kBFloat16,
-      "Input tensors must be float32, float16, or bfloat16");
+  CHECK_INPUT(2, probs);
+  CHECK_DTYPES(probs, at::kFloat, at::kHalf, at::kBFloat16);
+  CHECK_INPUT(2, probs.scalar_type(), renorm_probs);
+  CHECK_SAME_SHAPE(probs, renorm_probs);
 
   if (maybe_top_k_arr.has_value()) {
-    CHECK_INPUT((*maybe_top_k_arr));
-    TORCH_CHECK(maybe_top_k_arr->dim() == 1, "maybe_top_k_arr must be a 1D tensor [batch_size]");
+    CHECK_INPUT(1, at::kLong, (*maybe_top_k_arr));
     TORCH_CHECK(maybe_top_k_arr->size(0) == probs.size(0), "maybe_top_k_arr size must match batch_size");
-    TORCH_CHECK(maybe_top_k_arr->scalar_type() == torch::kInt64, "maybe_top_k_arr must be int64");
   } else {
     TORCH_CHECK(top_k_val > 0, "top_k_val must be positive");
   }

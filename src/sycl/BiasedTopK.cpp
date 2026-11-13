@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <sycl/sycl.hpp>
 
 #include "SGLKernelPerf.h"
@@ -108,7 +109,7 @@ struct BiasedTopkKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     for (uint32_t e = lane_id; e < num_experts_; e += kWarpSize) {
       const float input_val = static_cast<float>(input_[static_cast<int64_t>(row_idx) * num_experts_ + e]);
-      float bias_val = bias_[e];
+      float bias_val = bias_ != nullptr ? bias_[e] : 0.0f;
       float score_val = compute_score<kScoringFunc>(input_val);
       shared_scores[e] = score_val + bias_val;
       shared_original_scores[e] = score_val;
@@ -246,7 +247,7 @@ struct BiasedTopkSmallTokenKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 
     for (uint32_t e = tid; e < num_experts_; e += threads_per_block) {
       const float input_val = static_cast<float>(input_[static_cast<int64_t>(row_idx) * num_experts_ + e]);
-      float bias_val = bias_[e];
+      float bias_val = bias_ != nullptr ? bias_[e] : 0.0f;
       float score_val = compute_score<kScoringFunc>(input_val);
       shared_scores[e] = score_val + bias_val;
       shared_original_scores[e] = score_val;
@@ -335,7 +336,7 @@ struct BiasedTopkSmallTokenKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
 template <typename T, ScoringFunc kScoringFunc, uint32_t kWarpsPerToken>
 void launch_biased_topk_small_token_kernel(
     const at::Tensor& input,
-    const at::Tensor& bias,
+    const float* bias,
     at::Tensor& output,
     at::Tensor& indices,
     uint32_t topk,
@@ -351,13 +352,12 @@ void launch_biased_topk_small_token_kernel(
   sycl::range<3> global_range{1, num_rows * kWarpsPerToken, kWarpSize};
 
   auto* input_ptr = reinterpret_cast<const T*>(input.data_ptr());
-  auto* bias_ptr = reinterpret_cast<const float*>(bias.data_ptr());
   auto* output_ptr = reinterpret_cast<float*>(output.data_ptr());
   auto* indices_ptr = reinterpret_cast<int32_t*>(indices.data_ptr());
 
   BiasedTopkSmallTokenKernel<T, kScoringFunc, kWarpsPerToken> task(
       input_ptr,
-      bias_ptr,
+      bias,
       output_ptr,
       indices_ptr,
       num_rows,
@@ -374,7 +374,7 @@ void launch_biased_topk_small_token_kernel(
 template <typename T, ScoringFunc kScoringFunc>
 void launch_biased_topk(
     const at::Tensor& input,
-    const at::Tensor& bias,
+    const float* bias,
     at::Tensor& output,
     at::Tensor& indices,
     uint32_t topk,
@@ -436,13 +436,12 @@ void launch_biased_topk(
   sycl::range<3> global_range{1, num_blocks * warps_per_cta, kWarpSize};
 
   auto* input_ptr = reinterpret_cast<const T*>(input.data_ptr());
-  auto* bias_ptr = reinterpret_cast<const float*>(bias.data_ptr());
   auto* output_ptr = reinterpret_cast<float*>(output.data_ptr());
   auto* indices_ptr = reinterpret_cast<int32_t*>(indices.data_ptr());
 
   BiasedTopkKernel<T, kScoringFunc> task(
       input_ptr,
-      bias_ptr,
+      bias,
       output_ptr,
       indices_ptr,
       num_rows,
@@ -460,7 +459,7 @@ void launch_biased_topk(
 
 SGL_KERNEL_EXPORT void biased_topk(
     const at::Tensor& input,
-    const at::Tensor& bias,
+    const std::optional<at::Tensor>& bias,
     at::Tensor& output,
     at::Tensor& indices,
     int64_t topk,
@@ -470,13 +469,15 @@ SGL_KERNEL_EXPORT void biased_topk(
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
   TORCH_CHECK(input.dim() == 2, "input must be 2D, got ", input.dim(), "D");
-  TORCH_CHECK(bias.dim() == 1, "bias must be 1D, got ", bias.dim(), "D");
-  TORCH_CHECK(input.size(1) == bias.size(0), "input.size(1) must match bias.size(0)");
+  if (bias.has_value()) {
+    TORCH_CHECK(bias->dim() == 1, "bias must be 1D, got ", bias->dim(), "D");
+    TORCH_CHECK(input.size(1) == bias->size(0), "input.size(1) must match bias.size(0)");
+    TORCH_CHECK(bias->scalar_type() == torch::kFloat32, "bias must be float32");
+  }
   TORCH_CHECK(
       input.scalar_type() == torch::kFloat32 || input.scalar_type() == torch::kFloat16 ||
           input.scalar_type() == torch::kBFloat16,
       "input must be float32, float16, or bfloat16");
-  TORCH_CHECK(bias.scalar_type() == torch::kFloat32, "bias must be float32");
   TORCH_CHECK(input.size(1) <= kMaxExperts, "num_experts exceeds maximum supported value: ", kMaxExperts);
   TORCH_CHECK(topk > num_fused_shared_experts, "topk must be greater than num_fused_shared_experts");
   TORCH_CHECK(topk <= kMaxTopK, "topk exceeds maximum supported value: ", kMaxTopK);
@@ -488,6 +489,7 @@ SGL_KERNEL_EXPORT void biased_topk(
   TORCH_CHECK(output.size(0) == input.size(0) && output.size(1) == topk, "output shape mismatch");
   TORCH_CHECK(indices.size(0) == input.size(0) && indices.size(1) == topk, "indices shape mismatch");
 
+  const float* bias_ptr = bias.has_value() ? bias->data_ptr<float>() : nullptr;
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
 
@@ -498,7 +500,8 @@ SGL_KERNEL_EXPORT void biased_topk(
                        static_cast<double>(N) * static_cast<double>(topk) *
                            (1.0 + std::log2(std::max<double>(1.0, static_cast<double>(E))));
   const double bytes = static_cast<double>(N) * static_cast<double>(E) * static_cast<double>(input.element_size()) +
-                       static_cast<double>(E) * 4.0 + static_cast<double>(N) * static_cast<double>(topk) * (4.0 + 4.0);
+                       (bias.has_value() ? static_cast<double>(E) * 4.0 : 0.0) +
+                       static_cast<double>(N) * static_cast<double>(topk) * (4.0 + 4.0);
   SGL_KERNEL_PERF_SCOPE("biased_topk", queue, bytes, flops);
 #endif
 
@@ -506,7 +509,7 @@ SGL_KERNEL_EXPORT void biased_topk(
     AT_DISPATCH_FLOATING_TYPES_V2(input.scalar_type(), "biased_topk_kernel", [&] {
       launch_biased_topk<scalar_t, ScoringFunc::kSigmoid>(
           input,
-          bias,
+          bias_ptr,
           output,
           indices,
           static_cast<uint32_t>(topk),
@@ -520,7 +523,7 @@ SGL_KERNEL_EXPORT void biased_topk(
     AT_DISPATCH_FLOATING_TYPES_V2(input.scalar_type(), "biased_topk_kernel", [&] {
       launch_biased_topk<scalar_t, ScoringFunc::kSqrtSoftplus>(
           input,
-          bias,
+          bias_ptr,
           output,
           indices,
           static_cast<uint32_t>(topk),

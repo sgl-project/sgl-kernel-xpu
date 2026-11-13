@@ -4,6 +4,43 @@ import torch
 from sgl_kernel.utils import _get_cache_buf, get_xpu_stream
 
 
+def bf16_dense_gemm_xe20(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Compute BF16 ``input @ weight.T`` on Xe2 with FP32 accumulation.
+
+    Both tensors must be contiguous matrices on one XPU, with K divisible
+    by 32 and N divisible by 64. The kernel uses static dense tiles without
+    expert metadata or an atomic scheduler. Tile selection is fixed; callers
+    should retain their ordinary GEMM path for shapes that are faster there.
+    """
+    return torch.ops.sgl_kernel.bf16_dense_gemm_xe20.default(input, weight)
+
+
+if hasattr(torch.ops.sgl_kernel, "bf16_dense_gemm_xe20"):
+
+    @torch.library.register_fake("sgl_kernel::bf16_dense_gemm_xe20")
+    def _bf16_dense_gemm_xe20_fake(input, weight):
+        torch._check(input.ndim == 2 and weight.ndim == 2)
+        torch._check(input.device.type in ("xpu", "meta"))
+        torch._check(input.device == weight.device)
+        torch._check(input.dtype == weight.dtype == torch.bfloat16)
+        torch._check(input.is_contiguous() and weight.is_contiguous())
+        m, k = input.shape
+        n = weight.shape[0]
+        torch._check(k == weight.shape[1])
+        torch._check(k > 0)
+        torch._check(k % 32 == 0)
+        torch._check(n % 64 == 0)
+        torch._check(m <= 2147483520)
+        torch._check(n <= 2147483584)
+        torch._check(k <= 1073741823)
+        torch._check(m <= 0xFFFFFF)
+        torch._check(n <= 0xFFFFFF)
+        torch._check(2 * k <= 0xFFFFFF)
+        torch._check(2 * n <= 0xFFFFFF)
+        torch._check(((m + 127) // 128) * ((n + 63) // 64) <= 2147483647)
+        return input.new_empty((m, n))
+
+
 def awq_dequantize(
     qweight: torch.Tensor, scales: torch.Tensor, qzeros: torch.Tensor
 ) -> torch.ByteTensor:

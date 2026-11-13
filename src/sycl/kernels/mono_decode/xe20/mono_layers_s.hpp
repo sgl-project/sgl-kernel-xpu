@@ -11,7 +11,8 @@
 // - recurrent state: from slot state_idx[b]; after token t, to
 //   inter_ssm[b][t] ([rows][T][16][128][128] fp32);
 // - conv state: the three taps of slot state_idx[b]; the window after each
-//   token goes to inter_conv[b] ([rows][4096][T + 2], viewed by SGLang as
+//   token goes to inter_conv[b] ([rows][4096][T0 + 2] of the bound scratch's width
+//   T0 >= T, channel stride inter_conv_cstride, viewed by SGLang as
 //   [rows][T][4096][3] with window t = entries t .. t + 2): taps 1, 2 of the
 //   committed state, then the T inputs.
 // Attention: request b's context is seq_lens[b] - T cached tokens (page table
@@ -167,7 +168,7 @@ inline void gdn_layer_s(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const 
         qk[(b * T + t) * 384 + lid] = rnd<DT>(acc / (1.f + sycl::exp(-acc)));
       }
       if (lid >= 256 || ((h & 1) == 0 && c == 0)) {  // the windows: taps 1, 2, then the T inputs
-        e16* ln = P.inter_conv + (size_t)islot(b) * P.inter_conv_stride + (size_t)cch * (T + 2);
+        e16* ln = P.inter_conv + (size_t)islot(b) * P.inter_conv_stride + (size_t)cch * P.inter_conv_cstride;
 #pragma unroll
         for (int j = 0; j < T + 2; ++j)
           st16<DT>(ln, j, win[j + 1]);

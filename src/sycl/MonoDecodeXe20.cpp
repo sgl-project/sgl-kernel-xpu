@@ -617,6 +617,7 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
       P.inter_ssm_tstride = O.inter_ssm_tstride;
       P.inter_conv = O.inter_conv;
       P.inter_conv_stride = O.inter_conv_stride;
+      P.inter_conv_cstride = O.inter_conv_cstride;
       L.inter_tokens = it->second.inter_tokens;
       L.inter_rows = it->second.inter_rows;
       L.caches_bound = true;
@@ -779,6 +780,8 @@ void mono_bind_caches(int64_t layer, const std::vector<at::Tensor>& t, int64_t p
       P.inter_ssm_tstride = is.stride(1);
       P.inter_conv = reinterpret_cast<e16*>(ic.data_ptr());
       P.inter_conv_stride = ic.stride(0);
+      // T0 + 2 of the bound scratch: a step of T <= T0 tokens writes T + 2 of them
+      P.inter_conv_cstride = ic.stride(2);
       P.inter_idx = nullptr;  // a request's scratch row is its batch position
       L.inter_tokens = (int)tok;
       L.inter_rows = std::min(is.size(0), ic.size(0));

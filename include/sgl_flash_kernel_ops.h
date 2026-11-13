@@ -86,7 +86,11 @@ std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     // Optional per-token block id (-1 = none) enabling the bidirectional-block
     // mask in the prefill path: keys sharing a query's non-negative id are
     // attended bidirectionally, causal otherwise.
-    std::optional<const at::Tensor>& bidirectional_block_ids_);
+    std::optional<const at::Tensor>& bidirectional_block_ids_,
+    // Optional (b,) int32 real lengths of each q / k sequence for non-paged prefill;
+    // cu_seqlens_q / cu_seqlens_k then give only the offsets, so sequences may be padded.
+    std::optional<const at::Tensor>& seqused_q_,
+    std::optional<const at::Tensor>& seqused_k_);
 
 void flash_mla_decode(
     torch::Tensor& out,

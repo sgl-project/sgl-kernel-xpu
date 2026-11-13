@@ -297,8 +297,9 @@ class XeFMHAFwdKernel {
       //         problem_shape.seq_len_qo, problem_shape.seq_len_kv, problem_shape.seq_len_kv_cache},
       //     batch);
 
-      int seq_len_q =
-          problem_shape.seq_len_qo.cumulative_length[batch + 1] - problem_shape.seq_len_qo.cumulative_length[batch];
+      int seq_len_q = problem_shape.seq_len_qo.seqused ? problem_shape.seq_len_qo.seqused[batch]
+                                                       : problem_shape.seq_len_qo.cumulative_length[batch + 1] -
+                                                             problem_shape.seq_len_qo.cumulative_length[batch];
       int seq_len_k_new = 0;
       // Paged KV passes per-batch cache lengths in cu_seqlens_k (cumulative_length[b]
       // already holds this batch's KV length). Non-paged KV passes a cumulative
@@ -306,6 +307,8 @@ class XeFMHAFwdKernel {
       int seq_len_k_cache;
       if constexpr (CollectiveMainloop::PagedKV) {
         seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch];
+      } else if (problem_shape.seq_len_kv_cache.seqused) {
+        seq_len_k_cache = problem_shape.seq_len_kv_cache.seqused[batch];
       } else {
         seq_len_k_cache = problem_shape.seq_len_kv_cache.cumulative_length[batch + 1] -
                           problem_shape.seq_len_kv_cache.cumulative_length[batch];

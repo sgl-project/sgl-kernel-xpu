@@ -102,6 +102,20 @@ inline void dispatchFusedQKNormRopeScalarType(at::ScalarType scalar_type, const 
 }
 
 template <typename Fn>
+inline void dispatchFusedQKNormRopeCacheType(at::ScalarType scalar_type, const char* kernel_name, Fn&& fn) {
+  switch (scalar_type) {
+    case at::ScalarType::BFloat16:
+      fn(TypeTag<sycl::ext::oneapi::bfloat16>{});
+      break;
+    case at::ScalarType::Float:
+      fn(TypeTag<float>{});
+      break;
+    default:
+      TORCH_CHECK(false, "Unsupported dtype for ", kernel_name, ": ", scalar_type);
+  }
+}
+
+template <typename Fn>
 inline void dispatchFusedQKNormRopePositionsType(at::ScalarType scalar_type, const char* kernel_name, Fn&& fn) {
   switch (scalar_type) {
     case at::ScalarType::Int:
@@ -120,6 +134,9 @@ inline void dispatchFusedQKNormRopeHeadDim(int64_t head_dim, const char* kernel_
   switch (head_dim) {
     case 64:
       fn(std::integral_constant<int64_t, 64>{});
+      break;
+    case 96:
+      fn(std::integral_constant<int64_t, 96>{});
       break;
     case 128:
       fn(std::integral_constant<int64_t, 128>{});
@@ -287,6 +304,10 @@ struct FusedQKNormRopeKernel {
     using accscalar_t = float;
     constexpr int numElemsPerThread = head_dim / NUM_REDUCE_STAGES;
     static_assert(numElemsPerThread % VecSize == 0, "VecSize must evenly divide numElemsPerThread");
+    // The interleave path pairs elements[i +/- 1] within a lane, so each lane
+    // must hold an even number of elements.
+    static_assert(
+        !interleave || numElemsPerThread % 2 == 0, "numElemsPerThread must be even for the interleaved pairing");
     constexpr int numChunks = numElemsPerThread / VecSize;
     using VecT = aligned_vector_loop<scalar_t, VecSize>;
 
@@ -632,7 +653,7 @@ SGL_KERNEL_EXPORT void fused_qk_norm_rope(
 // strides may be arbitrary (e.g. q/k sliced out of a larger packed buffer),
 // so they are passed in explicitly rather than assumed to equal
 // num_heads * head_dim / head_dim.
-template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename IdType, int64_t kVecSize>
+template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename cache_t, typename IdType, int64_t kVecSize>
 struct FusedQKNormRopeCacheKernel {
   static_assert(kHeadDim <= 256, "Only head_dim <= 256 is supported");
   static_assert(
@@ -640,14 +661,18 @@ struct FusedQKNormRopeCacheKernel {
 
   static constexpr uint32_t kElemsPerThread = static_cast<uint32_t>(kHeadDim / NUM_REDUCE_STAGES);
   static_assert(kElemsPerThread % kVecSize == 0, "kVecSize must evenly divide kElemsPerThread");
+  // The non-neox (interleaved) path rotates (elems[i], elems[i+1]) pairs
+  // within a lane, so each lane must hold an even number of elements.
+  static_assert(
+      kIsNeox || kElemsPerThread % 2 == 0, "kElemsPerThread must be even for the interleaved real/imag pairing");
   static constexpr uint32_t kNumChunks = kElemsPerThread / kVecSize;
 
   scalar_t* q_ptr;
   scalar_t* k_ptr;
   const scalar_t* q_weight_ptr;
   const scalar_t* k_weight_ptr;
-  const float* cos_sin_cache_ptr;  // [max_position, kRopeDim]
-  const IdType* positions;         // [num_tokens]
+  const cache_t* cos_sin_cache_ptr;  // [max_position, kRopeDim]
+  const IdType* positions;           // [num_tokens]
   int64_t rope_dim;
   int64_t rotary_lanes;
   int64_t half_rotary_lanes;
@@ -717,8 +742,8 @@ struct FusedQKNormRopeCacheKernel {
       }
 
       const int64_t pos = static_cast<int64_t>(positions[token_id]);
-      const float* cos_ptr = cos_sin_cache_ptr + pos * rope_dim;
-      const float* sin_ptr = cos_ptr + rope_dim / 2;
+      const cache_t* cos_ptr = cos_sin_cache_ptr + pos * rope_dim;
+      const cache_t* sin_ptr = cos_ptr + rope_dim / 2;
       const bool apply_rotary = static_cast<int64_t>(lane_id) < rotary_lanes;
 
       if constexpr (kIsNeox) {
@@ -740,8 +765,8 @@ struct FusedQKNormRopeCacheKernel {
             int dim_idx = static_cast<int>(lane_id * kElemsPerThread + i);
             dim_idx = (dim_idx * 2) % static_cast<int>(rope_dim);
             const int half_idx = dim_idx / 2;
-            const float cos = cos_ptr[half_idx];
-            const float sin = sin_ptr[half_idx];
+            const float cos = static_cast<float>(cos_ptr[half_idx]);
+            const float sin = static_cast<float>(sin_ptr[half_idx]);
             elems[i] = elems[i] * cos + swapped * sin;
           }
         }
@@ -750,7 +775,13 @@ struct FusedQKNormRopeCacheKernel {
 #pragma unroll
           for (uint32_t i = 0; i < kElemsPerThread; i += 2) {
             const int half_idx = static_cast<int>(lane_id * kElemsPerThread + i) / 2;
-            ropeRotate(elems[i], elems[i + 1], cos_ptr[half_idx], sin_ptr[half_idx], elems[i], elems[i + 1]);
+            ropeRotate(
+                elems[i],
+                elems[i + 1],
+                static_cast<float>(cos_ptr[half_idx]),
+                static_cast<float>(sin_ptr[half_idx]),
+                elems[i],
+                elems[i + 1]);
           }
         }
       }
@@ -768,13 +799,13 @@ struct FusedQKNormRopeCacheKernel {
   }
 };
 
-template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename IdType, int64_t kVecSize>
+template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename cache_t, typename IdType, int64_t kVecSize>
 void launchFusedQKNormRopeCacheVecImpl(
     scalar_t* q_ptr,
     scalar_t* k_ptr,
     const scalar_t* q_weight_ptr,
     const scalar_t* k_weight_ptr,
-    const float* cos_sin_cache_ptr,
+    const cache_t* cos_sin_cache_ptr,
     const IdType* positions_ptr,
     int64_t q_token_stride,
     int64_t k_token_stride,
@@ -790,7 +821,7 @@ void launchFusedQKNormRopeCacheVecImpl(
     sycl::queue& queue,
     int64_t gridSize,
     int64_t blockSize) {
-  using KernelT = FusedQKNormRopeCacheKernel<kHeadDim, kIsNeox, scalar_t, IdType, kVecSize>;
+  using KernelT = FusedQKNormRopeCacheKernel<kHeadDim, kIsNeox, scalar_t, cache_t, IdType, kVecSize>;
   KernelT kernel{
       q_ptr,
       k_ptr,
@@ -813,13 +844,162 @@ void launchFusedQKNormRopeCacheVecImpl(
   sycl_kernel_submit(sycl::range<1>(gridSize * blockSize), sycl::range<1>(blockSize), queue, kernel);
 }
 
-template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename IdType>
+template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename cache_t, typename IdType>
+struct FusedQKNormRopeCacheCTAKernel {
+  scalar_t* q_ptr;
+  scalar_t* k_ptr;
+  const scalar_t* q_weight_ptr;
+  const scalar_t* k_weight_ptr;
+  const cache_t* cos_sin_cache_ptr;
+  const IdType* positions;
+  int64_t rope_dim;
+  int64_t q_token_stride;
+  int64_t k_token_stride;
+  int64_t q_head_stride;
+  int64_t k_head_stride;
+  uint32_t num_qo_heads;
+  uint32_t num_kv_heads;
+  uint32_t num_tokens;
+  float eps;
+  sycl::local_accessor<float, 1> stage;
+
+  [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item) const {
+    const int64_t local_id = static_cast<int64_t>(item.get_local_id(0));
+    const int64_t workgroup_size = static_cast<int64_t>(item.get_local_range(0));
+    const int64_t workgroup_id = static_cast<int64_t>(item.get_group(0));
+    const int64_t num_workgroups = static_cast<int64_t>(item.get_group_range(0));
+    const int64_t num_qk_heads = static_cast<int64_t>(num_qo_heads) + static_cast<int64_t>(num_kv_heads);
+    const int64_t num_works = static_cast<int64_t>(num_tokens) * num_qk_heads;
+
+    for (int64_t work_id = workgroup_id; work_id < num_works; work_id += num_workgroups) {
+      const int64_t token_id = work_id / num_qk_heads;
+      const int64_t head_id = work_id % num_qk_heads;
+      const bool load_q = head_id < static_cast<int64_t>(num_qo_heads);
+
+      scalar_t* row_ptr;
+      const scalar_t* weight_ptr;
+      if (load_q) {
+        row_ptr = rowPtr(q_ptr, token_id, head_id, q_token_stride, q_head_stride);
+        weight_ptr = q_weight_ptr;
+      } else {
+        row_ptr = rowPtr(k_ptr, token_id, head_id - static_cast<int64_t>(num_qo_heads), k_token_stride, k_head_stride);
+        weight_ptr = k_weight_ptr;
+      }
+
+      float sum_of_squares = 0.0f;
+      for (int64_t dim = local_id; dim < kHeadDim; dim += workgroup_size) {
+        const float x = static_cast<float>(row_ptr[dim]);
+        stage[dim] = x;
+        sum_of_squares += x * x;
+      }
+
+      sum_of_squares = sycl::reduce_over_group(item.get_group(), sum_of_squares, sycl::plus<float>());
+      const float norm_factor = sycl::rsqrt(sum_of_squares / static_cast<float>(kHeadDim) + eps);
+
+      item.barrier(sycl::access::fence_space::local_space);
+
+      for (int64_t dim = local_id; dim < kHeadDim; dim += workgroup_size) {
+        stage[dim] = stage[dim] * norm_factor * static_cast<float>(weight_ptr[dim]);
+      }
+
+      item.barrier(sycl::access::fence_space::local_space);
+
+      const int64_t pos = static_cast<int64_t>(positions[token_id]);
+      const cache_t* cos_ptr = cos_sin_cache_ptr + pos * rope_dim;
+      const cache_t* sin_ptr = cos_ptr + rope_dim / 2;
+      const int64_t half_rope_dim = rope_dim / 2;
+
+      for (int64_t dim = local_id; dim < kHeadDim; dim += workgroup_size) {
+        float out = stage[dim];
+        if (dim < rope_dim) {
+          if constexpr (kIsNeox) {
+            const bool first_half = dim < half_rope_dim;
+            const int64_t partner_dim = first_half ? dim + half_rope_dim : dim - half_rope_dim;
+            const float partner = stage[partner_dim];
+            const int64_t half_idx = first_half ? dim : dim - half_rope_dim;
+            const float cos_v = static_cast<float>(cos_ptr[half_idx]);
+            const float sin_v = static_cast<float>(sin_ptr[half_idx]);
+            out = out * cos_v + (first_half ? -partner : partner) * sin_v;
+          } else {
+            const bool even_dim = (dim & 1) == 0;
+            const int64_t partner_dim = even_dim ? dim + 1 : dim - 1;
+            const float partner = stage[partner_dim];
+            const int64_t half_idx = dim / 2;
+            const float cos_v = static_cast<float>(cos_ptr[half_idx]);
+            const float sin_v = static_cast<float>(sin_ptr[half_idx]);
+            out = even_dim ? out * cos_v - partner * sin_v : out * cos_v + partner * sin_v;
+          }
+        }
+        row_ptr[dim] = static_cast<scalar_t>(out);
+      }
+
+      item.barrier(sycl::access::fence_space::local_space);
+    }
+  }
+};
+
+template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename cache_t, typename IdType>
+void launchFusedQKNormRopeCacheCTAImpl(
+    scalar_t* q_ptr,
+    scalar_t* k_ptr,
+    const scalar_t* q_weight_ptr,
+    const scalar_t* k_weight_ptr,
+    const cache_t* cos_sin_cache_ptr,
+    const IdType* positions_ptr,
+    int64_t q_token_stride,
+    int64_t k_token_stride,
+    int64_t q_head_stride,
+    int64_t k_head_stride,
+    int64_t num_tokens,
+    int64_t num_qo_heads,
+    int64_t num_kv_heads,
+    int64_t rope_dim,
+    float eps,
+    sycl::queue& queue) {
+  const int64_t num_works = num_tokens * (num_qo_heads + num_kv_heads);
+  const int64_t max_wg_size =
+      capWorkgroupSize(dpcppMaxWorkGroupSize(dpcppGetDeviceIdOfCurrentQueue()), NUM_REDUCE_STAGES);
+  const int64_t workgroup_size = std::max<int64_t>(
+      NUM_REDUCE_STAGES,
+      std::min<int64_t>(max_wg_size, divUp<int64_t>(kHeadDim, NUM_REDUCE_STAGES) * NUM_REDUCE_STAGES));
+  const int64_t max_resident_wgs =
+      std::max<int64_t>(1, dpcppMaxWorkItemsPerTile(dpcppGetDeviceIdOfCurrentQueue()) / workgroup_size);
+  const int64_t num_wgs = std::max<int64_t>(1, std::min<int64_t>(num_works, max_resident_wgs));
+
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<float, 1> stage(sycl::range<1>(static_cast<size_t>(kHeadDim)), cgh);
+    FusedQKNormRopeCacheCTAKernel<kHeadDim, kIsNeox, scalar_t, cache_t, IdType> kernel{
+        q_ptr,
+        k_ptr,
+        q_weight_ptr,
+        k_weight_ptr,
+        cos_sin_cache_ptr,
+        positions_ptr,
+        rope_dim,
+        q_token_stride,
+        k_token_stride,
+        q_head_stride,
+        k_head_stride,
+        static_cast<uint32_t>(num_qo_heads),
+        static_cast<uint32_t>(num_kv_heads),
+        static_cast<uint32_t>(num_tokens),
+        eps,
+        stage};
+    cgh.parallel_for(
+        sycl::nd_range<1>(
+            sycl::range<1>(static_cast<size_t>(num_wgs * workgroup_size)),
+            sycl::range<1>(static_cast<size_t>(workgroup_size))),
+        kernel);
+  });
+}
+
+template <int64_t kHeadDim, bool kIsNeox, typename scalar_t, typename cache_t, typename IdType>
 void launchFusedQKNormRopeCacheImpl(
     scalar_t* q_ptr,
     scalar_t* k_ptr,
     const scalar_t* q_weight_ptr,
     const scalar_t* k_weight_ptr,
-    const float* cos_sin_cache_ptr,
+    const cache_t* cos_sin_cache_ptr,
     const IdType* positions_ptr,
     int64_t q_token_stride,
     int64_t k_token_stride,
@@ -836,14 +1016,40 @@ void launchFusedQKNormRopeCacheImpl(
 
   constexpr int64_t kElemsPerThread = kHeadDim / NUM_REDUCE_STAGES;
   TORCH_CHECK(rope_dim > 0 && rope_dim <= kHeadDim, "Invalid rope_dim: ", rope_dim);
-  TORCH_CHECK(rope_dim % kElemsPerThread == 0, "rope_dim must align with per-lane vector width");
+  // The warp kernel assigns each lane kElemsPerThread consecutive elements and
+  // decides apply_rotary at lane granularity, so the rope region must end on a
+  // lane boundary (rope_dim % kElemsPerThread == 0). Its neox path additionally
+  // swaps the first/second rope halves via an XOR sub-group shuffle with
+  // half_rotary_lanes, which only pairs lanes correctly when rotary_lanes is a
+  // power of two (>= 2). Any configuration the warp kernel can't express falls
+  // back to the CTA kernel, which stages rows through local memory and indexes
+  // per element, so it has neither restriction.
+  const bool lane_aligned = (rope_dim % kElemsPerThread == 0);
   const int64_t rotary_lanes = rope_dim / kElemsPerThread;
   const int64_t half_rotary_lanes = rotary_lanes / 2;
+  bool use_cta = !lane_aligned;
   if constexpr (kIsNeox) {
-    TORCH_CHECK(
-        rotary_lanes >= 2 && (rotary_lanes & (rotary_lanes - 1)) == 0,
-        "NeoX fused qknorm+rope requires rotary lane count to be a power of 2, got ",
-        rotary_lanes);
+    use_cta = use_cta || rotary_lanes < 2 || (rotary_lanes & (rotary_lanes - 1)) != 0;
+  }
+  if (use_cta) {
+    launchFusedQKNormRopeCacheCTAImpl<kHeadDim, kIsNeox, scalar_t, cache_t, IdType>(
+        q_ptr,
+        k_ptr,
+        q_weight_ptr,
+        k_weight_ptr,
+        cos_sin_cache_ptr,
+        positions_ptr,
+        q_token_stride,
+        k_token_stride,
+        q_head_stride,
+        k_head_stride,
+        num_tokens,
+        num_qo_heads,
+        num_kv_heads,
+        rope_dim,
+        eps,
+        queue);
+    return;
   }
   // q/k rows may be non-contiguous beyond the last dimension (e.g. sliced
   // out of a larger packed buffer), so the chosen vector width must also
@@ -856,7 +1062,7 @@ void launchFusedQKNormRopeCacheImpl(
 
   dispatchFusedQKNormRopeVecSize<kElemsPerThread>(vec_size, [&](auto vec_size_tag) {
     constexpr int64_t kVecSize = decltype(vec_size_tag)::value;
-    launchFusedQKNormRopeCacheVecImpl<kHeadDim, kIsNeox, scalar_t, IdType, kVecSize>(
+    launchFusedQKNormRopeCacheVecImpl<kHeadDim, kIsNeox, scalar_t, cache_t, IdType, kVecSize>(
         q_ptr,
         k_ptr,
         q_weight_ptr,
@@ -1794,7 +2000,9 @@ SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
   TORCH_CHECK(q.scalar_type() == k.scalar_type(), "q and k must have the same dtype");
   TORCH_CHECK(q_weight.scalar_type() == q.scalar_type(), "q_weight dtype must match q dtype");
   TORCH_CHECK(k_weight.scalar_type() == k.scalar_type(), "k_weight dtype must match k dtype");
-  TORCH_CHECK(cos_sin_cache.scalar_type() == at::ScalarType::Float, "cos_sin_cache must be float32");
+  TORCH_CHECK(
+      cos_sin_cache.scalar_type() == at::ScalarType::Float || cos_sin_cache.scalar_type() == at::ScalarType::BFloat16,
+      "cos_sin_cache must be float32 or bfloat16");
 
   CHECK_DEVICE(q);
   // Only the last dimension (head_dim) needs to be contiguous; q/k may be
@@ -1875,47 +2083,50 @@ SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
 
   dispatchFusedQKNormRopeScalarType<false>(q_view.scalar_type(), "fused_inplace_qknorm_rope", [&](auto scalar_tag) {
     using scalar_t = typename decltype(scalar_tag)::type;
-    dispatchFusedQKNormRopePositionsType(positions.scalar_type(), "fused_inplace_qknorm_rope", [&](auto id_tag) {
-      using IdType = typename decltype(id_tag)::type;
-      dispatchFusedQKNormRopeHeadDim(head_dim, "fused_inplace_qknorm_rope", [&](auto head_dim_tag) {
-        constexpr int64_t kHeadDimConst = decltype(head_dim_tag)::value;
-        if (is_neox) {
-          launchFusedQKNormRopeCacheImpl<kHeadDimConst, true, scalar_t, IdType>(
-              static_cast<scalar_t*>(q_view.data_ptr()),
-              static_cast<scalar_t*>(k_view.data_ptr()),
-              static_cast<const scalar_t*>(q_weight.data_ptr()),
-              static_cast<const scalar_t*>(k_weight.data_ptr()),
-              static_cast<const float*>(cos_sin_cache.data_ptr()),
-              static_cast<const IdType*>(positions.data_ptr()),
-              q_view.stride(0),
-              k_view.stride(0),
-              q_head_stride,
-              k_head_stride,
-              num_tokens,
-              num_qo_heads,
-              num_kv_heads,
-              rope_dim,
-              static_cast<float>(eps),
-              queue);
-        } else {
-          launchFusedQKNormRopeCacheImpl<kHeadDimConst, false, scalar_t, IdType>(
-              static_cast<scalar_t*>(q_view.data_ptr()),
-              static_cast<scalar_t*>(k_view.data_ptr()),
-              static_cast<const scalar_t*>(q_weight.data_ptr()),
-              static_cast<const scalar_t*>(k_weight.data_ptr()),
-              static_cast<const float*>(cos_sin_cache.data_ptr()),
-              static_cast<const IdType*>(positions.data_ptr()),
-              q_view.stride(0),
-              k_view.stride(0),
-              q_head_stride,
-              k_head_stride,
-              num_tokens,
-              num_qo_heads,
-              num_kv_heads,
-              rope_dim,
-              static_cast<float>(eps),
-              queue);
-        }
+    dispatchFusedQKNormRopeCacheType(cos_sin_cache.scalar_type(), "fused_inplace_qknorm_rope", [&](auto cache_tag) {
+      using cache_t = typename decltype(cache_tag)::type;
+      dispatchFusedQKNormRopePositionsType(positions.scalar_type(), "fused_inplace_qknorm_rope", [&](auto id_tag) {
+        using IdType = typename decltype(id_tag)::type;
+        dispatchFusedQKNormRopeHeadDim(head_dim, "fused_inplace_qknorm_rope", [&](auto head_dim_tag) {
+          constexpr int64_t kHeadDimConst = decltype(head_dim_tag)::value;
+          if (is_neox) {
+            launchFusedQKNormRopeCacheImpl<kHeadDimConst, true, scalar_t, cache_t, IdType>(
+                static_cast<scalar_t*>(q_view.data_ptr()),
+                static_cast<scalar_t*>(k_view.data_ptr()),
+                static_cast<const scalar_t*>(q_weight.data_ptr()),
+                static_cast<const scalar_t*>(k_weight.data_ptr()),
+                static_cast<const cache_t*>(cos_sin_cache.data_ptr()),
+                static_cast<const IdType*>(positions.data_ptr()),
+                q_view.stride(0),
+                k_view.stride(0),
+                q_head_stride,
+                k_head_stride,
+                num_tokens,
+                num_qo_heads,
+                num_kv_heads,
+                rope_dim,
+                static_cast<float>(eps),
+                queue);
+          } else {
+            launchFusedQKNormRopeCacheImpl<kHeadDimConst, false, scalar_t, cache_t, IdType>(
+                static_cast<scalar_t*>(q_view.data_ptr()),
+                static_cast<scalar_t*>(k_view.data_ptr()),
+                static_cast<const scalar_t*>(q_weight.data_ptr()),
+                static_cast<const scalar_t*>(k_weight.data_ptr()),
+                static_cast<const cache_t*>(cos_sin_cache.data_ptr()),
+                static_cast<const IdType*>(positions.data_ptr()),
+                q_view.stride(0),
+                k_view.stride(0),
+                q_head_stride,
+                k_head_stride,
+                num_tokens,
+                num_qo_heads,
+                num_kv_heads,
+                rope_dim,
+                static_cast<float>(eps),
+                queue);
+          }
+        });
       });
     });
   });

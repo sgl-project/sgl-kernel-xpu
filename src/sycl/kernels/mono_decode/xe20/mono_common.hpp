@@ -65,6 +65,9 @@ constexpr int EPOCH = NCNT * 16;
 // consecutive uses of a region carry consecutive tags, so a word left from an
 // older use never matches the 16-bit tag
 constexpr int MBT = EPOCH + 4, MBT2 = EPOCH + 16;
+// the MTP prologue's tag counters (its own scratch): one per row count 1, 2, 3,
+// 4, 6, 8, each with its own mailbox region (mono_mtp.hpp)
+constexpr int MTPT = EPOCH + 18;
 // two words: the address of the device's health words (mono_health), written
 // at registration and read only by a wait that is taking long
 constexpr int HEALTH_PTR = EPOCH + 28;

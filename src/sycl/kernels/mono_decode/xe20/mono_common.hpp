@@ -485,17 +485,25 @@ inline void signal(sycl::nd_item<1> it, uint32_t* c) {
   sycl::group_barrier(it.get_group());
   if (it.get_local_linear_id() == 0) cnt_ref(*c).fetch_add(1u, sycl::memory_order::release);
 }
-// No device-scope acquire fence after the barrier: it lowers to an L1
-// invalidate on every thread, which delays the hand-off. Not needed here: a WG
-// reads another WG's hand-off data only after the matching wait and never
-// touches those lines earlier in the same launch, and L1 starts clean at every
-// launch.
+// The consumer polls with a relaxed load; the producer's release is the fence
+// in signal() and the release RMW. After the loop the polling work-item takes
+// one device-scope acquire fence, and the work-group barrier then orders the
+// data for the rest of the work-group (the fence synchronizes with the
+// producer's release, the barrier with the other threads; happens-before is
+// transitive). One fence a WG lowers to one L1 invalidate; a fence in every
+// thread would invalidate once per thread and delay the hand-off more.
+// Measured against the same wait without the fence on two B70
+// (bf16, 8 rotating layer copies, A B A B twice): GDN layers 0 us, attention
+// layers of 1 row +0.9 us (1K context) / +1.3 us (32K context), i.e. +0.8 %
+// each, 8 rows and the verify kernels within 1 us: about 0.2 % of a decode step.
 // The counters and targets wrap at 2^32 (32 producers a call: after 2^27
 // calls of a layer), so compare the signed difference.
 inline void wait_for(sycl::nd_item<1> it, uint32_t* c, uint32_t target) {
-  if (it.get_local_linear_id() == 0)
+  if (it.get_local_linear_id() == 0) {
     while ((int32_t)(cnt_ref(*c).load(sycl::memory_order::relaxed) - target) < 0) {
     }
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+  }
   sycl::group_barrier(it.get_group());
 }
 // in-WG barrier with SLM-only memory semantics (group_barrier also fences

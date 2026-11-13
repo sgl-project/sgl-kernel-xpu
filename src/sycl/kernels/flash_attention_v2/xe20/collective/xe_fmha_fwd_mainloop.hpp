@@ -77,6 +77,17 @@ CUTLASS_DEVICE Element apply_logit_softcap(Element value, Element softcap) {
   return softcap * sycl::tanh(value / kLog2e / softcap) * kLog2e;
 }
 
+// s = qk_scale * s + log2(e) * bias_at(i), folding qk_scale into this tile.
+template <typename ElementS, typename FragS, typename BiasAt>
+CUTLASS_DEVICE void add_scaled_bias(FragS& scores, ElementS& qk_scale, BiasAt const& bias_at) {
+  constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
+  CUTLASS_PRAGMA_UNROLL
+  for (int i = 0; i < scores.size(); ++i) {
+    scores(i) = sycl::mad(qk_scale, scores(i), kLog2e * bias_at(i));
+  }
+  qk_scale = ElementS(1);
+}
+
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // The sheared relative-bias surface (rel_bias_band_cols / rel_bias_padded_cols /
@@ -266,6 +277,7 @@ struct FMHAFwdMainloop<
     int64_t rel_bias_token_stride = 0;
     int64_t rel_bias_head_stride = 0;
     int rel_bias_extent = 0;
+    float const* ptr_alibi_slopes = nullptr;  // [num_heads_q]; non-null computes the bias in place of ptr_rel_bias
     // Optional per-token block id. Non-null enables the bidirectional-block
     // mask below: tokens sharing a non-negative id attend both ways; -1 = none.
     int const* ptr_block_id = nullptr;
@@ -303,6 +315,7 @@ struct FMHAFwdMainloop<
         args.rel_bias_token_stride,
         args.rel_bias_head_stride,
         args.rel_bias_extent,
+        args.ptr_alibi_slopes,
         args.ptr_block_id,
 #if FMHA_PREFILL_ENABLE_SCORE_BLOCK2D
         ScoreBlock2D ? reinterpret_cast<ElementScoreStore*>(workspace) : nullptr};
@@ -330,6 +343,30 @@ struct FMHAFwdMainloop<
   }
 
   template <typename QVCoord>
+  CUTLASS_DEVICE void apply_alibi_bias(
+      FragS& scores,
+      int K,
+      ElementS& qk_scale,
+      TiledMMAQK const& mma_qk,
+      int seq_len_kv_cache,
+      int bias_head_start,
+      QVCoord const& blk_qv,
+      int thr_id,
+      int full_tile_offset,
+      int q_rows) const {
+    Tensor cPgP = make_identity_tensor(make_shape(seq_len_kv_cache, seq_len_kv_cache));
+    Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+    auto cS_thread = mma_qk.get_slice(thr_id).partition_C(gP);
+    add_scaled_bias(scores, qk_scale, [&](int i) {
+      int row_idx = get<0>(cS_thread(i));
+      int row_kv_idx = (PackGQA ? 0 : row_idx) + full_tile_offset;
+      int slope_idx = bias_head_start + (PackGQA ? sycl::min(row_idx, q_rows - 1) : 0);
+      ElementS slope = params.ptr_alibi_slopes[slope_idx];
+      return -slope * sycl::fabs(static_cast<ElementS>(get<1>(cS_thread(i)) - row_kv_idx));
+    });
+  }
+
+  template <typename QVCoord>
   CUTLASS_DEVICE void apply_relative_bias(
       FragS& scores,
       int K,
@@ -342,7 +379,6 @@ struct FMHAFwdMainloop<
       QVCoord const& blk_qv,
       int thr_id,
       int full_tile_offset) const {
-    constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
     constexpr int k_tile = get<1>(TileShapeQK{});
     constexpr int q_tile = get<0>(TileShapeQK{});
     int const row_kv_first = PackGQA ? full_tile_offset : get<0>(blk_qv) * q_tile + full_tile_offset;
@@ -382,12 +418,7 @@ struct FMHAFwdMainloop<
       copy(copy_bias_load, tBiasLoadG(_, _, _, bias_col / k_tile), tBiasLoadR);
       reorder(tBiasLoadR, bias);
     }
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < scores.size(); ++i) {
-      ElementS const scaled_bias = kLog2e * static_cast<ElementS>(bias(i));
-      scores(i) = sycl::mad(qk_scale, scores(i), scaled_bias);
-    }
-    qk_scale = ElementS(1);
+    add_scaled_bias(scores, qk_scale, [&](int i) { return static_cast<ElementS>(bias(i)); });
   }
 
   template <int StaticScoreMode = -1, typename QVCoord>
@@ -796,18 +827,32 @@ struct FMHAFwdMainloop<
       // original scale for the next K tile.
       ElementS score_scale = qk_scale;
       if constexpr (HasRelBias) {
-        apply_relative_bias(
-            tSrS,
-            K,
-            score_scale,
-            mma_qk,
-            seq_len_kv_cache,
-            q_head,
-            bias_head_start,
-            q_token_offset,
-            blk_qv,
-            thr_id,
-            full_tile_offset);
+        if (params.ptr_alibi_slopes != nullptr) {
+          apply_alibi_bias(
+              tSrS,
+              K,
+              score_scale,
+              mma_qk,
+              seq_len_kv_cache,
+              bias_head_start,
+              blk_qv,
+              thr_id,
+              full_tile_offset,
+              int(size<0>(Q_2D)));
+        } else {
+          apply_relative_bias(
+              tSrS,
+              K,
+              score_scale,
+              mma_qk,
+              seq_len_kv_cache,
+              q_head,
+              bias_head_start,
+              q_token_offset,
+              blk_qv,
+              thr_id,
+              full_tile_offset);
+        }
       }
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
       auto rescale = softmax(K == blk_k0, tSrS, tA_max, tA_sum, score_scale);
@@ -1042,6 +1087,7 @@ struct DecodeFwdMainloop<
     ElementQ const* ptr_rel_bias = nullptr;
     int64_t rel_bias_row_stride = 0;
     int rel_bias_extent = 0;
+    float const* ptr_alibi_slopes = nullptr;  // [num_heads_q]; non-null computes the bias in place of ptr_rel_bias
   };
 
   // Kernel-facing parameters
@@ -1072,16 +1118,39 @@ struct DecodeFwdMainloop<
         args.window_size_right,
         args.ptr_rel_bias,
         args.rel_bias_row_stride,
-        args.rel_bias_extent};
+        args.rel_bias_extent,
+        args.ptr_alibi_slopes};
   }
 
   CUTLASS_HOST_DEVICE static bool can_implement(Arguments const& args) {
     if constexpr (HasRelBias) {
+      if (args.ptr_alibi_slopes != nullptr) return true;
       constexpr int k_tile = get<1>(TileShapeQK{});
       if (args.ptr_rel_bias == nullptr || args.rel_bias_extent <= 0) return false;
       if (args.rel_bias_row_stride != rel_bias_padded_cols(args.rel_bias_extent, /*m_drift=*/0, k_tile)) return false;
     }
     return true;
+  }
+
+  template <typename QVCoord>
+  CUTLASS_DEVICE void apply_alibi_bias(
+      FragS& scores,
+      int K,
+      ElementS& score_scale,
+      TiledMMAQK const& mma_qk,
+      int row_kv,
+      int bias_row_base,
+      QVCoord const& blk_qv,
+      int thr_id,
+      int q_rows) const {
+    Tensor cPgP = make_identity_tensor(make_shape(row_kv + 1, row_kv + 1));
+    Tensor gP = local_tile(cPgP, take<0, 2>(TileShapeQK{}), make_coord(get<0>(blk_qv), K));
+    auto cS_thread = mma_qk.get_slice(thr_id).partition_C(gP);
+    add_scaled_bias(scores, score_scale, [&](int i) {
+      int row_idx = sycl::min(int(get<0>(cS_thread(i))), q_rows - 1);  // clamp padded rows in bounds
+      ElementS slope = params.ptr_alibi_slopes[bias_row_base + row_idx];
+      return -slope * sycl::fabs(static_cast<ElementS>(get<1>(cS_thread(i)) - row_kv));
+    });
   }
 
   template <typename QVCoord>
@@ -1094,7 +1163,6 @@ struct DecodeFwdMainloop<
       int bias_row_base,
       QVCoord const& blk_qv,
       int thr_id) const {
-    constexpr ElementS kLog2e = ElementS(1.4426950408889634074);
     constexpr int k_tile = get<1>(TileShapeQK{});
     constexpr int m_tile = get<0>(TileShapeQK{});
     int const bias_cols = static_cast<int>(params.rel_bias_row_stride);
@@ -1114,11 +1182,7 @@ struct DecodeFwdMainloop<
     auto bias = make_subgroup_tensor(make_fragment_like<ElementQ>(scores.layout()), scores.tv_layout());
     copy(copy_bias_load, tBiasLoadG(_, _, _, bias_col / k_tile), tBiasLoadR);
     reorder(tBiasLoadR, bias);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < scores.size(); ++i) {
-      scores(i) = sycl::mad(score_scale, scores(i), kLog2e * static_cast<ElementS>(bias(i)));
-    }
-    score_scale = ElementS(1);
+    add_scaled_bias(scores, score_scale, [&](int i) { return static_cast<ElementS>(bias(i)); });
   }
 
   template <typename QVCoord>
@@ -1327,7 +1391,12 @@ struct DecodeFwdMainloop<
 
       if constexpr (HasRelBias) {
         ElementS block_scale = qk_scale;
-        apply_relative_bias(tSrS, K, block_scale, mma_qk, seq_len - 1, bias_row_base, blk_qv, thr_id);
+        if (params.ptr_alibi_slopes != nullptr) {
+          apply_alibi_bias(
+              tSrS, K, block_scale, mma_qk, seq_len - 1, bias_row_base, blk_qv, thr_id, int(size<0>(Q_2D)));
+        } else {
+          apply_relative_bias(tSrS, K, block_scale, mma_qk, seq_len - 1, bias_row_base, blk_qv, thr_id);
+        }
         softmax(K == 0, tSrS, tA_max, tA_sum, tArA, block_scale);
       } else {
         softmax(K == 0, tSrS, tA_max, tA_sum, tArA, qk_scale);

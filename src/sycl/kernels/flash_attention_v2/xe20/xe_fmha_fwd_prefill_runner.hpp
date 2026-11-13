@@ -208,6 +208,7 @@ struct Arguments {
   void* skip_batch_mask_ptr = nullptr;
 
   torch::TensorOptions tensor_opts;
+  const float* __restrict__ alibi_slopes_ptr = nullptr;  // [h] fp32 ALiBi slopes
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
@@ -472,6 +473,7 @@ struct PrefillRunner {
             params.rel_bias_token_stride,
             params.rel_bias_head_stride,
             params.rel_bias_extent,
+            params.alibi_slopes_ptr,
             params.block_id_ptr,
         },
         {},

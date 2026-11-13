@@ -304,6 +304,10 @@ struct FusedQKNormRopeKernel {
     using accscalar_t = float;
     constexpr int numElemsPerThread = head_dim / NUM_REDUCE_STAGES;
     static_assert(numElemsPerThread % VecSize == 0, "VecSize must evenly divide numElemsPerThread");
+    // The interleave path pairs elements[i +/- 1] within a lane, so each lane
+    // must hold an even number of elements.
+    static_assert(
+        !interleave || numElemsPerThread % 2 == 0, "numElemsPerThread must be even for the interleaved pairing");
     constexpr int numChunks = numElemsPerThread / VecSize;
     using VecT = aligned_vector_loop<scalar_t, VecSize>;
 
@@ -657,6 +661,10 @@ struct FusedQKNormRopeCacheKernel {
 
   static constexpr uint32_t kElemsPerThread = static_cast<uint32_t>(kHeadDim / NUM_REDUCE_STAGES);
   static_assert(kElemsPerThread % kVecSize == 0, "kVecSize must evenly divide kElemsPerThread");
+  // The non-neox (interleaved) path rotates (elems[i], elems[i+1]) pairs
+  // within a lane, so each lane must hold an even number of elements.
+  static_assert(
+      kIsNeox || kElemsPerThread % 2 == 0, "kElemsPerThread must be even for the interleaved real/imag pairing");
   static constexpr uint32_t kNumChunks = kElemsPerThread / kVecSize;
 
   scalar_t* q_ptr;
@@ -1008,30 +1016,40 @@ void launchFusedQKNormRopeCacheImpl(
 
   constexpr int64_t kElemsPerThread = kHeadDim / NUM_REDUCE_STAGES;
   TORCH_CHECK(rope_dim > 0 && rope_dim <= kHeadDim, "Invalid rope_dim: ", rope_dim);
-  TORCH_CHECK(rope_dim % kElemsPerThread == 0, "rope_dim must align with per-lane vector width");
+  // The warp kernel assigns each lane kElemsPerThread consecutive elements and
+  // decides apply_rotary at lane granularity, so the rope region must end on a
+  // lane boundary (rope_dim % kElemsPerThread == 0). Its neox path additionally
+  // swaps the first/second rope halves via an XOR sub-group shuffle with
+  // half_rotary_lanes, which only pairs lanes correctly when rotary_lanes is a
+  // power of two (>= 2). Any configuration the warp kernel can't express falls
+  // back to the CTA kernel, which stages rows through local memory and indexes
+  // per element, so it has neither restriction.
+  const bool lane_aligned = (rope_dim % kElemsPerThread == 0);
   const int64_t rotary_lanes = rope_dim / kElemsPerThread;
   const int64_t half_rotary_lanes = rotary_lanes / 2;
+  bool use_cta = !lane_aligned;
   if constexpr (kIsNeox) {
-    if (rotary_lanes < 2 || (rotary_lanes & (rotary_lanes - 1)) != 0) {
-      launchFusedQKNormRopeCacheCTAImpl<kHeadDim, kIsNeox, scalar_t, cache_t, IdType>(
-          q_ptr,
-          k_ptr,
-          q_weight_ptr,
-          k_weight_ptr,
-          cos_sin_cache_ptr,
-          positions_ptr,
-          q_token_stride,
-          k_token_stride,
-          q_head_stride,
-          k_head_stride,
-          num_tokens,
-          num_qo_heads,
-          num_kv_heads,
-          rope_dim,
-          eps,
-          queue);
-      return;
-    }
+    use_cta = use_cta || rotary_lanes < 2 || (rotary_lanes & (rotary_lanes - 1)) != 0;
+  }
+  if (use_cta) {
+    launchFusedQKNormRopeCacheCTAImpl<kHeadDim, kIsNeox, scalar_t, IdType>(
+        q_ptr,
+        k_ptr,
+        q_weight_ptr,
+        k_weight_ptr,
+        cos_sin_cache_ptr,
+        positions_ptr,
+        q_token_stride,
+        k_token_stride,
+        q_head_stride,
+        k_head_stride,
+        num_tokens,
+        num_qo_heads,
+        num_kv_heads,
+        rope_dim,
+        eps,
+        queue);
+    return;
   }
   // q/k rows may be non-contiguous beyond the last dimension (e.g. sliced
   // out of a larger packed buffer), so the chosen vector width must also

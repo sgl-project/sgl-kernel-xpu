@@ -259,6 +259,74 @@ def test_fast_topk_v2_512_mixed_lengths() -> None:
             assert set(indices[row].tolist()) == set(reference.tolist())
 
 
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize("length", [2049, 3001, 8192, 8193, 16384, 16385])
+@pytest.mark.parametrize("has_row_starts", [False, True])
+@pytest.mark.parametrize(
+    "distribution", ["random", "one_bin", "negative_bin", "mixed", "equal"]
+)
+@torch.inference_mode()
+def test_fast_topk_v2_dsa_correctness(k, length, has_row_starts, distribution):
+    generator = torch.Generator().manual_seed(7)
+    starts = [1, 3, 5] if has_row_starts else [0, 0, 0]
+    score = torch.rand(3, length + max(starts), generator=generator)
+    if distribution in ("one_bin", "negative_bin", "mixed"):
+        score = 1.0 + score * 0.001
+        if distribution == "negative_bin":
+            score = -score
+        if distribution == "mixed":
+            score[:, :100] = 2.0
+    elif distribution == "equal":
+        score.fill_(1.0)
+    lengths = [length, length - 3, k - 1]
+    result = fast_topk_v2(
+        score.to("xpu"),
+        torch.tensor(lengths, dtype=torch.int32, device="xpu"),
+        k,
+        row_starts=(
+            torch.tensor(starts, dtype=torch.int32, device="xpu")
+            if has_row_starts
+            else None
+        ),
+    ).cpu()
+
+    for row, (start, n) in enumerate(zip(starts, lengths)):
+        selected = result[row, : min(n, k)].long()
+        assert selected.unique().numel() == min(n, k)
+        assert (selected >= 0).all() and (selected < n).all()
+        values = score[row, start : start + n]
+        torch.testing.assert_close(
+            values[selected].sort().values,
+            values.topk(min(n, k)).values.sort().values,
+            rtol=0,
+            atol=0,
+        )
+        if n < k:
+            assert (result[row, n:] == -1).all()
+
+
+@pytest.mark.parametrize("length", [3001, 8193, 16385])
+@torch.inference_mode()
+def test_fast_topk_v2_infinite_scores(length):
+    score = torch.full((2, length), -float("inf"))
+    score[0, :20] = float("inf")
+    score[0, 20:100] = 1e20
+    score[1, :1000] = float("inf")
+    result = fast_topk_v2(
+        score.to("xpu"), torch.full((2,), length, dtype=torch.int32, device="xpu"), 512
+    ).cpu()
+    for row in range(2):
+        indices = result[row].long()
+        assert indices.unique().numel() == 512
+        assert (indices >= 0).all() and (indices < length).all()
+        torch.testing.assert_close(
+            score[row, indices].sort().values,
+            score[row].topk(512).values.sort().values,
+            rtol=0,
+            atol=0,
+        )
+
+
 def test_fast_topk_v2_rejects_unsupported_k() -> None:
     score, lengths, _ = _setup_fast_topk_v2(1, 1024, False)
     with pytest.raises(RuntimeError, match="only supports topk=512 or 2048"):

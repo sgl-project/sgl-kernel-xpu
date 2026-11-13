@@ -11,6 +11,8 @@
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "dsa_topk/topk_register.hpp"
+#include "dsa_topk/topk_streaming.hpp"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -375,13 +377,18 @@ FastTopKParams get_params(
   return params;
 }
 
+template <int Level>
 struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   FastTopKParams params;
   int topk;
+  using DsaBase = vllm::dsa_topk::TopKRadixBase<12>;
+  sycl::local_accessor<typename DsaBase::Smem, 1> smem;
 
   FastTopKKernel(const FastTopKParams& p, int k) : params(p), topk(k) {}
 
-  void sycl_ker_config_convention([[maybe_unused]] sycl::handler& cgh) {}
+  void sycl_ker_config_convention(sycl::handler& cgh) {
+    smem = sycl::local_accessor<typename DsaBase::Smem, 1>(1, cgh);
+  }
 
   [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
     const int64_t bid = static_cast<int64_t>(item.get_group(0));
@@ -393,7 +400,14 @@ struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     if (length <= topk) {
       trivial_topk(item, indice, length, topk);
     } else {
-      radix_topk(item, score, indice, row_start, length, topk);
+      vllm::dsa_topk::TopKProblem problem{
+          score + row_start, indice, static_cast<uint32_t>(topk), static_cast<uint32_t>(length)};
+      if constexpr (Level == 0)
+        vllm::dsa_topk::TopKRegister<2>::forward(item, problem, &smem[0]);
+      else if constexpr (Level == 1)
+        vllm::dsa_topk::TopKRegister<4>::forward(item, problem, &smem[0]);
+      else
+        vllm::dsa_topk::TopKStreaming::forward(item, problem, &smem[0]);
     }
   }
 };
@@ -697,9 +711,15 @@ fast_topk(const at::Tensor& score, const at::Tensor& lengths, int64_t topk, std:
   auto stream = at::xpu::getCurrentXPUStream();
   auto& queue = stream.queue();
 
-  FastTopKKernel kernel(params, static_cast<int>(topk));
-  sycl_kernel_submit(
-      sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock), queue, kernel);
+  const auto global = sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock);
+  const auto local = sycl::range<1>(kThreadsPerBlock);
+  if (score.size(1) <= 8192) {
+    sycl_kernel_submit(global, local, queue, FastTopKKernel<0>(params, static_cast<int>(topk)));
+  } else if (score.size(1) <= 16384) {
+    sycl_kernel_submit(global, local, queue, FastTopKKernel<1>(params, static_cast<int>(topk)));
+  } else {
+    sycl_kernel_submit(global, local, queue, FastTopKKernel<2>(params, static_cast<int>(topk)));
+  }
   return indices;
 }
 

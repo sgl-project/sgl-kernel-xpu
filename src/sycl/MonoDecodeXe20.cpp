@@ -114,6 +114,7 @@ constexpr int64_t kHdr = 64;
 struct Region {
   ze_context_handle_t ctx = nullptr;
   ze_device_handle_t dev = nullptr;
+  int device = -1;  // the torch XPU device that created it: its queue serves every later use
   char* own = nullptr;
   char* peer = nullptr;
   int64_t bytes = 0;
@@ -336,6 +337,56 @@ Layer& layer_of(int64_t layer, const at::Tensor& like) {
   return it->second;
 }
 
+// Every tensor of an op is an XPU tensor of the layer's device: a CPU or
+// other-device tensor would be handed to the kernels as a device pointer.
+void check_on(const at::Tensor& t, int device, const char* op, const char* name) {
+  TORCH_CHECK(
+      t.is_xpu() && t.get_device() == device,
+      "mono: ",
+      op,
+      ": ",
+      name,
+      " must be an XPU tensor on device ",
+      device,
+      " (the layer's), got ",
+      t.device());
+}
+void check_on(const std::optional<at::Tensor>& t, int device, const char* op, const char* name) {
+  if (t.has_value()) check_on(*t, device, op, name);
+}
+// a metadata vector the kernels read as a contiguous array [>= n]
+void check_vec(const at::Tensor& t, at::ScalarType dt, int64_t n, const char* name) {
+  TORCH_CHECK(
+      t.scalar_type() == dt && t.dim() == 1 && t.size(0) >= n && t.stride(0) == 1,
+      "mono: ",
+      name,
+      " must be a unit-stride ",
+      dt,
+      " vector with at least ",
+      n,
+      " elements, got ",
+      t.scalar_type(),
+      " ",
+      t.sizes(),
+      " ",
+      t.strides());
+}
+// positions: [T], or mrope [3, T] of which the kernels read row 0
+void check_positions(const at::Tensor& t, int64_t n) {
+  TORCH_CHECK(
+      t.scalar_type() == at::kLong && (t.dim() == 1 || t.dim() == 2) && t.size(-1) >= n && t.stride(-1) == 1,
+      "mono: positions must be an int64 [>= ",
+      n,
+      "] (or mrope [3, >= ",
+      n,
+      "]) tensor with unit stride on the token axis, got ",
+      t.scalar_type(),
+      " ",
+      t.sizes(),
+      " ",
+      t.strides());
+}
+
 }  // namespace
 
 // -----------------------------------------------------------------------------
@@ -374,7 +425,8 @@ void mono_set_deadline(double seconds) {
 int64_t mono_ipc_create(int64_t bytes) {
   check_device("mono_ipc_create");
   auto r = std::make_unique<Region>();
-  sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+  r->device = (int)c10::xpu::current_device();
+  sycl::queue& q = c10::xpu::getCurrentXPUStream(r->device).queue();
   r->ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
   r->dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
   r->bytes = kHdr + bytes;
@@ -422,7 +474,7 @@ int64_t mono_ipc_open(int64_t h, std::vector<int64_t> peer, int64_t local_fd) {
   TORCH_CHECK(r.peer == nullptr, "mono: peer already opened");
   TORCH_CHECK(peer.size() == 4 + ZE_MAX_IPC_HANDLE_SIZE / 4, "mono: bad peer handle info");
   const uint64_t peer_cookie = (uint64_t)(uint32_t)peer[2] | ((uint64_t)(uint32_t)peer[3] << 32);
-  sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+  sycl::queue& q = c10::xpu::getCurrentXPUStream(r.device).queue();  // the region's own device
   auto verify = [&](void* p) {
     uint64_t c = 0;
     q.memcpy(&c, static_cast<char*>(p) + kCookieOff, sizeof(c)).wait();
@@ -491,11 +543,15 @@ int64_t mono_mbox_bytes() {
 // Registering a layer again keeps its scratch (and so its mailbox tags).
 void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, const std::vector<at::Tensor>& t) {
   using namespace sgl_mono;
-  check_device("mono_register_layer");
   TORCH_CHECK(t.size() == (attn ? 18u : 21u), "mono: wrong number of tensors for layer ", layer);
+  TORCH_CHECK(t[0].is_xpu(), "mono: mono_register_layer: the weights must be XPU tensors, got ", t[0].device());
   Layer L;
   L.attn = attn;
   L.device = t[0].get_device();
+  c10::DeviceGuard guard(t[0].device());  // the scratch and the queue are the weights' device's
+  check_device("mono_register_layer", L.device);
+  for (const at::Tensor& w : t)
+    check_on(w, L.device, "mono_register_layer", "a weight");
   const at::ScalarType dt = L.dtype = dtype16(t[0], "input_norm_w");
   Ptrs& P = L.P;
   P.in_norm_w = t16(t[0], HID, "input_norm_w", dt);
@@ -539,7 +595,7 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
     P.dt_bias = t16(t[19], NVH, "dt_bias", dt);
     P.gnorm_w = t16(t[20], DV, "norm_w", dt);
   }
-  sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+  sycl::queue& q = c10::xpu::getCurrentXPUStream(L.device).queue();
   auto it = g_layers.find(layer);
   if (it != g_layers.end() && it->second.cnt_mem) {  // re-registration: keep the counters (mailbox tags)
     L.cnt_mem = it->second.cnt_mem;
@@ -592,8 +648,12 @@ void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, c
 // picks this rank's half of the fc output rows.
 void mono_register_mtp(int64_t layer, int64_t mbox, int64_t peer, const std::vector<at::Tensor>& t, int64_t rank) {
   using namespace sgl_mono;
-  check_device("mono_register_mtp");
   TORCH_CHECK(t.size() == 3u, "mono: the MTP prologue takes [fc, pre_fc_norm_embedding, pre_fc_norm_hidden]");
+  TORCH_CHECK(t[0].is_xpu(), "mono: mono_register_mtp: the weights must be XPU tensors, got ", t[0].device());
+  c10::DeviceGuard guard(t[0].device());
+  check_device("mono_register_mtp", t[0].get_device());
+  for (const at::Tensor& w : t)
+    check_on(w, t[0].get_device(), "mono_register_mtp", "a weight");
   TORCH_CHECK(rank == 0 || rank == 1, "mono: rank must be 0 or 1, got ", rank);
   TORCH_CHECK(
       t[0].dim() == 2 && t[0].size(0) == HID && t[0].size(1) == MTP_FC_IN && t[0].is_contiguous(),
@@ -607,7 +667,7 @@ void mono_register_mtp(int64_t layer, int64_t mbox, int64_t peer, const std::vec
   L.P.fc_w = t16(t[0], (int64_t)HID * MTP_FC_IN, "mtp fc", dt);
   L.P.in_norm_w = t16(t[1], HID, "pre_fc_norm_embedding", dt);
   L.P.post_norm_w = t16(t[2], HID, "pre_fc_norm_hidden", dt);
-  sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+  sycl::queue& q = c10::xpu::getCurrentXPUStream(L.device).queue();
   auto it = g_layers.find(layer);
   if (it != g_layers.end() && it->second.scratch) {  // re-registration: keep the scratch (mailbox tags)
     L.scratch = it->second.scratch;
@@ -629,6 +689,8 @@ void mono_bind_caches(int64_t layer, const std::vector<at::Tensor>& t, int64_t p
   using namespace sgl_mono;
   TORCH_CHECK(t.size() == 2u || t.size() == 4u, "mono: bind_caches takes 2 tensors (or 4: with the verify scratch)");
   Layer& L = layer_of(layer, t[0]);
+  for (const at::Tensor& c : t)
+    check_on(c, L.device, "mono_bind_caches", "a cache");
   TORCH_CHECK(!L.mtp, "mono: kernel ", layer, " is an MTP prologue, it has no caches");
   const at::ScalarType dt = L.dtype;
   Ptrs& P = L.P;
@@ -662,16 +724,18 @@ void mono_bind_caches(int64_t layer, const std::vector<at::Tensor>& t, int64_t p
     const at::Tensor& cs = t[0];
     const at::Tensor& ss = t[1];
     TORCH_CHECK(
-        cs.scalar_type() == dt && cs.dim() == 3 && cs.size(1) == CONVD && cs.size(2) >= 3 && cs.stride(2) == 1 &&
+        cs.scalar_type() == dt && cs.dim() == 3 && cs.size(1) == CONVD && cs.size(2) == 3 && cs.stride(2) == 1 &&
             cs.stride(1) == cs.size(2),
-        "mono: conv state must be [slots, 4096, >= 3] in the layer's dtype (channel major, taps innermost), got ",
+        "mono: conv state must be [slots, 4096, 3] in the layer's dtype (channel major, taps innermost; the kernels "
+        "keep "
+        "the 3 history taps in entries 0..2), got ",
         cs.scalar_type(),
         " ",
         cs.sizes(),
         " ",
         cs.strides());
     TORCH_CHECK(
-        (cs.size(2) == 3 ? (reinterpret_cast<uintptr_t>(cs.data_ptr()) & 15) == 0 && cs.stride(0) % 8 == 0 : true),
+        (reinterpret_cast<uintptr_t>(cs.data_ptr()) & 15) == 0 && cs.stride(0) % 8 == 0,
         "mono: conv state slots must be 16-B aligned");
     TORCH_CHECK(
         ss.scalar_type() == at::kFloat && ss.dim() == 4 && ss.size(1) == NVH && ss.size(2) == DV && ss.size(3) == DK &&
@@ -743,6 +807,13 @@ void mono_decode_layer(
   Layer& L = layer_of(layer, hidden);
   TORCH_CHECK(!L.mtp, "mono: kernel ", layer, " is an MTP prologue, not a decoder layer");
   TORCH_CHECK(L.caches_bound, "mono: layer ", layer, " has no caches bound");
+  check_on(residual, L.device, "mono_decode_layer", "residual");
+  check_on(hid_out, L.device, "mono_decode_layer", "hid_out");
+  check_on(res_out, L.device, "mono_decode_layer", "res_out");
+  check_on(positions, L.device, "mono_decode_layer", "positions");
+  check_on(m0, L.device, "mono_decode_layer", "m0");
+  check_on(m1, L.device, "mono_decode_layer", "m1");
+  check_on(m2, L.device, "mono_decode_layer", "m2");
   const int64_t nb = hidden.dim() == 2 ? hidden.size(0) : 1;
   TORCH_CHECK(
       nb == 1 || nb == 2 || nb == 3 || nb == 4 || nb == 6 || nb == 8,
@@ -755,16 +826,15 @@ void mono_decode_layer(
   P.hid_out = t16(hid_out, nb * HID, "hid_out", L.dtype);
   P.res_out = t16(res_out, nb * HID, "res_out", L.dtype);
   const bool bf = L.dtype == at::kBFloat16;
-  sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+  c10::DeviceGuard guard(c10::Device(c10::kXPU, L.device));
+  sycl::queue& q = c10::xpu::getCurrentXPUStream(L.device).queue();
   if (L.attn) {
     TORCH_CHECK(m1.has_value() && m2.has_value(), "mono: attention layer needs seq_lens and out_cache_loc");
     TORCH_CHECK(m0.scalar_type() == at::kInt && m0.stride(-1) == 1, "mono: page table must be int32 (unit stride)");
-    TORCH_CHECK(m1->scalar_type() == at::kInt, "mono: seq_lens must be int32");
-    TORCH_CHECK(m2->scalar_type() == at::kLong, "mono: out_cache_loc must be int64");
-    TORCH_CHECK(positions.scalar_type() == at::kLong, "mono: positions must be int64");
-    TORCH_CHECK(
-        m0.dim() == 2 && m0.size(0) >= nb && m1->numel() >= nb && m2->numel() >= nb && positions.size(-1) >= nb,
-        "mono: attention metadata smaller than the batch");
+    TORCH_CHECK(m0.dim() == 2 && m0.size(0) >= nb, "mono: page table must be [>= rows, n]");
+    check_vec(*m1, at::kInt, nb, "seq_lens");
+    check_vec(*m2, at::kLong, nb, "out_cache_loc");
+    check_positions(positions, nb);
     P.block_table = m0.data_ptr<int>();
     P.bt_stride = (int)m0.stride(0);
     P.seq_lens = m1->data_ptr<int>();
@@ -775,8 +845,7 @@ void mono_decode_layer(
     else
       launch_attn<sycl::half>(q, (int)nb, P, L.S, L.SB);
   } else {
-    TORCH_CHECK(m0.scalar_type() == at::kInt, "mono: state indices must be int32");
-    TORCH_CHECK(m0.numel() >= nb, "mono: state indices smaller than the batch");
+    check_vec(m0, at::kInt, nb, "state indices");
     P.state_idx = m0.data_ptr<int>();
     if (bf)
       launch_gdn<bf16>(q, (int)nb, P, L.S, L.SB);
@@ -792,13 +861,16 @@ bool mono_mtp_prologue(int64_t layer, const at::Tensor& embed, const at::Tensor&
   using namespace sgl_mono;
   Layer& L = layer_of(layer, embed);
   TORCH_CHECK(L.mtp, "mono: kernel ", layer, " is not an MTP prologue");
+  check_on(hidden, L.device, "mono_mtp_prologue", "hidden");
+  check_on(out, L.device, "mono_mtp_prologue", "out");
   const int64_t nb = embed.dim() == 2 ? embed.size(0) : 1;
   TORCH_CHECK(hidden.size(0) >= nb && out.size(0) >= nb, "mono: MTP hidden / out smaller than the batch");
   Ptrs P = L.P;
   P.hs_in = t16(embed, nb * HID, "embed", L.dtype);
   P.res_in = t16(hidden, nb * HID, "hidden", L.dtype);
   P.hid_out = t16(out, nb * HID, "out", L.dtype);
-  sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+  c10::DeviceGuard guard(c10::Device(c10::kXPU, L.device));
+  sycl::queue& q = c10::xpu::getCurrentXPUStream(L.device).queue();
   return L.dtype == at::kBFloat16 ? launch_mtp<bf16>(q, (int)nb, P, L.S, L.rank)
                                   : launch_mtp<sycl::half>(q, (int)nb, P, L.S, L.rank);
 }
@@ -825,6 +897,13 @@ bool mono_decode_layer_verify(
   Layer& L = layer_of(layer, hidden);
   TORCH_CHECK(!L.mtp, "mono: kernel ", layer, " is an MTP prologue, not a decoder layer");
   TORCH_CHECK(L.caches_bound, "mono: layer ", layer, " has no caches bound");
+  check_on(residual, L.device, "mono_decode_layer_verify", "residual");
+  check_on(hid_out, L.device, "mono_decode_layer_verify", "hid_out");
+  check_on(res_out, L.device, "mono_decode_layer_verify", "res_out");
+  check_on(positions, L.device, "mono_decode_layer_verify", "positions");
+  check_on(m0, L.device, "mono_decode_layer_verify", "m0");
+  check_on(m1, L.device, "mono_decode_layer_verify", "m1");
+  check_on(m2, L.device, "mono_decode_layer_verify", "m2");
   const int64_t nb = hidden.dim() == 2 ? hidden.size(0) : 1;
   TORCH_CHECK(tokens >= 2 && nb % tokens == 0, "mono: verify needs rows = requests x tokens, got ", nb, " x ", tokens);
   const int64_t nrq = nb / tokens;
@@ -834,16 +913,16 @@ bool mono_decode_layer_verify(
   P.hid_out = t16(hid_out, nb * HID, "hid_out", L.dtype);
   P.res_out = t16(res_out, nb * HID, "res_out", L.dtype);
   const bool bf = L.dtype == at::kBFloat16;
-  sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+  c10::DeviceGuard guard(c10::Device(c10::kXPU, L.device));
+  sycl::queue& q = c10::xpu::getCurrentXPUStream(L.device).queue();
   if (L.attn) {
     TORCH_CHECK(m1.has_value() && m2.has_value(), "mono: attention layer needs seq_lens and out_cache_loc");
     TORCH_CHECK(
         m0.scalar_type() == at::kInt && m0.dim() == 2 && m0.stride(1) == 1 && m0.size(0) >= nrq,
         "mono: page table must be int32 [>= requests, n]");
-    TORCH_CHECK(m1->scalar_type() == at::kInt && m1->numel() >= nrq, "mono: seq_lens must be int32 [>= requests]");
-    TORCH_CHECK(m2->scalar_type() == at::kLong && m2->numel() >= nb, "mono: out_cache_loc must be int64 [rows]");
-    TORCH_CHECK(
-        positions.scalar_type() == at::kLong && positions.size(-1) >= nb, "mono: positions must be int64 [rows]");
+    check_vec(*m1, at::kInt, nrq, "seq_lens (one a request)");
+    check_vec(*m2, at::kLong, nb, "out_cache_loc (one a row)");
+    check_positions(positions, nb);
     P.block_table = m0.data_ptr<int>();
     P.bt_stride = (int)m0.stride(0);
     P.seq_lens = m1->data_ptr<int>();
@@ -862,7 +941,7 @@ bool mono_decode_layer_verify(
       " rows, the step ",
       nrq,
       " requests");
-  TORCH_CHECK(m0.scalar_type() == at::kInt && m0.numel() >= nrq, "mono: state indices must be int32 [>= requests]");
+  check_vec(m0, at::kInt, nrq, "state indices (one a request)");
   P.state_idx = m0.data_ptr<int>();
   return bf ? launch_gdn_verify<bf16>(q, (int)nb, (int)tokens, P, L.S, L.SB)
             : launch_gdn_verify<sycl::half>(q, (int)nb, (int)tokens, P, L.S, L.SB);
@@ -888,7 +967,7 @@ void mono_fault_inject(int64_t layer, int64_t delta) {
   TORCH_CHECK(it != g_layers.end(), "mono: layer ", layer, " not registered");
   uint32_t* cnt = it->second.S.cnt;
   const uint32_t d = (uint32_t)delta;
-  sycl::queue& q = c10::xpu::getCurrentXPUStream().queue();
+  sycl::queue& q = c10::xpu::getCurrentXPUStream(it->second.device).queue();
   q.single_task<class MonoFaultInjectK>([=] {
     for (int i = 0; i < 4; ++i)
       cnt[MBT + i] += d;  // rows 1, 2, 4, 8

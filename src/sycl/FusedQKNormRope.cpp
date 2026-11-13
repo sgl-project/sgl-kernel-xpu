@@ -1032,7 +1032,7 @@ void launchFusedQKNormRopeCacheImpl(
     use_cta = use_cta || rotary_lanes < 2 || (rotary_lanes & (rotary_lanes - 1)) != 0;
   }
   if (use_cta) {
-    launchFusedQKNormRopeCacheCTAImpl<kHeadDim, kIsNeox, scalar_t, IdType>(
+    launchFusedQKNormRopeCacheCTAImpl<kHeadDim, kIsNeox, scalar_t, cache_t, IdType>(
         q_ptr,
         k_ptr,
         q_weight_ptr,

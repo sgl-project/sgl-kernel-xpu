@@ -219,3 +219,130 @@ def test_spec_reasons(monkeypatch):
         "SGLANG_MAMBA_CONV_DTYPE" in r
         for r in spec.config_disable_reasons(_cfg(dtype="float16"), _hf())
     )
+
+
+@pytest.mark.parametrize("field", ["rope_parameters", "rope_scaling"])
+@pytest.mark.parametrize(
+    "scaling",
+    [
+        {"rope_type": "linear", "factor": 2.0},
+        {
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 262144,
+        },
+        {"type": "dynamic", "factor": 2.0},
+    ],
+)
+def test_spec_rejects_scaled_rope(monkeypatch, field, scaling):
+    # the kernels compute the plain frequencies of theta; SGLang's attention
+    # (prefill) would apply the scaling
+    spec = _spec()
+    monkeypatch.setattr(spec, "_conv_dtype", lambda: None)
+    hf = _hf()
+    setattr(hf.text_config, field, {"rope_theta": spec.ROPE_THETA, **scaling})
+    reasons = spec.config_disable_reasons(_cfg(), hf)
+    assert any("rope_type" in r for r in reasons), reasons
+
+
+def test_spec_accepts_the_checkpoints_default_rope(monkeypatch):
+    spec = _spec()
+    monkeypatch.setattr(spec, "_conv_dtype", lambda: None)
+    hf = _hf()
+    hf.text_config.rope_parameters = {  # Qwen3.6-35B-A3B's config.json
+        "rope_type": "default",
+        "rope_theta": spec.ROPE_THETA,
+        "partial_rotary_factor": 0.25,
+        "mrope_interleaved": True,
+        "mrope_section": [11, 11, 10],
+    }
+    assert spec.config_disable_reasons(_cfg(), hf) == []
+    hf.text_config.rope_scaling = None  # a dict without a type is unscaled too
+    hf.text_config.rope_parameters = {"rope_theta": spec.ROPE_THETA}
+    assert spec.config_disable_reasons(_cfg(), hf) == []
+
+
+@pytest.mark.parametrize(
+    "dtype, kv, ok",
+    [
+        ("bfloat16", "auto", True),
+        ("bfloat16", "bfloat16", True),
+        ("bfloat16", "float16", False),
+        ("float16", "bfloat16", False),
+        ("float16", "float16", True),
+        ("auto", "float16", False),  # auto: the checkpoint's bf16
+    ],
+)
+def test_spec_kv_dtype_must_match_the_model(monkeypatch, dtype, kv, ok):
+    spec = _spec()
+    monkeypatch.setattr(
+        spec, "_conv_dtype", lambda: "float16" if dtype == "float16" else None
+    )
+    reasons = spec.config_disable_reasons(_cfg(dtype=dtype, kv_cache_dtype=kv), _hf())
+    assert (not any("kv_cache_dtype" in r for r in reasons)) is ok, reasons
+
+
+def test_spec_auto_dtype_follows_the_checkpoint(monkeypatch):
+    # dtype auto on an fp16 checkpoint needs the fp16 conv state like dtype fp16
+    spec = _spec()
+    monkeypatch.setattr(spec, "_conv_dtype", lambda: "bfloat16")
+    hf = _hf()
+    hf.torch_dtype = "float16"
+    reasons = spec.config_disable_reasons(_cfg(dtype="auto"), hf)
+    assert any("SGLANG_MAMBA_CONV_DTYPE=float16" in r for r in reasons), reasons
+    monkeypatch.setattr(spec, "_conv_dtype", lambda: "float16")
+    assert spec.config_disable_reasons(_cfg(dtype="auto"), hf) == []
+
+
+def test_spec_layer_count_has_an_upper_bound(monkeypatch):
+    # kernel ids: target 7000 + layer, the MTP drafter 7100 / 7101
+    spec = _spec()
+    monkeypatch.setattr(spec, "_conv_dtype", lambda: None)
+    for layers, ok in (
+        (1, True),
+        (spec.MAX_LAYERS, True),
+        (spec.MAX_LAYERS + 1, False),
+    ):
+        hf = _hf()
+        hf.text_config.num_hidden_layers = layers
+        got = spec.config_disable_reasons(_cfg(), hf)
+        assert (got == []) is ok, (layers, got)
+
+
+# ----------------------------------------------------------------------------
+# runtime arguments and the peer handshake
+
+
+def test_forward_refuses_arguments_it_does_not_serve():
+    runtime = pytest.importorskip("sgl_kernel.monokernel.qwen3_5.runtime")
+    runtime._check_call(False, None, {})
+    for args in ((True, None, {}), (False, object(), {}), (False, None, {"x": 1})):
+        with pytest.raises(RuntimeError, match="does not serve"):
+            runtime._check_call(*args)
+    with pytest.raises(RuntimeError, match="no kernel"):  # not an assert
+        runtime._require(False, "no kernel")
+
+
+def test_fd_exchange_gives_up_when_the_peer_never_connects(tmp_path):
+    import os
+
+    import torch.distributed as dist
+
+    peer = pytest.importorskip("sgl_kernel.monokernel.peer")
+    dist.init_process_group(
+        "gloo", store=dist.HashStore(), rank=0, world_size=1, group_name="fd_test"
+    )
+    try:
+        r, w = os.pipe()
+        with pytest.raises(TimeoutError):
+            peer._exchange_fd(r, 0, dist.group.WORLD, timeout=0.5)
+        os.close(r)
+        os.close(w)
+    finally:
+        dist.destroy_process_group()
+    import glob
+    import tempfile
+
+    assert not glob.glob(
+        os.path.join(tempfile.gettempdir(), f"sgl_xpu_mono_{os.getpid()}.sock")
+    )

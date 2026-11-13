@@ -60,6 +60,7 @@ suites = {
         TestFile("test_hadamard.py"),
         TestFile("test_fp4_paged_mqa_logits.py"),
         TestFile("test_fp8_paged_mqa_logits.py"),
+        TestFile("test_inkling_gate.py"),
         TestFile("test_fp8_mqa_logits.py"),
         TestFile("test_indexer_rope_pack.py"),
         TestFile("test_c128_v2.py"),

@@ -431,6 +431,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
 #endif  // USE_MOE
 
+#if SYCL_INTEL_TARGET == 20
+  m.def("fp8_w8a16_mm_xe20(Tensor! output, Tensor input, Tensor weight, Tensor weight_scale, Tensor? bias) -> ()");
+  m.impl("fp8_w8a16_mm_xe20", torch::kXPU, &fp8_w8a16_mm_xe20);
+#endif  // SYCL_INTEL_TARGET == 20
+
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
   m.def("merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");

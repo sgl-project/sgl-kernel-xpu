@@ -7,6 +7,7 @@ from sgl_kernel import (
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
+    topk_among_blocks,
     topk_transform,
     topk_transform_paged,
     topk_transform_ragged,
@@ -22,6 +23,31 @@ transform_topk_range = [512, 1024]
 transform_seq_len_range = [4096, 16384, 65536]
 page_size_range = [64, 256]
 ragged_topk_range = [512, 1024, 2048]
+AMONG_BLOCK_DTYPES = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+among_batch_size_range = [32, 132]
+among_width_range = [4096, 16384]
+among_block_count_range = [64, 128]
+among_block_size_range = [8]
+among_topk_range = [128, 512]
+among_dtype_range = ["float32"]
+
+
+def _torch_topk_among_blocks(
+    scores: torch.Tensor,
+    blocks: torch.Tensor,
+    topk: int,
+    block_size: int,
+) -> torch.Tensor:
+    batch_size = scores.shape[0]
+    offsets = torch.arange(block_size, device=scores.device)
+    positions = (blocks.unsqueeze(-1) * block_size + offsets).reshape(batch_size, -1)
+    candidate_scores = scores.float().gather(1, positions)
+    selected = torch.topk(candidate_scores, topk, dim=-1, sorted=False).indices
+    return positions.gather(1, selected)
 
 
 def build_configs(
@@ -33,6 +59,12 @@ def build_configs(
     transform_seq_len_range=transform_seq_len_range,
     page_size_range=page_size_range,
     ragged_topk_range=ragged_topk_range,
+    among_batch_size_range=among_batch_size_range,
+    among_width_range=among_width_range,
+    among_block_count_range=among_block_count_range,
+    among_block_size_range=among_block_size_range,
+    among_topk_range=among_topk_range,
+    among_dtype_range=among_dtype_range,
 ):
     topk_configs = [
         (bs, topk, seq_len, has_row_starts)
@@ -73,6 +105,20 @@ def build_configs(
             batch_size_range, fused_topk_range, seq_len_range, has_row_starts_range
         )
     ]
+    topk_among_blocks_configs = [
+        (bs, width, block_count, block_size, topk, dtype)
+        for bs, width, block_count, block_size, topk, dtype in product(
+            among_batch_size_range,
+            among_width_range,
+            among_block_count_range,
+            among_block_size_range,
+            among_topk_range,
+            among_dtype_range,
+        )
+        if width % block_size == 0
+        and block_count <= width // block_size
+        and topk <= block_count * block_size
+    ]
 
     return (
         topk_configs,
@@ -80,6 +126,7 @@ def build_configs(
         topk_transform_configs,
         topk_transform_ragged_configs,
         topk_transform_ragged_fused_configs,
+        topk_among_blocks_configs,
     )
 
 
@@ -89,9 +136,68 @@ def build_configs(
     topk_transform_configs,
     topk_transform_ragged_configs,
     topk_transform_ragged_fused_configs,
+    topk_among_blocks_configs,
 ) = build_configs()
 
 all_results = []
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["bs", "width", "block_count", "block_size", "topk", "dtype"],
+        x_vals=topk_among_blocks_configs,
+        line_arg="provider",
+        line_vals=["sgl_kernel", "torch"],
+        line_names=["SGL Kernel", "PyTorch"],
+        styles=[("blue", "-"), ("green", "--")],
+        ylabel="Time (ms)",
+        plot_name="topk-among-blocks-performance",
+        args={},
+    )
+)
+def benchmark_topk_among_blocks(
+    bs, width, block_count, block_size, topk, dtype, provider
+):
+    torch.manual_seed(42)
+    torch.xpu.manual_seed_all(42)
+    total_blocks = width // block_size
+    scores = torch.randn(bs, width, dtype=AMONG_BLOCK_DTYPES[dtype], device="xpu")
+    blocks = torch.stack(
+        [torch.randperm(total_blocks)[:block_count] for _ in range(bs)]
+    ).to(device="xpu", dtype=torch.int64)
+    lengths = torch.full((bs,), width, dtype=torch.int64, device="xpu")
+
+    if provider == "sgl_kernel":
+        fn = lambda: topk_among_blocks(scores, lengths, blocks, topk, block_size)
+        expected = _torch_topk_among_blocks(scores, blocks, topk, block_size)
+        torch.testing.assert_close(
+            torch.sort(fn(), dim=-1).values,
+            torch.sort(expected, dim=-1).values,
+        )
+    else:
+        fn = lambda: _torch_topk_among_blocks(scores, blocks, topk, block_size)
+
+    for _ in range(5):
+        fn()
+    torch.xpu.synchronize()
+    ms, _, _ = triton.testing.do_bench(
+        fn, quantiles=[0.5, 0.25, 0.75], return_mode="median"
+    )
+    torch.xpu.empty_cache()
+    all_results.append(
+        {
+            "op": "topk_among_blocks",
+            "bs": bs,
+            "width": width,
+            "block_count": block_count,
+            "block_size": block_size,
+            "topk": topk,
+            "dtype": dtype,
+            "provider": provider,
+            "ms": ms,
+        }
+    )
+    return ms
 
 
 @triton.testing.perf_report(
@@ -543,18 +649,48 @@ if __name__ == "__main__":
         default=ragged_topk_range,
         help="topk for topk_transform_ragged",
     )
+    parser.add_argument(
+        "--among-batch-sizes", nargs="+", type=int, default=among_batch_size_range
+    )
+    parser.add_argument(
+        "--among-widths", nargs="+", type=int, default=among_width_range
+    )
+    parser.add_argument(
+        "--among-block-counts", nargs="+", type=int, default=among_block_count_range
+    )
+    parser.add_argument(
+        "--among-block-sizes", nargs="+", type=int, default=among_block_size_range
+    )
+    parser.add_argument("--among-topks", nargs="+", type=int, default=among_topk_range)
+    parser.add_argument(
+        "--among-dtypes",
+        nargs="+",
+        choices=AMONG_BLOCK_DTYPES,
+        default=among_dtype_range,
+    )
     args = parser.parse_args()
-    cfgs, fused_cfgs, transform_cfgs, ragged_cfgs, transform_ragged_fused_cfgs = (
-        build_configs(
-            args.batch_sizes,
-            args.topks,
-            args.fused_topks,
-            args.seq_lens,
-            args.transform_topks,
-            args.transform_seq_lens,
-            args.page_sizes,
-            args.ragged_topks,
-        )
+    (
+        cfgs,
+        fused_cfgs,
+        transform_cfgs,
+        ragged_cfgs,
+        transform_ragged_fused_cfgs,
+        among_blocks_cfgs,
+    ) = build_configs(
+        args.batch_sizes,
+        args.topks,
+        args.fused_topks,
+        args.seq_lens,
+        args.transform_topks,
+        args.transform_seq_lens,
+        args.page_sizes,
+        args.ragged_topks,
+        args.among_batch_sizes,
+        args.among_widths,
+        args.among_block_counts,
+        args.among_block_sizes,
+        args.among_topks,
+        args.among_dtypes,
     )
     benchmark_fast_topk_v2.benchmarks.x_vals = cfgs
     benchmark_fast_topk_transform_fused.benchmarks.x_vals = fused_cfgs
@@ -564,6 +700,7 @@ if __name__ == "__main__":
     benchmark_topk_transform.benchmarks.x_vals = transform_cfgs
     benchmark_topk_transform_paged.benchmarks.x_vals = transform_cfgs
     benchmark_topk_transform_ragged.benchmarks.x_vals = ragged_cfgs
+    benchmark_topk_among_blocks.benchmarks.x_vals = among_blocks_cfgs
 
     benchmark_fast_topk_v2.run(print_data=False)
     benchmark_fast_topk_transform_fused.run(print_data=False)
@@ -571,6 +708,7 @@ if __name__ == "__main__":
     benchmark_topk_transform.run(print_data=False)
     benchmark_topk_transform_paged.run(print_data=False)
     benchmark_topk_transform_ragged.run(print_data=False)
+    benchmark_topk_among_blocks.run(print_data=False)
     print("Benchmark finished!")
 
     df = pd.DataFrame(all_results)

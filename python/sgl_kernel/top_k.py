@@ -101,6 +101,22 @@ def topk_transform(
     )
 
 
+def topk_among_blocks(
+    scores: torch.Tensor,
+    lengths: torch.Tensor,
+    blocks: torch.Tensor,
+    topk: int,
+    block_size: int,
+) -> torch.Tensor:
+    return torch.ops.sgl_kernel.topk_among_blocks(
+        scores,
+        lengths,
+        blocks,
+        topk,
+        block_size,
+    )
+
+
 def topk_transform_paged(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,

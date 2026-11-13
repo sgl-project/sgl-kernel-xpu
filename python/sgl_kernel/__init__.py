@@ -264,6 +264,7 @@ from sgl_kernel.top_k import (
     fast_topk_transform_fused,
     fast_topk_transform_ragged_fused,
     fast_topk_v2,
+    topk_among_blocks,
     topk_transform,
     topk_transform_paged,
     topk_transform_ragged,

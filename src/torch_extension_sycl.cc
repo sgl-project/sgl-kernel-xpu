@@ -224,6 +224,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "int page_size, Tensor? out_raw_indices) -> ()");
   m.impl("topk_transform", torch::kXPU, &topk_transform);
 
+  m.def("topk_among_blocks(Tensor scores, Tensor lengths, Tensor blocks, int topk, int block_size) -> Tensor");
+  m.impl("topk_among_blocks", torch::kXPU, &topk_among_blocks);
+
   m.def(
       "topk_transform_paged(Tensor scores, Tensor seq_lens, Tensor? page_tables, "
       "Tensor! out_page_indices, int page_size, Tensor metadata) -> ()");

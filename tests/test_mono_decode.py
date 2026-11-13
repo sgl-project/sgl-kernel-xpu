@@ -23,6 +23,7 @@ from mono_decode_utils import (
     loopback_ar,
     loopback_ar_fp16,
     mailbox,
+    mono_available,
     ref_attn,
     ref_gdn,
     requires_mono,
@@ -53,8 +54,15 @@ def _run(layer, h, r, positions, m0, m1=None, m2=None):
 
 
 def _check(got, ref, tol, what=""):
+    """Finite, the direction of the reference (cosine) and its size: a result
+    scaled by a constant has the cosine of the reference, so the relative error
+    is bounded too (twice the error a cosine of ``tol`` allows)."""
+    assert torch.isfinite(got.float()).all(), f"{what} not finite"
     c = cos(got, ref)
-    assert torch.isfinite(got.float()).all() and c > tol, f"{what} cos {c:.7f}"
+    assert c > tol, f"{what} cos {c:.7f}"
+    err = (got.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12)
+    bound = 2 * (2 * (1 - tol)) ** 0.5
+    assert err < bound, f"{what} relative error {err:.4f} (bound {bound:.4f})"
 
 
 def _compare(ho, ro, ref, nb, tol_h=0.999, tol_r=0.9999):
@@ -64,6 +72,13 @@ def _compare(ho, ro, ref, nb, tol_h=0.999, tol_r=0.9999):
         _check(ro[b].cpu(), er[b], tol_r, f"res_out row {b}")
         if gap[b] > 0.02:  # a near tie of the 8th / 9th expert may pick either
             _check(ho[b].cpu(), eh[b], tol_h, f"hid_out row {b}")
+        else:  # either expert may be picked: the output is finite and of the reference's size
+            got = ho[b].cpu().float()
+            assert torch.isfinite(got).all(), f"hid_out row {b} not finite (near tie)"
+            ratio = got.norm() / eh[b].float().norm().clamp_min(1e-12)
+            assert (
+                0.7 < ratio < 1.4
+            ), f"hid_out row {b} size {ratio:.3f} x reference (near tie)"
 
 
 @requires_mono
@@ -332,6 +347,87 @@ def test_input_checks():
         h, r = rows(1, gen, DEVICE, other)
         with pytest.raises(RuntimeError, match="the layer's dtype"):
             _run(layer, h, r, zero[:1].long(), zero[:1])
+
+
+@requires_mono
+def test_conv_state_must_have_three_taps():
+    # the kernels keep the 3 history taps in entries 0..2; the stock conv update
+    # keeps the trailing taps of a wider state, so a wider state is refused
+    gen = torch.Generator().manual_seed(9)
+    layer, _mb = next(_ids), mailbox(DEVICE)
+    _ops().mono_register_layer(
+        layer, False, addr(_mb), addr(_mb), gdn_tensors(gen, DEVICE, F16)
+    )
+    conv, ssm = gdn_caches(gen, DEVICE, 2, F16, taps=4)
+    with pytest.raises(RuntimeError, match="conv state"):
+        _ops().mono_bind_caches(layer, [conv, ssm], 64)
+
+
+def _strided(t):
+    """The same values as a stride-2 view (base[::2]) of a twice as long tensor."""
+    base = torch.zeros(2 * t.numel(), dtype=t.dtype, device=t.device)
+    base[::2] = t
+    return base[::2]
+
+
+@requires_mono
+@pytest.mark.parametrize("which", ["seq_lens", "out_cache_loc", "positions", "state"])
+def test_metadata_must_be_unit_stride_xpu_vectors(which):
+    gen = torch.Generator().manual_seed(10)
+    attn = which != "state"
+    if attn:
+        kc, vc = kv_caches(gen, DEVICE, 256, F16)
+        layer, _mb = _register(True, attn_tensors(gen, DEVICE, F16), [kc, vc])
+        m0 = torch.ones(1, 4, dtype=torch.int32, device=DEVICE)
+        m1 = torch.tensor([5], dtype=torch.int32, device=DEVICE)
+        m2 = torch.tensor([64 + 4], dtype=torch.int64, device=DEVICE)
+    else:
+        conv, ssm = gdn_caches(gen, DEVICE, 2, F16)
+        layer, _mb = _register(False, gdn_tensors(gen, DEVICE, F16), [conv, ssm])
+        m0 = torch.ones(1, dtype=torch.int32, device=DEVICE)
+        m1 = m2 = None
+    pos = torch.tensor([4], dtype=torch.int64, device=DEVICE)
+    h, r = rows(1, gen, DEVICE, F16)
+    ok = _run(layer, h, r, pos, m0, m1, m2)  # the contiguous vectors run
+    assert torch.isfinite(ok[0].float()).all()
+    bad = dict(seq_lens=m1, out_cache_loc=m2, positions=pos, state=m0)[which]
+    args = dict(positions=pos, m0=m0, m1=m1, m2=m2)
+    key = dict(seq_lens="m1", out_cache_loc="m2", positions="positions", state="m0")
+    args[key[which]] = _strided(bad)
+    with pytest.raises(RuntimeError, match="unit stride|unit-stride"):
+        _run(layer, h, r, **args)
+    # and on the host: a CPU tensor is no device pointer
+    args[key[which]] = bad.cpu()
+    with pytest.raises(RuntimeError, match="XPU tensor"):
+        _run(layer, h, r, **args)
+
+
+@requires_mono
+def test_the_layers_device_serves_calls_while_another_is_current():
+    if torch.xpu.device_count() < 2 or not mono_available(1):
+        pytest.skip("needs two Xe2 GPUs with 32 Xe cores")
+    gen = torch.Generator().manual_seed(11)
+    dev1 = torch.device("xpu:1")
+    mb = mailbox(dev1)
+    with torch.xpu.device(0):  # xpu:0 is current, the layer lives on xpu:1
+        kc, vc = kv_caches(gen, dev1, 256, F16)
+        layer = next(_ids)
+        _ops().mono_register_layer(
+            layer, True, addr(mb), addr(mb), attn_tensors(gen, dev1, F16)
+        )
+        _ops().mono_bind_caches(layer, [kc, vc], 64)
+        h, r = rows(1, gen, dev1, F16)
+        m0 = torch.ones(1, 4, dtype=torch.int32, device=dev1)
+        m1 = torch.tensor([5], dtype=torch.int32, device=dev1)
+        m2 = torch.tensor([64 + 4], dtype=torch.int64, device=dev1)
+        pos = torch.tensor([4], dtype=torch.int64, device=dev1)
+        ho, _ro = _run(layer, h, r, pos, m0, m1, m2)
+        torch.xpu.synchronize(1)
+        assert torch.isfinite(ho.float()).all()
+        with pytest.raises(RuntimeError, match="XPU tensor on device 1"):
+            _run(layer, h, r, pos.to(DEVICE), m0, m1, m2)
+        with pytest.raises(RuntimeError, match="XPU tensor on device 1"):
+            _run(layer, h, r, pos, m0, m1.to(DEVICE), m2)
 
 
 VERIFY_SHAPES = [

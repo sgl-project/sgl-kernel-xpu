@@ -20,8 +20,8 @@ from sglang.kernels.plugin_kernels.xpu.spec import (
     Requirements,
 )
 
-# The shapes the kernels are written for (the text config of the model; any
-# number of layers, each a GatedDeltaNet or full-attention layer)
+# The shapes the kernels are written for (the text config of the model; up to
+# MAX_LAYERS layers, each a GatedDeltaNet or full-attention layer)
 TEXT_CONFIG = {
     "hidden_size": 2048,
     "full_attention_interval": 4,
@@ -43,6 +43,8 @@ TEXT_CONFIG = {
     "hidden_act": "silu",
 }
 ROPE_THETA = 10_000_000
+# the kernel ids of the target are 7000 + layer; the MTP drafter's are 7100 / 7101
+MAX_LAYERS = 100
 WIDTHS = (1, 2, 3, 4, 6, 8)
 # tokens a request of a verify step (1 + draft tokens) the verify kernels have
 VERIFY_TOKENS = (2, 3, 4, 6, 8)
@@ -52,11 +54,64 @@ def text_config(hf_config: Any) -> Any:
     return getattr(hf_config, "text_config", None) or hf_config
 
 
+def _rope_dicts(tc: Any) -> list:
+    """The RoPE dicts of the config (``rope_parameters`` in transformers 5,
+    ``rope_scaling`` before), as SGLang's get_rope_config reads them."""
+    return [
+        d
+        for d in (
+            getattr(tc, "rope_parameters", None),
+            getattr(tc, "rope_scaling", None),
+        )
+        if isinstance(d, dict) and d
+    ]
+
+
 def _rope_theta(tc: Any):
-    params = (
-        getattr(tc, "rope_parameters", None) or getattr(tc, "rope_scaling", None) or {}
-    )
+    params = (_rope_dicts(tc) or [{}])[0]
     return params.get("rope_theta", getattr(tc, "rope_theta", None))
+
+
+def _rope_scaling_types(tc: Any) -> list:
+    """The RoPE types other than 'default' (SGLang treats a dict without a
+    type as unscaled). The kernels compute the plain frequencies of theta only."""
+    types = []
+    for d in _rope_dicts(tc):
+        kind = d.get("rope_type", d.get("type"))
+        if kind not in (None, "default"):
+            types.append(str(kind))
+    return types
+
+
+_DTYPES = {
+    "bfloat16": "bfloat16",
+    "bf16": "bfloat16",
+    "float16": "float16",
+    "half": "float16",
+    "fp16": "float16",
+}
+
+
+def _dtype_name(value: Any):
+    """'bfloat16' / 'float16' for the spellings of a dtype (str or torch.dtype),
+    else None."""
+    return _DTYPES.get(str(value).removeprefix("torch.").lower())
+
+
+def _model_dtype(cfg: Any, hf_config: Any) -> str:
+    """The dtype the model runs in: the server argument, or for 'auto' the
+    checkpoint's (SGLang's ModelConfig resolves it the same way); bfloat16 when
+    neither is known."""
+    named = _dtype_name(getattr(cfg, "dtype", "auto"))
+    if named:
+        return named
+    tc = text_config(hf_config)
+    for conf in (hf_config, tc):
+        for attr in ("dtype", "torch_dtype"):
+            named = _dtype_name(getattr(conf, attr, None))
+            if named:
+                return named
+    return "bfloat16"
 
 
 def config_disable_reasons(cfg: Any, hf_config: Any) -> list:
@@ -69,12 +124,17 @@ def config_disable_reasons(cfg: Any, hf_config: Any) -> list:
         if getattr(tc, key, None) != want
     ]
     layers = getattr(tc, "num_hidden_layers", None)
-    if not layers or layers < 1:
+    if not layers or layers < 1 or layers > MAX_LAYERS:
         reasons.append(
-            f"config.num_hidden_layers {layers!r} (one kernel per layer, any count)"
+            f"config.num_hidden_layers {layers!r} (one kernel per layer, 1 to {MAX_LAYERS})"
         )
     if _rope_theta(tc) != ROPE_THETA:
         reasons.append(f"rope_theta {_rope_theta(tc)!r} is not {ROPE_THETA}")
+    scaled = _rope_scaling_types(tc)
+    if scaled:
+        reasons.append(
+            f"rope_type {scaled} is not 'default' (the kernels compute unscaled RoPE only)"
+        )
     quant = getattr(hf_config, "quantization_config", None) or {}
     if quant.get("quant_method") != "fp8" or list(
         quant.get("weight_block_size") or []
@@ -100,15 +160,20 @@ def config_disable_reasons(cfg: Any, hf_config: Any) -> list:
             reasons.append(
                 f"speculative_num_draft_tokens {tokens} is not one of {list(VERIFY_TOKENS)}"
             )
-    dtype = str(getattr(cfg, "dtype", "auto"))
+    dtype = _model_dtype(cfg, hf_config)
     conv_dtype = _conv_dtype()
-    if dtype in ("float16", "half") and conv_dtype != "float16":
+    if dtype == "float16" and conv_dtype != "float16":
         reasons.append(
             "an fp16 model needs SGLANG_MAMBA_CONV_DTYPE=float16 (one dtype for activations and conv state)"
         )
-    if dtype in ("auto", "bfloat16") and conv_dtype not in ("bfloat16", None):
+    if dtype == "bfloat16" and conv_dtype not in ("bfloat16", None):
         reasons.append(
             f"SGLANG_MAMBA_CONV_DTYPE {conv_dtype!r} is not the model dtype bfloat16"
+        )
+    kv = str(getattr(cfg, "kv_cache_dtype", "auto"))
+    if kv != "auto" and _dtype_name(kv) != dtype:
+        reasons.append(
+            f"kv_cache_dtype {kv!r} must be 'auto' or the model dtype {dtype!r} (one dtype for activations and the KV cache)"
         )
     return reasons
 

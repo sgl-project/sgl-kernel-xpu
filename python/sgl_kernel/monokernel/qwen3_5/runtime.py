@@ -20,6 +20,31 @@ from ..peer import PeerRegion, tp_agree
 logger = logging.getLogger(__name__)
 
 
+def _require(ok, message: str):
+    """Raises (an assert would vanish under ``python -O``, leaving the outputs
+    uninitialised) when a launch that the plan promised is refused."""
+    if not ok:
+        raise RuntimeError(message)
+
+
+def _check_call(get_embedding, pp_proxy_tensors, extra: dict):
+    """The model forward's other arguments: ``input_embeds`` is served, the
+    rest is refused instead of ignored."""
+    unsupported = [
+        name
+        for name, given in (
+            ("get_embedding", bool(get_embedding)),
+            ("pp_proxy_tensors", pp_proxy_tensors is not None),
+            *((k, True) for k in extra),
+        )
+        if given
+    ]
+    _require(
+        not unsupported,
+        f"the monokernel forward does not serve {unsupported} (the model's own forward does)",
+    )
+
+
 def language_model(model: torch.nn.Module) -> torch.nn.Module:
     """The decoder stack (embed_tokens, layers, norm)."""
     return model.model
@@ -154,9 +179,20 @@ class MonoQwen35:
                 )
         self.bound = key
 
-    def forward(self, plan, input_ids, positions, forward_batch, *args, **kwargs):
+    def forward(
+        self,
+        plan,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        get_embedding=False,
+        pp_proxy_tensors=None,
+        **kwargs,
+    ):
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
+        _check_call(get_embedding, pp_proxy_tensors, kwargs)
         backend = get_attn_backend()
         if not torch.xpu.is_current_stream_capturing():
             self.watch.check()  # a failed earlier step (eager; replayed graphs: the watch thread)
@@ -172,7 +208,10 @@ class MonoQwen35:
             pos = positions
         m_attn = (fmd.page_table, fmd.cache_seqlens_int32, forward_batch.out_cache_loc)
         m_gdn = (lmd.mamba_cache_indices, None, None)
-        hidden = self.lm.embed_tokens(input_ids[:rows])
+        if input_embeds is None:
+            hidden = self.lm.embed_tokens(input_ids[:rows])
+        else:
+            hidden = input_embeds[:rows]
         residual = torch.zeros_like(hidden)
         ops = torch.ops.sgl_kernel
         for i in range(len(self.layers)):
@@ -192,7 +231,7 @@ class MonoQwen35:
                     m[1],
                     m[2],
                 )
-                assert ok, f"no verify kernel for {rows} rows x {tokens} tokens"
+                _require(ok, f"no verify kernel for {rows} rows x {tokens} tokens")
             else:
                 ops.mono_decode_layer(
                     self.ids[i], hidden, residual, out, res, pos, m[0], m[1], m[2]
@@ -268,9 +307,20 @@ class MonoQwen35MTP:
             )
             self.bound = key
 
-    def forward(self, plan, input_ids, positions, forward_batch, *args, **kwargs):
+    def forward(
+        self,
+        plan,
+        input_ids,
+        positions,
+        forward_batch,
+        input_embeds=None,
+        get_embedding=False,
+        pp_proxy_tensors=None,
+        **kwargs,
+    ):
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
+        _check_call(get_embedding, pp_proxy_tensors, kwargs)
         backend = get_attn_backend()
         self._bind(backend)
         rows = plan.key.rows
@@ -285,13 +335,16 @@ class MonoQwen35MTP:
             )
         fmd = getattr(backend, "full_attn_backend", backend).forward_metadata
         lm = language_model(self.model)
-        embed = lm.embed_tokens(input_ids[:rows])
+        if input_embeds is None:
+            embed = lm.embed_tokens(input_ids[:rows])
+        else:
+            embed = input_embeds[:rows]
         x = torch.empty_like(embed)
         ops = torch.ops.sgl_kernel
         ok = ops.mono_mtp_prologue(
             self.PROLOGUE, embed, forward_batch.spec_info.hidden_states, x
         )
-        assert ok, f"no MTP prologue kernel for {rows} rows"
+        _require(ok, f"no MTP prologue kernel for {rows} rows")
         out, res = torch.empty_like(x), torch.empty_like(x)
         if plan.key.forward_mode == "draft_extend":
             # seq_lens already counts the extend rows, as a verify step's do
@@ -307,9 +360,10 @@ class MonoQwen35MTP:
                 fmd.cache_seqlens_int32,
                 forward_batch.out_cache_loc,
             )
-            assert ok, (
+            _require(
+                ok,
                 f"no verify kernel for {rows} rows x "
-                f"{plan.key.tokens_per_request} tokens (draft extend)"
+                f"{plan.key.tokens_per_request} tokens (draft extend)",
             )
         else:
             ops.mono_decode_layer(

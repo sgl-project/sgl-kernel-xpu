@@ -973,5 +973,7 @@ void mono_fault_inject(int64_t layer, int64_t delta) {
       cnt[MBT + i] += d;  // rows 1, 2, 4, 8
     for (int i = 0; i < 2; ++i)
       cnt[MBT2 + i] += d;  // rows 3, 6
+    for (int i = 0; i < 6; ++i)
+      cnt[MTPT + i] += d;  // the MTP prologue's row counts (unused words in a decoder layer)
   });
 }

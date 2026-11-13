@@ -5,7 +5,8 @@
 // by the caller), h the hidden state the drafter continues from, norm_e /
 // norm_h Gemma RMSNorms and fc SGLang's 16-bit nn.Linear(4096, 2048), the
 // same full [2048][4096] on both ranks: each rank computes its half of the
-// output rows and the halves are gathered through the P2P mailbox. The draft
+// output rows and the halves are gathered through the P2P mailbox (a region
+// and a tag counter for each row count). The draft
 // decoder layer that follows is an attention layer kernel.
 //
 // Ptrs fields (the decoder-layer struct, reused; 16-bit data in the dtype DT):
@@ -18,7 +19,26 @@
 namespace sgl_mono {
 
 constexpr size_t MTP_MB_FC = 0;  // mailbox words of the fc gather
-static_assert(MTP_MB_FC + (size_t)NBMAX * MTP_FC_OUT / 2 <= MBOX_WORDS_B, "MTP prologue mailbox");
+// A row count has its own tag counter and its own mailbox region (the rows
+// 1, 2, 3, 4, 6, 8 regions follow each other), as the decoder layers' row
+// configurations do: every word of a region is rewritten by every use of its
+// row count, so a word left from an older use is at most one tag old and the
+// 16-bit tag cannot match it. (With one region and counter for all row counts,
+// the words of the rows a narrower call does not write keep their old tag, and
+// a wider call 65536 calls later would take them for fresh.)
+template <int NB>
+constexpr int mtp_idx() {
+  static_assert(NB == 1 || NB == 2 || NB == 3 || NB == 4 || NB == 6 || NB == 8, "MTP prologue rows");
+  return NB == 1 ? 0 : NB == 2 ? 1 : NB == 3 ? 2 : NB == 4 ? 3 : NB == 6 ? 4 : 5;
+}
+template <int NB>
+constexpr size_t mtp_region() {  // words from the start of the mailbox
+  constexpr int rows_before = NB == 1 ? 0 : NB == 2 ? 1 : NB == 3 ? 3 : NB == 4 ? 6 : NB == 6 ? 10 : 16;
+  return MTP_MB_FC + (size_t)rows_before * (MTP_FC_OUT / 2);
+}
+constexpr int MTP_ROWS_ALL = 1 + 2 + 3 + 4 + 6 + 8;
+static_assert(MTP_MB_FC + (size_t)MTP_ROWS_ALL * MTP_FC_OUT / 2 <= MBOX_WORDS_B, "MTP prologue mailbox");
+static_assert(MTPT + 6 <= HEALTH_PTR, "MTP tag counters");
 constexpr int MTP_SLM = NBMAX * MTP_FC_IN * 2 + 4096;  // z rows (fp16) + reductions
 constexpr int MTP_KCH = MTP_FC_IN / (16 * 8);          // 16-B chunks of a fc row per lane (32)
 
@@ -31,7 +51,7 @@ inline void mtp_prologue(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const
   const int lane = sg.get_local_linear_id();
   auto grp = it.get_group();
   const uint32_t call = uc_load32(S.cnt + EPOCH) + 1u;
-  const uint32_t mtag = uc_load32(S.cnt + MBT) + 1u;
+  const uint32_t mtag = uc_load32(S.cnt + MTPT + mtp_idx<NB>()) + 1u;  // this row count's tag
   half* z = reinterpret_cast<half*>(slm);                              // [NB][4096]
   float* red = reinterpret_cast<float*>(slm + NBMAX * MTP_FC_IN * 2);  // [32 SGs][2]
   float* part = S.part_rt;                                             // [NWG][2]: sums of squares e | h
@@ -72,7 +92,7 @@ inline void mtp_prologue(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const
   wait_for(it, S.cnt + C_A * 16, NWG * call);
   if (wg == 0 && lid == 0) {  // every WG has read the epoch and the mailbox tag
     cnt_ref(S.cnt[EPOCH]).store(call);
-    cnt_ref(S.cnt[MBT]).store(mtag);
+    cnt_ref(S.cnt[MTPT + mtp_idx<NB>()]).store(mtag);
   }
 #pragma unroll
   for (int b = 0; b < NB; ++b) {
@@ -124,7 +144,7 @@ inline void mtp_prologue(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const
   if (lid < NB * NSG / 2) {
     const int b = lid / (NSG / 2), p = lid % (NSG / 2);
     const uint32_t mine = pack16(yo[b * NSG + 2 * p].u, yo[b * NSG + 2 * p + 1].u);
-    const size_t word = MTP_MB_FC + (size_t)b * (MTP_FC_OUT / 2) + wg * (NSG / 2) + p;
+    const size_t word = mtp_region<NB>() + (size_t)b * (MTP_FC_OUT / 2) + wg * (NSG / 2) + p;
     mb_put(S.peer + word, mb_word(mine, mtag));
     const int col = wg * NSG + 2 * p;
     *reinterpret_cast<uint32_t*>(P.hid_out + b * HID + rank * MTP_FC_OUT + col) = mine;

@@ -746,3 +746,57 @@ def test_mtp_prologue(nb, rank, dtype):
     assert not _ops().mono_mtp_prologue(
         layer, e5, h5, torch.empty_like(e5)
     )  # no 5-row kernel
+
+
+# the MTP prologue's tag counters in a layer's counter words: EPOCH (6 stage
+# counters x 16) + 18, one per row count in this order
+MTP_TAGS = 6 * 16 + 18
+MTP_WIDTHS = (1, 2, 3, 4, 6, 8)
+
+
+@requires_mono
+def test_mtp_prologue_tags_are_per_row_count():
+    """Each row count of the MTP prologue has its own mailbox region and tag
+    counter, as the decoder layers do: a call advances only its own counter.
+    (With one counter and region for all row counts, the rows a narrow call does
+    not write keep an old tag, which a wide call 65536 calls later takes for
+    fresh.) The tags stay correct across the 16-bit wrap, where wire tag 0 also
+    matches a word that was never written."""
+    gen = torch.Generator().manual_seed(12)
+    dtype = BF16
+    fc = (torch.randn(2048, 4096, generator=gen) * 0.02).to(dtype).to(DEVICE)
+    ne = (torch.randn(2048, generator=gen) * 0.1).to(dtype).to(DEVICE)
+    nh = (torch.randn(2048, generator=gen) * 0.1).to(dtype).to(DEVICE)
+    layer, mb = next(_ids), mailbox(DEVICE)
+    _ops().mono_register_mtp(layer, addr(mb), addr(mb), [fc, ne, nh], 0)
+    cnt = _ops().mono_layer_counters(layer)
+
+    def tags():
+        torch.xpu.synchronize()
+        return [int(cnt[MTP_TAGS + i]) & 0xFFFFFFFF for i in range(6)]
+
+    def call(nb):
+        e = torch.randn(nb, 2048, generator=gen).to(dtype).to(DEVICE)
+        h = (torch.randn(nb, 2048, generator=gen) * 3).to(dtype).to(DEVICE)
+        out = torch.empty_like(e)
+        assert _ops().mono_mtp_prologue(layer, e, h, out)
+        torch.xpu.synchronize()
+        ref = _mtp_ref(fc.cpu(), ne.cpu(), nh.cpu(), e.cpu(), h.cpu(), dtype)
+        for b in range(nb):
+            _check(out.cpu()[b, :1024], ref[b, :1024], 0.9999, f"{nb} rows, row {b}")
+
+    # a call advances the counter of its own row count only
+    before = tags()
+    for i, nb in enumerate(MTP_WIDTHS):
+        call(nb)
+        after = tags()
+        assert [a - b for a, b in zip(after, before)] == [int(j == i) for j in range(6)]
+        before = after
+    # wide and narrow calls alternate across the wrap of every counter (tags
+    # 65535, 65536 = wire tag 0, 65537 = wire tag 1)
+    for i in range(6):
+        cnt[MTP_TAGS + i] = 65533
+    for _ in range(4):
+        for nb in (8, 1, 6, 2, 4, 3):
+            call(nb)
+    assert tags() == [65533 + 4] * 6

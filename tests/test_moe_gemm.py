@@ -183,6 +183,11 @@ def _check_moe_gemm(
     if act_type == "relu2" and bias_dtype != False:
         pytest.skip("relu2 only supports bias_dtype=False")
 
+    # Only the Xe2 kernel (moe_grouped_mm_nt_xe20) supports expert counts that
+    # are not a multiple of 8; the Xe3 kernel still requires it.
+    if num_experts % 8 != 0 and not utils.is_xe2_device():
+        pytest.skip("n_experts not a multiple of 8 is only supported on Xe2")
+
     torch.xpu.manual_seed_all(0)
 
     # NOTE: Nemotron3 Nano is using a non-gated MoE w/ activation type ReLU2
@@ -299,6 +304,36 @@ def test_moe_gemm_gemma4_tp4_shapes(num_tokens):
         intermediate_size=176,
         bias_dtype=False,
         act=("silu", None, None),
+        routed_scaling_factor=2.5,
+    )
+
+
+# Only the Xe2 kernel supports expert counts that are not a multiple of 8.
+# Kept as a small separate test so it does not slow down test_moe_gemm.
+@pytest.mark.parametrize(
+    "act",
+    [
+        ("silu", None, None),
+        ("gelu", None, None),
+        ("silu", SWIGLU_ALPHA, SWIGLU_LIMIT),  # swiglu_gpt_oss
+        ("relu2", None, None),
+    ],
+)
+@pytest.mark.parametrize("bias_dtype", [False, "float32"])
+@pytest.mark.parametrize("num_experts", [60, 62])
+@pytest.mark.parametrize("topk", [2, 6])
+@pytest.mark.parametrize("num_tokens", [1, 33, 222])
+def test_moe_gemm_n_experts_not_multiple_of_8(
+    num_tokens, topk, num_experts, bias_dtype, act
+):
+    _check_moe_gemm(
+        num_tokens=num_tokens,
+        topk=topk,
+        num_experts=num_experts,
+        hidden_size=1024,
+        intermediate_size=512,
+        bias_dtype=bias_dtype,
+        act=act,
         routed_scaling_factor=2.5,
     )
 

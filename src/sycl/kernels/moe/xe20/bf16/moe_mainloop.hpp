@@ -67,7 +67,7 @@ inline constexpr int SILU = moe_xe20::ACT_SILU;
 inline constexpr int GELU = moe_xe20::ACT_GELU;
 inline constexpr int SWIGLU_GPT_OSS = moe_xe20::ACT_SWIGLU_GPT_OSS;
 
-template <int Stages>
+template <int Stages, bool RegisterDoubleBuffer = false>
 class XeDefault {};
 
 template <
@@ -89,6 +89,7 @@ struct MoEMainloop {
 
 template <
     int Stages,
+    bool RegisterDoubleBuffer,
     class TiledCopyA_,
     class TiledCopyB_,
     class TilesCopyD_,
@@ -101,7 +102,7 @@ template <
     bool FuseAct,
     ActivationType ActType>
 struct MoEMainloop<
-    XeDefault<Stages>,
+    XeDefault<Stages, RegisterDoubleBuffer>,
     TiledCopyA_,
     TiledCopyB_,
     TilesCopyD_,
@@ -205,22 +206,67 @@ struct MoEMainloop<
       prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
     }
 
-    for (int k_tile = k_start_idx; k_tile < k_tile_count; k_tile++, prefetch_k++) {
-      barrier_arrive(barrier_scope);
+    if constexpr (RegisterDoubleBuffer) {
+      auto tArA_next = thr_copy_a.partition_sg_fragment_D(gA(_, _, 0));
+      auto tBrB_next = thr_copy_b.partition_sg_fragment_D(gB(_, _, 0));
 
-      copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA);
-      copy(tiled_copy_b, tBgB(_, _, _, k_tile), tBrB);
+      // Prime one operand pair. The next pair can load while DPAS consumes
+      // the current pair: no accumulator arithmetic or K order is changed.
+      copy(tiled_copy_a, tAgA(_, _, _, 0), tArA);
+      copy(tiled_copy_b, tBgB(_, _, _, 0), tBrB);
+      int k_tile = 0;
+      for (; k_tile + 1 < k_tile_count; k_tile += 2) {
+        barrier_arrive(barrier_scope);
+        copy(tiled_copy_a, tAgA(_, _, _, k_tile + 1), tArA_next);
+        copy(tiled_copy_b, tBgB(_, _, _, k_tile + 1), tBrB_next);
+        if (k_tile + Stages < k_tile_count) {
+          prefetch(prefetch_a, pAgA(_, _, _, k_tile + Stages));
+          prefetch(prefetch_b, pBgB(_, _, _, k_tile + Stages));
+        }
+        reorder(tArA, tSrA);
+        reorder(tBrB, tSrB);
+        cute::gemm(mma, tSrA, tSrB, tCrC);
+        barrier_wait(barrier_scope);
 
-      if (prefetch_k < k_tile_count) {
-        prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
-        prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
+        barrier_arrive(barrier_scope);
+        if (k_tile + 2 < k_tile_count) {
+          copy(tiled_copy_a, tAgA(_, _, _, k_tile + 2), tArA);
+          copy(tiled_copy_b, tBgB(_, _, _, k_tile + 2), tBrB);
+        }
+        if (k_tile + 1 + Stages < k_tile_count) {
+          prefetch(prefetch_a, pAgA(_, _, _, k_tile + 1 + Stages));
+          prefetch(prefetch_b, pBgB(_, _, _, k_tile + 1 + Stages));
+        }
+        reorder(tArA_next, tSrA);
+        reorder(tBrB_next, tSrB);
+        cute::gemm(mma, tSrA, tSrB, tCrC);
+        barrier_wait(barrier_scope);
       }
+      if (k_tile < k_tile_count) {
+        barrier_arrive(barrier_scope);
+        reorder(tArA, tSrA);
+        reorder(tBrB, tSrB);
+        cute::gemm(mma, tSrA, tSrB, tCrC);
+        barrier_wait(barrier_scope);
+      }
+    } else {
+      for (int k_tile = k_start_idx; k_tile < k_tile_count; k_tile++, prefetch_k++) {
+        barrier_arrive(barrier_scope);
 
-      reorder(tArA, tSrA);
-      reorder(tBrB, tSrB);
+        copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA);
+        copy(tiled_copy_b, tBgB(_, _, _, k_tile), tBrB);
 
-      cute::gemm(mma, tSrA, tSrB, tCrC);
-      barrier_wait(barrier_scope);
+        if (prefetch_k < k_tile_count) {
+          prefetch(prefetch_a, pAgA(_, _, _, prefetch_k));
+          prefetch(prefetch_b, pBgB(_, _, _, prefetch_k));
+        }
+
+        reorder(tArA, tSrA);
+        reorder(tBrB, tSrB);
+
+        cute::gemm(mma, tSrA, tSrB, tCrC);
+        barrier_wait(barrier_scope);
+      }
     }
 
     // Add bias if needed
@@ -244,7 +290,15 @@ struct MoEMainloop<
     copy(tiled_copy_d, tCrD_final_sg_tensor, tCgD);
   }
 
-  template <typename Coord>
+  // Preserve the existing MoE activation arithmetic unless a dense caller
+  // explicitly supplies another compile-time activation policy.
+  struct DefaultFusedActivation {
+    CUTLASS_DEVICE float operator()(float gate, float up, float alpha, float limit) const {
+      return moe_xe20::apply_fused_activation<static_cast<int>(ActType)>(gate, up, alpha, limit);
+    }
+  };
+
+  template <typename Coord, typename Activation = DefaultFusedActivation>
   CUTLASS_DEVICE void operator()(
       ATensor& A,   // (M,K)
       BTensor& B0,  // (N/2,K)
@@ -256,7 +310,8 @@ struct MoEMainloop<
       BiasTensor Bias0,
       BiasTensor Bias1,
       float gemm1_alpha,
-      float gemm1_limit) {
+      float gemm1_limit,
+      Activation activation = {}) {
     auto wg_m = get<0>(blk_coord);
     auto wg_n = get<1>(blk_coord);
     auto wg_n1 = get<2>(blk_coord);
@@ -376,8 +431,7 @@ struct MoEMainloop<
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tCrC0.size(); ++i) {
-      tCrC0(i) =
-          moe_xe20::apply_fused_activation<static_cast<int>(ActType)>(tCrC0(i), tCrC1(i), gemm1_alpha, gemm1_limit);
+      tCrC0(i) = activation(tCrC0(i), tCrC1(i), gemm1_alpha, gemm1_limit);
     }
 
     reorder(tCrC0, tCrD_final_sg_tensor0);

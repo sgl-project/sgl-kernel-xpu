@@ -28,6 +28,7 @@ suites = {
         TestFile("test_flash_mla_sparse_fwd.py"),
         TestFile("test_moe_align.py"),
         TestFile("test_moe_gemm.py"),
+        TestFile("test_fp8_w8a16_gemm.py"),
         TestFile("test_moe_sum_reduce.py"),
         TestFile("test_moe_prepare_input.py"),
         TestFile("test_swiglu_with_alpha_limit.py"),

@@ -92,7 +92,9 @@ enum {
 // two words after the health pointer: the wait deadline in cycles of the
 // sub-group clock (~2.8 GHz), set per device (mono_set_deadline)
 constexpr int DEADLINE = EPOCH + 30;
-// two words: the address of the peer's health words (P2P mapping), or 0
+// two words: reserved for the address of the peer's health words (P2P mapping)
+// that a rank giving up its wait would flag. The host does not set it yet (0:
+// no flag is written), so the peer's own wait gives up at its deadline.
 constexpr int PEER_HEALTH_PTR = EPOCH + 32;
 // two words: the address of this layer's mailbox region (for the health record)
 constexpr int MBOX_PTR = EPOCH + 34;

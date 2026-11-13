@@ -161,7 +161,7 @@ struct ScratchB {
 };
 constexpr int ACH = 80;                // cached tokens per SG pair and pass
 constexpr int APAIRS = NWG * NSG / 2;  // 512
-constexpr int APASS = NBMAX;           // passes: up to NBMAX * 40960 cached tokens per step
+constexpr int APASS = NBMAX;           // partial slots reserved for up to NBMAX passes (an upper bound of the buffers)
 inline size_t attn_part_bytes() {      // partial o, (m, l), then per slot the row
                                        // [APASS * APAIRS] int, per pair the count
   return (size_t)APASS * APAIRS * NQ * (HD * 2 + 2 * 4) + (size_t)APASS * APAIRS * 4 + (size_t)APAIRS * 4;
@@ -1087,8 +1087,9 @@ constexpr int ADYN_MIN = 96 * 1024;  // cached tokens per step from which the
 constexpr int ATK = EPOCH + 8;       // batched attention: ticket counter per row [8] (reset each call)
 constexpr int AB_QPK = 49152, AB_CS = AB_QPK + NBMAX * 4096, AB_KVN = AB_CS + NBMAX * 256,
               AB_QS = AB_KVN + NBMAX * 1024, AB_W = AB_QS + NQ * HD * 2, AB_SM3 = AB_W + 2048,
-              AB_LST = AB_SM3 + 1024,  // merge: slot lists [8][512] i16
-    AB_WL = AB_LST + NBMAX * 512 * 2,  // merge: weights [8][512] f32
+              AB_LST = AB_SM3 + 1024,  // [8][512] i16 (no reader in the current kernels; kept so that the offsets
+                                       // after it, and the SLM layout of the measured kernels, do not move)
+    AB_WL = AB_LST + NBMAX * 512 * 2,  // [8][512] f32 (likewise)
     AB_TK = AB_WL + NBMAX * 512 * 4,   // ticket ring [16][2] + ack [16]
     AB_BYTES = AB_TK + 256;
 static_assert(AB_BYTES <= 131072, "SLM of the batched attention layer");

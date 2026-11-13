@@ -1,0 +1,74 @@
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -993,10 +993,19 @@
+             backend = get_attn_backend()
+             backend = getattr(backend, "linear_attn_backend", backend)
+             if backend.supports_fused_gdn(self.attn, forward_batch):
++                if not getattr(self, "_sgl_logged_fused", False):
++                    print("SGL_GPTQ_GDN fused", flush=True)
++                    self._sgl_logged_fused = True
+                 return self._forward_xpu(
+                     backend, projected_states_qkvz, projected_states_ba, forward_batch
+                 )
+ 
++        if not getattr(self, "_sgl_logged_slow", False):
++            print(
++                f"SGL_GPTQ_GDN slow mode={forward_batch.forward_mode}",
++                flush=True,
++            )
++            self._sgl_logged_slow = True
+         use_strided_prefill_z = False
+         packed_verify = False
+         if forward_batch.forward_mode.is_target_verify():
+@@ -1604,11 +1613,25 @@
+         # fused AR+quant hands down a (fp8, scale) / (bf16, fp8, scale) tuple
+         hs = hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+         if not forward_batch.forward_mode.is_idle() and hs.shape[0] > 0:
++            import os
++            import time
++
++            _time_layer = getattr(self.attn, "layer_id", -1) == 3
++            if _time_layer and os.environ.get("SGL_GPTQ_STEP") == "1":
++                torch.xpu.synchronize()
++            _t0 = time.perf_counter() if _time_layer else None
+             hidden_states = self.self_attention(
+                 positions=positions,
+                 hidden_states=hidden_states,
+                 forward_batch=forward_batch,
+             )
++            if _t0 is not None:
++                if os.environ.get("SGL_GPTQ_STEP") == "1":
++                    torch.xpu.synchronize()
++                print(
++                    f"SGL_GPTQ_FULL mode={forward_batch.forward_mode} dt={time.perf_counter() - _t0:.4f}",
++                    flush=True,
++                )
+ 
+         # Fully Connected
+         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+@@ -1882,6 +1905,13 @@
+ 
+         aux_hidden_states = AuxHiddenStateList()
+         # Pass through decoder layers
++        import os as _os
++        import time as _time
++
++        _step = _os.environ.get("SGL_GPTQ_STEP") == "1"
++        if _step:
++            torch.xpu.synchronize()
++            _step_t0 = _time.perf_counter()
+         for layer_idx in range(self.start_layer, self.end_layer):
+             layer = self.layers[layer_idx]
+             with get_global_expert_distribution_recorder().with_current_layer(
+@@ -1909,5 +1939,11 @@
+                     input_deepstack_embeds[:, sep : sep + self.hidden_size],
+                 )
+ 
++        if _os.environ.get("SGL_GPTQ_STEP") == "1":
++            torch.xpu.synchronize()
++            print(
++                f"SGL_GPTQ_STEP mode={forward_batch.forward_mode} dt={_time.perf_counter() - _step_t0:.4f}",
++                flush=True,
++            )
+         if not self.pp_group.is_last_rank:
+             return residual_batch.to_pp(hidden_states, forward_batch)

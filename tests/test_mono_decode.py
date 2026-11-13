@@ -461,11 +461,25 @@ def _scratch(nrows, tokens, dtype):
 def test_gdn_verify_vs_reference(nb, tokens, dtype):
     if dtype == BF16 and (nb, tokens) not in ((4, 2), (6, 3), (8, 8)):
         pytest.skip("bf16: a subset of the shapes")
+    _gdn_verify_vs_reference(nb, tokens, dtype, tokens)
+
+
+@requires_mono
+@pytest.mark.parametrize("dtype", [F16, BF16])
+@pytest.mark.parametrize("nb,tokens,scratch_tokens", [(4, 2, 8), (6, 3, 4), (8, 4, 8)])
+def test_gdn_verify_in_a_wider_scratch(nb, tokens, scratch_tokens, dtype):
+    # a step that verifies fewer tokens than the scratch was sized for (adaptive
+    # speculation sizes the pool for the largest candidate): the windows of a
+    # channel are T0 + 2 apart in the scratch, not T + 2
+    _gdn_verify_vs_reference(nb, tokens, dtype, scratch_tokens)
+
+
+def _gdn_verify_vs_reference(nb, tokens, dtype, scratch_tokens):
     nreq = nb // tokens
     gen = torch.Generator().manual_seed(200 + nb * 10 + tokens)
     t = gdn_tensors(gen, DEVICE, dtype)
     conv, ssm = gdn_caches(gen, DEVICE, nreq + 2, dtype)
-    iss, win = _scratch(nreq + 1, tokens, dtype)
+    iss, win = _scratch(nreq + 1, scratch_tokens, dtype)
     h, r = rows(nb, gen, DEVICE, dtype)
     slots = torch.randperm(nreq + 1, generator=gen)[:nreq].to(torch.int32) + 1
     conv0, ssm0 = conv.cpu(), ssm.cpu()

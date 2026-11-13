@@ -173,7 +173,7 @@ struct Ptrs {
   // goes to intermediate slot inter_idx[b], token t
   float* inter_ssm;  // [slots][T][16][128][128]
   e16* inter_conv;   // [slots][T][4096][3]
-  int64_t inter_ssm_stride, inter_ssm_tstride, inter_conv_stride, inter_conv_tstride;
+  int64_t inter_ssm_stride, inter_ssm_tstride, inter_conv_stride, inter_conv_cstride;
   const int* inter_idx;  // [requests]
   // ATTN
   const uint8_t* qkv_w;  // [4608][2048]: per head q (256) | gate (256), then k, v

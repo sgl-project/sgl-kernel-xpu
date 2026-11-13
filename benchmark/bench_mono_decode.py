@@ -12,22 +12,30 @@ Run (two cards):
 """
 
 import argparse
+import importlib.util
 import os
-import sys
 import tempfile
 
 import torch
 import torch.multiprocessing as mp
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tests"))
-from mono_decode_utils import (  # noqa: E402
-    attn_tensors,
-    exchange_fd,
-    gdn_caches,
-    gdn_tensors,
-    kv_caches,
-    rows,
-)
+
+def _fixtures():
+    """The tests' fixtures (random layers, mailboxes, the fd exchange), loaded
+    by path: no pytest and no change of sys.path."""
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "tests",
+        "mono_decode_fixtures.py",
+    )
+    spec = importlib.util.spec_from_file_location("mono_decode_fixtures", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+fx = _fixtures()
 
 
 def _worker(rank, path, conn, args):
@@ -41,7 +49,7 @@ def _worker(rank, path, conn, args):
     h = ops.mono_ipc_create(nl * ops.mono_mbox_bytes())
     info = ops.mono_ipc_export(h)
     conn.send(info)
-    ops.mono_ipc_open(h, conn.recv(), exchange_fd(rank, path, int(info[1])))
+    ops.mono_ipc_open(h, conn.recv(), fx.exchange_fd(rank, path, int(info[1])))
     own, peer = ops.mono_ipc_ptr(h, False), ops.mono_ipc_ptr(h, True)
     mb = ops.mono_mbox_bytes()
     slot = iter(range(nl))
@@ -50,11 +58,13 @@ def _worker(rank, path, conn, args):
     weights = {}  # kind -> NCP weight sets, shared by the cases
 
     def case(attn, nb, ctx):
-        gen = torch.Generator().manual_seed(rank + 1)
+        gen = torch.Generator().manual_seed(rank + 1)  # this rank's caches
         if attn not in weights:
+            # as in a TP2 model: the norms, router and shared gate are the same
+            # on both ranks, the other weights are the rank's shards
             weights[attn] = [
-                attn_tensors(gen, dev, dtype) if attn else gdn_tensors(gen, dev, dtype)
-                for _ in range(args.ncp)
+                fx.layer_tensors(attn, 1000 * (rank + 1) + c, dev, dtype, rep_seed=c)
+                for c in range(args.ncp)
             ]
         layers = []
         for c in range(args.ncp):
@@ -64,7 +74,7 @@ def _worker(rank, path, conn, args):
             if attn:
                 ps = 64
                 npr = (ctx + 1 + ps - 1) // ps + 1
-                kc, vc = kv_caches(gen, dev, (nb * npr + 1) * ps, dtype)
+                kc, vc = fx.kv_caches(gen, dev, (nb * npr + 1) * ps, dtype)
                 ops.mono_bind_caches(layer, [kc, vc], ps)
                 pt = (torch.arange(nb * npr, dtype=torch.int32) + 1).view(nb, npr)
                 loc = torch.tensor(
@@ -77,11 +87,13 @@ def _worker(rank, path, conn, args):
                 )
                 keep = (t, kc, vc)
             else:
-                conv, ssm = gdn_caches(gen, dev, nb + 1, dtype)
+                conv, ssm = fx.gdn_caches(gen, dev, nb + 1, dtype)
                 ops.mono_bind_caches(layer, [conv, ssm], 64)
                 m = (torch.arange(nb, dtype=torch.int32, device=dev) + 1, None, None)
                 keep = (t, conv, ssm)
-            hs, rs = rows(nb, gen, dev, dtype)
+            hs, rs = fx.rows(
+                nb, torch.Generator().manual_seed(5), dev, dtype
+            )  # the same on both ranks
             layers.append(
                 (layer, keep, m, hs, rs, torch.empty_like(hs), torch.empty_like(rs))
             )
@@ -103,6 +115,14 @@ def _worker(rank, path, conn, args):
             run(args.iters)
             e1.record()
             torch.xpu.synchronize()
+            # a failed kernel gives up its waits and the later calls are fast:
+            # never report such a round as a speedup
+            if int(ops.mono_health(rank)[0]) != 0 or not all(
+                bool(torch.isfinite(c[5].float()).all()) for c in layers
+            ):
+                raise RuntimeError(
+                    f"{'attn' if attn else 'gdn'} rows {nb}: a wait gave up or an output is not finite"
+                )
             times.append(e0.elapsed_time(e1) * 1000.0 / args.iters)
         times.sort()
         out.append(
@@ -141,18 +161,23 @@ def main():
     ]
     for pr in procs:
         pr.start()
-    i0, i1 = c0[0].recv(), c1[0].recv()
-    c0[0].send(i1)
-    c1[0].send(i0)
-    r = []
-    for c, pr in ((c0, procs[0]), (c1, procs[1])):
-        while not c[0].poll(1.0):
-            if not pr.is_alive():
-                raise SystemExit(f"worker {pr.name} exited with {pr.exitcode}")
-        r.append(c[0].recv())
-    r0, r1 = r
-    for pr in procs:
-        pr.join()
+    c0[
+        1
+    ].close()  # the parent's copies of the workers' ends: a worker that dies is an EOF
+    c1[1].close()
+    try:
+        i0, i1 = fx.recv_from(c0[0], procs[0]), fx.recv_from(c1[0], procs[1])
+        c0[0].send(i1)
+        c1[0].send(i0)
+        r0, r1 = (fx.recv_from(c[0], pr) for c, pr in ((c0, procs[0]), (c1, procs[1])))
+        r0, r1 = list(r0), list(r1)
+        for pr in procs:
+            pr.join(timeout=60)
+    finally:  # a failed worker must not leave the other one blocked
+        for pr in procs:
+            if pr.is_alive():
+                pr.terminate()
+            pr.join(timeout=10)
     print(
         f"mono decode layer, {args.dtype}, device us per call (median / min of {args.rounds} rounds), rank0 | rank1"
     )

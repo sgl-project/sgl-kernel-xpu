@@ -23,25 +23,11 @@ from mono_decode_utils import (
     gdn_caches,
     gdn_tensors,
     kv_caches,
+    layer_tensors,
+    recv_from,
     requires_two_cards,
     rows,
 )
-
-# tensors replicated on both ranks (norms, router, shared gate; GDN gated norm;
-# attention q / k norms); the rest are the rank's shards
-_REPLICATED = {0, 1, 2, 3}
-_REPLICATED_GDN = _REPLICATED | {20}
-_REPLICATED_ATTN = _REPLICATED | {16, 17}
-
-
-def layer_tensors(attn, shard_seed, dev, dtype):
-    def build(seed):
-        gen = torch.Generator().manual_seed(seed)
-        return attn_tensors(gen, dev, dtype) if attn else gdn_tensors(gen, dev, dtype)
-
-    rep, own = build(0), build(shard_seed)
-    keep = _REPLICATED_ATTN if attn else _REPLICATED_GDN
-    return [rep[i] if i in keep else own[i] for i in range(len(rep))]
 
 
 def _worker(rank, path, conn):
@@ -209,21 +195,34 @@ def _worker(rank, path, conn):
 
 def _run_pair():
     ctx = mp.get_context("spawn")
-    path = os.path.join(tempfile.mkdtemp(), "mono_tp2.sock")
-    c0, c1 = ctx.Pipe(), ctx.Pipe()
-    procs = [
-        ctx.Process(target=_worker, args=(0, path, c0[1])),
-        ctx.Process(target=_worker, args=(1, path, c1[1])),
-    ]
-    for p in procs:
-        p.start()
-    i0, i1 = c0[0].recv(), c1[0].recv()
-    c0[0].send(i1)
-    c1[0].send(i0)
-    r0, r1 = (torch.load(io.BytesIO(c[0].recv())) for c in (c0, c1))
-    for p in procs:
-        p.join(timeout=300)
-        assert p.exitcode == 0
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "mono_tp2.sock")
+        c0, c1 = ctx.Pipe(), ctx.Pipe()
+        procs = [
+            ctx.Process(target=_worker, args=(0, path, c0[1])),
+            ctx.Process(target=_worker, args=(1, path, c1[1])),
+        ]
+        try:
+            for p in procs:
+                p.start()
+            c0[1].close()  # the parent's copies: a worker that dies is an EOF
+            c1[1].close()
+            i0 = recv_from(c0[0], procs[0])
+            i1 = recv_from(c1[0], procs[1])
+            c0[0].send(i1)
+            c1[0].send(i0)
+            r0, r1 = (
+                torch.load(io.BytesIO(recv_from(c, p)))
+                for c, p in ((c0[0], procs[0]), (c1[0], procs[1]))
+            )
+            for p in procs:
+                p.join(timeout=300)
+                assert p.exitcode == 0
+        finally:  # a failed worker must not leave the other one blocked
+            for p in procs:
+                if p.is_alive():
+                    p.terminate()
+                p.join(timeout=10)
     return r0, r1
 
 
@@ -255,10 +254,13 @@ CASES = [
 def test_layer_ranks_bitwise_equal(pair, case):
     r0, r1 = pair
     for s in ("base", "swap"):
-        ho0, _ = r0[f"{case}_{s}"]
-        ho1, _ = r1[f"{case}_{s}"]
-        assert torch.isfinite(ho0.float()).all()
+        ho0, ro0 = r0[f"{case}_{s}"]
+        ho1, ro1 = r1[f"{case}_{s}"]
+        for x in (ho0, ro0, ho1, ro1):
+            assert torch.isfinite(x.float()).all()
+            assert x.float().abs().max() > 0  # all-zero outputs are not a result
         assert torch.equal(ho0, ho1)
+        assert torch.equal(ro0, ro1)  # the residual after the mixer's all-reduce
 
 
 @requires_two_cards

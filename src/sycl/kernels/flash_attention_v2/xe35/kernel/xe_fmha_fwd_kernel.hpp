@@ -537,14 +537,17 @@ class XeFMHAFwdKernel {
         } else {
           // "New" K/V may be absent (cache-only non-paged, e.g. varlen prefill):
           // its cumulative pointer is then null, so keep the base offset at 0.
+          // Per-token offsets use each tensor's own seq stride (K: mode 0, V: mode 1),
+          // so a row-strided K or V (e.g. a slice of a fused qkv output) is addressed
+          // correctly for every sequence, not only the first.
           if (kv_cumulative) {
-            offset_k = s.num_heads_kv * s.head_size_qk * kv_cumulative[idx_b];
-            offset_v = s.num_heads_kv * s.head_size_vo * kv_cumulative[idx_b];
+            offset_k = get<0>(p.dK) * kv_cumulative[idx_b];
+            offset_v = get<1>(p.dV) * kv_cumulative[idx_b];
           }
           if (s.seq_len_kv_cache.cumulative_length) {
             auto kv_cumulative_cache = s.seq_len_kv_cache.cumulative_length;
-            offset_k_cache = s.num_heads_kv * s.head_size_qk * kv_cumulative_cache[idx_b];
-            offset_v_cache = s.num_heads_kv * s.head_size_vo * kv_cumulative_cache[idx_b];
+            offset_k_cache = get<0>(p.dK_cache) * kv_cumulative_cache[idx_b];
+            offset_v_cache = get<1>(p.dV_cache) * kv_cumulative_cache[idx_b];
           }
         }
         offset_o = s.num_heads_q * s.head_size_vo * qo_cumulative[idx_b];
@@ -580,9 +583,9 @@ class XeFMHAFwdKernel {
       // whereas the host passes standard [total_seq, num_heads, dim] tensors and
       // supplies matching strides in p.dQ/dK/dV/dO. The two only coincide when
       // num_heads == 1; overriding them corrupts multi-head results. The var-len
-      // per-batch base offsets (offset_q = num_heads * head_size * cumulative)
-      // are already computed for the [total_seq, num_heads, dim] layout, so the
-      // host strides are the correct choice for both the new and cache tensors.
+      // per-batch base offsets are computed for the [total_seq, num_heads, dim]
+      // layout (Q/O packed, K/V from their own seq strides), so the host strides
+      // are the correct choice for both the new and cache tensors.
 
       Tensor Q = make_tensor(make_gmem_ptr(dcQ), make_layout(shape_Q, stride_q));
       Tensor K = make_tensor(make_gmem_ptr(dcK), make_layout(shape_K, stride_k));

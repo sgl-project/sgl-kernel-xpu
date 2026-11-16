@@ -29,6 +29,7 @@ __attribute__((visibility("default"))) void FmhaPrefillFp8Runner<@HEAD_DIM@, @EL
   // FP8 KV cache: Q is bf16 or fp16, K/V cache are fp8 (e4m3 or e5m2). The
   // mainloop dequantizes K/V with the per-tensor k_scale/v_scale (Fp8KV path).
   TORCH_CHECK(params.is_e4m3 || params.is_e5m2, "FmhaPrefillFp8Runner requires an fp8 KV cache");
+  TORCH_CHECK(params.alibi_slopes_ptr == nullptr, "ALiBi does not support fp8 KV cache");
   TORCH_CHECK(
       params.softmax_sink_ptr == nullptr, "fp8 KV cache prefill does not support sink logits");
   // No /*LSE=*/true instantiation is compiled for the fp8 KV path (it would

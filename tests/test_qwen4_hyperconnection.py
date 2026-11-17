@@ -200,7 +200,7 @@ def test_empty():
 def test_rejects_bad_inputs():
     hc, hidden = 4, 64
     residual, block, injection = make(2, hc * hidden), make(2, hidden), make(2, hc)
-    with pytest.raises(RuntimeError, match="bfloat16"):
+    with pytest.raises(RuntimeError, match="BFloat16"):
         sgl_kernel.hc_combine(residual.half(), block.half(), None, hc)
     with pytest.raises(RuntimeError, match="contiguous"):
         sgl_kernel.hc_combine(make(hc * hidden, 2).t(), block, None, hc)
@@ -360,9 +360,9 @@ def test_noncontiguous_rejected():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_other_dtypes_rejected(dtype):
     x = make(2, 256).to(dtype)
-    with pytest.raises(RuntimeError, match="bfloat16"):
+    with pytest.raises(RuntimeError, match="BFloat16"):
         sgl_kernel.hc_silu(x, 4)
-    with pytest.raises(RuntimeError, match="bfloat16"):
+    with pytest.raises(RuntimeError, match="BFloat16"):
         sgl_kernel.hc_gate_mix(x, x, 4)
 
 

@@ -513,15 +513,21 @@ SGL_KERNEL_EXPORT void hc_pre_big_fuse(
     std::optional<double> norm_eps) {
   CHECK_INPUT(3, at::kFloat, gemm_out_mul);
   CHECK_INPUT(2, at::kFloat, gemm_out_sqrsum);
-  CHECK_INPUT(1, at::kFloat, hc_scale);
-  CHECK_INPUT(1, at::kFloat, hc_base);
+  CHECK_INPUT(hc_scale);
+  CHECK_DTYPE(at::kFloat, hc_scale);
+  CHECK_INPUT(hc_base);
+  CHECK_DTYPE(at::kFloat, hc_base);
   CHECK_INPUT(3, at::kBFloat16, residual_flat);
-  CHECK_INPUT(2, at::kFloat, post_mix);
-  CHECK_INPUT(2, at::kFloat, comb_mix);
-  CHECK_INPUT(2, at::kBFloat16, layer_input);
+  CHECK_INPUT(post_mix);
+  CHECK_DTYPE(at::kFloat, post_mix);
+  CHECK_INPUT(comb_mix);
+  CHECK_DTYPE(at::kFloat, comb_mix);
+  CHECK_INPUT(layer_input);
+  CHECK_DTYPE(at::kBFloat16, layer_input);
 
   if (norm_weight.has_value()) {
-    CHECK_INPUT(1, at::kBFloat16, norm_weight.value());
+    CHECK_INPUT(norm_weight.value());
+    CHECK_DTYPE(at::kBFloat16, norm_weight.value());
   }
 
   constexpr int HC = 4;
@@ -541,15 +547,15 @@ SGL_KERNEL_EXPORT void hc_pre_big_fuse(
 
   CHECK_SHAPE(gemm_out_mul, n_splits, T, HC3);
   CHECK_SHAPE(gemm_out_sqrsum, n_splits, T);
-  CHECK_SHAPE(hc_scale, 3);
-  CHECK_SHAPE(hc_base, HC3);
   CHECK_SHAPE(residual_flat, T, HC, hidden_size);
-  CHECK_SHAPE(post_mix, T, HC);
-  CHECK_SHAPE(comb_mix, T, HC2);
-  CHECK_SHAPE(layer_input, T, hidden_size);
+  TORCH_CHECK(hc_scale.numel() == 3, "hc_scale must have 3 elements");
+  TORCH_CHECK(hc_base.numel() == HC3, "hc_base must have ", HC3, " elements");
+  TORCH_CHECK(post_mix.numel() == T * HC, "post_mix size mismatch");
+  TORCH_CHECK(comb_mix.numel() == T * HC2, "comb_mix size mismatch");
+  TORCH_CHECK(layer_input.numel() == T * hidden_size, "layer_input size mismatch");
 
   if (norm_weight.has_value()) {
-    CHECK_SHAPE(norm_weight.value(), hidden_size);
+    TORCH_CHECK(norm_weight.value().numel() == hidden_size, "norm_weight size must match hidden_size");
   }
 
   auto q = dpcppGetCurrentQueue();

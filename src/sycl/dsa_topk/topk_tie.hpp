@@ -2,9 +2,6 @@
 #pragma once
 
 // handle_tie family: exact radix select over the threshold bin's ties.
-// Direct port of topk_impl.cuh (handle_tie, radix_tie_select,
-// refine_find_threshold, select_smallest_indices). The deterministic-mode
-// branches compile out under DSA_TOPK_MODE=0/1.
 
 #include <cstdint>
 #include <sycl/sycl.hpp>
@@ -12,7 +9,7 @@
 #include "topk_config.hpp"
 #include "topk_warp.hpp"
 
-namespace vllm {
+namespace sgl_kernel {
 namespace dsa_topk {
 
 struct TieOps : TopKConfig {
@@ -334,4 +331,4 @@ struct TieOps : TopKConfig {
 };
 
 }  // namespace dsa_topk
-}  // namespace vllm
+}  // namespace sgl_kernel

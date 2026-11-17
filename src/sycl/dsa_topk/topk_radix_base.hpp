@@ -11,10 +11,10 @@
 #include "topk_tie.hpp"
 #include "topk_warp.hpp"
 
-namespace vllm {
+namespace sgl_kernel {
 namespace dsa_topk {
 
-// Minimal AlignedVector<float,4> equivalent (vectorized load of the vi-th vec).
+// Four-element input vector supporting aligned and scalar loads.
 struct Vec4 {
   sycl::vec<float, 4> v;
   inline void load(const float* ptr, int64_t vi) {
@@ -40,8 +40,7 @@ struct Vec4 {
     for (int j = 0; j < 4; ++j)
       v[j] = static_cast<uint32_t>(j) < n ? p[j] : pad;
   }
-  // Widening load from bf16: read 4 bf16, widen to fp32. Used by the sparse
-  // (cand) path so it reuses the register-resident fp32 histogram/tie pipeline.
+  // Read four bf16 values and widen them to fp32.
   inline void load(const sycl::ext::oneapi::bfloat16* ptr, int64_t vi) {
     const uint16_t* p = reinterpret_cast<const uint16_t*>(ptr) + vi * 4;
 #pragma unroll
@@ -93,8 +92,7 @@ struct TopKRadixBase : TieOps {
     };
   };
 
-  // for_each_input: single-block vectorized scan, fn(value, index). N==1 path
-  // only (cluster scan not ported in stage 1).
+  // Scan one row with a work-group, invoking fn(value, index).
   template <typename F>
   static void for_each_input(const sycl::nd_item<1>& item, const float* in, uint32_t seq_len, F&& fn) {
     const uint32_t tx = item.get_local_linear_id();
@@ -244,4 +242,4 @@ struct TopKRadixBase : TieOps {
 };
 
 }  // namespace dsa_topk
-}  // namespace vllm
+}  // namespace sgl_kernel

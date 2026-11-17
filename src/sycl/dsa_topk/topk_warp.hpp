@@ -1,18 +1,17 @@
 // Adapted from vllm-xpu-kernels csrc/dsa_topk (5bc6a53a).
 #pragma once
 
-// SYCL equivalents of the CUDA warp/subgroup primitives used by the DSA top-k
-// port. One logical "warp" is a 32-wide sub_group.
+// SYCL subgroup primitives for DSA top-k. A logical warp is a 32-wide sub_group.
 
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
-namespace vllm {
+namespace sgl_kernel {
 namespace dsa_topk {
 
 inline constexpr uint32_t kWarpSize = 32;
 
-// atomicAdd/Sub/Or on shared local memory (work_group scope, local space).
+// Relaxed work-group atomics on shared local memory.
 using SlmAtomic = sycl::atomic_ref<
     uint32_t,
     sycl::memory_order::relaxed,
@@ -29,29 +28,25 @@ inline uint32_t slm_atomic_or(uint32_t& addr, uint32_t v) {
   return SlmAtomic(addr).fetch_or(v);
 }
 
-// __shfl_sync(0xFFFFFFFF, value, src): broadcast lane `src` to the whole warp.
+// Broadcast lane `src` to the whole subgroup.
 template <typename T>
 inline T warp_broadcast(const sycl::sub_group& sg, T value, uint32_t src = 0) {
   return sycl::select_from_group(sg, value, src);
 }
 
-// warp::inclusive_sum(val, lane): inclusive prefix sum within the sub_group.
+// Inclusive prefix sum within the subgroup.
 template <typename T>
 inline T warp_inclusive_sum(const sycl::sub_group& sg, T val) {
   return sycl::inclusive_scan_over_group(sg, val, sycl::plus<T>());
 }
 
-// warp::reduce_sum(val): sum reduction across the sub_group (every lane gets
-// it).
+// Sum reduction across the subgroup; every lane gets the result.
 template <typename T>
 inline T warp_reduce_sum(const sycl::sub_group& sg, T val) {
   return sycl::reduce_over_group(sg, val, sycl::plus<T>());
 }
 
-// warp_sum_bool(pred): count of lanes (in `mask`) whose predicate is true.
-// The CUDA default mask is the whole warp; callers that pass a partial mask
-// want the count among the first `active` lanes, which we emulate with the lane
-// id.
+// Count true predicates across all lanes in the subgroup.
 inline uint32_t warp_sum_bool(const sycl::sub_group& sg, bool pred) {
   return sycl::reduce_over_group(sg, static_cast<uint32_t>(pred ? 1u : 0u), sycl::plus<uint32_t>());
 }
@@ -63,13 +58,8 @@ inline uint32_t warp_sum_bool_masked(const sycl::sub_group& sg, bool pred, uint3
   return sycl::reduce_over_group(sg, v, sycl::plus<uint32_t>());
 }
 
-// Subgroup-aggregated atomic increment. Each lane with `pred` set claims one
-// slot in `counter`; returns this lane's unique slot index (base + rank) or
-// UINT32_MAX if !pred. Collapses up to kWarpSize fetch_add into ONE per
-// subgroup, cutting SLM-atomic contention in the collect/tie phases where every
-// hit element otherwise serializes on a single counter. The slot ordering is
-// per-subgroup-contiguous; callers must not depend on a global scan order (the
-// DSA top-k above/tie buffers do not).
+// Each matching lane claims one slot; other lanes return UINT32_MAX.
+// One atomic per subgroup reduces contention; slot order is subgroup-local.
 inline uint32_t slm_atomic_add_agg(const sycl::sub_group& sg, uint32_t& counter, bool pred) {
   const uint32_t inc = pred ? 1u : 0u;
   const uint32_t rank = sycl::exclusive_scan_over_group(sg, inc, sycl::plus<uint32_t>());
@@ -80,12 +70,11 @@ inline uint32_t slm_atomic_add_agg(const sycl::sub_group& sg, uint32_t& counter,
   return pred ? base + rank : 0xFFFFFFFFu;
 }
 
-// Order-preserving float -> uint32 key (larger float -> larger key), matching
-// topk_impl.cuh::extract_exact_bin.
+// Order-preserving float -> uint32 key (larger float -> larger key).
 inline uint32_t extract_exact_bin(float x) {
   const uint32_t bits = sycl::bit_cast<uint32_t>(x);
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
 }  // namespace dsa_topk
-}  // namespace vllm
+}  // namespace sgl_kernel

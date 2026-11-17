@@ -2,7 +2,7 @@
 #pragma once
 
 // TopKStreaming: rows too long for the register path -- two vectorized passes
-// over global memory. Direct port of topk_impl.cuh's TopKStreaming::forward.
+// over global memory.
 
 #include <cstdint>
 #include <sycl/sycl.hpp>
@@ -11,7 +11,7 @@
 #include "topk_radix_base.hpp"
 #include "topk_warp.hpp"
 
-namespace vllm {
+namespace sgl_kernel {
 namespace dsa_topk {
 
 struct TopKStreaming : TopKRadixBase<12> {
@@ -68,4 +68,4 @@ struct TopKStreaming : TopKRadixBase<12> {
 };
 
 }  // namespace dsa_topk
-}  // namespace vllm
+}  // namespace sgl_kernel

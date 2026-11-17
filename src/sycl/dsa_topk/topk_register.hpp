@@ -2,7 +2,7 @@
 #pragma once
 
 // TopKRegister: register-resident top-k. Scores stay in registers across both
-// passes (read once). Direct port of topk_impl.cuh's TopKRegister::forward.
+// passes (read once).
 
 #include <cstdint>
 #include <sycl/sycl.hpp>
@@ -11,7 +11,7 @@
 #include "topk_radix_base.hpp"
 #include "topk_warp.hpp"
 
-namespace vllm {
+namespace sgl_kernel {
 namespace dsa_topk {
 
 inline uint32_t div_ceil_u(uint32_t a, uint32_t b) {
@@ -23,8 +23,7 @@ struct TopKRegister : TopKRadixBase<12> {
   static constexpr uint32_t kLocalVecs = kLocalVecs_;
   static constexpr uint32_t kMaxSeqLen = kBlockSize * kVecSize * kLocalVecs;
 
-  // Input scalar type InT (float, or bfloat16 for the sparse path which widens
-  // on load). `in_ptr` overrides problem.in (whose type is fixed to float).
+  // Input may be float or bf16, which widens on load. `in` overrides problem.in.
   template <typename InT>
   static void forward_in(const sycl::nd_item<1>& item, const TopKProblem& problem, const InT* in, void* _smem) {
     auto group = item.get_group();
@@ -114,4 +113,4 @@ struct TopKRegister : TopKRadixBase<12> {
 };
 
 }  // namespace dsa_topk
-}  // namespace vllm
+}  // namespace sgl_kernel

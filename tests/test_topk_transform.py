@@ -327,6 +327,262 @@ def test_fast_topk_v2_infinite_scores(length):
         )
 
 
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize(
+    "batch,width",
+    [
+        (2047, 6144),
+        (2048, 6144),
+        (2049, 6144),
+        (2048, 6145),
+        (4096, 6145),
+        (4095, 8192),
+        (4096, 4096),
+        (4096, 4097),
+        (4097, 8192),
+        (4096, 10240),
+        (4096, 10241),
+    ],
+)
+@pytest.mark.parametrize("has_row_starts", [False, True])
+@torch.inference_mode()
+def test_fast_topk_v2_medium_windows(k, batch, width, has_row_starts):
+    generator = torch.Generator().manual_seed(19)
+    starts = torch.arange(batch, dtype=torch.int32) % 8 if has_row_starts else None
+    lengths = torch.linspace(k + 1, width - 7, batch).int()
+    lengths[:4] = torch.tensor([0, k - 1, k, k + 1])
+    score = torch.randn(batch, width, generator=generator)
+    result = fast_topk_v2(
+        score.to("xpu"),
+        lengths.to("xpu"),
+        k,
+        row_starts=starts.to("xpu") if starts is not None else None,
+    ).cpu()
+
+    rows = list(range(4)) + torch.linspace(4, batch - 1, 12).long().tolist()
+    for row in rows:
+        n = int(lengths[row])
+        start = int(starts[row]) if starts is not None else 0
+        indices = result[row, : min(n, k)].long()
+        assert indices.unique().numel() == min(n, k)
+        assert ((indices >= 0) & (indices < n)).all()
+        values = score[row, start : start + n]
+        torch.testing.assert_close(
+            values[indices].sort().values,
+            values.topk(min(n, k)).values.sort().values,
+            rtol=0,
+            atol=0,
+        )
+        if n <= k:
+            torch.testing.assert_close(result[row, :n], torch.arange(n).int())
+            assert (result[row, n:] == -1).all()
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        "candidates128",
+        "candidates129",
+        "candidates256",
+        "candidates257",
+        "one_bin",
+        "negative_bin",
+        "equal",
+        "infinite",
+        "tiny",
+    ],
+)
+@torch.inference_mode()
+def test_fast_topk_v2_medium_fallback(k, distribution):
+    generator = torch.Generator().manual_seed(23)
+    batch, width = 4096, 8192
+    score = 1.0 + torch.rand(batch, width + 3, generator=generator) * 0.001
+    if distribution.startswith("candidates"):
+        candidates = int(distribution.removeprefix("candidates"))
+        score.fill_(-2.0)
+        score[:, 3 : k + 2] = 2.0
+        score[:, k + 2 : k + 2 + candidates] = 1.0 + torch.arange(candidates) * 1e-6
+    elif distribution == "negative_bin":
+        score.neg_()
+    elif distribution == "equal":
+        score.zero_()
+    elif distribution == "infinite":
+        score.fill_(-float("inf"))
+        score[:, 3:103] = float("inf")
+        score[:, 103:1003] = 1e20
+    elif distribution == "tiny":
+        score = (score - 1.0005) * 1e-30
+    result = fast_topk_v2(
+        score.to("xpu"),
+        torch.full((batch,), width, dtype=torch.int32, device="xpu"),
+        k,
+        row_starts=torch.full((batch,), 3, dtype=torch.int32, device="xpu"),
+    ).cpu()
+    for row in torch.linspace(0, batch - 1, 16).long().tolist():
+        indices = result[row].long()
+        assert indices.unique().numel() == k
+        assert ((indices >= 0) & (indices < width)).all()
+        values = score[row, 3:]
+        torch.testing.assert_close(
+            values[indices].sort().values,
+            values.topk(k).values.sort().values,
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize(
+    "batch,width",
+    [
+        (255, 2048),
+        (256, 2048),
+        (257, 2048),
+        (256, 2049),
+        (512, 2049),
+        (511, 4096),
+        (512, 4096),
+        (513, 4096),
+        (4095, 4096),
+        (4096, 513),
+        (4096, 2048),
+        (4096, 2049),
+        (4097, 3001),
+        (4096, 4095),
+        (4096, 4096),
+    ],
+)
+@pytest.mark.parametrize("has_row_starts", [False, True])
+@torch.inference_mode()
+def test_fast_topk_v2_narrow_windows(k, batch, width, has_row_starts):
+    generator = torch.Generator().manual_seed(29)
+    starts = torch.arange(batch, dtype=torch.int32) % 4 if has_row_starts else None
+    max_lengths = (
+        width - starts
+        if starts is not None
+        else torch.full((batch,), width, dtype=torch.int32)
+    )
+    lengths = torch.minimum(torch.linspace(0, width, batch).int(), max_lengths)
+    lengths[:4] = torch.minimum(torch.tensor([0, k - 1, k, k + 1]), max_lengths[:4])
+    lengths[-4:] = max_lengths[-4:]
+    score = torch.randn(batch, width, generator=generator)
+    result = fast_topk_v2(
+        score.to("xpu"),
+        lengths.to("xpu"),
+        k,
+        row_starts=starts.to("xpu") if starts is not None else None,
+    ).cpu()
+
+    rows = list(range(4)) + torch.linspace(4, batch - 1, 12).long().tolist()
+    for row in rows:
+        n = int(lengths[row])
+        start = int(starts[row]) if starts is not None else 0
+        indices = result[row, : min(n, k)].long()
+        assert indices.unique().numel() == min(n, k)
+        assert ((indices >= 0) & (indices < n)).all()
+        values = score[row, start : start + n]
+        torch.testing.assert_close(
+            values[indices].sort().values,
+            values.topk(min(n, k)).values.sort().values,
+            rtol=0,
+            atol=0,
+        )
+        if n <= k:
+            torch.testing.assert_close(result[row, :n], torch.arange(n).int())
+            assert (result[row, n:] == -1).all()
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize(
+    "distribution",
+    [
+        "candidates128",
+        "candidates129",
+        "refined512",
+        "refined513",
+        "one_bin",
+        "negative_bin",
+        "equal",
+        "infinite",
+        "huge",
+        "tiny",
+    ],
+)
+@torch.inference_mode()
+def test_fast_topk_v2_narrow_fallback(k, distribution):
+    generator = torch.Generator().manual_seed(31)
+    batch, width = 4096, 4096
+    starts = torch.arange(batch, dtype=torch.int32) % 4
+    lengths = width - starts - torch.arange(batch, dtype=torch.int32) % 8
+    score = 1.0 + torch.rand(batch, width, generator=generator) * 0.001
+    if distribution.startswith(("candidates", "refined")):
+        count = int(distribution.removeprefix("candidates").removeprefix("refined"))
+        score.fill_(-2.0)
+        for start in range(4):
+            score[start::4, start : start + k - 1] = 2.0
+            values = (
+                1.0 + torch.arange(count) * 1e-6
+                if distribution.startswith("candidates")
+                else 1.0
+            )
+            score[start::4, start + k - 1 : start + k - 1 + count] = values
+    elif distribution == "negative_bin":
+        score.neg_()
+    elif distribution == "equal":
+        score.zero_()
+    elif distribution == "infinite":
+        score.fill_(-float("inf"))
+        score[:, 4:104] = float("inf")
+        score[:, 104:1004] = 1e20
+    elif distribution == "huge":
+        score.mul_(1e20)
+    elif distribution == "tiny":
+        score = (score - 1.0005) * 1e-30
+    result = fast_topk_v2(
+        score.to("xpu"), lengths.to("xpu"), k, row_starts=starts.to("xpu")
+    ).cpu()
+    for row in range(16):
+        n, start = int(lengths[row]), int(starts[row])
+        indices = result[row].long()
+        assert indices.unique().numel() == k
+        assert ((indices >= 0) & (indices < n)).all()
+        values = score[row, start : start + n]
+        torch.testing.assert_close(
+            values[indices].sort().values,
+            values.topk(k).values.sort().values,
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize("width", [4096, 4097])
+@torch.inference_mode()
+def test_fast_topk_v2_prefill_graph(width):
+    score = torch.randn(4096, width, device="xpu")
+    score[::2] = 1.0 + score[::2] * 0.0001
+    lengths = torch.full((4096,), width, dtype=torch.int32, device="xpu")
+    for _ in range(3):
+        fast_topk_v2(score, lengths, 512)
+    torch.xpu.synchronize()
+    graph = torch.xpu.XPUGraph()
+    with torch.xpu.graph(graph):
+        output = fast_topk_v2(score, lengths, 512)
+    score.neg_()
+    graph.replay()
+    indices = output[:4].cpu().long()
+    values = score[:4].cpu()
+    assert ((indices >= 0) & (indices < width)).all()
+    ordered = indices.sort().values
+    assert (ordered[:, 1:] > ordered[:, :-1]).all()
+    torch.testing.assert_close(
+        values.gather(1, indices).sort().values,
+        values.topk(512).values.sort().values,
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_fast_topk_v2_rejects_unsupported_k() -> None:
     score, lengths, _ = _setup_fast_topk_v2(1, 1024, False)
     with pytest.raises(RuntimeError, match="only supports topk=512 or 2048"):

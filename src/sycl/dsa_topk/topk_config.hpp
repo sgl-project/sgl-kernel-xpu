@@ -2,8 +2,6 @@
 #pragma once
 
 // DSA top-k configuration, key extraction and coarse-bin boundaries.
-// Direct port of topk_impl.cuh (TopKConfig, extract_coarse_bin,
-// coarse_bin_bounds, TieValue, TopKProblem).
 
 #include <cstdint>
 #include <limits>
@@ -11,11 +9,11 @@
 
 #include "topk_warp.hpp"
 
-namespace vllm {
+namespace sgl_kernel {
 namespace dsa_topk {
 
 // ---------------------------------------------------------------------------
-// Exactness contract (SGL_TOPK_MODE): FAST=0, EXACT=1, DETERMINISTIC=2.
+// Exactness modes: FAST=0, EXACT=1, DETERMINISTIC=2.
 // Chosen at compile time by the DSA_TOPK_MODE macro.
 // ---------------------------------------------------------------------------
 #ifndef DSA_TOPK_MODE
@@ -51,7 +49,7 @@ inline constexpr float infinity_value() {
   return std::numeric_limits<float>::infinity();
 }
 
-// fp32 -> coarse kBits bin via the ordered fp16 key (topk_impl.cuh).
+// fp32 -> coarse kBits bin via the ordered fp16 key.
 template <uint32_t kBits>
 inline uint32_t extract_coarse_bin(float x) {
   static_assert(0 < kBits && kBits < 15);
@@ -61,7 +59,7 @@ inline uint32_t extract_coarse_bin(float x) {
   return (bits ^ (sign | 0x80000000u)) >> (32 - kBits);
 }
 
-// ordered16 key (one half) -> fp32. Mirrors topk_impl.cuh's to_fp32, scalar.
+// Convert an ordered 16-bit half-precision key to fp32.
 inline float ordered16_to_fp32(uint32_t k16 /* low 16 bits used */) {
   const uint16_t bits = static_cast<uint16_t>(k16 ^ 0x8000u ^ (((~k16 >> 15) & 0x1u) * 0x7FFFu));
   const sycl::half h = sycl::bit_cast<sycl::half>(bits);
@@ -69,7 +67,7 @@ inline float ordered16_to_fp32(uint32_t k16 /* low 16 bits used */) {
 }
 
 // fp32 bounds {lo, hi} of coarse bin `bin`: "above" iff v >= hi, "tie" iff
-// v >= lo and not above. Port of coarse_bin_bounds (scalar half conversions).
+// v >= lo and not above.
 template <uint32_t kBits>
 inline sycl::float2 coarse_bin_bounds(uint32_t bin) {
   constexpr uint32_t kShift = 16 - kBits;
@@ -109,7 +107,7 @@ struct alignas(8) TieValue {
 
 struct TopKProblem {
   const float* in;
-  int32_t* out;  // page_indices [topk]
+  int32_t* out;  // selected indices [topk]
   uint32_t topk;
   uint32_t seq_len;
   int32_t bias = 0;
@@ -121,9 +119,8 @@ struct TopKProblem {
 };
 
 // ---------------------------------------------------------------------------
-// TopKConfig: block/warp/tie sizing. kBlockSize=1024 so
-// kNumWarps==kWarpSize==32 (PVC max work-group = 1024, sub_group = 32), keeping
-// handle_tie's static assumption intact.
+// One 1024-thread work-group has 32 subgroups of 32 lanes.
+// Tie handling requires the subgroup count to equal the subgroup width.
 // ---------------------------------------------------------------------------
 struct TopKConfig {
   static constexpr uint32_t kMaxTopK = 2048;
@@ -154,4 +151,4 @@ struct TopKConfig {
 };
 
 }  // namespace dsa_topk
-}  // namespace vllm
+}  // namespace sgl_kernel

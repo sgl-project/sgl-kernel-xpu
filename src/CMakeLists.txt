@@ -252,3 +252,28 @@ set(ATen_XPU_SYCL_XE20 ${ATen_XPU_SYCL_XE20} PARENT_SCOPE)
 set(ATen_XPU_SYCL_XE35 ${ATen_XPU_SYCL_XE35} PARENT_SCOPE)
 
 include(BuildOnLinux.cmake)
+
+# The single-dispatch diffusion CUTE target needs the checked dense-attention
+# overlay for the repository's shared SYCL-TLA pin. Keep it local to this
+# target; the other attention operators continue to use the unmodified pin.
+if(TARGET sgl-ops-sycl-DiffusionAttentionXe20)
+    set(_diffusion_tla_source ${repo-cutlass-sycl_SOURCE_DIR})
+    set(_diffusion_overlay ${CMAKE_BINARY_DIR}/diffusion_tla_overlay)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        ${PROJECT_SOURCE_DIR}/tools/prepare_diffusion_tla.py
+        ${PROJECT_SOURCE_DIR}/tools/diffusion_mainloop.inc)
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE}
+                ${PROJECT_SOURCE_DIR}/tools/prepare_diffusion_tla.py
+                ${_diffusion_tla_source} ${_diffusion_overlay}
+        RESULT_VARIABLE _diffusion_overlay_result)
+    if(NOT _diffusion_overlay_result EQUAL 0)
+        message(FATAL_ERROR "Cannot prepare the SYCL-TLA diffusion attention overlay")
+    endif()
+    target_include_directories(sgl-ops-sycl-DiffusionAttentionXe20 BEFORE PRIVATE
+        ${_diffusion_overlay}
+        ${_diffusion_tla_source}/include
+        ${_diffusion_tla_source}/tools/util/include
+        ${_diffusion_tla_source}/examples/common
+        ${_diffusion_tla_source}/applications)
+endif()

@@ -279,7 +279,7 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit(
   const int num_groups = input.numel() / group_size;
 
   CHECK_EQ(input.numel() % group_size, 0);
-  CHECK_EQ(output_s.dim(), 2);
+  CHECK_DIM(2, output_s);
 
   auto queue = dpcppGetCurrentQueue();
 
@@ -307,16 +307,8 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_8bit(
   const int scale_stride = output_s.stride(1);
 
   // Check for supported dtypes to avoid silent dispatch failure
-  TORCH_CHECK(
-      input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16 ||
-          input.scalar_type() == at::ScalarType::Float,
-      "sgl_per_token_group_quant_8bit: input dtype must be Float16, BFloat16, or Float32, got ",
-      input.scalar_type());
-
-  TORCH_CHECK(
-      dst_type == at::ScalarType::Char || dst_type == at::ScalarType::Float8_e4m3fn,
-      "sgl_per_token_group_quant_8bit: output_q dtype must be Int8 or Float8_e4m3fn, got ",
-      dst_type);
+  CHECK_DTYPES(input, at::ScalarType::Half, at::ScalarType::BFloat16, at::ScalarType::Float);
+  CHECK_DTYPES(output_q, at::ScalarType::Char, at::ScalarType::Float8_e4m3fn);
 
   sycl::range<1> global_range(num_blocks * num_threads);
   sycl::range<1> local_range(num_threads);

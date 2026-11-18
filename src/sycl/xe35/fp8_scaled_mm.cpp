@@ -42,6 +42,7 @@
 
 #include <cute/tensor.hpp>
 
+#include "../Utils.h"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/collective/xe_epilogue.hpp"
 #include "cutlass/epilogue/fusion/xe_callbacks.hpp"
@@ -52,14 +53,6 @@
 #include "cutlass/util/device_memory.h"
 #include "cutlass/util/packed_stride.hpp"
 #include "sgl_kernel_export.h"
-
-#define CUTLASS_CHECK(status)              \
-  {                                        \
-    auto s_ = (status);                    \
-    if (s_ != cutlass::Status::kSuccess) { \
-      return s_;                           \
-    }                                      \
-  }
 
 using namespace cute;
 
@@ -277,11 +270,13 @@ struct Fp8ScaledGemmRunner {
     size_t workspace_size = Gemm::get_workspace_size(arguments);
     cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
 
-    CUTLASS_CHECK(gemm_op.can_implement(arguments));
-    CUTLASS_CHECK(gemm_op.initialize(arguments, workspace.get()));
-    CUTLASS_CHECK(gemm_op.run(queue));
+    auto status = gemm_op.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) return status;
 
-    return cutlass::Status::kSuccess;
+    status = gemm_op.initialize(arguments, workspace.get());
+    if (status != cutlass::Status::kSuccess) return status;
+
+    return gemm_op.run(queue);
   }
 };
 
@@ -367,9 +362,8 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_scaled_mm_xpu(
       out_dtype == at::kFloat || out_dtype == at::kBFloat16 || out_dtype == at::kHalf,
       "out_dtype must be float, bfloat16, or float16");
 
-  auto is_aligned_16 = [](const at::Tensor& t) { return (reinterpret_cast<uintptr_t>(t.data_ptr()) % 16) == 0; };
-  TORCH_CHECK(is_aligned_16(mat_a), "mat_a must be 16-byte aligned");
-  TORCH_CHECK(is_aligned_16(mat_b), "mat_b must be 16-byte aligned");
+  CHECK_ALIGNMENT(16, mat_a);
+  CHECK_ALIGNMENT(16, mat_b);
 
   const int64_t M = mat_a.size(0);
   const int64_t N = mat_b.size(0);

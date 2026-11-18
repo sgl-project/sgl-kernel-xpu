@@ -470,8 +470,7 @@ SGL_KERNEL_EXPORT void biased_topk(
     double routed_scaling_factor,
     bool apply_routed_scaling_factor_on_output) {
   TORCH_CHECK(input.dim() == 2, "input must be 2D, got ", input.dim(), "D");
-  TORCH_CHECK(bias.dim() == 1, "bias must be 1D, got ", bias.dim(), "D");
-  TORCH_CHECK(input.size(1) == bias.size(0), "input.size(1) must match bias.size(0)");
+  CHECK_SHAPE(bias, input.size(1));
   TORCH_CHECK(
       input.scalar_type() == torch::kFloat32 || input.scalar_type() == torch::kFloat16 ||
           input.scalar_type() == torch::kBFloat16,
@@ -483,10 +482,8 @@ SGL_KERNEL_EXPORT void biased_topk(
   TORCH_CHECK(scoring_func == 0 || scoring_func == 1, "scoring_func must be 0 (sigmoid) or 1 (sqrtsoftplus)");
   TORCH_CHECK(output.scalar_type() == torch::kFloat32, "output must be float32");
   TORCH_CHECK(indices.scalar_type() == torch::kInt32, "indices must be int32");
-  TORCH_CHECK(output.dim() == 2, "output must be 2D, got ", output.dim(), "D");
-  TORCH_CHECK(indices.dim() == 2, "indices must be 2D, got ", indices.dim(), "D");
-  TORCH_CHECK(output.size(0) == input.size(0) && output.size(1) == topk, "output shape mismatch");
-  TORCH_CHECK(indices.size(0) == input.size(0) && indices.size(1) == topk, "indices shape mismatch");
+  CHECK_SHAPE(output, input.size(0), topk);
+  CHECK_SHAPE(indices, input.size(0), topk);
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();

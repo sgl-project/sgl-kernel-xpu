@@ -153,8 +153,8 @@ def test_short_conv_state_out_and_empty():
 
 STATE_ERRORS = {
     "state_len_17": "state length must be in",
-    "fp32_state": "state must be bfloat16 or float16",
-    "int32_indices": "state_indices must be int64",
+    "fp32_state": "state must have dtype",
+    "int32_indices": "state_indices must have dtype Long",
     "x_dtype": "x must have the same dtype as state",
     "x_shape": "x must have shape",
     "out_shape": "conv_input must have shape",
@@ -377,12 +377,12 @@ def test_verify_conv_empty():
 
 
 VERIFY_ERRORS = {
-    "fp16_x": "x must be a 2-D bfloat16 tensor",
-    "fp16_state": "state must be bfloat16 or float32",
+    "fp16_x": "x must have dtype BFloat16",
+    "fp16_state": "state must have dtype",
     "width_mismatch": "x must have shape",
     "width_33": "width must be in",
     "valid_dtype": "valid must be a bool tensor",
-    "residual_shape": "residual must be bfloat16 with shape",
+    "residual_shape": "residual and x must have the same shape",
     "intermediate_small": "intermediate must have shape",
     "intermediate_dtype": "intermediate must be bfloat16 or float32",
     "intermediate_dtype_no_state": "intermediate must be bfloat16 or float32",

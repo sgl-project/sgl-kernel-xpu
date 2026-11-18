@@ -49,6 +49,20 @@
 
 namespace {
 
+inline int nextPowerOf2(uint32_t a) {
+  if (a <= 1) return 1;
+  return 1 << (32 - __builtin_clz(a - 1));
+}
+
+inline int round_up_headdim(int head_size) {
+  if (head_size <= 64) return 64;
+  if (head_size <= 96) return 96;
+  if (head_size <= 128) return 128;
+  if (head_size <= 192) return 192;
+  if (head_size <= 256) return 256;
+  return 512;
+}
+
 const float*
 get_per_tensor_descale_ptr(const at::Tensor& descale, const at::Tensor& ref, const char* name, const char* context) {
   TORCH_CHECK(descale.scalar_type() == at::ScalarType::Float, name, " must be float32");

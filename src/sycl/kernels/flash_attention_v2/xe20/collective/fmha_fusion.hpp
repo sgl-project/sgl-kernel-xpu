@@ -61,7 +61,8 @@ template <class Shape, class Idx>
 CUTE_HOST_DEVICE constexpr auto apply_variable_length(Shape const& shape, Idx const& idx) {
   return transform_leaf(shape, [&](auto const& s) {
     if constexpr (is_variable_length_v<remove_cvref_t<decltype(s)>>) {
-      return s.seqused ? s.seqused[idx] : s.cumulative_length[idx + 1] - s.cumulative_length[idx];
+      int const len = s.cumulative_length[idx + 1] - s.cumulative_length[idx];
+      return s.seqused ? cute::min(s.seqused[idx], len) : len;
     } else {
       return s;
     }

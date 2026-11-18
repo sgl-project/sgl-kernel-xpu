@@ -1537,7 +1537,15 @@ void mha_fwd(
   // decode batches. The two complementary skip masks partition every query token
   // across the launches, so the shared buffers end up fully written with no
   // stitching or extra copies needed.
-  launch(prefill::mha_fwd, max_seqlen_q, is_prefill.logical_not(), std::nullopt, block_id_, std::nullopt, std::nullopt, std::nullopt);
+  launch(
+      prefill::mha_fwd,
+      max_seqlen_q,
+      is_prefill.logical_not(),
+      std::nullopt,
+      block_id_,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt);
 }
 
 }  // namespace chunkprefill
@@ -1716,7 +1724,8 @@ SGL_KERNEL_EXPORT std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     //
     // This condition is sufficient but not necessary: a non-uniform
     // all-prefill batch falls through to chunkprefill, which is still correct.
-    dispatch(prefill::mha_fwd, std::nullopt, std::nullopt, bidirectional_block_ids_, std::nullopt, seqused_q_, seqused_k_);
+    dispatch(
+        prefill::mha_fwd, std::nullopt, std::nullopt, bidirectional_block_ids_, std::nullopt, seqused_q_, seqused_k_);
   } else {
     // Non-uniform paged batches fall back to chunkprefill.
     dispatch(chunkprefill::mha_fwd, bidirectional_block_ids_);

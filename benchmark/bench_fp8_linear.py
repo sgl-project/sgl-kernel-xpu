@@ -12,14 +12,23 @@
 #
 # Shapes are the dense projections of Qwen3.6-35B-A3B at TP=2 and TP=4 and Llama-3.1-8B at TP=1,
 # at decode (small M) and prefill (large M) token counts.
+#
+# Each fp8_* row carries w8a8_rowwise as its reference when that provider runs, so
+# speedup > 1 means fp8_linear is faster than the W8A8 path.
 import argparse
+import sys
+from pathlib import Path
 
 import torch
 import triton
-from _bench import require_arch
+from _bench import BenchSpec, ProblemShape, format_tables, make_row, require_arch
 from sgl_kernel import fp8_linear, sgl_per_token_quant_fp8
 
-FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+# The FP8 weight quantization helpers live next to the tests.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
+from fp8_utils import quantize_fp8_block  # noqa: E402
+from fp8_utils import quantize_fp8_per_channel  # noqa: E402
+from fp8_utils import quantize_fp8_per_tensor  # noqa: E402
 
 # (N, K)
 WEIGHT_SHAPES = {
@@ -29,44 +38,36 @@ WEIGHT_SHAPES = {
 }
 M_VALUES = [1, 4, 16, 64, 256, 1024, 4096]
 PROVIDERS = ["fp8_tensor", "fp8_channel", "fp8_block", "bf16", "w8a8_rowwise"]
+REFERENCE = "w8a8_rowwise"
 
-
-def _quant_tensor(w):
-    scale = w.abs().max().float() / FP8_MAX
-    return (w.float() / scale).to(torch.float8_e4m3fn), scale.reshape(1)
-
-
-def _quant_block(w):
-    n, k = w.shape
-    blocks = w.float().view(n // 128, 128, k // 128, 128)
-    scale = blocks.abs().amax(dim=(1, 3)) / FP8_MAX
-    w_fp8 = (blocks / scale[:, None, :, None]).to(torch.float8_e4m3fn)
-    return w_fp8.view(n, k).contiguous(), scale.contiguous()
-
-
-def _quant_channel(w):
-    scale = w.abs().amax(dim=1, keepdim=True).float() / FP8_MAX
-    return (w.float() / scale).to(torch.float8_e4m3fn), scale
+SPEC = BenchSpec(
+    kernel="fp8_linear",
+    shape=ProblemShape(
+        ("m", "n", "k"),
+        description="y[m, n] = x[m, k] (bf16) @ w[n, k]^T; fp8_* = fp8_linear "
+        "with per-tensor / per-channel / 128x128 block scales",
+    ),
+)
 
 
 def make_fn(provider, m, n, k):
     x = torch.randn(m, k, dtype=torch.bfloat16, device="xpu")
     w = torch.randn(n, k, dtype=torch.bfloat16, device="xpu") * 0.02
     if provider == "fp8_tensor":
-        w_fp8, scale = _quant_tensor(w)
+        w_fp8, scale, _ = quantize_fp8_per_tensor(w)
         return lambda: fp8_linear(x, w_fp8, scale)
     if provider == "fp8_channel":
-        w_fp8, scale = _quant_channel(w)
-        return lambda: fp8_linear(x, w_fp8, scale.view(-1))
+        w_fp8, scale, _ = quantize_fp8_per_channel(w)
+        return lambda: fp8_linear(x, w_fp8, scale)
     if provider == "fp8_block":
-        w_fp8, scale = _quant_block(w)
+        w_fp8, scale, _ = quantize_fp8_block(w)
         return lambda: fp8_linear(x, w_fp8, scale)
     if provider == "bf16":
         return lambda: torch.matmul(x, w.t())
     if provider == "w8a8_rowwise":
-        w_fp8, w_scale = _quant_channel(w)
+        w_fp8, w_scale, _ = quantize_fp8_per_channel(w)
         w_fp8_t = w_fp8.t()
-        w_scale_t = w_scale.t().contiguous()
+        w_scale_t = w_scale.view(1, -1)
         x_q = torch.empty(m, k, dtype=torch.float8_e4m3fn, device="xpu")
         x_s = torch.empty(m, 1, dtype=torch.float32, device="xpu")
 
@@ -80,20 +81,46 @@ def make_fn(provider, m, n, k):
     raise ValueError(provider)
 
 
+def _time_us(fn):
+    for _ in range(5):
+        fn()
+    torch.xpu.synchronize()
+    return triton.testing.do_bench(fn, return_mode="median") * 1000
+
+
+def _bytes(provider, m, n, k):
+    # Activations and output in bf16; the weight in FP8 except for bf16.
+    weight = n * k * (2 if provider == "bf16" else 1)
+    return weight + 2 * m * k + 2 * m * n
+
+
 def run(models, providers):
     rows = []
     for model in models:
         for n, k in WEIGHT_SHAPES[model]:
             for m in M_VALUES:
-                row = {"model": model, "N": n, "K": k, "M": m}
+                times = {p: _time_us(make_fn(p, m, n, k)) for p in providers}
                 for provider in providers:
-                    fn = make_fn(provider, m, n, k)
-                    for _ in range(5):
-                        fn()
-                    torch.xpu.synchronize()
-                    ms = triton.testing.do_bench(fn, return_mode="median")
-                    row[provider] = ms * 1000
-                rows.append(row)
+                    has_ref = provider.startswith("fp8_") and REFERENCE in times
+                    rows.append(
+                        make_row(
+                            SPEC,
+                            dtype=(
+                                torch.bfloat16
+                                if provider == "bf16"
+                                else torch.float8_e4m3fn
+                            ),
+                            size=(m, n, k),
+                            time_us=times[provider],
+                            bandwidth_gbs=_bytes(provider, m, n, k)
+                            / times[provider]
+                            / 1e3,
+                            tflops=2 * m * n * k / times[provider] / 1e6,
+                            provider=provider,
+                            reference_provider=REFERENCE if has_ref else None,
+                            reference_time_us=times[REFERENCE] if has_ref else None,
+                        )
+                    )
                 torch.xpu.empty_cache()
     return rows
 
@@ -107,13 +134,9 @@ def main():
     parser.add_argument("--providers", nargs="+", default=PROVIDERS, choices=PROVIDERS)
     args = parser.parse_args()
 
-    rows = run(args.models, args.providers)
-    header = ["model", "N", "K", "M"] + [f"{p} (us)" for p in args.providers]
-    print(" | ".join(header))
-    for row in rows:
-        values = [row["model"], row["N"], row["K"], row["M"]]
-        values += [f"{row[p]:.1f}" for p in args.providers]
-        print(" | ".join(str(v) for v in values))
+    print()
+    print(format_tables(run(args.models, args.providers)))
+    print()
 
 
 if __name__ == "__main__":

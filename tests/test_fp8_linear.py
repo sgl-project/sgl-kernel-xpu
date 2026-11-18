@@ -3,10 +3,12 @@ from unittest import mock
 import pytest
 import sgl_kernel.gemm as gemm
 import torch
+from fp8_utils import (
+    quantize_fp8_block,
+    quantize_fp8_per_channel,
+    quantize_fp8_per_tensor,
+)
 from sgl_kernel import fp8_linear, fp8_linear_supported
-
-FP8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
-BLOCK = 128
 
 # Per-rank (N, K) of the dense projections of Qwen3.6-35B-A3B: full-attention
 # qkv / o_proj, linear-attention in_proj_qkvz / out_proj, shared-expert
@@ -18,39 +20,10 @@ SHAPES = SHAPES_TP2 + SHAPES_TP4
 M_VALUES = [1, 3, 16, 64, 128, 1000]
 
 
-def _quant_per_tensor(w: torch.Tensor):
-    scale = (w.abs().max().float() / FP8_E4M3_MAX).clamp(min=1e-12)
-    w_fp8 = (w.float() / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-    w_fp8 = w_fp8.to(torch.float8_e4m3fn)
-    return w_fp8, scale.reshape(1), w_fp8.float() * scale
-
-
-def _quant_block(w: torch.Tensor):
-    n, k = w.shape
-    n_blocks = (n + BLOCK - 1) // BLOCK
-    padded = torch.zeros(n_blocks * BLOCK, k, dtype=torch.float32, device=w.device)
-    padded[:n] = w.float()
-    blocks = padded.view(n_blocks, BLOCK, k // BLOCK, BLOCK)
-    scale = (blocks.abs().amax(dim=(1, 3)) / FP8_E4M3_MAX).clamp(min=1e-12)
-    expanded = scale[:, None, :, None]
-    w_fp8 = (blocks / expanded).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-    w_fp8 = w_fp8.to(torch.float8_e4m3fn)
-    w_dq = (w_fp8.float() * expanded).view(n_blocks * BLOCK, k)[:n]
-    w_fp8 = w_fp8.view(n_blocks * BLOCK, k)[:n].contiguous()
-    return w_fp8, scale.contiguous(), w_dq
-
-
-def _quant_per_channel(w: torch.Tensor):
-    scale = (w.abs().amax(dim=1).float() / FP8_E4M3_MAX).clamp(min=1e-12)
-    w_fp8 = (w.float() / scale[:, None]).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX)
-    w_fp8 = w_fp8.to(torch.float8_e4m3fn)
-    return w_fp8, scale, w_fp8.float() * scale[:, None]
-
-
 QUANT = {
-    "per_tensor": _quant_per_tensor,
-    "per_channel": _quant_per_channel,
-    "block": _quant_block,
+    "per_tensor": quantize_fp8_per_tensor,
+    "per_channel": quantize_fp8_per_channel,
+    "block": quantize_fp8_block,
 }
 
 

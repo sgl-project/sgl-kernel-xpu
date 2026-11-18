@@ -72,6 +72,7 @@ struct TopKRadixBase : TieOps {
   struct Smem {
     uint32_t count_eq;
     uint32_t count_gt;
+    uint32_t has_nan;
     float v_hi;
     float v_lo;
     uint32_t thr_count;

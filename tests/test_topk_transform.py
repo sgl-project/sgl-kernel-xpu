@@ -327,6 +327,25 @@ def test_fast_topk_v2_infinite_scores(length):
         )
 
 
+@pytest.mark.parametrize(
+    "length", [pytest.param(513, id="register"), pytest.param(16385, id="streaming")]
+)
+@torch.inference_mode()
+def test_fast_topk_v2_nan_scores(length):
+    score = torch.ones((1, length), dtype=torch.float32)
+    score[0, :20] = float("nan")
+    result = fast_topk_v2(
+        score.to("xpu"), torch.tensor([length], dtype=torch.int32, device="xpu"), 512
+    ).cpu()
+
+    indices = result[0].long()
+    assert indices.unique().numel() == 512
+    assert ((indices >= 0) & (indices < length)).all()
+    selected_scores = score[0, indices]
+    assert selected_scores.isnan().sum() == 20
+    assert (selected_scores == 1.0).sum() == 492
+
+
 @pytest.mark.parametrize("k", [512, 2048])
 @pytest.mark.parametrize(
     "batch,width",

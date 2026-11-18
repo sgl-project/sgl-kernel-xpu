@@ -34,6 +34,7 @@ struct TopKRegister : TopKRadixBase<12> {
     if (tx == 0) {
       smem->count_eq = 0;
       smem->count_gt = 0;
+      smem->has_nan = 0;
     }
     sycl::group_barrier(group);
 
@@ -59,8 +60,10 @@ struct TopKRegister : TopKRadixBase<12> {
       const uint32_t vi = tx + kBlockSize * i;
       if (vi >= num_full) break;
 #pragma unroll
-      for (uint32_t j = 0; j < kVecSize; ++j)
+      for (uint32_t j = 0; j < kVecSize; ++j) {
+        if (vi * kVecSize + j < problem.seq_len && sycl::isnan(local_vecs[i][j])) slm_atomic_or(smem->has_nan, 1);
         slm_atomic_add(smem->histogram[extract_coarse_bin<kHistBits>(local_vecs[i][j])], 1);
+      }
     }
     const uint32_t num_padding = kVecSize - tail_start + problem.input_start;
     if (tx == 0 && num_padding > 0) {
@@ -68,6 +71,10 @@ struct TopKRegister : TopKRadixBase<12> {
       slm_atomic_add(smem->histogram[0], num_padding);
     }
     sycl::group_barrier(group);
+    if (smem->has_nan) {
+      select_overflow(item, problem, smem);
+      return;
+    }
 
     // Phase 2: find the threshold bin.
     find_threshold(item, problem.topk, num_full * kVecSize, smem, [&](uint32_t threshold_bin) {

@@ -24,11 +24,13 @@ struct TopKStreaming : TopKRadixBase<12> {
     if (tx == 0) {
       smem->count_eq = 0;
       smem->count_gt = 0;
+      smem->has_nan = 0;
     }
     sycl::group_barrier(group);
 
     // Phase 1: load and build histogram.
     for_each_input(item, problem.in, problem.seq_len, [&](float val, uint32_t) {
+      if (sycl::isnan(val)) slm_atomic_or(smem->has_nan, 1);
       slm_atomic_add(smem->histogram[extract_coarse_bin<kHistBits>(val)], 1);
     });
     const uint32_t num_padding = problem.input_start;
@@ -37,6 +39,10 @@ struct TopKStreaming : TopKRadixBase<12> {
       slm_atomic_add(smem->histogram[0], num_padding);
     }
     sycl::group_barrier(group);
+    if (smem->has_nan) {
+      select_overflow(item, problem, smem);
+      return;
+    }
 
     // Phase 2: find the threshold bin.
     find_threshold(item, problem.topk, problem.seq_len, smem, [&](uint32_t threshold_bin) {

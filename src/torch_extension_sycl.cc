@@ -33,6 +33,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kXPU, &awq_dequantize);
 
+  m.def("h3_indexed_gate(Tensor(a!) out, Tensor x, Tensor gate, Tensor other, Tensor indices) -> ()");
+  m.impl("h3_indexed_gate", torch::kXPU, &at::native::xpu::h3_indexed_gate);
+
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kXPU, &silu_and_mul);
 

@@ -73,6 +73,7 @@ inline uint32_t slm_atomic_add_agg(const sycl::sub_group& sg, uint32_t& counter,
 // Order-preserving float -> uint32 key (larger float -> larger key).
 inline uint32_t extract_exact_bin(float x) {
   const uint32_t bits = sycl::bit_cast<uint32_t>(x);
+  if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0) return 0xFFFFFFFFu;
   return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 

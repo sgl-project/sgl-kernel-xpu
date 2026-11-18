@@ -16,7 +16,7 @@ constexpr int kRefineBuckets = 1536;
 
 struct Scratch {
   int indices[kFinalItems];
-  float values[kFinalItems];
+  uint32_t keys[kFinalItems];
   alignas(16) int bins[kBins * kCopies];
   int tmp[32];
   int vars[5];
@@ -97,7 +97,7 @@ inline bool reduce(const sycl::nd_item<3>& item, const float* input, int length,
     sg_accepted += sycl::popcount(accepted_mask[i]);
     if (live && bins[i] == threshold) {
       const int slot = atomic_add(candidate_cursor, 1) - accepted;
-      s.values[slot] = values[i];
+      s.keys[slot] = float_key(values[i]);
       s.indices[slot] = tid + i * kThreads;
     }
   }
@@ -116,11 +116,11 @@ inline bool reduce(const sycl::nd_item<3>& item, const float* input, int length,
   const int candidates = s.vars[1];
   const int remaining = topk - accepted;
   for (int i = sg_id; i < candidates; i += kThreads / kSubgroupSize) {
-    const float value = s.values[i];
+    const uint32_t value_key = s.keys[i];
     int rank = 0;
     for (int j = lane; j < candidates; j += kSubgroupSize) {
-      const float other = s.values[j];
-      if (value < other || (value == other && i < j)) ++rank;
+      const uint32_t other_key = s.keys[j];
+      if (value_key > other_key || (value_key == other_key && i < j)) ++rank;
     }
     rank = sycl::reduce_over_group(sg, rank, sycl::plus<int>());
     if (lane == 0 && rank < remaining) output[accepted + rank] = s.indices[i];
@@ -236,7 +236,7 @@ inline bool refine(
         s.output[atomic_add(s.bins + bucket, 1)] = index;
       } else if (bucket == threshold) {
         const int slot = atomic_add(s.vars + 3, 1);
-        s.values[slot] = x;
+        s.keys[slot] = float_key(x);
         s.indices[slot] = index;
       }
     }
@@ -246,11 +246,11 @@ inline bool refine(
   const int candidates = s.vars[3];
   const int final_base = s.vars[2];
   for (int i = tid; i < candidates; i += kThreads) {
-    const float value = s.values[i];
+    const uint32_t value_key = s.keys[i];
     int rank = 0;
     for (int j = 0; j < candidates; ++j) {
-      const float other = s.values[j];
-      if (value < other || (value == other && i < j)) ++rank;
+      const uint32_t other_key = s.keys[j];
+      if (value_key > other_key || (value_key == other_key && i < j)) ++rank;
     }
     if (rank < topk - final_base) s.output[final_base + rank] = s.indices[i];
   }

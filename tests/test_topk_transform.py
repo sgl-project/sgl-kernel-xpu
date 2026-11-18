@@ -330,10 +330,12 @@ def test_fast_topk_v2_infinite_scores(length):
 @pytest.mark.parametrize(
     "length", [pytest.param(513, id="register"), pytest.param(16385, id="streaming")]
 )
+@pytest.mark.parametrize("negative_nan", [False, True], ids=["positive", "negative"])
 @torch.inference_mode()
-def test_fast_topk_v2_nan_scores(length):
+def test_fast_topk_v2_nan_scores(length, negative_nan):
     score = torch.ones((1, length), dtype=torch.float32)
-    score[0, :20] = float("nan")
+    nan_bits = -0x00400000 if negative_nan else 0x7FC00000
+    score[0, :20] = torch.tensor([nan_bits], dtype=torch.int32).view(torch.float32)[0]
     result = fast_topk_v2(
         score.to("xpu"), torch.tensor([length], dtype=torch.int32, device="xpu"), 512
     ).cpu()
@@ -344,6 +346,34 @@ def test_fast_topk_v2_nan_scores(length):
     selected_scores = score[0, indices]
     assert selected_scores.isnan().sum() == 20
     assert (selected_scores == 1.0).sum() == 492
+
+
+@pytest.mark.parametrize(
+    "batch,width",
+    [pytest.param(512, 4096, id="narrow"), pytest.param(4096, 8192, id="medium")],
+)
+@pytest.mark.parametrize("nan_count", [20, 513], ids=["below-k", "above-k"])
+@pytest.mark.parametrize("negative_nan", [False, True], ids=["positive", "negative"])
+@torch.inference_mode()
+def test_fast_topk_v2_prefill_nan(batch, width, nan_count, negative_nan):
+    score = torch.ones((batch, width), dtype=torch.float32)
+    nan_bits = -0x00400000 if negative_nan else 0x7FC00000
+    score[0, :nan_count] = torch.tensor([nan_bits], dtype=torch.int32).view(
+        torch.float32
+    )[0]
+    result = fast_topk_v2(
+        score.to("xpu"),
+        torch.full((batch,), width, dtype=torch.int32, device="xpu"),
+        512,
+    ).cpu()
+
+    indices = result[0].long()
+    assert indices.unique().numel() == 512
+    assert ((indices >= 0) & (indices < width)).all()
+    selected_scores = score[0, indices]
+    selected_nans = min(nan_count, 512)
+    assert selected_scores.isnan().sum() == selected_nans
+    assert (selected_scores == 1.0).sum() == 512 - selected_nans
 
 
 @pytest.mark.parametrize("k", [512, 2048])

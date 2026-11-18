@@ -18,7 +18,7 @@ struct Scratch {
   alignas(16) int bins[kBins];
   int tmp[32];
   int indices[kMaxCandidates];
-  float values[kMaxCandidates];
+  uint32_t keys[kMaxCandidates];
   int vars[5];
 };
 
@@ -31,13 +31,16 @@ inline int atomic_add(int* address, int value) {
 
 inline uint32_t float_key(float x) {
   const uint32_t bits = sycl::bit_cast<uint32_t>(x);
+  if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0) return 0;
   return (bits & 0x80000000u) ? bits : (~bits & 0x7fffffffu);
 }
 
 inline int bin_of(float x) {
   const uint16_t bits = sycl::bit_cast<uint16_t>(static_cast<sycl::half>(x));
+  const bool nan = ((bits & 0x7C00u) == 0x7C00u) & ((bits & 0x03FFu) != 0);
   const uint16_t key = (bits & 0x8000u) ? bits : (~bits & 0x7fffu);
-  return key >> 5;
+  const uint16_t mask = static_cast<uint16_t>(0u - static_cast<uint16_t>(!nan));
+  return (key >> 5) & mask;
 }
 
 template <int N>
@@ -239,7 +242,7 @@ inline bool reduce(const sycl::nd_item<3>& item, const float* input, int length,
       for (int i = 0; i < kItems; ++i) {
         if ((candidate_mask[i] >> lane) & 1u) {
           const int slot = candidate + sycl::popcount(candidate_mask[i] & lower_lanes);
-          s.values[slot] = values[i];
+          s.keys[slot] = float_key(values[i]);
           s.indices[slot] = offsets[i];
         }
         candidate += sycl::popcount(candidate_mask[i]);
@@ -251,11 +254,11 @@ inline bool reduce(const sycl::nd_item<3>& item, const float* input, int length,
   const int candidates = s.vars[1];
   const int remaining = topk - accepted;
   for (int i = sg_id; i < candidates; i += kThreads / kSubgroupSize) {
-    const float value = s.values[i];
+    const uint32_t value_key = s.keys[i];
     int rank = 0;
     for (int j = lane; j < candidates; j += kSubgroupSize) {
-      const float other = s.values[j];
-      if (value < other || (value == other && i < j)) ++rank;
+      const uint32_t other_key = s.keys[j];
+      if (value_key > other_key || (value_key == other_key && i < j)) ++rank;
     }
     rank = sycl::reduce_over_group(sg, rank, sycl::plus<int>());
     if (lane == 0 && rank < remaining) output[accepted + rank] = s.indices[i];

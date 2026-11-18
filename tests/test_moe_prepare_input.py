@@ -173,7 +173,7 @@ def test_prepare_moe_input_small_rejects_capacity_overflow(num_tokens, top_k, er
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 5, 16, 64, 128, 224, 1024])
-@pytest.mark.parametrize("num_experts", [1, 4, 8, 32, 40, 64, 128, 256])
+@pytest.mark.parametrize("num_experts", [1, 4, 8, 32, 40, 64, 128, 256, 1025, 2560])
 @pytest.mark.parametrize("top_k", [1, 2, 4, 6, 8])
 @pytest.mark.parametrize("hidden_dims", [16, 32, 64, 128, 1024, 1536, 2048])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
@@ -183,6 +183,11 @@ def test_prepare_input_moe(
 ):
     if num_experts < top_k:
         pytest.skip("invalid combination")
+    if num_experts > 256 and not (
+        top_k == 8 and hidden_dims == 2048 and dtype == torch.bfloat16 and use_factors
+    ):
+        # More experts than one work-group's size limit; one config per token count.
+        pytest.skip("reduce parameter space for large expert counts")
     if not use_factors:
         # Keep a single representative config for the null-factors path.
         keep_null_factors_case = (

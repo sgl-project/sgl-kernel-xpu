@@ -176,19 +176,33 @@ void compute_expert_blockscale_offsets_sycl_impl(
 
 template <typename T>
 struct compute_expert_offsets_sycl_k_T {
-  compute_expert_offsets_sycl_k_T(T* expert_offsets, T* atomic_buffer, const uint32_t num_experts)
-      : expert_offsets_(expert_offsets), atomic_buffer_(atomic_buffer), num_experts_(num_experts) {}
+  compute_expert_offsets_sycl_k_T(
+      T* expert_offsets, T* atomic_buffer, const uint32_t num_experts, const uint32_t experts_per_item)
+      : expert_offsets_(expert_offsets),
+        atomic_buffer_(atomic_buffer),
+        num_experts_(num_experts),
+        experts_per_item_(experts_per_item) {}
 
+  // Each work-item scans a contiguous run of experts, so one work-group covers
+  // more experts than the device's work-group size limit.
   void operator()(sycl::nd_item<1> it) const {
-    int lid = it.get_local_id(0);
-    T x = (lid < num_experts_) ? expert_offsets_[lid] : 0;
-    T scanned = exclusive_scan_over_group(it.get_group(), x, sycl::plus<T>());
-    if (lid < num_experts_) atomic_buffer_[lid] = scanned;
+    const uint32_t begin = it.get_local_id(0) * experts_per_item_;
+    const uint32_t end = sycl::min(begin + experts_per_item_, num_experts_);
+    T run_total = 0;
+    for (uint32_t e = begin; e < end; ++e) {
+      run_total += expert_offsets_[e];
+    }
+    T offset = exclusive_scan_over_group(it.get_group(), run_total, sycl::plus<T>());
+    for (uint32_t e = begin; e < end; ++e) {
+      atomic_buffer_[e] = offset;
+      offset += expert_offsets_[e];
+    }
   }
 
   T* expert_offsets_;
   T* atomic_buffer_;
   const uint32_t num_experts_;
+  const uint32_t experts_per_item_;
 };
 
 template <typename T>
@@ -202,9 +216,12 @@ void compute_expert_offsets_sycl_impl(
 
   using Kernel = compute_expert_offsets_sycl_k_T<T>;
 
-  Kernel task(expert_offsets_ptr, atomic_buffer_ptr, num_experts);
+  const uint32_t max_wg_size = dpcppMaxWorkGroupSize(expert_offsets.device().index());
+  const uint32_t wg_size = std::min(max_wg_size, num_experts);
+  const uint32_t experts_per_item = (num_experts + wg_size - 1) / wg_size;
+  Kernel task(expert_offsets_ptr, atomic_buffer_ptr, num_experts, experts_per_item);
 
-  sycl_kernel_submit(num_experts, num_experts, queue, task);
+  sycl_kernel_submit(wg_size, wg_size, queue, task);
   return;
 }
 

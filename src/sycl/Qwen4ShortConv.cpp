@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <limits>
 #include <sycl/sycl.hpp>
-#include <type_traits>
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
@@ -14,7 +13,6 @@
 namespace {
 
 using bf16 = sycl::ext::oneapi::bfloat16;
-using fp16 = sycl::half;
 
 constexpr int WG_SIZE = 256;
 constexpr int64_t CHANNELS_PER_WG = WG_SIZE;
@@ -227,28 +225,19 @@ namespace at::native::xpu {
 // slot of state[slots, C, L] advances in place to conv_input[:, :, 1:]. Real slots must be unique.
 SGL_KERNEL_EXPORT void qwen4_short_conv_state(
     torch::Tensor& conv_input, torch::Tensor& state, torch::Tensor& state_indices, torch::Tensor& x) {
-  CHECK_INPUT(conv_input);
-  CHECK_INPUT(state);
-  CHECK_INPUT(state_indices);
-  CHECK_INPUT(x);
-  TORCH_CHECK(
-      state.scalar_type() == at::kBFloat16 || state.scalar_type() == at::kHalf,
-      "state must be bfloat16 or float16, got ",
-      state.scalar_type());
+  CHECK_INPUT(3, conv_input);
+  CHECK_INPUT(3, state);
+  CHECK_INPUT(1, at::kLong, state_indices);
+  CHECK_INPUT(2, x);
+  CHECK_DTYPES(state, at::kBFloat16, at::kHalf);
   TORCH_CHECK(x.scalar_type() == state.scalar_type(), "x must have the same dtype as state");
   TORCH_CHECK(conv_input.scalar_type() == state.scalar_type(), "conv_input must have the same dtype as state");
-  TORCH_CHECK(state_indices.scalar_type() == at::kLong, "state_indices must be int64");
-  TORCH_CHECK(state.dim() == 3, "state must have shape [slots, C, L]");
   const int64_t channels = state.size(1);
   const int64_t state_len = state.size(2);
   TORCH_CHECK(state_len > 0 && state_len <= MAX_STATE_LEN, "state length must be in [1, ", MAX_STATE_LEN, "]");
-  TORCH_CHECK(state_indices.dim() == 1, "state_indices must be 1-D");
   const int64_t tokens = state_indices.size(0);
-  TORCH_CHECK(x.dim() == 2 && x.size(0) == tokens && x.size(1) == channels, "x must have shape [N, C]");
-  TORCH_CHECK(
-      conv_input.dim() == 3 && conv_input.size(0) == tokens && conv_input.size(1) == channels &&
-          conv_input.size(2) == state_len + 1,
-      "conv_input must have shape [N, C, L + 1]");
+  CHECK_SHAPE(x, tokens, channels);
+  CHECK_SHAPE(conv_input, tokens, channels, state_len + 1);
   at::assert_no_overlap(conv_input, state);
   at::assert_no_overlap(conv_input, x);
   at::assert_no_overlap(state, x);
@@ -263,33 +252,22 @@ SGL_KERNEL_EXPORT void qwen4_short_conv_state(
                          reinterpret_cast<uintptr_t>(conv_input.data_ptr()) % pack_bytes == 0;
 
   auto q = c10::xpu::getCurrentXPUStream().queue();
-  auto launch = [&](auto tag, auto vec) {
-    using T = decltype(tag);
-    ShortConvStateKernel<T, decltype(vec)::value> kernel{
-        {},
-        reinterpret_cast<T*>(state.data_ptr()),
-        state_indices.data_ptr<int64_t>(),
-        reinterpret_cast<const T*>(x.data_ptr()),
-        reinterpret_cast<T*>(conv_input.data_ptr()),
-        channels,
-        static_cast<int>(state_len),
-        {},
-        {}};
-    sycl_kernel_submit(
-        sycl::range<2>(tokens, channel_blocks * STATE_WG_SIZE), sycl::range<2>(1, STATE_WG_SIZE), q, kernel);
-  };
-  auto launch_dtype = [&](auto vec) {
-    if (state.scalar_type() == at::kBFloat16) {
-      launch(bf16{}, vec);
-    } else {
-      launch(fp16{}, vec);
-    }
-  };
-  if (vectorize) {
-    launch_dtype(std::integral_constant<int, STATE_VEC>{});
-  } else {
-    launch_dtype(std::integral_constant<int, 1>{});
-  }
+  SYCL_DISPATCH_FLOATING_TYPES_V1(state.scalar_type(), "qwen4_short_conv_state", [&] {
+    SGL_DISPATCH_VEC_SIZE_SET(vectorize ? STATE_VEC : 1, (1, 8), [&] {
+      ShortConvStateKernel<scalar_t, VEC_SIZE> kernel{
+          {},
+          reinterpret_cast<scalar_t*>(state.data_ptr()),
+          state_indices.data_ptr<int64_t>(),
+          reinterpret_cast<const scalar_t*>(x.data_ptr()),
+          reinterpret_cast<scalar_t*>(conv_input.data_ptr()),
+          channels,
+          static_cast<int>(state_len),
+          {},
+          {}};
+      sycl_kernel_submit(
+          sycl::range<2>(tokens, channel_blocks * STATE_WG_SIZE), sycl::range<2>(1, STATE_WG_SIZE), q, kernel);
+    });
+  });
 }
 
 // Verify-step short conv: with conv_input[r] = [state[state_indices[r]] as bf16, x viewed as [R, W, C] transposed],
@@ -308,33 +286,28 @@ SGL_KERNEL_EXPORT void qwen4_verify_conv(
     int64_t width,
     int64_t dilation) {
   CHECK_INPUT(output);
-  CHECK_INPUT(x);
+  CHECK_INPUT(2, at::kBFloat16, x);
   CHECK_INPUT(residual);
-  CHECK_INPUT(weight);
+  CHECK_INPUT(3, at::kBFloat16, weight);
   CHECK_INPUT(valid);
   CHECK_DEVICE(state);
   CHECK_DEVICE(state_indices);
-  TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 2, "x must be a 2-D bfloat16 tensor");
-  TORCH_CHECK(state.dim() == 3 && state.size(1) == x.size(1), "state must have shape [slots, C, L]");
-  TORCH_CHECK(state_indices.dim() == 1, "state_indices must be 1-D");
+  CHECK_DIM(3, state);
+  CHECK_SHAPE(state, state.size(0), x.size(1), state.size(2));
+  CHECK_DIM(1, state_indices);
   const int64_t requests = state_indices.size(0);
   const int64_t channels = x.size(1);
   const int64_t state_len = state.size(2);
   TORCH_CHECK(width > 0 && width <= MAX_VERIFY_WIDTH, "width must be in [1, ", MAX_VERIFY_WIDTH, "]");
   TORCH_CHECK(state_len <= MAX_STATE_LEN, "state length must be at most ", MAX_STATE_LEN);
-  TORCH_CHECK(x.size(0) == requests * width, "x must have shape [R * W, C]");
-  TORCH_CHECK(
-      valid.scalar_type() == at::kBool && valid.dim() == 1 && valid.size(0) == x.size(0),
-      "valid must be a bool tensor of shape [R * W]");
-  TORCH_CHECK(
-      residual.scalar_type() == at::kBFloat16 && residual.sizes() == x.sizes(),
-      "residual must be bfloat16 with shape [R * W, C]");
-  TORCH_CHECK(
-      output.scalar_type() == at::kBFloat16 && output.sizes() == x.sizes(),
-      "output must be bfloat16 with shape [R * W, C]");
-  TORCH_CHECK(
-      weight.scalar_type() == at::kBFloat16 && weight.dim() == 3 && weight.size(0) == channels && weight.size(1) == 1,
-      "weight must be bfloat16 with shape [C, 1, K]");
+  CHECK_SHAPE(x, requests * width, channels);
+  TORCH_CHECK(valid.scalar_type() == at::kBool, "valid must be a bool tensor of shape [R * W]");
+  CHECK_SHAPE(valid, x.size(0));
+  CHECK_DTYPE(at::kBFloat16, residual);
+  CHECK_SAME_SHAPE(residual, x);
+  CHECK_DTYPE(at::kBFloat16, output);
+  CHECK_SAME_SHAPE(output, x);
+  CHECK_SHAPE(weight, channels, 1, weight.size(2));
   const int64_t kernel_size = weight.size(2);
   TORCH_CHECK(
       dilation > 0 && kernel_size > 0 && (kernel_size - 1) * dilation == state_len,
@@ -374,10 +347,7 @@ SGL_KERNEL_EXPORT void qwen4_verify_conv(
 
   auto q = c10::xpu::getCurrentXPUStream().queue();
   const auto inter_dtype = has_intermediate ? intermediate->scalar_type() : at::kBFloat16;
-  TORCH_CHECK(
-      state.scalar_type() == at::kBFloat16 || state.scalar_type() == at::kFloat,
-      "state must be bfloat16 or float32, got ",
-      state.scalar_type());
+  CHECK_DTYPES(state, at::kBFloat16, at::kFloat);
   SGL_DISPATCH_BOOL2(state.scalar_type() == at::kBFloat16, STATE_BF16, inter_dtype == at::kBFloat16, INTER_BF16, [&] {
     using StateT = std::conditional_t<STATE_BF16, bf16, float>;
     using InterT = std::conditional_t<INTER_BF16, bf16, float>;

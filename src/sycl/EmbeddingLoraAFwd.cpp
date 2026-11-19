@@ -214,23 +214,17 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
         seg_lens,  // [num_segments,] optional; currently unused, reserved for future per-segment optimizations
     std::optional<int64_t> max_len_opt  // upper bound on segment length; default: longest segment (one sync)
 ) {
-  CHECK_INPUT(input_ids);
-  CHECK_INPUT(weights);
-  CHECK_INPUT(seg_indptr);
-  CHECK_INPUT(weight_indices);
-  CHECK_INPUT(lora_ranks);
-  CHECK_INPUT(output);
+  CHECK_INPUT(1, input_ids);
+  CHECK_INPUT(3, weights);
+  CHECK_INPUT(1, seg_indptr);
+  CHECK_INPUT(1, weight_indices);
+  CHECK_INPUT(1, lora_ranks);
+  CHECK_INPUT(2, weights.scalar_type(), output);
   if (extra_embeddings.has_value()) {
-    CHECK_INPUT(extra_embeddings.value());
+    CHECK_INPUT(3, extra_embeddings.value());
   }
 
-  TORCH_CHECK(input_ids.dim() == 1, "input_ids must be a 1D tensor");
-  TORCH_CHECK(weights.dim() == 3, "weights must be a 3D tensor");
   TORCH_CHECK(weights.size(2) == vocab_size, "weights' vocab_size dimension must match the provided vocab_size");
-  TORCH_CHECK(seg_indptr.dim() == 1, "seg_indptr must be a 1D tensor");
-  TORCH_CHECK(weight_indices.dim() == 1, "weight_indices must be a 1D tensor");
-  TORCH_CHECK(lora_ranks.dim() == 1, "lora_ranks must be a 1D tensor");
-  TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
 
   const int64_t num_loras_i64 = weights.size(0);
   const int64_t max_rank_i64 = weights.size(1);
@@ -247,7 +241,6 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
   TORCH_CHECK(
       output.size(0) == num_tokens_i64 && output.size(1) == max_rank_i64,
       "Output tensor must have shape (num_tokens, max_rank)");
-  TORCH_CHECK(output.scalar_type() == weights.scalar_type(), "Output tensor dtype must match weights dtype");
   output.zero_();
   if (num_tokens_i64 == 0) {
     return;
@@ -270,12 +263,10 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
   }
 
   if (extra_embeddings.has_value()) {
-    TORCH_CHECK(extra_embeddings->dim() == 3, "extra_embeddings must be a 3D tensor");
     TORCH_CHECK(extra_embeddings->size(0) == num_loras_i64, "extra_embeddings.size(0) must equal weights.size(0)");
     TORCH_CHECK(
         extra_embeddings->size(2) == max_rank_i64, "extra_embeddings.size(2) must equal max_rank (weights.size(1))");
-    TORCH_CHECK(
-        extra_embeddings->scalar_type() == weights.scalar_type(), "extra_embeddings dtype must match weights dtype");
+    CHECK_DTYPE(weights.scalar_type(), extra_embeddings.value());
   }
   lora_debug_checks::check_lora_ranks(lora_ranks, max_rank_i64);
 

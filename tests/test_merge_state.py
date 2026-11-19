@@ -133,16 +133,34 @@ def merge_state_triton(
 @pytest.mark.parametrize("num_heads", [32])
 @pytest.mark.parametrize("head_dim", [128])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_merge_state(seq_len, num_heads, head_dim, dtype):
-    va = torch.randn(seq_len, num_heads, head_dim, dtype=dtype).to(f"{device}:0")
-    sa = torch.randn(seq_len, num_heads, dtype=torch.float32).to(f"{device}:0")
-    vb = torch.randn(seq_len, num_heads, head_dim, dtype=dtype).to(f"{device}:0")
-    sb = torch.randn(seq_len, num_heads, dtype=torch.float32).to(f"{device}:0")
+@pytest.mark.parametrize("seed", [0, 42])
+def test_merge_state(seq_len, num_heads, head_dim, dtype, seed):
+    generator = torch.Generator().manual_seed(seed)
+    va = torch.randn(seq_len, num_heads, head_dim, dtype=dtype, generator=generator)
+    sa = torch.randn(seq_len, num_heads, dtype=torch.float32, generator=generator)
+    vb = torch.randn(seq_len, num_heads, head_dim, dtype=dtype, generator=generator)
+    sb = torch.randn(seq_len, num_heads, dtype=torch.float32, generator=generator)
+
+    max_s = torch.maximum(sa.double(), sb.double())
+    a_weight = torch.exp2(sa.double() - max_s)
+    b_weight = torch.exp2(sb.double() - max_s)
+    denominator = a_weight + b_weight
+    expected_v = (
+        (va.double() * a_weight.unsqueeze(-1) + vb.double() * b_weight.unsqueeze(-1))
+        / denominator.unsqueeze(-1)
+    ).to(dtype)
+    expected_s = (max_s + torch.log2(denominator)).float()
+
+    va, sa, vb, sb = (tensor.to(f"{device}:0") for tensor in (va, sa, vb, sb))
     v_merged, s_merged = merge_state_triton(va, sa, vb, sb)
     v_merged_std, s_merged_std = merge_state(va, sa, vb, sb)
 
-    assert torch.allclose(v_merged, v_merged_std, atol=1e-2)
-    assert torch.allclose(s_merged, s_merged_std, atol=1e-2)
+    # FP32 evaluation order can put a result on opposite sides of a BF16/FP16 rounding boundary.
+    rtol = max(1e-5, torch.finfo(dtype).eps)
+    for output in (v_merged, v_merged_std):
+        torch.testing.assert_close(output.cpu(), expected_v, rtol=rtol, atol=1e-6)
+    for output in (s_merged, s_merged_std):
+        torch.testing.assert_close(output.cpu(), expected_s, rtol=1e-5, atol=1e-6)
 
 
 if __name__ == "__main__":

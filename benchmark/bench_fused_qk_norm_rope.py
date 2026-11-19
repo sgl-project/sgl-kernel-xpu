@@ -1,5 +1,6 @@
 import argparse
 import gc
+import inspect
 import itertools
 import math
 import os
@@ -431,7 +432,24 @@ CACHE_CONFIGS = [
     (False, 3, 1, 4, 2, 64, 32, False, "bf16", "int32", "bf16"),
     (False, 4, 1, 6, 2, 96, 96, False, "bf16", "int32", "bf16"),
     (True, 2, 4, 16, 4, 128, 128, False, "bf16", "int32", "bf16"),
+    # MiniMax-H3 DiT per-rank shape: partial NeoX RoPE (rope_dim 96 of head_dim 128).
+    # rotary lanes = 12 (not a power of 2), so the non-exact path takes the CTA fallback.
+    (False, 18880, 1, 14, 14, 128, 96, True, "bf16", "int32", "fp32"),
+    (False, 18880, 1, 14, 14, 128, 96, True, "bf16", "int32", "bf16"),
 ]
+
+
+def supports_round_norm_before_rope(head_dim, rope_dim, is_neox, dtype_name):
+    """Shapes accepted by fused_inplace_qknorm_rope(round_norm_before_rope=True)."""
+    if (
+        "round_norm_before_rope"
+        not in inspect.signature(sgl_kernel.fused_inplace_qknorm_rope).parameters
+    ):
+        return False  # sgl_kernel build without round_norm_before_rope
+    if dtype_name != "bf16" or head_dim not in (64, 128):
+        return False
+    # NeoX: each rotary half must cover whole lanes of head_dim // 16 elements
+    return not is_neox or rope_dim % (head_dim // 8) == 0
 
 
 @triton.testing.perf_report(
@@ -451,9 +469,13 @@ CACHE_CONFIGS = [
         ],
         x_vals=[list(config) for config in CACHE_CONFIGS],
         line_arg="provider",
-        line_vals=["native_split", "cache_fused"],
-        line_names=["Native split", "SGL Kernel cache fused"],
-        styles=[("blue", "-"), ("green", "-")],
+        line_vals=["native_split", "cache_fused", "cache_fused_exact"],
+        line_names=[
+            "Native split",
+            "SGL Kernel cache fused",
+            "SGL Kernel cache fused (round_norm_before_rope)",
+        ],
+        styles=[("blue", "-"), ("green", "-"), ("red", "-")],
         ylabel="Latency (us)",
         plot_name="fused-qk-norm-rope-with-cache-performance",
         args={},
@@ -513,6 +535,23 @@ def benchmark_cache(
                 positions,
                 is_neox,
                 1e-6,
+            )
+
+    elif provider == "cache_fused_exact":
+        if not supports_round_norm_before_rope(head_dim, rope_dim, is_neox, dtype_name):
+            return float("nan"), float("nan"), float("nan")
+
+        def fn() -> None:
+            sgl_kernel.fused_inplace_qknorm_rope(
+                q,
+                k,
+                q_weight,
+                k_weight,
+                cos_sin_cache,
+                positions,
+                is_neox,
+                1e-6,
+                round_norm_before_rope=True,
             )
 
     else:

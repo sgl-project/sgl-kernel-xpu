@@ -20,6 +20,13 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 #include "sgl_kernel_torch_shim.h"
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+  m.def("convrot_rotate_quantize(Tensor input, int group_size=256) -> (Tensor, Tensor)");
+  m.impl("convrot_rotate_quantize", torch::kXPU, &convrot_rotate_quantize);
+  m.def(
+      "convrot_int8_linear_prequant(Tensor input, Tensor weight, Tensor input_scale, "
+      "Tensor weight_scale, Tensor? bias=None) -> Tensor");
+  m.impl("convrot_int8_linear_prequant", torch::kXPU, &convrot_int8_linear_prequant);
+
   m.def("weak_ref_tensor(Tensor(a) tensor) -> Tensor(a)");
   m.impl("weak_ref_tensor", torch::kXPU, &weak_ref_tensor);
 
@@ -142,6 +149,32 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "Tensor! positions, Tensor! retrive_index, Tensor! retrive_next_token, "
       "Tensor! retrive_next_sibling, int batch_size, int draft_token_num) -> ()");
   m.impl("reconstruct_indices_from_tree_mask", torch::kXPU, &reconstruct_indices_from_tree_mask);
+
+  /*
+   * Ngram embedding (LongCat-Flash)
+   */
+  m.def(
+      "compute_n_gram_ids(int ne_n, int ne_k, Tensor ne_weights, Tensor ne_mods, "
+      "Tensor exclusive_ne_embedder_size_sums, Tensor tokens, Tensor exclusive_req_len_sums, "
+      "Tensor ne_token_table, Tensor row_indices, Tensor column_starts, Tensor! n_gram_ids, "
+      "int eos_token_id) -> ()");
+  m.impl("compute_n_gram_ids", torch::kXPU, &compute_n_gram_ids);
+
+  m.def(
+      "compute_n_gram_ids_decode(int ne_n, int ne_k, Tensor ne_weights, Tensor ne_mods, "
+      "Tensor exclusive_ne_embedder_size_sums, Tensor ne_token_table, Tensor row_indices, "
+      "Tensor column_starts, Tensor! n_gram_ids, int eos_token_id) -> ()");
+  m.impl("compute_n_gram_ids_decode", torch::kXPU, &compute_n_gram_ids_decode);
+
+  m.def(
+      "update_token_table(Tensor tokens, Tensor! ne_token_table, Tensor row_indices, "
+      "Tensor column_starts, Tensor req_lens, Tensor ignore_tokens) -> ()");
+  m.impl("update_token_table", torch::kXPU, &update_token_table);
+
+  m.def(
+      "update_token_table_decode(Tensor tokens, Tensor! ne_token_table, Tensor row_indices, "
+      "Tensor column_starts) -> ()");
+  m.impl("update_token_table_decode", torch::kXPU, &update_token_table_decode);
 
   /*
    * Fast radix top-k (DeepSeek V3.2 indexer)
@@ -530,7 +563,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool     return_softmax_lse,"
       "    Tensor?  rel_bias=None,"
       "    bool     rel_bias_is_sheared=False,"
-      "    Tensor?  bidirectional_block_ids=None) -> (Tensor(a!), Tensor?)");
+      "    Tensor?  bidirectional_block_ids=None,"
+      "    Tensor?  alibi_slopes=None) -> (Tensor(a!), Tensor?)");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 #endif  // USE_FMHA
 

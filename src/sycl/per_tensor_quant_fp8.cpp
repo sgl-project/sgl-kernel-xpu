@@ -165,11 +165,9 @@ sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor outpu
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);
-  TORCH_CHECK(
-      input.scalar_type() == at::ScalarType::BFloat16 || input.scalar_type() == at::ScalarType::Half,
-      "input must be BFloat16/Half tensor");
-  TORCH_CHECK(output_q.scalar_type() == at::ScalarType::Float8_e4m3fn, "output must be Float8_e4m3fn tensor");
-  TORCH_CHECK(output_s.scalar_type() == at::ScalarType::Float, "scale must be Float tensor");
+  CHECK_DTYPES(input, at::kHalf, at::kBFloat16);
+  CHECK_DTYPE(at::kFloat8_e4m3fn, output_q);
+  CHECK_DTYPE(at::kFloat, output_s);
 
   const int block_size = 256;
   const int64_t num_elements = input.numel();

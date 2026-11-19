@@ -104,21 +104,13 @@ SGL_KERNEL_EXPORT void gate_up_lora_b_fwd(
     const std::optional<torch::Tensor>&
         base_output  // [num_tokens, 2*N] optional; this can be the base model's output for a fused add
 ) {
-  CHECK_INPUT(input_x);
-  CHECK_INPUT(gate_up_lora_b);
-  CHECK_INPUT(seg_indptr);
-  CHECK_INPUT(weight_indices);
-  CHECK_INPUT(lora_ranks);
-  CHECK_INPUT(scalings);
-  CHECK_INPUT(output);
-
-  TORCH_CHECK(input_x.dim() == 2, "input_x must be a 2D tensor");
-  TORCH_CHECK(gate_up_lora_b.dim() == 3, "gate_up_lora_b must be a 3D tensor");
-  TORCH_CHECK(seg_indptr.dim() == 1, "seg_indptr must be a 1D tensor");
-  TORCH_CHECK(weight_indices.dim() == 1, "weight_indices must be a 1D tensor");
-  TORCH_CHECK(lora_ranks.dim() == 1, "lora_ranks must be a 1D tensor");
-  TORCH_CHECK(scalings.dim() == 1, "scalings must be a 1D tensor");
-  TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
+  CHECK_INPUT(2, input_x);
+  CHECK_INPUT(3, gate_up_lora_b);
+  CHECK_INPUT(1, seg_indptr);
+  CHECK_INPUT(1, weight_indices);
+  CHECK_INPUT(1, lora_ranks);
+  CHECK_INPUT(1, scalings);
+  CHECK_INPUT(2, output);
 
   TORCH_CHECK(output_dim > 0, "output_dim (N) must be greater than 0");
 
@@ -139,9 +131,7 @@ SGL_KERNEL_EXPORT void gate_up_lora_b_fwd(
   TORCH_CHECK(weight_indices.numel() == num_segments_i64, "weight_indices.numel() must equal seg_indptr.numel() - 1");
   lora_debug_checks::check_weight_indices(weight_indices, num_loras_i64, "gate_up_lora_b");
   // Validate output tensor size and dtype.
-  TORCH_CHECK(
-      output.size(0) == num_tokens_i64 && output.size(1) == n_total_i64,
-      "Output tensor must have shape (num_tokens, 2 * N)");
+  CHECK_SHAPE(output, num_tokens_i64, n_total_i64);
   TORCH_CHECK(
       output.scalar_type() == gate_up_lora_b.scalar_type(), "Output tensor dtype must match gate_up_lora_b dtype");
   TORCH_CHECK(

@@ -48,6 +48,14 @@ using fptr_t = int64_t;
 // default visibility to remain exported and dynamically linkable.
 #pragma GCC visibility push(default)
 
+std::tuple<at::Tensor, at::Tensor> convrot_rotate_quantize(const at::Tensor& input, int64_t group_size);
+at::Tensor convrot_int8_linear_prequant(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& input_scale,
+    const at::Tensor& weight_scale,
+    const std::optional<at::Tensor>& bias);
+
 /*
  * From csrc/allreduce
  */
@@ -1076,6 +1084,47 @@ void reconstruct_indices_from_tree_mask(
     at::Tensor& retrive_next_sibling,
     int64_t batch_size,
     int64_t draft_token_num);
+
+// Ngram embedding (LongCat-Flash): SYCL port of speculative/ngram_embedding.cuh.
+void compute_n_gram_ids(
+    int64_t ne_n,
+    int64_t ne_k,
+    const at::Tensor& ne_weights,
+    const at::Tensor& ne_mods,
+    const at::Tensor& exclusive_ne_embedder_size_sums,
+    const at::Tensor& tokens,
+    const at::Tensor& exclusive_req_len_sums,
+    const at::Tensor& ne_token_table,
+    const at::Tensor& row_indices,
+    const at::Tensor& column_starts,
+    at::Tensor& n_gram_ids,
+    int64_t eos_token_id);
+
+void compute_n_gram_ids_decode(
+    int64_t ne_n,
+    int64_t ne_k,
+    const at::Tensor& ne_weights,
+    const at::Tensor& ne_mods,
+    const at::Tensor& exclusive_ne_embedder_size_sums,
+    const at::Tensor& ne_token_table,
+    const at::Tensor& row_indices,
+    const at::Tensor& column_starts,
+    at::Tensor& n_gram_ids,
+    int64_t eos_token_id);
+
+void update_token_table(
+    const at::Tensor& tokens,
+    const at::Tensor& ne_token_table,
+    const at::Tensor& row_indices,
+    const at::Tensor& column_starts,
+    const at::Tensor& req_lens,
+    const at::Tensor& ignore_tokens);
+
+void update_token_table_decode(
+    const at::Tensor& tokens,
+    const at::Tensor& ne_token_table,
+    const at::Tensor& row_indices,
+    const at::Tensor& column_starts);
 
 void segment_packbits(
     at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t sycl_stream);

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <sycl/ext/oneapi/free_function_kernel_properties.hpp>
 #include <sycl/sycl.hpp>
 
 #include "SGLKernelPerf.h"
@@ -636,101 +637,140 @@ struct TopKAmongBlocksState {
 };
 
 template <typename score_t>
-struct TopKAmongBlocksKernel {
-  const score_t* scores;
-  const int64_t* lengths;
-  const int64_t* blocks;
-  int64_t* output;
-  int64_t score_row_stride;
-  int64_t score_col_stride;
-  int64_t width;
-  int block_count;
-  int block_size;
-  int topk;
+inline bool topk_among_blocks_candidate(
+    const score_t* scores,
+    const int64_t* lengths,
+    const int64_t* blocks,
+    int64_t score_row_stride,
+    int64_t score_col_stride,
+    int64_t width,
+    int block_count,
+    int block_size,
+    int64_t row,
+    int index,
+    int64_t& position,
+    uint32_t& key) {
+  const int64_t block = blocks[row * block_count + index / block_size];
+  if (block < 0 || block > (width - 1) / block_size) return false;
+  position = block * block_size + index % block_size;
+  if (position >= width || position >= lengths[row]) return false;
+  const float score = static_cast<float>(scores[row * score_row_stride + position * score_col_stride]);
+  if (score == -std::numeric_limits<float>::infinity()) return false;
+  key = sycl::isnan(score) ? 0xffffffffu : convert_to_uint32(score);
+  return true;
+}
 
-  bool candidate(int64_t row, int index, int64_t& position, uint32_t& key) const {
-    const int64_t block = blocks[row * block_count + index / block_size];
-    if (block < 0 || block > (width - 1) / block_size) return false;
-    position = block * block_size + index % block_size;
-    if (position >= width || position >= lengths[row]) return false;
-    const float score = static_cast<float>(scores[row * score_row_stride + position * score_col_stride]);
-    if (score == -std::numeric_limits<float>::infinity()) return false;
-    key = sycl::isnan(score) ? 0xffffffffu : convert_to_uint32(score);
-    return true;
+}  // namespace
+
+template <typename score_t>
+SYCL_EXT_ONEAPI_FUNCTION_PROPERTY((sycl::ext::oneapi::experimental::nd_range_kernel<1>))
+void topk_among_blocks_kernel(
+    const score_t* scores,
+    const int64_t* lengths,
+    const int64_t* blocks,
+    int64_t* output,
+    int64_t score_row_stride,
+    int64_t score_col_stride,
+    int64_t width,
+    int block_count,
+    int block_size,
+    int topk) {
+  auto item = sycl::ext::oneapi::this_work_item::get_nd_item<1>();
+  const int64_t row = item.get_group(0);
+  const int tid = item.get_local_id(0);
+  const int candidates = block_count * block_size;
+  auto group = item.get_group();
+  int32_t* hist = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2 * kHistStride]>(group);
+  TopKAmongBlocksState& state = *sycl::ext::oneapi::group_local_memory_for_overwrite<TopKAmongBlocksState>(group);
+  if (tid == 0) {
+    state.prefix = 0;
+    state.remaining_rank = topk;
   }
-
-  [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
-    const int64_t row = item.get_group(0);
-    const int tid = item.get_local_id(0);
-    const int candidates = block_count * block_size;
-    auto group = item.get_group();
-    int32_t* hist = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2 * kHistStride]>(group);
-    TopKAmongBlocksState& state = *sycl::ext::oneapi::group_local_memory_for_overwrite<TopKAmongBlocksState>(group);
-    if (tid == 0) {
-      state.prefix = 0;
-      state.remaining_rank = topk;
+  for (int round = 0; round < kRadixRounds; ++round) {
+    if (tid < kRadix + 1) {
+      hist[tid] = 0;
+      hist[kHistStride + tid] = 0;
     }
-    for (int round = 0; round < kRadixRounds; ++round) {
-      if (tid < kRadix + 1) {
-        hist[tid] = 0;
-        hist[kHistStride + tid] = 0;
-      }
-      item.barrier(sycl::access::fence_space::local_space);
-      const uint32_t prefix = state.prefix;
-      for (int index = tid; index < candidates; index += kThreadsPerBlock) {
-        int64_t position;
-        uint32_t key;
-        if (candidate(row, index, position, key) &&
-            (round == 0 || (key >> (kKeyBits - round * kRadixBits)) == prefix)) {
-          LocalAtomic(hist[(key >> (kKeyBits - kRadixBits - round * kRadixBits)) & 0xffu]).fetch_add(1);
-        }
-      }
-      item.barrier(sycl::access::fence_space::local_space);
-      run_cumsum(item, hist);
-      if (tid == 0) {
-        if (round == 0) {
-          state.remaining_rank = sycl::min(topk, hist[0]);
-          state.selected_count = state.remaining_rank;
-        }
-        if (state.remaining_rank > 0) {
-          int bin = kRadix - 1;
-          while (bin > 0 && hist[bin] < state.remaining_rank)
-            --bin;
-          state.prefix = (prefix << kRadixBits) | static_cast<uint32_t>(bin);
-          state.remaining_rank -= hist[bin + 1];
-        }
-      }
-      item.barrier(sycl::access::fence_space::local_space);
-      if (round == 0) {
-        const int32_t selected_count = state.selected_count;
-        for (int index = selected_count + tid; index < topk; index += kThreadsPerBlock)
-          output[row * topk + index] = -1;
-        if (selected_count == 0) return;
-      }
-    }
-    if (tid == 0) state.greater_written = state.equal_seen = 0;
     item.barrier(sycl::access::fence_space::local_space);
-    const uint32_t threshold = state.prefix;
-    const int32_t selected_count = state.selected_count;
-    const int32_t threshold_count = state.remaining_rank;
-    const int iterations = (candidates + kThreadsPerBlock - 1) / kThreadsPerBlock;
-    for (int iteration = 0; iteration < iterations; ++iteration) {
-      const int index = iteration * kThreadsPerBlock + tid;
-      int64_t position = 0;
-      uint32_t key = 0;
-      const bool valid = index < candidates && candidate(row, index, position, key);
-      const int greater = valid && key > threshold;
-      const int equal = valid && key == threshold;
-      const int greater_pos = wg_reserve(item, state.greater_written, greater);
-      const int equal_pos = wg_reserve(item, state.equal_seen, equal);
-      if (greater || (equal && equal_pos < threshold_count)) {
-        const int output_index = greater ? greater_pos : selected_count - threshold_count + equal_pos;
-        output[row * topk + output_index] = position;
+    const uint32_t prefix = state.prefix;
+    for (int index = tid; index < candidates; index += kThreadsPerBlock) {
+      int64_t position;
+      uint32_t key;
+      if (topk_among_blocks_candidate(
+              scores,
+              lengths,
+              blocks,
+              score_row_stride,
+              score_col_stride,
+              width,
+              block_count,
+              block_size,
+              row,
+              index,
+              position,
+              key) &&
+          (round == 0 || (key >> (kKeyBits - round * kRadixBits)) == prefix)) {
+        LocalAtomic(hist[(key >> (kKeyBits - kRadixBits - round * kRadixBits)) & 0xffu]).fetch_add(1);
       }
     }
+    item.barrier(sycl::access::fence_space::local_space);
+    run_cumsum(item, hist);
+    if (tid == 0) {
+      if (round == 0) {
+        state.remaining_rank = sycl::min(topk, hist[0]);
+        state.selected_count = state.remaining_rank;
+      }
+      if (state.remaining_rank > 0) {
+        int bin = kRadix - 1;
+        while (bin > 0 && hist[bin] < state.remaining_rank)
+          --bin;
+        state.prefix = (prefix << kRadixBits) | static_cast<uint32_t>(bin);
+        state.remaining_rank -= hist[bin + 1];
+      }
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (round == 0) {
+      const int32_t selected_count = state.selected_count;
+      for (int index = selected_count + tid; index < topk; index += kThreadsPerBlock)
+        output[row * topk + index] = -1;
+      if (selected_count == 0) return;
+    }
   }
-};
+  if (tid == 0) state.greater_written = state.equal_seen = 0;
+  item.barrier(sycl::access::fence_space::local_space);
+  const uint32_t threshold = state.prefix;
+  const int32_t selected_count = state.selected_count;
+  const int32_t threshold_count = state.remaining_rank;
+  const int iterations = (candidates + kThreadsPerBlock - 1) / kThreadsPerBlock;
+  for (int iteration = 0; iteration < iterations; ++iteration) {
+    const int index = iteration * kThreadsPerBlock + tid;
+    int64_t position = 0;
+    uint32_t key = 0;
+    const bool valid = index < candidates && topk_among_blocks_candidate(
+                                                 scores,
+                                                 lengths,
+                                                 blocks,
+                                                 score_row_stride,
+                                                 score_col_stride,
+                                                 width,
+                                                 block_count,
+                                                 block_size,
+                                                 row,
+                                                 index,
+                                                 position,
+                                                 key);
+    const int greater = valid && key > threshold;
+    const int equal = valid && key == threshold;
+    const int greater_pos = wg_reserve(item, state.greater_written, greater);
+    const int equal_pos = wg_reserve(item, state.equal_seen, equal);
+    if (greater || (equal && equal_pos < threshold_count)) {
+      const int output_index = greater ? greater_pos : selected_count - threshold_count + equal_pos;
+      output[row * topk + output_index] = position;
+    }
+  }
+}
 
+namespace {
 struct TopKTransformRaggedKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   const float* score;
   const int32_t* seq_lens;
@@ -985,22 +1025,26 @@ SGL_KERNEL_EXPORT at::Tensor topk_among_blocks(
   if (scores.size(1) == 0 || blocks.size(1) == 0) return output.fill_(-1);
   auto& queue = c10::xpu::getCurrentXPUStream().queue();
   AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, scores.scalar_type(), "topk_among_blocks", [&] {
-    TopKAmongBlocksKernel<scalar_t> kernel{
-        scores.data_ptr<scalar_t>(),
-        lengths_i64.data_ptr<int64_t>(),
-        blocks_i64.data_ptr<int64_t>(),
-        output.data_ptr<int64_t>(),
-        scores.stride(0),
-        scores.stride(1),
-        scores.size(1),
-        static_cast<int>(blocks.size(1)),
-        static_cast<int>(block_size),
-        static_cast<int>(topk)};
-    sycl_kernel_submit(
-        sycl::range<1>(static_cast<size_t>(scores.size(0)) * kThreadsPerBlock),
-        sycl::range<1>(kThreadsPerBlock),
-        queue,
-        kernel);
+    const sycl::nd_range<1> launch_range(
+        sycl::range<1>(static_cast<size_t>(scores.size(0)) * kThreadsPerBlock), sycl::range<1>(kThreadsPerBlock));
+    const sycl::ext::oneapi::experimental::launch_config<sycl::nd_range<1>> launch_config(launch_range);
+    auto event = queue.submit([&](sycl::handler& cgh) {
+      sycl::ext::oneapi::experimental::nd_launch(
+          cgh,
+          launch_config,
+          sycl::ext::oneapi::experimental::kernel_function<topk_among_blocks_kernel<scalar_t>>,
+          scores.data_ptr<scalar_t>(),
+          lengths_i64.data_ptr<int64_t>(),
+          blocks_i64.data_ptr<int64_t>(),
+          output.data_ptr<int64_t>(),
+          scores.stride(0),
+          scores.stride(1),
+          scores.size(1),
+          static_cast<int>(blocks.size(1)),
+          static_cast<int>(block_size),
+          static_cast<int>(topk));
+    });
+    __sglkernel_track_event(event);
   });
   return output;
 }

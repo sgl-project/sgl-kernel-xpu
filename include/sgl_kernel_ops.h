@@ -26,6 +26,12 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
+torch::Tensor bf16_dense_gemm_xe20(const torch::Tensor& input, const torch::Tensor& weight);
+torch::Tensor
+bf16_dense_gelu_tanh_mul_lut_xe20(const torch::Tensor& input, const torch::Tensor& weight, const torch::Tensor& table);
+
+bool bf16_dense_gelu_tanh_mul_lut_xe20_prefill_supported(int64_t m, int64_t n, int64_t k);
+
 #define _CONCAT(A, B) A##B
 #define CONCAT(A, B) _CONCAT(A, B)
 

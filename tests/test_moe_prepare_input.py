@@ -299,6 +299,23 @@ def test_prepare_input_moe(
 
     # validate expert offsets
     torch.testing.assert_close(expert_offsets, expert_offsets_xpu.to("cpu"))
+
+    # Routes map one-to-one onto rows grouped by ascending expert id; the order
+    # within an expert is not fixed.
+    dst = output_permutation_xpu.cpu().to(torch.int64)
+    assert torch.equal(torch.sort(dst).values, torch.arange(dst.numel()))
+    expert_ends = torch.cumsum(expert_offsets, 0).to(torch.int64)
+    expert_starts = expert_ends - expert_offsets
+    route_experts = flat_topk.to(torch.int64)
+    assert bool(
+        (
+            (dst >= expert_starts[route_experts]) & (dst < expert_ends[route_experts])
+        ).all()
+    )
+    # Each row reads back the token its route came from.
+    route_tokens = torch.arange(dst.numel()) // top_k
+    assert torch.equal(input_permutation_xpu.cpu()[dst].to(torch.int64), route_tokens)
+
     input_tensor = torch.randn(num_tokens, hidden_dims, dtype=dtype)
     input_tensor_xpu = input_tensor.clone().to(device)
     output_tensor_xpu = torch.empty(

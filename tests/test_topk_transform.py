@@ -730,10 +730,22 @@ def test_topk_among_blocks(
 
     actual = topk_among_blocks(scores, lengths, blocks, topk, block_size)
     expected = _topk_among_blocks_reference(scores, lengths, blocks, topk, block_size)
-    torch.testing.assert_close(
-        torch.sort(actual, dim=-1).values,
-        torch.sort(expected, dim=-1).values,
-    )
+    assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype
+    assert actual.device == expected.device
+    for row in range(batch_size):
+        assert (actual[row] == -1).sum() == (expected[row] == -1).sum()
+        selected = actual[row][actual[row] != -1]
+        reference = expected[row][expected[row] != -1]
+        assert ((selected >= 0) & (selected < width) & (selected < lengths[row])).all()
+        assert selected.unique().numel() == selected.numel()
+        assert (selected.unsqueeze(-1) // block_size == blocks[row]).any(dim=-1).all()
+        torch.testing.assert_close(
+            torch.sort(scores[row, selected].float()).values,
+            torch.sort(scores[row, reference].float()).values,
+            rtol=0,
+            atol=0,
+        )
 
     tied_storage = torch.zeros((1, width * 2), dtype=dtype, device="xpu")
     tied_scores = tied_storage[:, ::2]

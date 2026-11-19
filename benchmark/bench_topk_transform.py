@@ -170,9 +170,26 @@ def benchmark_topk_among_blocks(
     if provider == "sgl_kernel":
         fn = lambda: topk_among_blocks(scores, lengths, blocks, topk, block_size)
         expected = _torch_topk_among_blocks(scores, blocks, topk, block_size)
+        actual = fn()
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        assert actual.device == expected.device
+        assert ((actual >= 0) & (actual < width)).all()
+        assert (actual < lengths.unsqueeze(1)).all()
+        assert (
+            (actual.unsqueeze(-1) // block_size == blocks.unsqueeze(1))
+            .any(dim=-1)
+            .all()
+        )
+        sorted_indices = torch.sort(actual, dim=-1).values
+        assert (sorted_indices[:, 1:] != sorted_indices[:, :-1]).all()
+        actual_scores = scores.float().gather(1, actual)
+        expected_scores = scores.float().gather(1, expected)
         torch.testing.assert_close(
-            torch.sort(fn(), dim=-1).values,
-            torch.sort(expected, dim=-1).values,
+            torch.sort(actual_scores, dim=-1).values,
+            torch.sort(expected_scores, dim=-1).values,
+            rtol=0,
+            atol=0,
         )
     else:
         fn = lambda: _torch_topk_among_blocks(scores, blocks, topk, block_size)

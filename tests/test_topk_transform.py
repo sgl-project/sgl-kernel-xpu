@@ -635,6 +635,17 @@ def test_topk_transform(
         max_permit_error=5,
     )
 
+    if with_raw:
+        assert_equal(
+            score,
+            torch.sort(ref_raw, dim=-1).values,
+            torch.sort(out_raw, dim=-1).values,
+            bs,
+            topk,
+            seq_len,
+            max_permit_error=5,
+        )
+
 
 def _topk_among_blocks_reference(
     scores: torch.Tensor,

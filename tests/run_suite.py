@@ -69,6 +69,7 @@ suites = {
         TestFile("test_fused_norm_rope_v2.py"),
         TestFile("test_hc_post.py"),
         TestFile("test_diffusion_scale_residual_norm.py"),
+        TestFile("test_h3_fused.py"),
         TestFile("test_jit_kernels.py"),
         TestFile("test_transfer_mamba.py"),
         TestFile("test_embedding_lora_a_fwd.py"),

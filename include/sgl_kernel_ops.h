@@ -126,6 +126,13 @@ at::Tensor weak_ref_tensor(const at::Tensor& tensor);
  * From csrc/elementwise
  */
 namespace at::native::xpu {
+at::Tensor h3_indexed_rms_adaln(
+    const at::Tensor& x,
+    const at::Tensor& weight,
+    const at::Tensor& shift,
+    const at::Tensor& scale,
+    const at::Tensor& indices,
+    double eps);
 void rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);
 void fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps);
 void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input, torch::Tensor& weight, double eps);

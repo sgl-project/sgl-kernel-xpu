@@ -21,6 +21,9 @@ constexpr int kMaxTopK = 2048;
 constexpr std::array<int, 2> kSupportedTopK = {512, kMaxTopK};
 constexpr int kThreadsPerBlock = 1024;
 constexpr int kRadix = 256;
+constexpr int kRadixBits = 8;
+constexpr int kKeyBits = std::numeric_limits<uint32_t>::digits;
+constexpr int kRadixRounds = kKeyBits / kRadixBits;
 constexpr int kHistPad = 128;  // padding so suffix-sum can read [tx + j] safely
 constexpr int kHistStride = kRadix + kHistPad;
 constexpr int kSmemInputBytes = 32 * 1024;  // 32 KB for ping-pong index buffer
@@ -667,7 +670,7 @@ struct TopKAmongBlocksKernel {
       state.prefix = 0;
       state.remaining_rank = topk;
     }
-    for (int round = 0; round < 4; ++round) {
+    for (int round = 0; round < kRadixRounds; ++round) {
       if (tid < kRadix + 1) {
         hist[tid] = 0;
         hist[kHistStride + tid] = 0;
@@ -677,8 +680,9 @@ struct TopKAmongBlocksKernel {
       for (int index = tid; index < candidates; index += kThreadsPerBlock) {
         int64_t position;
         uint32_t key;
-        if (candidate(row, index, position, key) && (round == 0 || (key >> (32 - round * 8)) == prefix)) {
-          LocalAtomic(hist[(key >> (24 - round * 8)) & 0xffu]).fetch_add(1);
+        if (candidate(row, index, position, key) &&
+            (round == 0 || (key >> (kKeyBits - round * kRadixBits)) == prefix)) {
+          LocalAtomic(hist[(key >> (kKeyBits - kRadixBits - round * kRadixBits)) & 0xffu]).fetch_add(1);
         }
       }
       item.barrier(sycl::access::fence_space::local_space);
@@ -692,7 +696,7 @@ struct TopKAmongBlocksKernel {
           int bin = kRadix - 1;
           while (bin > 0 && hist[bin] < state.remaining_rank)
             --bin;
-          state.prefix = (prefix << 8) | static_cast<uint32_t>(bin);
+          state.prefix = (prefix << kRadixBits) | static_cast<uint32_t>(bin);
           state.remaining_rank -= hist[bin + 1];
         }
       }

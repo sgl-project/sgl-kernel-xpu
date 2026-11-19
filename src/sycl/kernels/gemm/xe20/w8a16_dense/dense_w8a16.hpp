@@ -107,9 +107,11 @@ struct DecodeKernel {
 
   [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> it) const {
     const int wg_lin = int(it.get_group(0));
-    const int ntn = p.N / BN;
-    const int wg = wg_lin % ntn;  // N tile
-    const int wm = wg_lin / ntn;  // M tile (M > MT: several M tiles re-read the weight via L2)
+    // M > MT runs several M tiles over the same weight strip; their work-groups are adjacent so
+    // the strip the first one loads is still in L2 for the others, whatever the weight size.
+    const int ntm = (p.M + MT - 1) / MT;
+    const int wg = wg_lin / ntm;  // N tile
+    const int wm = wg_lin % ntm;  // M tile
     auto sg = it.get_sub_group();
     const int sgid = int(sg.get_group_linear_id());
     const int nsg = int(sg.get_group_linear_range());

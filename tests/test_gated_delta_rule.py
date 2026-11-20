@@ -17,6 +17,8 @@ generalized here to variable-per-sequence lengths via ``query_start_loc``
 ``num_spec_tokens``-per-request layout).
 """
 
+import json
+
 import pytest
 import sgl_kernel  # noqa: F401  registers torch.ops.sgl_kernel.gated_delta_rule
 import torch
@@ -188,6 +190,63 @@ def _run_op(i, token_indx=None):
         0,
     )
     torch.xpu.synchronize()
+
+
+@pytest.mark.parametrize("length,seeded", [(2048, None), (2053, True), (8192, False)])
+@pytest.mark.parametrize("strided_gates", [False, True])
+def test_long_prefill_matches_sequential_without_mutating_inputs(
+    length, seeded, strided_gates
+):
+    inputs = _make_inputs(
+        [length],
+        torch.bfloat16,
+        torch.device("xpu"),
+        nk=4,
+        nv=12,
+        has_initial_state=None if seeded is None else [seeded],
+    )
+    inputs["ssm_state"] = inputs["ssm_state"].float()
+    if strided_gates:
+        packed_gates = torch.cat((inputs["b"], inputs["a"]), dim=1)
+        inputs["b"], inputs["a"] = packed_gates.chunk(2, dim=1)
+    expected = {
+        key: value.clone() if isinstance(value, torch.Tensor) else value
+        for key, value in inputs.items()
+    }
+    original = {key: inputs[key].clone() for key in ("q", "k", "v", "a", "b")}
+    identity = torch.arange(length, device="xpu", dtype=torch.int32)
+    _run_op(expected, token_indx=identity)
+    _run_op(inputs)
+    torch.testing.assert_close(
+        inputs["core_attn_out"], expected["core_attn_out"], rtol=3e-2, atol=5e-2
+    )
+    torch.testing.assert_close(
+        inputs["ssm_state"], expected["ssm_state"], rtol=3e-2, atol=2e-2
+    )
+    for key, value in original.items():
+        torch.testing.assert_close(inputs[key], value, rtol=0, atol=0)
+
+
+def test_long_prefill_selects_chunk_kernel(tmp_path):
+    inputs = _make_inputs([2048], torch.bfloat16, torch.device("xpu"), nk=4, nv=12)
+    inputs["ssm_state"] = inputs["ssm_state"].float()
+    _run_op(inputs)
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.XPU,
+        ]
+    ) as profiler:
+        _run_op(inputs)
+    path = tmp_path / "chunk_dispatch.json"
+    profiler.export_chrome_trace(str(path))
+    kernels = {
+        event["name"]
+        for event in json.loads(path.read_text())["traceEvents"]
+        if event.get("cat") == "kernel"
+    }
+    assert any("ChunkFwdOKernel" in name for name in kernels), kernels
+    assert not any("gated_delta_rule_kernel<" in name for name in kernels), kernels
 
 
 @pytest.mark.parametrize(

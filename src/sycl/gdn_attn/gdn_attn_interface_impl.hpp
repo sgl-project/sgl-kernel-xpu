@@ -539,15 +539,54 @@ SGL_KERNEL_EXPORT void gated_delta_rule(
     const int64_t num_prefills,
     const int64_t num_decodes) {
   auto& queue = dpcppGetCurrentQueue();
+  if (num_prefills == 1 && num_decodes == 0 && !token_indx.has_value() && q.size(0) >= 2048 && q.size(2) == 128 &&
+      v.size(2) == 128 && q.scalar_type() == at::kBFloat16 && ssm_state.scalar_type() == at::kFloat &&
+      q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && ssm_state.is_contiguous()) {
+    auto sections =
+        gdn::gdn_workspace_sections(1, q.size(0), 1, q.size(1), v.size(1), q.size(2), v.size(2), 1, q.scalar_type());
+    auto normalized_q = torch::zeros(sections[0].shape, q.options());
+    auto normalized_k = torch::zeros(sections[1].shape, k.options());
+    auto padded_v = torch::zeros(sections[2].shape, v.options());
+    auto beta = torch::zeros(sections[3].shape, b.options().dtype(at::kFloat));
+    auto alpha = torch::zeros(sections[4].shape, a.options().dtype(at::kFloat));
+    normalized_q.narrow(0, 0, q.size(0)).copy_(q);
+    normalized_k.narrow(0, 0, k.size(0)).copy_(k);
+    padded_v.narrow(0, 0, v.size(0)).copy_(v);
+    beta.narrow(1, 0, b.size(0)).copy_(b.to(at::kFloat).sigmoid().transpose(0, 1));
+    alpha.narrow(1, 0, a.size(0)).copy_(a.transpose(0, 1));
+    l2norm(queue, normalized_q, normalized_k);
+    auto initial_state = has_initial_state.has_value()
+                             ? has_initial_state
+                             : std::optional<torch::Tensor>(torch::ones({1}, q.options().dtype(at::kBool)));
+    chunk_gated_delta_rule(
+        queue,
+        core_attn_out,
+        normalized_q,
+        normalized_k,
+        padded_v,
+        beta,
+        alpha,
+        A_log,
+        dt_bias,
+        ssm_state,
+        query_start_loc,
+        cache_indices,
+        initial_state,
+        static_cast<int>(num_prefills),
+        static_cast<int>(num_decodes));
+    return;
+  }
   std::optional<torch::Tensor> no_num_accepted_tokens{std::nullopt};
+  auto contiguous_b = b.contiguous();
+  auto contiguous_a = a.contiguous();
   gdn::gated_delta_rule(
       queue,
       core_attn_out,
       q,
       k,
       v,
-      b,
-      a,
+      contiguous_b,
+      contiguous_a,
       A_log,
       dt_bias,
       ssm_state,

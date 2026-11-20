@@ -183,13 +183,16 @@ struct Xe3FmhaConfig {
 
     const int q_seq_stride = static_cast<int>(q_dense.stride(0));
     const int q_head_stride = static_cast<int>(q_dense.stride(1));
-    const int kv_seq_stride = static_cast<int>(k_pool.stride(0));
-    const int kv_head_stride = static_cast<int>(k_pool.stride(1));
+    const int k_seq_stride = static_cast<int>(k_pool.stride(0));
+    const int k_head_stride = static_cast<int>(k_pool.stride(1));
+    // V may be a row-strided slice of a fused qkv output while K is contiguous.
+    const int v_seq_stride = static_cast<int>(v_pool.stride(0));
+    const int v_head_stride = static_cast<int>(v_pool.stride(1));
     const int o_seq_stride = static_cast<int>(out_dense.stride(0));
     const int o_head_stride = static_cast<int>(out_dense.stride(1));
     typename FMHAKernel::StrideQ stride_q{q_seq_stride, {}, q_head_stride, 0};
-    typename FMHAKernel::StrideK stride_k{kv_seq_stride, {}, kv_head_stride, 0};
-    typename FMHAKernel::StrideV stride_v{{}, kv_seq_stride, kv_head_stride, 0};
+    typename FMHAKernel::StrideK stride_k{k_seq_stride, {}, k_head_stride, 0};
+    typename FMHAKernel::StrideV stride_v{{}, v_seq_stride, v_head_stride, 0};
     typename FMHAKernel::StrideO stride_o{o_seq_stride, {}, o_head_stride, 0};
 
     cutlass::KernelHardwareInfo hw_info;
@@ -818,13 +821,16 @@ struct Xe3FmhaConfig {
 
     const int q_seq_stride = static_cast<int>(q_dense.stride(0));
     const int q_head_stride = static_cast<int>(q_dense.stride(1));
-    const int kv_seq_stride = static_cast<int>(k_pool.stride(0));
-    const int kv_head_stride = static_cast<int>(k_pool.stride(1));
+    const int k_seq_stride = static_cast<int>(k_pool.stride(0));
+    const int k_head_stride = static_cast<int>(k_pool.stride(1));
+    // V may be a row-strided slice of a fused qkv output while K is contiguous.
+    const int v_seq_stride = static_cast<int>(v_pool.stride(0));
+    const int v_head_stride = static_cast<int>(v_pool.stride(1));
     const int o_seq_stride = static_cast<int>(out_dense.stride(0));
     const int o_head_stride = static_cast<int>(out_dense.stride(1));
     typename FMHAKernel::StrideQ stride_q{q_seq_stride, {}, q_head_stride, 0};
-    typename FMHAKernel::StrideK stride_k{kv_seq_stride, {}, kv_head_stride, 0};
-    typename FMHAKernel::StrideV stride_v{{}, kv_seq_stride, kv_head_stride, 0};
+    typename FMHAKernel::StrideK stride_k{k_seq_stride, {}, k_head_stride, 0};
+    typename FMHAKernel::StrideV stride_v{{}, v_seq_stride, v_head_stride, 0};
     typename FMHAKernel::StrideO stride_o{o_seq_stride, {}, o_head_stride, 0};
 
     cutlass::KernelHardwareInfo hw_info;

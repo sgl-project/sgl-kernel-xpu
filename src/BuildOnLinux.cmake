@@ -207,6 +207,10 @@ foreach(sycl_src ${ATen_XPU_SYCL_XE20})
     endif()
   endforeach()
 
+  if(_src_name MATCHES "^DiffusionAttention(Fp16|Bf16)?Xe20$")
+    set(_matched "DiffusionAttentionXe20_")
+  endif()
+
   if(_matched)
     # Strip trailing underscores so the library name reads as a family name.
     string(REGEX REPLACE "_+$" "" _key "${_matched}")
@@ -250,12 +254,31 @@ foreach(sycl_src ${ATen_XPU_SYCL_XE20})
     set(_lib_srcs ${sycl_src})
   endif()
 
-  sycl_add_library(
-    ${sycl_lib}
-    ${XE20_OFFLINE_COMPILER_FLAGS}
-    ${COMMON_DEVICE_LINK_FLAGS}
-    SHARED
-    SYCL_SOURCES ${_lib_srcs})
+  if(_key STREQUAL "DiffusionAttentionXe20")
+    # Keep the two dtype implementations in one installed library. Scope their
+    # validated O3 flags to this target and restore the other kernel settings.
+    set(_diffusion_saved_compile_flags ${SYCL_COMPILE_FLAGS})
+    set(_diffusion_saved_host_flags ${SYCL_HOST_FLAGS})
+    set(SYCL_COMPILE_FLAGS -fsycl -std=c++20 -O3 -DNDEBUG
+        -fno-sycl-instrument-device-code -fsycl-targets=spir64_gen
+        -Wno-deprecated-declarations)
+    list(APPEND SYCL_HOST_FLAGS -O3 -DNDEBUG)
+    sycl_add_library(
+      ${sycl_lib}
+      "-device bmg"
+      ${COMMON_DEVICE_LINK_FLAGS}
+      SHARED
+      SYCL_SOURCES ${_lib_srcs})
+    set(SYCL_COMPILE_FLAGS ${_diffusion_saved_compile_flags})
+    set(SYCL_HOST_FLAGS ${_diffusion_saved_host_flags})
+  else()
+    sycl_add_library(
+      ${sycl_lib}
+      ${XE20_OFFLINE_COMPILER_FLAGS}
+      ${COMMON_DEVICE_LINK_FLAGS}
+      SHARED
+      SYCL_SOURCES ${_lib_srcs})
+  endif()
   target_link_libraries(common_ops PUBLIC ${sycl_lib})
   list(APPEND SGL_OPS_LIBRARIES ${sycl_lib})
 

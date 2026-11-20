@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import torch
@@ -112,3 +113,40 @@ def fused_scale_residual_norm_scale_shift(
         shift,
         eps,
     )
+
+
+_DIFFUSION_SDP_LIBRARY = "libsgl-ops-sycl-DiffusionAttentionXe20.so"
+
+
+def _diffusion_sdp_op():
+    """Load the BMG-only D128 attention operator from the selected wheel backend."""
+    if not hasattr(torch.ops.sgl_kernel, "diffusion_sdp"):
+        from ._arch import select_backend
+
+        backend = select_backend()
+        path = Path(__file__).resolve().parent / backend / _DIFFUSION_SDP_LIBRARY
+        if not path.is_file():
+            raise RuntimeError(
+                f"SYCL-TLA diffusion attention library is missing: {path}"
+            )
+        torch.ops.load_library(str(path))
+    return torch.ops.sgl_kernel.diffusion_sdp
+
+
+def is_available():
+    """Whether this XPU wheel provides dense D128 diffusion attention."""
+    try:
+        _diffusion_sdp_op()
+        return True
+    except (OSError, RuntimeError):
+        return False
+
+
+def sdp(q, k, v):
+    """Dense noncausal self-attention for matching FP16/BF16 [1,L,H,128] tensors.
+
+    BMG only, with fixed scale 1/sqrt(128) and one unmasked sequence per call.
+    Strided QKV views are materialized internally. The output is contiguous
+    and has the same shape and dtype as the inputs.
+    """
+    return _diffusion_sdp_op()(q, k, v)

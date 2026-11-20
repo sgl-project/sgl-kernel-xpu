@@ -173,7 +173,7 @@ def test_prepare_moe_input_small_rejects_capacity_overflow(num_tokens, top_k, er
 
 
 @pytest.mark.parametrize("num_tokens", [1, 2, 5, 16, 64, 128, 224, 1024])
-@pytest.mark.parametrize("num_experts", [1, 4, 8, 32, 40, 64, 128, 256])
+@pytest.mark.parametrize("num_experts", [1, 4, 8, 32, 40, 64, 128, 256, 1025, 2560])
 @pytest.mark.parametrize("top_k", [1, 2, 4, 6, 8])
 @pytest.mark.parametrize("hidden_dims", [16, 32, 64, 128, 1024, 1536, 2048])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
@@ -183,6 +183,11 @@ def test_prepare_input_moe(
 ):
     if num_experts < top_k:
         pytest.skip("invalid combination")
+    if num_experts > 256 and not (
+        top_k == 8 and hidden_dims == 2048 and dtype == torch.bfloat16 and use_factors
+    ):
+        # More experts than one work-group's size limit; one config per token count.
+        pytest.skip("reduce parameter space for large expert counts")
     if not use_factors:
         # Keep a single representative config for the null-factors path.
         keep_null_factors_case = (
@@ -294,6 +299,23 @@ def test_prepare_input_moe(
 
     # validate expert offsets
     torch.testing.assert_close(expert_offsets, expert_offsets_xpu.to("cpu"))
+
+    # Routes map one-to-one onto rows grouped by ascending expert id; the order
+    # within an expert is not fixed.
+    dst = output_permutation_xpu.cpu().to(torch.int64)
+    assert torch.equal(torch.sort(dst).values, torch.arange(dst.numel()))
+    expert_ends = torch.cumsum(expert_offsets, 0).to(torch.int64)
+    expert_starts = expert_ends - expert_offsets
+    route_experts = flat_topk.to(torch.int64)
+    assert bool(
+        (
+            (dst >= expert_starts[route_experts]) & (dst < expert_ends[route_experts])
+        ).all()
+    )
+    # Each row reads back the token its route came from.
+    route_tokens = torch.arange(dst.numel()) // top_k
+    assert torch.equal(input_permutation_xpu.cpu()[dst].to(torch.int64), route_tokens)
+
     input_tensor = torch.randn(num_tokens, hidden_dims, dtype=dtype)
     input_tensor_xpu = input_tensor.clone().to(device)
     output_tensor_xpu = torch.empty(

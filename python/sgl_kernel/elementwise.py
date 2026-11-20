@@ -906,3 +906,54 @@ def fused_q_indexer_rope_hadamard_fp4_quant(
         )
     )
     return (q_fp4, q_sf), weights_out
+
+
+def indexed_scale_shift_bf16_(
+    x: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    r"""In-place per-row scale-and-shift of ``x``, gathering ``shift``/``scale`` by ``indices``.
+
+    ``x[i] = x[i] * (1 + scale[indices[i]]) + shift[indices[i]]``, rounding to
+    bf16 after each step.
+
+    Parameters
+    ----------
+    x: torch.Tensor
+        BF16 contiguous (in last dim) tensor, shape ``(rows, hidden)``; updated in-place.
+    shift: torch.Tensor
+        BF16 contiguous (in last dim) tensor, shape ``(num_indices, hidden)``.
+    scale: torch.Tensor
+        BF16 contiguous (in last dim) tensor, same shape as ``shift``.
+    indices: torch.Tensor
+        int32 or int64 contiguous tensor, shape ``(rows,)``.
+    """
+    torch.ops.sgl_kernel.indexed_scale_shift_bf16_(x, shift, scale, indices)
+    return x
+
+
+def indexed_gate_bf16_(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    other: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    r"""In-place gated add on ``x``, gathering ``gate`` by ``indices``.
+
+    ``x[i] += gate[indices[i]] * other[i]``, rounding to bf16 after each step.
+
+    Parameters
+    ----------
+    x: torch.Tensor
+        BF16 contiguous (in last dim) tensor, shape ``(rows, hidden)``; updated in-place.
+    gate: torch.Tensor
+        BF16 contiguous (in last dim) tensor, shape ``(num_indices, hidden)``.
+    other: torch.Tensor
+        BF16 contiguous (in last dim) tensor, shape ``(rows, hidden)``.
+    indices: torch.Tensor
+        int32 or int64 contiguous tensor, shape ``(rows,)``.
+    """
+    torch.ops.sgl_kernel.indexed_gate_bf16_(x, gate, other, indices)
+    return x

@@ -64,7 +64,7 @@ def calculate_effective_bandwidth(batch_size, num_heads, head_dim, time_ms):
 # Test configurations
 batch_size_range = [1, 8, 16, 32, 64, 128]
 num_heads_range = [8, 16, 32]
-head_dim_range = [64, 128, 256]
+head_dim_range = [64, 128, 256, 512, 1024]
 configs = list(itertools.product(batch_size_range, num_heads_range, head_dim_range))
 
 

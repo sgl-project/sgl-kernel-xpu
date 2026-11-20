@@ -115,8 +115,14 @@ def test_rmsnorm_jit_vs_aot():
 @pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
 @pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "num_tokens, num_qo_heads, num_kv_heads, head_dim",
+    [(2048, 8, 2, 128), (64, 16, 16, 512)],
+)
 @pytest.mark.parametrize("packed_qkv", [False, True])
-def test_qknorm_jit_vs_reference(dtype, packed_qkv):
+def test_qknorm_jit_vs_reference(
+    dtype, packed_qkv, num_tokens, num_qo_heads, num_kv_heads, head_dim
+):
     """Test QKNorm JIT accuracy vs PyTorch reference for head_dim=128.
 
     With ``packed_qkv`` the q/k inputs are slices of a fused QKV projection, so
@@ -124,8 +130,6 @@ def test_qknorm_jit_vs_reference(dtype, packed_qkv):
     kernel takes as a parameter. V must then stay untouched.
     """
     device = "xpu"
-    num_tokens = 2048
-    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
     eps = 1e-6
 
     qkv = torch.randn(
@@ -159,6 +163,106 @@ def test_qknorm_jit_vs_reference(dtype, packed_qkv):
     torch.testing.assert_close(q.float(), q_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(k.float(), k_ref, rtol=1e-2, atol=1e-2)
     assert torch.equal(v, v_ref)
+
+
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("pad_elems", [1, 2, 4])
+def test_qknorm_jit_padded_stride(dtype, pad_elems):
+    """QKNorm JIT accuracy under padded packed-QKV layouts.
+
+    head_dim=128 gives elems_per_thread=8, so the kernel's vec_size candidates
+    are {8, 4, 2, 1}. Shifting both the packed-QKV base pointer and the
+    per-token row stride by ``pad_elems`` elements caps the achievable vector
+    width at gcd(pad_elems, 8): pad_elems=4 forces vec_size<=4, pad_elems=2
+    forces vec_size<=2, and the odd pad_elems=1 forces the fully scalar
+    vec_size=1 path. This exercises `qknorm_pick_aligned_vec_size`'s pointer
+    and stride alignment checks without relying on a specific device's
+    preferred vector width.
+    """
+    device = "xpu"
+    num_tokens = 256
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    eps = 1e-6
+
+    row_elems = (num_qo_heads + 2 * num_kv_heads) * head_dim
+    stride = row_elems + pad_elems
+
+    # The leading `pad_elems` offset shifts q/k's base pointer by pad_elems
+    # dtype elements; the extra `pad_elems` gap per row shifts the row stride
+    # by the same amount, so both the pointer and stride checks are exercised
+    # together, as they would be for a slice of a larger padded buffer.
+    buf = torch.randn(num_tokens * stride + pad_elems, dtype=dtype, device=device)
+    qkv = buf[pad_elems:].as_strided((num_tokens, row_elems), (stride, 1))
+
+    q_size, kv_size = num_qo_heads * head_dim, num_kv_heads * head_dim
+    q = qkv[:, :q_size].unflatten(1, (num_qo_heads, head_dim))
+    k = qkv[:, q_size : q_size + kv_size].unflatten(1, (num_kv_heads, head_dim))
+    v = qkv[:, q_size + kv_size :]
+
+    q_weight = torch.randn(head_dim, dtype=dtype, device=device)
+    k_weight = torch.randn(head_dim, dtype=dtype, device=device)
+
+    q_ref, k_ref = reference_qknorm(
+        q.float(), k.float(), q_weight.float(), k_weight.float(), eps
+    )
+    v_ref = v.clone()
+    before = buf.clone()
+
+    # JIT kernel (in-place operation)
+    jit_qknorm(q, k, q_weight, k_weight, eps, head_dim=head_dim)
+
+    # Compare accuracy
+    torch.testing.assert_close(q.float(), q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k.float(), k_ref, rtol=1e-2, atol=1e-2)
+    assert torch.equal(v, v_ref)
+
+    # Bytes outside the packed-QKV view (the leading pad plus the per-row
+    # gaps) must be untouched regardless of which vector width was chosen.
+    in_view = torch.zeros_like(buf, dtype=torch.bool)
+    in_view[pad_elems:].as_strided((num_tokens, row_elems), (stride, 1)).fill_(True)
+    assert torch.equal(buf[~in_view], before[~in_view])
+
+
+@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
+@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_qknorm_jit_misaligned_weight_pointer(dtype):
+    """A misaligned q_weight/k_weight pointer alone must force the fully
+    scalar vec_size=1 fallback, even when q/k are contiguous and aligned.
+
+    `qknorm_pick_aligned_vec_size` requires every one of q/k/q_weight/k_weight
+    to satisfy the elem_size * vec_size byte-alignment check, so a single
+    misaligned weight pointer should degrade the whole launch to vec_size=1.
+    """
+    device = "xpu"
+    num_tokens = 256
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    eps = 1e-6
+
+    q = torch.randn(num_tokens, num_qo_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(num_tokens, num_kv_heads, head_dim, dtype=dtype, device=device)
+
+    # Slice the weight out of a buffer with 1 leading padding element so its
+    # data_ptr() sits at an odd multiple of the dtype size: no vec_size > 1
+    # can satisfy the byte-alignment check below.
+    q_weight = torch.randn(head_dim + 1, dtype=dtype, device=device)[1:]
+    k_weight = torch.randn(head_dim + 1, dtype=dtype, device=device)[1:]
+    assert q_weight.is_contiguous() and k_weight.is_contiguous()
+    assert q_weight.data_ptr() % (2 * q_weight.element_size()) != 0
+    assert k_weight.data_ptr() % (2 * k_weight.element_size()) != 0
+
+    q_ref, k_ref = reference_qknorm(
+        q.float(), k.float(), q_weight.float(), k_weight.float(), eps
+    )
+
+    # JIT kernel (in-place operation)
+    jit_qknorm(q, k, q_weight, k_weight, eps, head_dim=head_dim)
+
+    # Compare accuracy
+    torch.testing.assert_close(q.float(), q_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(k.float(), k_ref, rtol=1e-2, atol=1e-2)
 
 
 def reference_rope(q, k, cos_sin_cache, positions, is_neox, rope_dim):

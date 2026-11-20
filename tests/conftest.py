@@ -21,6 +21,10 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
+        "non_device: CPU or schema check; not Intel Arc Pro B70 evidence",
+    )
+    config.addinivalue_line(
+        "markers",
         "debug_checks: exercises value-level input checks that exist only in "
         "RelWithDebInfo builds. Skipped unless SGL_KERNEL_DEBUG_CHECKS=1 "
         "(set it when testing such a build).",

@@ -1,0 +1,171 @@
+--- a/python/sglang/srt/layers/attention/linear/gdn_backend.py
++++ b/python/sglang/srt/layers/attention/linear/gdn_backend.py
+@@ -247,8 +247,84 @@
+             "--enable-deterministic-inference. Use "
+             "--linear-attn-prefill-backend triton."
+         )
++
++
++
++class XpuGDNVerifyKernel:
++    """SYCL target_verify. Reads the committed SSM state and writes snapshots."""
++
++    def target_verify(
++        self,
++        A_log,
++        dt_bias,
++        q,
++        k,
++        v,
++        a,
++        b,
++        *,
++        ssm_states,
++        cache_indices,
++        query_start_loc,
++        intermediate_states_buffer,
++        intermediate_state_indices,
++        cache_steps,
++        retrieve_parent_token,
++        **kwargs,
++    ):
++        def flat_qkv(t):
++            if t.dim() == 4:
++                return t.reshape(-1, t.shape[-2], t.shape[-1]).contiguous()
++            if t.dim() == 3:
++                return t.contiguous()
++            raise RuntimeError(f"GDN verify qkv rank {t.dim()}")
+ 
++        def flat_gate(t):
++            if t.dim() == 3:
++                t = t.reshape(-1, t.shape[-1])
++            return t.contiguous()
+ 
++        qf, kf, vf = flat_qkv(q), flat_qkv(k), flat_qkv(v)
++        af, bf = flat_gate(a), flat_gate(b)
++        nseq = int(query_start_loc.shape[0] - 1)
++        idx = cache_indices[:nseq].to(torch.int32).contiguous()
++        iidx = intermediate_state_indices[:nseq].to(torch.int32).contiguous()
++        parent = retrieve_parent_token
++        if parent is not None:
++            parent = parent.contiguous()
++        if A_log.dtype != torch.float32:
++            A_log = A_log.float()
++        if dt_bias.dtype != vf.dtype:
++            dt_bias = dt_bias.to(vf.dtype)
++        out = torch.empty(
++            (qf.shape[0], vf.shape[1], vf.shape[2]),
++            dtype=vf.dtype,
++            device=vf.device,
++        )
++        torch.ops.sgl_kernel.gated_delta_rule_verify(
++            out,
++            qf,
++            kf,
++            vf,
++            bf,
++            af,
++            A_log,
++            dt_bias,
++            ssm_states,
++            idx,
++            intermediate_states_buffer,
++            iidx,
++            int(cache_steps),
++            None,
++            parent,
++        )
++        return out.view(v.shape)
++
++
+ class GDNKernelDispatcher:
+     """Dispatches GDN kernel calls to the appropriate backend per mode."""
+ 
+@@ -351,6 +427,9 @@
+         # SM90 FlashInfer verify requires a fp32 SSM state, so e.g.
+         # --mamba-ssm-dtype bfloat16 setups must be able to force Triton here.
+-        if verify_backend is not None and verify_backend.is_triton():
++        if decode_backend.is_intel_xpu() or prefill_backend.is_intel_xpu():
++            self.verify_kernel = XpuGDNVerifyKernel()
++            self.verify_kernel_is_flashinfer = False
++        elif verify_backend is not None and verify_backend.is_triton():
+             self.verify_kernel = triton_kernel
+             self.verify_kernel_is_flashinfer = False
+         elif (
+@@ -1045,19 +1124,35 @@
+             mixed_qkv_reshaped = mixed_qkv.view(
+                 batch_size, draft_token_num, -1
+             ).transpose(1, 2)
+-            mixed_qkv_processed = causal_conv1d_update(
+-                mixed_qkv_reshaped,
+-                conv_states,
+-                layer.conv_weights,
+-                layer.bias,
+-                layer.activation,
+-                conv_state_indices=cache_indices[:batch_size],
+-                intermediate_conv_window=intermediate_conv_window_cache,
+-                intermediate_state_indices=intermediate_state_indices[:batch_size],
+-                retrieve_next_token=retrieve_next_token,
+-                retrieve_next_sibling=retrieve_next_sibling,
+-                retrieve_parent_token=retrieve_parent_token,
+-            )
++            if hasattr(torch.ops.sgl_kernel, "causal_conv1d_update_verify"):
++                mixed_qkv_processed = torch.ops.sgl_kernel.causal_conv1d_update_verify(
++                    mixed_qkv_reshaped,
++                    conv_states,
++                    layer.conv_weights,
++                    layer.bias,
++                    layer.activation in ("silu", "swish"),
++                    cache_indices[:batch_size].to(torch.int32).contiguous(),
++                    intermediate_conv_window_cache,
++                    intermediate_state_indices[:batch_size].to(torch.int32).contiguous(),
++                    retrieve_next_token,
++                    retrieve_next_sibling,
++                    retrieve_parent_token,
++                    -1,
++                )
++            else:
++                mixed_qkv_processed = causal_conv1d_update(
++                    mixed_qkv_reshaped,
++                    conv_states,
++                    layer.conv_weights,
++                    layer.bias,
++                    layer.activation,
++                    conv_state_indices=cache_indices[:batch_size],
++                    intermediate_conv_window=intermediate_conv_window_cache,
++                    intermediate_state_indices=intermediate_state_indices[:batch_size],
++                    retrieve_next_token=retrieve_next_token,
++                    retrieve_next_sibling=retrieve_next_sibling,
++                    retrieve_parent_token=retrieve_parent_token,
++                )
+             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+         else:
+             if forward_metadata.has_mamba_track_mask:
+--- a/python/sglang/srt/hardware_backend/xpu/attention/xpu_gdn_backend.py
++++ b/python/sglang/srt/hardware_backend/xpu/attention/xpu_gdn_backend.py
+@@ -36,7 +36,9 @@
+                 "available. Rebuild sgl-kernel-xpu or use "
+                 "--linear-attn-backend triton."
+             )
+-        if mode.is_target_verify() or mode.is_draft_extend_v2():
++        # target_verify uses the standalone SYCL verify ops. Draft extend
++        # updates the live conv/SSM state, which the fused kernel already does.
++        if mode.is_target_verify():
+             return False
+         fm = self.forward_metadata
+         # A track mask only names prefix-cache checkpoint slots. The fused
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -1002,7 +1002,11 @@
+                     backend, projected_states_qkvz, projected_states_ba, forward_batch
+                 )
+ 
+-        if not getattr(self, "_sgl_logged_slow", False):
++        if (
++            not getattr(self, "_sgl_logged_slow", False)
++            and not forward_batch.forward_mode.is_target_verify()
++            and not forward_batch.forward_mode.is_draft_extend_v2()
++        ):
+             print(
+                 f"SGL_GPTQ_GDN slow mode={forward_batch.forward_mode}",
+                 flush=True,

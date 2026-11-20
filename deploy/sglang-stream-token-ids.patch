@@ -1,0 +1,15 @@
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -1237,12 +1237,6 @@
+                     "return_prompt_token_ids is not supported with streaming. "
+                     "Please set stream=false when using return_prompt_token_ids=true."
+                 )
+-            if request.return_token_ids:
+-                raise ValueError(
+-                    "return_token_ids is not supported with streaming on "
+-                    "/v1/chat/completions. Please set stream=false when using "
+-                    "return_token_ids=true."
+-                )
+             if request.return_meta_info:
+                 raise ValueError(
+                     "return_meta_info is not supported with streaming. "

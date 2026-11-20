@@ -1,0 +1,15 @@
+--- a/python/sglang/srt/hardware_backend/xpu/attention/xpu_gdn_backend.py
++++ b/python/sglang/srt/hardware_backend/xpu/attention/xpu_gdn_backend.py
+@@ -39,9 +39,9 @@ class XpuGDNAttnBackend(GDNAttnBackend):
+         if mode.is_target_verify() or mode.is_draft_extend_v2():
+             return False
+         fm = self.forward_metadata
+-        if getattr(fm, "has_mamba_track_mask", False):
+-            # chunked prefix-cache intermediate-state tracking unsupported
+-            return False
++        # A track mask only names prefix-cache checkpoint slots. The fused
++        # kernel still updates the live conv/SSM state, which is what decode
++        # reads. Refusing the mask dropped page_size 64/128 onto Triton.
+         if getattr(fm, "query_start_loc", None) is None:
+             return False
+         # GDN (not KDA) shared weights must be plain tensors

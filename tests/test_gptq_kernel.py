@@ -1,134 +1,86 @@
 import pytest
 import torch
-import utils
+
+if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+    pytest.skip("XPU not available", allow_module_level=True)
+
 from sgl_kernel import gptq_gemm
 
-from sglang.srt.layers.quantization.utils import pack_cols, pack_rows
 
-device = utils.get_device()
+def pack_rows(q_uint8):
+    k, n = q_uint8.shape
+    out = torch.zeros(k // 8, n, dtype=torch.int32)
+    for i in range(8):
+        out |= q_uint8[i::8].to(torch.int32) << (i * 4)
+    return out
 
 
-def torch_dequantize(q_weight, q_zeros, scales, g_idx, use_shuffle, bit, K, N):
-    assert bit == 4, "Reference dequantization only supports 4-bit"
-    group_size = K // scales.shape[0]
-    pack_factor = 32 // bit
+def pack_cols(z_uint8):
+    groups, n = z_uint8.shape
+    out = torch.zeros(groups, n // 8, dtype=torch.int32)
+    for i in range(8):
+        out |= z_uint8[:, i::8].to(torch.int32) << (i * 4)
+    return out
 
-    # unpack q_weight: (K//pack_factor, N) -> (K, N)
-    unpacked_q_weight = torch.empty(
-        q_weight.shape[0] * pack_factor,
-        q_weight.shape[1],
-        dtype=torch.uint8,
-        device=q_weight.device,
+
+def quantize(weight, g_idx, zero_format):
+    groups = int(g_idx.max().item()) + 1
+    n = weight.shape[1]
+    scales = torch.empty(groups, n)
+    stored = torch.empty(groups, n, dtype=torch.int32)
+    q = torch.empty_like(weight)
+    for gi in range(groups):
+        rows = weight[g_idx == gi]
+        wmin = rows.min(dim=0).values
+        wmax = rows.max(dim=0).values
+        scale = ((wmax - wmin) / 15.0).clamp(min=1e-4)
+        eff = (-wmin / scale).round()
+        if zero_format == 1:
+            eff = eff.clamp(1, 15)
+            stored[gi] = (eff - 1).to(torch.int32)
+        else:
+            eff = eff.clamp(0, 15)
+            stored[gi] = eff.to(torch.int32)
+        scales[gi] = scale
+        sel = g_idx == gi
+        q[sel] = (weight[sel] / scale + eff).round().clamp(0, 15)
+    return q, stored, scales
+
+
+def reference(act, q, stored, scales, g_idx, zero_format):
+    eff = stored[g_idx].to(torch.float32)
+    if zero_format == 1:
+        eff = eff + 1
+    return act @ ((q - eff) * scales[g_idx])
+
+
+@pytest.mark.parametrize("m", [1, 8])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("zero_format", [1, 2])
+@pytest.mark.parametrize("index_name", ["contiguous", "noncontiguous"])
+def test_gptq_gemm(m, dtype, zero_format, index_name):
+    k, n = 256, 32
+    groups = k // 128
+    contiguous = torch.arange(k) // 128
+    g_idx = contiguous if index_name == "contiguous" else (groups - 1) - contiguous
+    weight = torch.randn(k, n)
+    act = torch.randn(m, k)
+    q, stored, scales = quantize(weight, g_idx, zero_format)
+    act_q = act.to(dtype)
+    scales_q = scales.to(dtype)
+    ref = reference(act_q.float(), q, stored, scales_q.float(), g_idx, zero_format).to(dtype)
+    device = torch.device("xpu")
+    out = gptq_gemm(
+        act_q.to(device),
+        pack_rows(q.to(torch.uint8)).to(device),
+        pack_cols(stored.to(torch.uint8)).to(device),
+        scales_q.to(device),
+        g_idx.to(device=device, dtype=torch.int32),
+        False,
+        4,
+        zero_format,
     )
-    for i in range(pack_factor):
-        unpacked_q_weight[i::pack_factor, :] = (q_weight >> (i * 4)) & 0x0F
-
-    # unpack q_zeros: (num_groups, N//pack_factor) -> (num_groups, N)
-    unpacked_q_zeros = torch.empty(
-        q_zeros.shape[0],
-        q_zeros.shape[1] * pack_factor,
-        dtype=torch.uint8,
-        device=q_zeros.device,
-    )
-    for i in range(pack_factor):
-        unpacked_q_zeros[:, i::pack_factor] = (q_zeros >> (i * 4)) & 0x0F
-
-    unpacked_q_zeros += 1
-    unpacked_q_zeros = unpacked_q_zeros.to(scales.dtype)
-
-    scale_zeros = unpacked_q_zeros * scales  # (num_groups, N)
-
-    current_g_idx = torch.tensor(
-        [i // group_size for i in range(K)], dtype=torch.int32, device=q_weight.device
-    )
-
-    scale_mat = scales[current_g_idx]  # (K, N)
-    scale_zeros_mat = scale_zeros[current_g_idx]  # (K, N)
-
-    # dequant: weight * scale - scale_zeros
-    dequantized_b = unpacked_q_weight.to(scales.dtype) * scale_mat - scale_zeros_mat
-
-    return dequantized_b.reshape(K, N)
-
-
-def torch_gptq_gemm(
-    a, b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit
-):
-    K, N = a.shape[1], b_q_weight.shape[1]
-
-    b_dequant = torch_dequantize(
-        b_q_weight, b_gptq_qzeros, b_gptq_scales, b_g_idx, use_shuffle, bit, K, N
-    )
-    c = torch.matmul(a, b_dequant)
-    return c
-
-
-def _test_gptq_gemm_once(M, N, K, bit, group_size, use_shuffle, dtype, device=device):
-
-    b_fp = torch.randn(K, N, dtype=dtype, device=device)
-
-    assert K % group_size == 0, "K must be divisible by group_size"
-    num_groups = K // group_size
-
-    if use_shuffle:
-        return
-    else:
-        g_idx = torch.tensor(
-            [i // group_size for i in range(K)], dtype=torch.int32, device=device
-        )
-        b_shuffled = b_fp[g_idx]
-
-    b_grouped = b_shuffled.reshape(num_groups, group_size, N)
-
-    b_max = torch.max(b_grouped, dim=1, keepdim=True)[0]
-    b_min = torch.min(b_grouped, dim=1, keepdim=True)[0]
-
-    scales = (b_max - b_min) / (2**bit - 1)
-    scales = scales.clamp(min=1e-6)
-
-    zeros_float = (-b_min / scales).round()
-
-    q_b = (
-        (b_grouped / scales + zeros_float).round().clamp(0, 2**bit - 1).to(torch.uint8)
-    )
-
-    q_zeros_unpacked = zeros_float.to(torch.uint8) - 1
-
-    b_q_weight = pack_rows(q_b.reshape(K, N), bit, K, N)
-
-    q_zeros_unpacked = q_zeros_unpacked.reshape(num_groups, N)
-    b_gptq_qzeros = pack_cols(q_zeros_unpacked, bit, num_groups, N)
-    b_gptq_scales = scales.squeeze(1)
-
-    a = torch.randn(M, K, dtype=dtype, device=device)
-
-    c_ref = torch_gptq_gemm(
-        a, b_q_weight, b_gptq_qzeros, b_gptq_scales, g_idx, use_shuffle, bit
-    )
-    c_out = gptq_gemm(
-        a, b_q_weight, b_gptq_qzeros, b_gptq_scales, g_idx, use_shuffle, bit
-    )
-
-    rtol = 4e-2
-    atol = 4e-2
-    torch.testing.assert_close(c_ref, c_out, rtol=rtol, atol=atol)
-    print(
-        f"✅ Test passed: M={M}, N={N}, K={K}, bit={bit}, group_size={group_size}, use_shuffle={use_shuffle}, dtype={dtype}"
-    )
-
-
-@pytest.mark.parametrize("M", [1, 8, 128])
-@pytest.mark.parametrize("N", [2048, 4096])
-@pytest.mark.parametrize("K", [2048, 4096])
-@pytest.mark.parametrize("bit", [4])
-@pytest.mark.parametrize("group_size", [128])
-@pytest.mark.parametrize("use_shuffle", [False])
-@pytest.mark.parametrize("dtype", [torch.float16])
-def test_gptq_gemm(M, N, K, bit, group_size, use_shuffle, dtype):
-    if not torch.accelerator.is_available():
-        pytest.skip("HW not available")
-    _test_gptq_gemm_once(M, N, K, bit, group_size, use_shuffle, dtype, device)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    torch.xpu.synchronize()
+    diff = (out.float().cpu() - ref.float()).abs()
+    limit = torch.maximum(0.01 * ref.float().abs(), torch.full_like(ref.float(), 0.02))
+    assert torch.all(diff <= limit)

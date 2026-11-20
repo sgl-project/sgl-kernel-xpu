@@ -1,0 +1,15 @@
+--- a/python/sglang/srt/arg_groups/overrides.py
++++ b/python/sglang/srt/arg_groups/overrides.py
+@@ -419,8 +419,9 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
+-    if get_platform().is_xpu:
+-        return False
+     spec = get_linear_attn_spec(hf_config)
+     if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
+         spec is not None and spec.support_mamba_cache_extra_buffer
+     ):
+-        return view.linear_attn_backend == "triton"
++        # no_buffer asserts page_size=1. Paged KV (64/128) has to take
++        # extra_buffer. intel_xpu keeps the live GDN state in the fused
++        # kernel; the Triton tracker only copies prefix-cache checkpoints.
++        return view.linear_attn_backend in ("triton", "intel_xpu")
+     return False

@@ -1,0 +1,15 @@
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -412,9 +412,11 @@
+         )
+ 
+         self.in_proj_ba = self.create_ba_proj(
+             hidden_size=self.hidden_size,
+             num_v_heads=self.num_v_heads,
+-            quant_config=quant_config,
++            # in_proj_a/b are stored as floating-point weights. A GPTQ parameter
++            # is never filled and its product is NaN.
++            quant_config=None,
+             prefix=add_prefix("in_proj_ba", prefix),
+             parallel_group=parallel_group,
+         )

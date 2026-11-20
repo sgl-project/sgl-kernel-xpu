@@ -249,6 +249,29 @@ def test_long_prefill_selects_chunk_kernel(tmp_path):
     assert not any("gated_delta_rule_kernel<" in name for name in kernels), kernels
 
 
+@pytest.mark.parametrize("length,remap", [(37, False), (2048, True)])
+def test_sequential_strided_gates_match_contiguous(length, remap):
+    inputs = _make_inputs([length], torch.bfloat16, torch.device("xpu"), nk=4, nv=12)
+    inputs["ssm_state"] = inputs["ssm_state"].float()
+    packed_gates = torch.cat((inputs["b"], inputs["a"]), dim=1)
+    inputs["b"], inputs["a"] = packed_gates.chunk(2, dim=1)
+    assert not inputs["b"].is_contiguous() and not inputs["a"].is_contiguous()
+    expected = {
+        key: value.clone() if isinstance(value, torch.Tensor) else value
+        for key, value in inputs.items()
+    }
+    assert expected["b"].is_contiguous() and expected["a"].is_contiguous()
+    original_gates = packed_gates.clone()
+    token_indx = (
+        torch.arange(length, device="xpu", dtype=torch.int32) if remap else None
+    )
+    _run_op(expected, token_indx=token_indx)
+    _run_op(inputs, token_indx=token_indx)
+    torch.testing.assert_close(inputs["core_attn_out"], expected["core_attn_out"])
+    torch.testing.assert_close(inputs["ssm_state"], expected["ssm_state"])
+    torch.testing.assert_close(packed_gates, original_gates, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize(
     "seq_lens", [[1024], [37], [128, 256, 5], [1, 1, 1, 1], [513, 1, 200, 1]]
 )

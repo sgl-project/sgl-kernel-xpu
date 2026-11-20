@@ -1,6 +1,7 @@
 #include "jit/gdn_jit.h"
 
 #include <cstdint>
+#include <cstdlib>
 
 #include "jit/jit_arch.h"
 #include "jit/sycl_template_jit.h"
@@ -84,6 +85,8 @@ ChunkFn resolve(bool is_half, int state_code, int arch, std::string* err) {
     spec.extra_flags = as.extra_flags;
     spec.subs["SYCL_TARGET"] = as.sycl_target;
     spec.target = as.target;
+    const char* target_override = std::getenv("SGLANG_SYCL_AOT_TARGETS");
+    if (target_override && *target_override) spec.target.clear();
     spec.entry_symbol = "sgl_gdn_chunk_entry";
     spec.name =
         std::string("gdn_chunk_") + (is_half ? "f16" : "bf16") + "_s" + std::to_string(state_code) + "_" + as.suffix;

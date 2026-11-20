@@ -539,9 +539,14 @@ SGL_KERNEL_EXPORT void gated_delta_rule(
     const int64_t num_prefills,
     const int64_t num_decodes) {
   auto& queue = dpcppGetCurrentQueue();
-  if (num_prefills == 1 && num_decodes == 0 && !token_indx.has_value() && q.size(0) >= 2048 && q.size(2) == 128 &&
-      v.size(2) == 128 && q.scalar_type() == at::kBFloat16 && ssm_state.scalar_type() == at::kFloat &&
-      q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && ssm_state.is_contiguous()) {
+  bool use_chunk = num_prefills == 1 && num_decodes == 0 && !token_indx.has_value() && q.size(0) >= 2048 &&
+                   q.size(2) == 128 && v.size(2) == 128 && q.scalar_type() == at::kBFloat16 &&
+                   ssm_state.scalar_type() == at::kFloat && q.is_contiguous() && k.is_contiguous() &&
+                   v.is_contiguous() && ssm_state.is_contiguous();
+#ifdef USE_GDN_JIT
+  use_chunk = use_chunk && is_bmg();
+#endif
+  if (use_chunk) {
     auto sections =
         gdn::gdn_workspace_sections(1, q.size(0), 1, q.size(1), v.size(1), q.size(2), v.size(2), 1, q.scalar_type());
     auto normalized_q = torch::zeros(sections[0].shape, q.options());

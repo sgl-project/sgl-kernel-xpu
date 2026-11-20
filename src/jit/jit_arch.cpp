@@ -8,6 +8,8 @@ const ArchProfile& arch_profile(Arch a) {
   // (intel_gpu_bmg_g21) behavior is preserved unchanged.
   static const ArchProfile kBmg{
       /*target=*/"", /*macro=*/"", /*suffix=*/"bmg", /*arch_tag=*/"xe20", /*sycl_target=*/"20"};
+  static const ArchProfile kBmgG31{
+      /*target=*/"intel_gpu_bmg_g31", /*macro=*/"", /*suffix=*/"bmg_g31", /*arch_tag=*/"xe20", /*sycl_target=*/"20"};
   // XE3P selects the Xe35 kernel code path via -DXPU_ENABLED_XE3P. Its concrete
   // -fsycl-targets id is filled in once Xe35 AOT targets are finalized; until
   // then it leaves `target` empty (falls back to the default/env target).
@@ -15,6 +17,8 @@ const ArchProfile& arch_profile(Arch a) {
       /*target=*/"", /*macro=*/"XPU_ENABLED_XE3P", /*suffix=*/"xe3p", /*arch_tag=*/"xe35", /*sycl_target=*/"35"};
 
   switch (a) {
+    case Arch::BMG_G31:
+      return kBmgG31;
     case Arch::XE3P:
       return kXe3p;
     case Arch::BMG:

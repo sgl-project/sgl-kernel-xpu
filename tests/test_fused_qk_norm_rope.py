@@ -226,7 +226,7 @@ def fused_qk_norm_rope_with_cache_reference(
 @pytest.mark.parametrize("num_heads_q", [8, 32, 64])
 @pytest.mark.parametrize("num_heads_k", [4, 8])
 @pytest.mark.parametrize("num_heads_v", [4, 8])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("head_dim", [64, 96, 128])
 @pytest.mark.parametrize("is_neox", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_fused_qk_norm_rope_basic(
@@ -303,7 +303,7 @@ def test_fused_qk_norm_rope_basic(
 
 
 @pytest.mark.parametrize("num_tokens", [32, 128])
-@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("head_dim", [96, 128, 256])
 @pytest.mark.parametrize("is_neox", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_fused_qk_norm_rope_yarn(num_tokens, head_dim, is_neox, dtype):
@@ -471,7 +471,7 @@ def test_fused_qk_norm_rope_partial_rotary(num_tokens, head_dim, rotary_dim, dty
         (8, 4, 2),
     ],
 )
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [64, 96, 128, 256])
 @pytest.mark.parametrize("is_neox", [True, False])
 def test_fused_qk_norm_rope_fp8_e4m3(
     num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim, is_neox

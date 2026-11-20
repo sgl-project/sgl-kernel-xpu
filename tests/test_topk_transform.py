@@ -328,7 +328,7 @@ def test_fast_topk_v2_infinite_scores(length):
 
 
 @pytest.mark.parametrize(
-    "length", [pytest.param(513, id="register"), pytest.param(16385, id="streaming")]
+    "length", [pytest.param(513, id="short"), pytest.param(16385, id="long")]
 )
 @pytest.mark.parametrize("negative_nan", [False, True], ids=["positive", "negative"])
 @torch.inference_mode()
@@ -350,7 +350,7 @@ def test_fast_topk_v2_nan_scores(length, negative_nan):
 
 @pytest.mark.parametrize(
     "batch,width",
-    [pytest.param(512, 4096, id="narrow"), pytest.param(4096, 8192, id="medium")],
+    [pytest.param(256, 2048, id="narrow"), pytest.param(4096, 8192, id="medium")],
 )
 @pytest.mark.parametrize("nan_count", [20, 513], ids=["below-k", "above-k"])
 @pytest.mark.parametrize("negative_nan", [False, True], ids=["positive", "negative"])
@@ -376,111 +376,7 @@ def test_fast_topk_v2_prefill_nan(batch, width, nan_count, negative_nan):
     assert (selected_scores == 1.0).sum() == 512 - selected_nans
 
 
-@pytest.mark.parametrize("k", [512, 2048])
-@pytest.mark.parametrize(
-    "batch,width",
-    [
-        (2047, 6144),
-        (2048, 6144),
-        (2049, 6144),
-        (2048, 6145),
-        (4096, 6145),
-        (4095, 8192),
-        (4096, 4096),
-        (4096, 4097),
-        (4097, 8192),
-        (4096, 10240),
-        (4096, 10241),
-    ],
-)
-@pytest.mark.parametrize("has_row_starts", [False, True])
-@torch.inference_mode()
-def test_fast_topk_v2_medium_windows(k, batch, width, has_row_starts):
-    generator = torch.Generator().manual_seed(19)
-    starts = torch.arange(batch, dtype=torch.int32) % 8 if has_row_starts else None
-    lengths = torch.linspace(k + 1, width - 7, batch).int()
-    lengths[:4] = torch.tensor([0, k - 1, k, k + 1])
-    score = torch.randn(batch, width, generator=generator)
-    result = fast_topk_v2(
-        score.to("xpu"),
-        lengths.to("xpu"),
-        k,
-        row_starts=starts.to("xpu") if starts is not None else None,
-    ).cpu()
-
-    rows = list(range(4)) + torch.linspace(4, batch - 1, 12).long().tolist()
-    for row in rows:
-        n = int(lengths[row])
-        start = int(starts[row]) if starts is not None else 0
-        indices = result[row, : min(n, k)].long()
-        assert indices.unique().numel() == min(n, k)
-        assert ((indices >= 0) & (indices < n)).all()
-        values = score[row, start : start + n]
-        torch.testing.assert_close(
-            values[indices].sort().values,
-            values.topk(min(n, k)).values.sort().values,
-            rtol=0,
-            atol=0,
-        )
-        if n <= k:
-            torch.testing.assert_close(result[row, :n], torch.arange(n).int())
-            assert (result[row, n:] == -1).all()
-
-
-@pytest.mark.parametrize("k", [512, 2048])
-@pytest.mark.parametrize(
-    "distribution",
-    [
-        "candidates128",
-        "candidates129",
-        "candidates256",
-        "candidates257",
-        "one_bin",
-        "negative_bin",
-        "equal",
-        "infinite",
-        "tiny",
-    ],
-)
-@torch.inference_mode()
-def test_fast_topk_v2_medium_fallback(k, distribution):
-    generator = torch.Generator().manual_seed(23)
-    batch, width = 4096, 8192
-    score = 1.0 + torch.rand(batch, width + 3, generator=generator) * 0.001
-    if distribution.startswith("candidates"):
-        candidates = int(distribution.removeprefix("candidates"))
-        score.fill_(-2.0)
-        score[:, 3 : k + 2] = 2.0
-        score[:, k + 2 : k + 2 + candidates] = 1.0 + torch.arange(candidates) * 1e-6
-    elif distribution == "negative_bin":
-        score.neg_()
-    elif distribution == "equal":
-        score.zero_()
-    elif distribution == "infinite":
-        score.fill_(-float("inf"))
-        score[:, 3:103] = float("inf")
-        score[:, 103:1003] = 1e20
-    elif distribution == "tiny":
-        score = (score - 1.0005) * 1e-30
-    result = fast_topk_v2(
-        score.to("xpu"),
-        torch.full((batch,), width, dtype=torch.int32, device="xpu"),
-        k,
-        row_starts=torch.full((batch,), 3, dtype=torch.int32, device="xpu"),
-    ).cpu()
-    for row in torch.linspace(0, batch - 1, 16).long().tolist():
-        indices = result[row].long()
-        assert indices.unique().numel() == k
-        assert ((indices >= 0) & (indices < width)).all()
-        values = score[row, 3:]
-        torch.testing.assert_close(
-            values[indices].sort().values,
-            values.topk(k).values.sort().values,
-            rtol=0,
-            atol=0,
-        )
-
-
+# Batches around each switch between the 1024-thread kernel and the many-row kernel.
 @pytest.mark.parametrize("k", [512, 2048])
 @pytest.mark.parametrize(
     "batch,width",
@@ -488,25 +384,27 @@ def test_fast_topk_v2_medium_fallback(k, distribution):
         (255, 2048),
         (256, 2048),
         (257, 2048),
-        (256, 2049),
-        (512, 2049),
-        (511, 4096),
-        (512, 4096),
-        (513, 4096),
-        (4095, 4096),
         (4096, 513),
-        (4096, 2048),
-        (4096, 2049),
         (4097, 3001),
-        (4096, 4095),
-        (4096, 4096),
+        (2047, 4096),
+        (2048, 4096),
+        (2047, 6144),
+        (2048, 6144),
+        (2049, 6144),
+        (2048, 6145),
+        (4095, 6145),
+        (4096, 6145),
+        (4095, 8192),
+        (4096, 8192),
+        (4096, 10240),
+        (4096, 10241),
     ],
 )
 @pytest.mark.parametrize("has_row_starts", [False, True])
 @torch.inference_mode()
-def test_fast_topk_v2_narrow_windows(k, batch, width, has_row_starts):
+def test_fast_topk_v2_windows(k, batch, width, has_row_starts):
     generator = torch.Generator().manual_seed(29)
-    starts = torch.arange(batch, dtype=torch.int32) % 4 if has_row_starts else None
+    starts = torch.arange(batch, dtype=torch.int32) % 8 if has_row_starts else None
     max_lengths = (
         width - starts
         if starts is not None
@@ -542,14 +440,16 @@ def test_fast_topk_v2_narrow_windows(k, batch, width, has_row_starts):
             assert (result[row, n:] == -1).all()
 
 
+# Rows whose threshold bin holds many (or all) scores, on the many-row kernel.
 @pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize("width", [4096, 8192])
 @pytest.mark.parametrize(
     "distribution",
     [
         "candidates128",
         "candidates129",
-        "refined512",
-        "refined513",
+        "candidates256",
+        "candidates257",
         "one_bin",
         "negative_bin",
         "equal",
@@ -559,23 +459,20 @@ def test_fast_topk_v2_narrow_windows(k, batch, width, has_row_starts):
     ],
 )
 @torch.inference_mode()
-def test_fast_topk_v2_narrow_fallback(k, distribution):
+def test_fast_topk_v2_ties(k, width, distribution):
     generator = torch.Generator().manual_seed(31)
-    batch, width = 4096, 4096
+    batch = 4096
     starts = torch.arange(batch, dtype=torch.int32) % 4
     lengths = width - starts - torch.arange(batch, dtype=torch.int32) % 8
     score = 1.0 + torch.rand(batch, width, generator=generator) * 0.001
-    if distribution.startswith(("candidates", "refined")):
-        count = int(distribution.removeprefix("candidates").removeprefix("refined"))
+    if distribution.startswith("candidates"):
+        count = int(distribution.removeprefix("candidates"))
         score.fill_(-2.0)
         for start in range(4):
             score[start::4, start : start + k - 1] = 2.0
-            values = (
+            score[start::4, start + k - 1 : start + k - 1 + count] = (
                 1.0 + torch.arange(count) * 1e-6
-                if distribution.startswith("candidates")
-                else 1.0
             )
-            score[start::4, start + k - 1 : start + k - 1 + count] = values
     elif distribution == "negative_bin":
         score.neg_()
     elif distribution == "equal":

@@ -11,10 +11,8 @@
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "dsa_topk/topk_dsa.hpp"
 #include "dsa_topk/topk_prefill_medium.hpp"
-#include "dsa_topk/topk_prefill_narrow.hpp"
-#include "dsa_topk/topk_register.hpp"
-#include "dsa_topk/topk_streaming.hpp"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -377,17 +375,15 @@ FastTopKParams get_params(
   return params;
 }
 
-template <int Level>
-struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
+struct FastTopKDsaKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   FastTopKParams params;
   int topk;
-  using DsaBase = sgl_kernel::dsa_topk::TopKRadixBase<12>;
-  sycl::local_accessor<typename DsaBase::Smem, 1> smem;
+  sycl::local_accessor<sgl_kernel::dsa_topk::Smem, 1> smem;
 
-  FastTopKKernel(const FastTopKParams& p, int k) : params(p), topk(k) {}
+  FastTopKDsaKernel(const FastTopKParams& p, int k) : params(p), topk(k) {}
 
   void sycl_ker_config_convention(sycl::handler& cgh) {
-    smem = sycl::local_accessor<typename DsaBase::Smem, 1>(1, cgh);
+    smem = sycl::local_accessor<sgl_kernel::dsa_topk::Smem, 1>(1, cgh);
   }
 
   [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<1> item) const {
@@ -402,12 +398,7 @@ struct FastTopKKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     } else {
       sgl_kernel::dsa_topk::TopKProblem problem{
           score + row_start, indice, static_cast<uint32_t>(topk), static_cast<uint32_t>(length)};
-      if constexpr (Level == 0)
-        sgl_kernel::dsa_topk::TopKRegister<2>::forward(item, problem, &smem[0]);
-      else if constexpr (Level == 1)
-        sgl_kernel::dsa_topk::TopKRegister<4>::forward(item, problem, &smem[0]);
-      else
-        sgl_kernel::dsa_topk::TopKStreaming::forward(item, problem, &smem[0]);
+      sgl_kernel::dsa_topk::select(item, problem, &smem[0]);
     }
   }
 };
@@ -428,28 +419,6 @@ struct FastTopKMediumPrefillKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
     const int start = params.row_starts ? params.row_starts[row] : 0;
     const float* input = params.input + row * params.input_stride + start;
     sgl_kernel::prefill_topk::select(item, input, params.lengths[row], params.indices + row * topk, smem[0], topk);
-  }
-};
-
-struct FastTopKNarrowPrefillKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
-  FastTopKParams params;
-  int topk;
-  sycl::local_accessor<sgl_kernel::prefill_topk::narrow::Scratch, 1> smem;
-
-  FastTopKNarrowPrefillKernel(const FastTopKParams& p, int k) : params(p), topk(k) {}
-
-  void sycl_ker_config_convention(sycl::handler& cgh) {
-    smem = sycl::local_accessor<sgl_kernel::prefill_topk::narrow::Scratch, 1>(1, cgh);
-  }
-
-  [[sycl::reqd_sub_group_size(32)]] void operator()(sycl::nd_item<3> item) const {
-    const int64_t block = item.get_group(0);
-    // Interleave short and long causal rows to balance resident work-groups.
-    const int64_t row = (block & 1) ? item.get_group_range(0) - 1 - (block >> 1) : block >> 1;
-    const int start = params.row_starts ? params.row_starts[row] : 0;
-    const float* input = params.input + row * params.input_stride + start;
-    sgl_kernel::prefill_topk::narrow::select(
-        item, input, params.lengths[row], params.indices + row * topk, smem[0], topk);
   }
 };
 
@@ -748,19 +717,11 @@ fast_topk(const at::Tensor& score, const at::Tensor& lengths, int64_t topk, std:
   auto stream = at::xpu::getCurrentXPUStream();
   auto& queue = stream.queue();
 
-  // Xe3 crossovers vary with row width; keep small batches on DSA.
+  // Many short rows, or rows dominated by ties, go to the 128-thread kernel;
+  // otherwise a 1024-thread work-group per row has the lowest latency.
   const int64_t width = score.size(1);
-  const int64_t min_prefill_batch = width <= 2048 ? 256 : width <= 4096 ? 512 : width <= 6144 ? 2048 : 4096;
-  if (B >= min_prefill_batch && width <= sgl_kernel::prefill_topk::narrow::kRowCapacity) {
-    constexpr int threads = sgl_kernel::prefill_topk::narrow::kThreads;
-    sycl_kernel_submit(
-        sycl::range<3>(static_cast<size_t>(B) * threads, 1, 1),
-        sycl::range<3>(threads, 1, 1),
-        queue,
-        FastTopKNarrowPrefillKernel(params, static_cast<int>(topk)));
-    return indices;
-  }
-  if (B >= min_prefill_batch && width > 4096 && width <= sgl_kernel::prefill_topk::kRowCapacity) {
+  const int64_t min_batch = width <= 2048 ? 256 : width <= 6144 ? 2048 : 4096;
+  if (B >= min_batch && width <= sgl_kernel::prefill_topk::kRowCapacity) {
     constexpr int threads = sgl_kernel::prefill_topk::kThreads;
     sycl_kernel_submit(
         sycl::range<3>(static_cast<size_t>(B) * threads, 1, 1),
@@ -769,16 +730,11 @@ fast_topk(const at::Tensor& score, const at::Tensor& lengths, int64_t topk, std:
         FastTopKMediumPrefillKernel(params, static_cast<int>(topk)));
     return indices;
   }
-
-  const auto global = sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock);
-  const auto local = sycl::range<1>(kThreadsPerBlock);
-  if (score.size(1) <= 8192) {
-    sycl_kernel_submit(global, local, queue, FastTopKKernel<0>(params, static_cast<int>(topk)));
-  } else if (score.size(1) <= 16384) {
-    sycl_kernel_submit(global, local, queue, FastTopKKernel<1>(params, static_cast<int>(topk)));
-  } else {
-    sycl_kernel_submit(global, local, queue, FastTopKKernel<2>(params, static_cast<int>(topk)));
-  }
+  sycl_kernel_submit(
+      sycl::range<1>(static_cast<size_t>(B) * kThreadsPerBlock),
+      sycl::range<1>(kThreadsPerBlock),
+      queue,
+      FastTopKDsaKernel(params, static_cast<int>(topk)));
   return indices;
 }
 

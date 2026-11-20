@@ -4,7 +4,6 @@ import json
 import torch
 import triton.testing
 from sgl_kernel import fast_topk_v2
-from torch.profiler import ProfilerActivity, profile
 
 
 def get_effective_bytes(score, lengths, output, row_starts=None):
@@ -25,7 +24,6 @@ def main():
     parser.add_argument(
         "--rep", type=float, default=100, help="Triton timing budget in milliseconds"
     )
-    parser.add_argument("--check-dispatch", action="store_true")
     parser.add_argument("--suite", choices=["default", "dispatch"], default="default")
     parser.add_argument(
         "--batches",
@@ -135,26 +133,6 @@ def main():
         assert ms > 0, (name, ms)
         total_bytes = get_effective_bytes(score, lengths_cpu, output, starts)
         bandwidth_gbs = total_bytes / (ms / 1e3) / 1e9
-        events = []
-        if args.check_dispatch:
-            # Profile one untimed call for kernel identity, not latency.
-            torch.xpu.synchronize()
-            with profile(activities=[ProfilerActivity.XPU]) as prof:
-                run()
-                torch.xpu.synchronize()
-            events = [e for e in prof.key_averages() if "FastTopK" in e.key]
-            assert events, [e.key for e in prof.key_averages()]
-            physical_width = score.shape[1]
-            expected = (batch >= 2048 and 4096 < physical_width <= 6144) or (
-                batch >= 4096 and 6144 < physical_width <= 10240
-            )
-            actual = any("FastTopKMediumPrefillKernel" in e.key for e in events)
-            assert actual == expected, (name, [e.key for e in events])
-            expected = (batch >= 256 and physical_width <= 2048) or (
-                batch >= 512 and 2048 < physical_width <= 4096
-            )
-            actual = any("FastTopKNarrowPrefillKernel" in e.key for e in events)
-            assert actual == expected, (name, [e.key for e in events])
         us = ms * 1e3
         results.append(
             {
@@ -168,7 +146,6 @@ def main():
                 "p80_us": p80_ms * 1e3,
                 "effective_bytes": total_bytes,
                 "bandwidth_gbs": bandwidth_gbs,
-                "kernels": [e.key for e in events],
             }
         )
         print(f"{name:24s} {us:9.2f} us {bandwidth_gbs:9.2f} GB/s", flush=True)

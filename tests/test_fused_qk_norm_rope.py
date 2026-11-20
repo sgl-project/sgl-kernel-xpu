@@ -1148,5 +1148,119 @@ def test_fused_k_norm_rope_flashmla_zero_batch():
     )
 
 
+def _eager_rope(x, cos_sin_cache, rope_dim, is_neox):
+    """PyTorch eager RoPE in the activation dtype, every op rounding."""
+    half = rope_dim // 2
+    cos, sin = cos_sin_cache.split(half, dim=-1)
+    cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+    x_rot, x_pass = x[..., :rope_dim], x[..., rope_dim:]
+    if is_neox:
+        x1, x2 = torch.chunk(x_rot, 2, dim=-1)
+        cos, sin = torch.cat((cos, cos), dim=-1), torch.cat((sin, sin), dim=-1)
+        x_rot = x_rot * cos + torch.cat((-x2, x1), dim=-1) * sin
+    else:
+        re, im = x_rot[..., 0::2], x_rot[..., 1::2]
+        x_rot = torch.stack((re * cos - im * sin, re * sin + im * cos), dim=-1).flatten(
+            -2
+        )
+    return torch.cat((x_rot, x_pass), dim=-1)
+
+
+# head_dim 64 and 128 are where torch-xpu's RMSNorm summation order is reproduced; NeoX
+# rope_dims include MiniMax-H3's 96 of 128 (a non-power-of-2 rotary lane count). Q and K
+# are GQA views of one packed qkv buffer; scales cover unit and large activations.
+@pytest.mark.parametrize(
+    "head_dim,is_neox,rope_dim",
+    [
+        (64, True, 32),
+        (64, True, 64),
+        (128, True, 96),
+        (128, True, 128),
+        (64, False, 40),
+        (64, False, 64),
+        (128, False, 96),
+        (128, False, 128),
+    ],
+)
+@pytest.mark.parametrize("scale", [1.0, 30.0])
+@torch.no_grad()
+def test_fused_inplace_qknorm_rope_round_norm_before_rope_matches_eager(
+    head_dim, is_neox, rope_dim, scale
+):
+    # Measured: a different fp32 summation order changes a few elements per 10M;
+    # this many rows exposes one in every case.
+    num_tokens, num_qo_heads, num_kv_heads, dtype = 32768, 14, 2, torch.bfloat16
+    heads = num_qo_heads + 2 * num_kv_heads
+    g = torch.Generator(device=device).manual_seed(head_dim * rope_dim)
+    qkv = (
+        scale * torch.randn(num_tokens, heads * head_dim, device=device, generator=g)
+    ).to(dtype)
+    norms = []
+    for _ in range(2):
+        norm = torch.nn.RMSNorm(head_dim, eps=1e-5, device=device, dtype=dtype)
+        norm.weight.copy_(1 + 0.2 * torch.randn(head_dim, device=device, generator=g))
+        norms.append(norm)
+    angles = (
+        torch.randn(num_tokens, rope_dim // 2, device=device, generator=g).cumsum(0)
+        * 0.01
+    )
+    cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(dtype)
+    positions = torch.randperm(num_tokens, device=device, generator=g)
+
+    def split(buf):
+        rows = buf.view(num_tokens, heads, head_dim)
+        return (
+            rows[:, :num_qo_heads],
+            rows[:, num_qo_heads : num_qo_heads + num_kv_heads],
+        )
+
+    q, k = split(qkv)
+    ref_q = _eager_rope(norms[0](q), cache[positions], rope_dim, is_neox)
+    ref_k = _eager_rope(norms[1](k), cache[positions], rope_dim, is_neox)
+
+    out = qkv.clone()
+    q, k = split(out)
+    sgl_kernel.fused_inplace_qknorm_rope(
+        q,
+        k,
+        norms[0].weight,
+        norms[1].weight,
+        cache.float(),
+        positions,
+        is_neox,
+        eps=1e-5,
+        head_dim=head_dim,
+        rope_dim=rope_dim,
+        round_norm_before_rope=True,
+    )
+    assert torch.equal(q, ref_q)
+    assert torch.equal(k, ref_k)
+    v_cols = slice((num_qo_heads + num_kv_heads) * head_dim, None)
+    assert torch.equal(out[:, v_cols], qkv[:, v_cols])
+
+
+@pytest.mark.parametrize(
+    "head_dim,is_neox,rope_dim,dtype",
+    [
+        (256, True, 128, torch.bfloat16),  # summation order not reproduced
+        (128, True, 96, torch.float32),  # fp32 order not verified
+        (128, True, 96, torch.float16),  # per-op fp16 rounding not implemented
+        (128, True, 40, torch.bfloat16),  # rotary halves split a lane
+    ],
+)
+def test_fused_inplace_qknorm_rope_round_norm_before_rope_rejects_unsupported(
+    head_dim, is_neox, rope_dim, dtype
+):
+    q = torch.randn(4, 2, head_dim, dtype=dtype, device=device)
+    k = torch.randn(4, 2, head_dim, dtype=dtype, device=device)
+    w = torch.ones(head_dim, dtype=dtype, device=device)
+    cache = torch.zeros(4, rope_dim, dtype=torch.float32, device=device)
+    positions = torch.arange(4, device=device)
+    with pytest.raises(RuntimeError, match="round_norm_before_rope"):
+        sgl_kernel.fused_inplace_qknorm_rope(
+            q, k, w, w, cache, positions, is_neox, round_norm_before_rope=True
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

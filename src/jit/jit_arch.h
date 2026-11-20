@@ -18,7 +18,6 @@ namespace jit {
 enum class Arch {
   BMG = 0,   // Xe20 / Battlemage (intel_gpu_bmg_g21 / g31)
   XE3P = 1,  // Xe35 / XE3P
-  BMG_G31 = 2,
 };
 
 struct ArchProfile {

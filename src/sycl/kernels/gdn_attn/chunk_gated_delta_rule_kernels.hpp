@@ -939,8 +939,7 @@ void chunk_gated_delta_rule_impl(
       head_k_dim,
       num_v_heads,
       head_v_dim,
-      get_device_architecture() == syclex::architecture::intel_gpu_bmg_g31 ? static_cast<int>(sgl::jit::Arch::BMG_G31)
-                                                                           : jit_arch_code(),
+      jit_arch_code(),
       &jit_err);
   TORCH_CHECK(ok, "GDN chunk JIT launch failed: ", jit_err);
 #else

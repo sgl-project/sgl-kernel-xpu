@@ -227,6 +227,7 @@ def test_long_prefill_matches_sequential_without_mutating_inputs(
         torch.testing.assert_close(inputs[key], value, rtol=0, atol=0)
 
 
+@pytest.mark.arch("xe20")
 def test_long_prefill_selects_chunk_kernel(tmp_path):
     inputs = _make_inputs([2048], torch.bfloat16, torch.device("xpu"), nk=4, nv=12)
     inputs["ssm_state"] = inputs["ssm_state"].float()

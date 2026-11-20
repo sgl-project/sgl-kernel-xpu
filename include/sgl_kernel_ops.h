@@ -660,6 +660,16 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype);
+// Xe2 dense weight-only FP8 (W8A16) GEMM: output = input @ dequant(weight).T (+ bias).
+// input bf16 [M, K], weight float8_e4m3fn [N, K], output bf16 [M, N], bias float32 [N].
+// weight_scale is float32: one element (per-tensor), [N] (per-channel), or
+// [ceil(N/128), K/128] (128x128 block).
+void fp8_w8a16_mm_xe20(
+    torch::Tensor& output,
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& weight_scale,
+    const std::optional<at::Tensor>& bias);
 void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);

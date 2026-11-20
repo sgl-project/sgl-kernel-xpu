@@ -85,6 +85,12 @@ suites = {
         BenchFile("bench_moe_fused_gate.py", tee_log="moe_fused_gate.py.log"),
         BenchFile("bench_moe_wna16_grouped_gemm.py"),
         BenchFile(
+            "bench_fp8_linear.py",
+            # One model's shapes keep the per-commit run short.
+            args=["--models", "Qwen3.6-35B-A3B-TP2"],
+            estimated_time=40,
+        ),
+        BenchFile(
             "bench_fused_experts_wna16.py",
             # Drop the mid token count and two of three route seeds: the seeds
             # only average routing noise, and 1/2048 bracket the shape range.

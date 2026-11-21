@@ -151,6 +151,32 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("reconstruct_indices_from_tree_mask", torch::kXPU, &reconstruct_indices_from_tree_mask);
 
   /*
+   * Ngram embedding (LongCat-Flash)
+   */
+  m.def(
+      "compute_n_gram_ids(int ne_n, int ne_k, Tensor ne_weights, Tensor ne_mods, "
+      "Tensor exclusive_ne_embedder_size_sums, Tensor tokens, Tensor exclusive_req_len_sums, "
+      "Tensor ne_token_table, Tensor row_indices, Tensor column_starts, Tensor! n_gram_ids, "
+      "int eos_token_id) -> ()");
+  m.impl("compute_n_gram_ids", torch::kXPU, &compute_n_gram_ids);
+
+  m.def(
+      "compute_n_gram_ids_decode(int ne_n, int ne_k, Tensor ne_weights, Tensor ne_mods, "
+      "Tensor exclusive_ne_embedder_size_sums, Tensor ne_token_table, Tensor row_indices, "
+      "Tensor column_starts, Tensor! n_gram_ids, int eos_token_id) -> ()");
+  m.impl("compute_n_gram_ids_decode", torch::kXPU, &compute_n_gram_ids_decode);
+
+  m.def(
+      "update_token_table(Tensor tokens, Tensor! ne_token_table, Tensor row_indices, "
+      "Tensor column_starts, Tensor req_lens, Tensor ignore_tokens) -> ()");
+  m.impl("update_token_table", torch::kXPU, &update_token_table);
+
+  m.def(
+      "update_token_table_decode(Tensor tokens, Tensor! ne_token_table, Tensor row_indices, "
+      "Tensor column_starts) -> ()");
+  m.impl("update_token_table_decode", torch::kXPU, &update_token_table_decode);
+
+  /*
    * Fast radix top-k (DeepSeek V3.2 indexer)
    */
   m.def("fast_topk(Tensor score, Tensor lengths, int topk, Tensor? row_starts) -> Tensor");
@@ -405,6 +431,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_shuffle_mul_sum", torch::kXPU, &apply_shuffle_mul_sum);
 #endif  // USE_MOE
 
+#if SYCL_INTEL_TARGET == 20
+  m.def("fp8_w8a16_mm_xe20(Tensor! output, Tensor input, Tensor weight, Tensor weight_scale, Tensor? bias) -> ()");
+  m.impl("fp8_w8a16_mm_xe20", torch::kXPU, &fp8_w8a16_mm_xe20);
+#endif  // SYCL_INTEL_TARGET == 20
+
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
   m.impl("merge_state_v2", torch::kXPU, &merge_state_v2);
   m.def("merge_state(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");
@@ -534,7 +565,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    bool     return_softmax_lse,"
       "    Tensor?  rel_bias=None,"
       "    bool     rel_bias_is_sheared=False,"
-      "    Tensor?  bidirectional_block_ids=None) -> (Tensor(a!), Tensor?)");
+      "    Tensor?  bidirectional_block_ids=None,"
+      "    Tensor?  alibi_slopes=None) -> (Tensor(a!), Tensor?)");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
 #endif  // USE_FMHA
 

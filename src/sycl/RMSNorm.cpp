@@ -757,29 +757,28 @@ SGL_KERNEL_EXPORT void rmsnorm(torch::Tensor& output, torch::Tensor& input, torc
   timer.start();
 #endif
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "RMSNormKernelImpl", [&]() {
-        using input_t = scalar_t;
-        AT_DISPATCH_WEIGHT_TYPES(input_t, weight_.scalar_type(), "RMSNormKernelImpl", [&]() {
-          RMSNormKernelImplInternal<input_t, weight_t>(
-              input,
-              weight_,
-              M,
-              N,
-              static_cast<acc_type<input_t>>(eps),
-              output,
-              in_strides.batch_stride,
-              out_strides.batch_stride,
-              in_strides.inner0_size,
-              in_strides.inner0_stride,
-              out_strides.inner0_size,
-              out_strides.inner0_stride,
-              in_strides.inner1_size,
-              in_strides.inner1_stride,
-              out_strides.inner1_size,
-              out_strides.inner1_stride);
-        });
-      });
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input.scalar_type(), "RMSNormKernelImpl", [&]() {
+    using input_t = scalar_t;
+    AT_DISPATCH_WEIGHT_TYPES(input_t, weight_.scalar_type(), "RMSNormKernelImpl", [&]() {
+      RMSNormKernelImplInternal<input_t, weight_t>(
+          input,
+          weight_,
+          M,
+          N,
+          static_cast<acc_type<input_t>>(eps),
+          output,
+          in_strides.batch_stride,
+          out_strides.batch_stride,
+          in_strides.inner0_size,
+          in_strides.inner0_stride,
+          out_strides.inner0_size,
+          out_strides.inner0_stride,
+          in_strides.inner1_size,
+          in_strides.inner1_stride,
+          out_strides.inner1_size,
+          out_strides.inner1_stride);
+    });
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   profiling_queue.wait();
@@ -840,14 +839,13 @@ fused_add_rmsnorm(torch::Tensor input, torch::Tensor residual, torch::Tensor wei
 #endif
 
   // input and residual are contiguous and the same shape, so the kernel indexes them as M rows of N.
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
-        using input_t = scalar_t;
-        AT_DISPATCH_WEIGHT_TYPES(input_t, weight.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
-          FusedAddRMSNormKernelImplInternal<input_t, weight_t>(
-              input, weight, M, N, static_cast<acc_type<input_t>>(eps), residual);
-        });
-      });
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
+    using input_t = scalar_t;
+    AT_DISPATCH_WEIGHT_TYPES(input_t, weight.scalar_type(), "FusedAddRMSNormKernelImpl", [&]() {
+      FusedAddRMSNormKernelImplInternal<input_t, weight_t>(
+          input, weight, M, N, static_cast<acc_type<input_t>>(eps), residual);
+    });
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   profiling_queue.wait();
@@ -902,29 +900,28 @@ SGL_KERNEL_EXPORT void gemma_rmsnorm(torch::Tensor& output, torch::Tensor& input
   timer.start();
 #endif
 
-  AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
-        using input_t = scalar_t;
-        AT_DISPATCH_WEIGHT_TYPES(input_t, weight_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
-          GemmaRMSNormKernelImplInternal<input_t, weight_t>(
-              input,
-              weight_,
-              M,
-              N,
-              static_cast<acc_type<input_t>>(eps),
-              output,
-              in_strides.batch_stride,
-              out_strides.batch_stride,
-              in_strides.inner0_size,
-              in_strides.inner0_stride,
-              out_strides.inner0_size,
-              out_strides.inner0_stride,
-              in_strides.inner1_size,
-              in_strides.inner1_stride,
-              out_strides.inner1_size,
-              out_strides.inner1_stride);
-        });
-      });
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, input.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
+    using input_t = scalar_t;
+    AT_DISPATCH_WEIGHT_TYPES(input_t, weight_.scalar_type(), "GemmaRMSNormKernelImpl", [&]() {
+      GemmaRMSNormKernelImplInternal<input_t, weight_t>(
+          input,
+          weight_,
+          M,
+          N,
+          static_cast<acc_type<input_t>>(eps),
+          output,
+          in_strides.batch_stride,
+          out_strides.batch_stride,
+          in_strides.inner0_size,
+          in_strides.inner0_stride,
+          out_strides.inner0_size,
+          out_strides.inner0_stride,
+          in_strides.inner1_size,
+          in_strides.inner1_stride,
+          out_strides.inner1_size,
+          out_strides.inner1_stride);
+    });
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   profiling_queue.wait();
@@ -982,7 +979,7 @@ gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Te
 #endif
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, input_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
+      at::kHalf, at::kBFloat16, input_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
         using input_t = scalar_t;
         AT_DISPATCH_WEIGHT_TYPES(input_t, weight_.scalar_type(), "GemmaFusedAddRMSNormKernelImpl", [&]() {
           GemmaFusedAddRMSNormKernelImplInternal<input_t, weight_t>(
@@ -1123,7 +1120,7 @@ SGL_KERNEL_EXPORT void grouped_gemma_rmsnorm(
   CHECK_INPUT(weight);
   CHECK_INPUT(output);
   TORCH_CHECK(input.dim() >= 1, "input must have at least 1 dim");
-  TORCH_CHECK(input.sizes() == output.sizes(), "output must have the same shape as input");
+  CHECK_SAME_SHAPE(output, input);
   TORCH_CHECK(
       input.scalar_type() == at::kBFloat16 || input.scalar_type() == at::kHalf,
       "grouped_gemma_rmsnorm supports bfloat16 and float16, got ",
@@ -1143,13 +1140,13 @@ SGL_KERNEL_EXPORT void grouped_gemma_rmsnorm(
 
   const int64_t hidden = input.size(-1);
   TORCH_CHECK(hidden % group_size == 0, "hidden size ", hidden, " must be divisible by group_size ", group_size);
-  TORCH_CHECK(weight.dim() == 1 && weight.size(0) == hidden, "weight must be 1-D with hidden_size elements");
+  CHECK_SHAPE(weight, hidden);
   TORCH_CHECK(
       weight.device() == input.device() && output.device() == input.device(),
       "input, weight and output must be on the same device");
-  for (const auto* t : {&input, &weight, &output}) {
-    TORCH_CHECK(reinterpret_cast<uintptr_t>(t->data_ptr()) % 16 == 0, "tensors must be 16-byte aligned");
-  }
+  CHECK_ALIGNMENT(16, input);
+  CHECK_ALIGNMENT(16, weight);
+  CHECK_ALIGNMENT(16, output);
 
   if (input.numel() == 0) {
     return;

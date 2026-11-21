@@ -1,7 +1,7 @@
 from typing import List, Optional, Tuple
 
 import torch
-from sgl_kernel.utils import _get_cache_buf, get_xpu_stream
+from sgl_kernel.utils import _get_cache_buf, get_xpu_stream, is_xe2_arch
 
 
 def awq_dequantize(
@@ -40,6 +40,87 @@ def fp8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
         out_dtype,
         bias,
     )
+
+
+_FP8_BLOCK = 128
+
+
+def fp8_linear_supported(
+    n: Optional[int] = None, k: Optional[int] = None, block_scale: bool = False
+) -> bool:
+    """Whether ``fp8_linear`` runs on the current device and, given a weight
+    shape, takes that layer.
+
+    ``fp8_linear`` runs on BMG (Xe2) only; other devices keep their existing FP8
+    path.
+
+    Args:
+        n, k: optional [N, K] weight shape (per rank, after tensor-parallel
+            sharding). Without them, only the device is checked.
+        block_scale: True for 128x128 block scales, False for per-tensor or
+            per-channel scales.
+    """
+    if not is_xe2_arch():
+        return False
+    if n is None or k is None:
+        return True
+    # fp8_w8a16_mm_xe20 steps K by 64; block scales also need whole K blocks.
+    return n % 64 == 0 and k % (_FP8_BLOCK if block_scale else 64) == 0
+
+
+def _aligned64(t: torch.Tensor) -> bool:
+    return t.data_ptr() % 64 == 0
+
+
+def fp8_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Weight-only FP8 (W8A16) dense linear on BMG (Xe2):
+    ``out = input @ dequant(weight).T + bias``.
+
+    Runs the Xe2 dense W8A16 GEMM: weights are dequantized in registers, so
+    activations stay in bfloat16. Check the device and shape with
+    ``fp8_linear_supported`` first.
+
+    Args:
+        input: [M, K] bfloat16 activations.
+        weight: [N, K] float8_e4m3fn weights, contiguous and 64-byte aligned.
+        weight_scale: float32 weight scales: one per-tensor value (any shape with
+            a single element), 1D [N] per-channel scales, or 2D
+            [ceil(N / 128), K / 128] 128x128 block scales.
+        bias: optional [N].
+        out: optional [M, N] bfloat16 output buffer.
+    """
+    assert is_xe2_arch(), "fp8_linear runs the BMG (Xe2) dense W8A16 GEMM"
+    assert input.dtype == torch.bfloat16, "fp8_linear takes bfloat16 activations"
+    m = input.shape[0]
+    n = weight.shape[0]
+    if out is None:
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=input.device)
+    if m == 0:
+        return out
+    # The kernel reads and writes with block-2D accesses, which need 64-byte
+    # aligned base addresses; views at an offset take a copy.
+    input = input.contiguous()
+    if not _aligned64(input):
+        input = input.clone()
+    if weight_scale.numel() == 1:
+        weight_scale = weight_scale.reshape(1)
+    if bias is not None:
+        bias = bias.to(torch.float32).contiguous()
+    dst = (
+        out
+        if out.is_contiguous() and _aligned64(out)
+        else torch.empty_like(out, memory_format=torch.contiguous_format)
+    )
+    torch.ops.sgl_kernel.fp8_w8a16_mm_xe20(dst, input, weight, weight_scale, bias)
+    if dst is not out:
+        out.copy_(dst)
+    return out
 
 
 def _bmm_fp8_internal(

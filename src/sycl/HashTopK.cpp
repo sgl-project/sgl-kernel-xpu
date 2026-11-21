@@ -148,20 +148,17 @@ SGL_KERNEL_EXPORT void hash_topk(
     at::Tensor& topk_weights,
     at::Tensor& topk_ids,
     double routed_scaling_factor) {
-  TORCH_CHECK(router_logits.dim() == 2, "router_logits must be 2D [num_tokens, num_routed_experts]");
-  TORCH_CHECK(input_ids.dim() == 1, "input_ids must be 1D [num_tokens]");
-  TORCH_CHECK(tid2eid.dim() == 2, "tid2eid must be 2D [vocab_size, topk_routed]");
-  TORCH_CHECK(topk_weights.dim() == 2, "topk_weights must be 2D [num_tokens, topk_fused]");
-  TORCH_CHECK(topk_ids.dim() == 2, "topk_ids must be 2D [num_tokens, topk_fused]");
+  CHECK_DIM(2, router_logits);
+  CHECK_DIM(1, input_ids);
+  CHECK_DIM(2, tid2eid);
+  CHECK_DIM(2, topk_weights);
+  CHECK_DIM(2, topk_ids);
 
-  TORCH_CHECK(
-      router_logits.scalar_type() == at::kFloat || router_logits.scalar_type() == at::kHalf ||
-          router_logits.scalar_type() == at::kBFloat16,
-      "router_logits must be float32/float16/bfloat16");
-  TORCH_CHECK(input_ids.scalar_type() == at::kLong, "input_ids must be int64");
-  TORCH_CHECK(tid2eid.scalar_type() == at::kInt, "tid2eid must be int32");
-  TORCH_CHECK(topk_weights.scalar_type() == at::kFloat, "topk_weights must be float32");
-  TORCH_CHECK(topk_ids.scalar_type() == at::kInt, "topk_ids must be int32");
+  CHECK_DTYPES(router_logits, at::kFloat, at::kHalf, at::kBFloat16);
+  CHECK_DTYPE(at::kLong, input_ids);
+  CHECK_DTYPE(at::kInt, tid2eid);
+  CHECK_DTYPE(at::kFloat, topk_weights);
+  CHECK_DTYPE(at::kInt, topk_ids);
 
   const int64_t num_tokens = router_logits.size(0);
   const int64_t num_routed_experts = router_logits.size(1);

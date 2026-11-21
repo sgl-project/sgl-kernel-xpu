@@ -179,8 +179,7 @@ SGL_KERNEL_EXPORT void transfer_cache_dsv4_mla(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "transfer_cache_dsv4_mla", profiling_queue);
 #endif
 
   // block_size is a template parameter; 1024 is the default, the rest are
@@ -204,7 +203,7 @@ SGL_KERNEL_EXPORT void transfer_cache_dsv4_mla(
   const double flops = 0.0;
   const double bytes = static_cast<double>(src_indices.numel()) * static_cast<double>(src_indices.element_size()) +
                        static_cast<double>(dst_indices.numel()) * static_cast<double>(dst_indices.element_size());
-  ::sglkernel::report_kernel_perf("transfer_cache_dsv4_mla", profiling_queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }
 
@@ -324,8 +323,7 @@ SGL_KERNEL_EXPORT void load_cache_to_device_buffer_mla(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "load_cache_to_device_buffer_mla", profiling_queue);
 #endif
 
   if (is_dsv4_layout) {
@@ -343,6 +341,6 @@ SGL_KERNEL_EXPORT void load_cache_to_device_buffer_mla(
       static_cast<double>(device_buffer_locs.numel()) * static_cast<double>(device_buffer_locs.element_size()) +
       static_cast<double>(host_cache.numel()) * static_cast<double>(host_cache.element_size()) +
       static_cast<double>(device_buffer.numel()) * static_cast<double>(device_buffer.element_size());
-  ::sglkernel::report_kernel_perf("load_cache_to_device_buffer_mla", profiling_queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }

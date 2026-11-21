@@ -4,6 +4,8 @@
 #include <ATen/xpu/XPUContext.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <iterator>
 #include <stdexcept>
 #include <type_traits>
 
@@ -16,13 +18,58 @@
   TORCH_CHECK(x.sizes() == c10::ArrayRef<int64_t>({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_LAST_DIM_CONTIGUOUS(x) \
-  TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
-#define CHECK_INPUT(x) \
-  CHECK_DEVICE(x);     \
-  CHECK_CONTIGUOUS(x);
-#define CHECK_LAST_DIM_CONTIGUOUS_INPUT(x) \
-  CHECK_DEVICE(x);                         \
-  CHECK_LAST_DIM_CONTIGUOUS(x)
+  TORCH_CHECK((x).dim() > 0 && (x).stride(-1) == 1, #x " must be contiguous at last dimension")
+#define CHECK_DIM(d, x) TORCH_CHECK((x).dim() == (d), #x " must be a " #d "D tensor")
+
+// CHECK_ALIGNMENT(positive byte constant, tensor): checks the base pointer only.
+#define CHECK_ALIGNMENT(bytes, x) \
+  TORCH_CHECK(reinterpret_cast<std::uintptr_t>((x).data_ptr()) % (bytes) == 0, #x " must be ", (bytes), "-byte aligned")
+
+#define CHECK_DTYPE(dtype, x) \
+  TORCH_CHECK((x).scalar_type() == (dtype), #x " must have dtype ", (dtype), ", got ", (x).scalar_type())
+
+// CHECK_DTYPES(tensor, dtype1, dtype2, ...)
+#define CHECK_DTYPES(x, ...)                                                                \
+  [&] {                                                                                     \
+    const at::ScalarType _allowed[] = {__VA_ARGS__};                                        \
+    const auto _actual = (x).scalar_type();                                                 \
+    TORCH_CHECK(                                                                            \
+        std::find(std::begin(_allowed), std::end(_allowed), _actual) != std::end(_allowed), \
+        #x " must have dtype ",                                                             \
+        c10::ArrayRef<at::ScalarType>(_allowed),                                            \
+        ", got ",                                                                           \
+        _actual);                                                                           \
+  }()
+
+#define SGL_CHECK_INPUT_SELECT(_1, _2, _3, CHECK, ...) CHECK
+#define SGL_CHECK_INPUT_1(CONTIGUOUS, x) \
+  do {                                   \
+    CHECK_DEVICE(x);                     \
+    CONTIGUOUS(x);                       \
+  } while (0)
+#define SGL_CHECK_INPUT_2(CONTIGUOUS, d, x) \
+  do {                                      \
+    CHECK_DIM(d, x);                        \
+    SGL_CHECK_INPUT_1(CONTIGUOUS, x);       \
+  } while (0)
+#define SGL_CHECK_INPUT_3(CONTIGUOUS, d, dtype, x) \
+  do {                                             \
+    SGL_CHECK_INPUT_2(CONTIGUOUS, d, x);           \
+    CHECK_DTYPE(dtype, x);                         \
+  } while (0)
+// CHECK_INPUT(tensor) / CHECK_INPUT(dim, tensor) / CHECK_INPUT(dim, dtype, tensor)
+#define CHECK_INPUT(...)                                                                       \
+  SGL_CHECK_INPUT_SELECT(__VA_ARGS__, SGL_CHECK_INPUT_3, SGL_CHECK_INPUT_2, SGL_CHECK_INPUT_1) \
+  (CHECK_CONTIGUOUS, __VA_ARGS__)
+// CHECK_LAST_DIM_CONTIGUOUS_INPUT(tensor) / (dim, tensor) / (dim, dtype, tensor)
+#define CHECK_LAST_DIM_CONTIGUOUS_INPUT(...)                                                   \
+  SGL_CHECK_INPUT_SELECT(__VA_ARGS__, SGL_CHECK_INPUT_3, SGL_CHECK_INPUT_2, SGL_CHECK_INPUT_1) \
+  (CHECK_LAST_DIM_CONTIGUOUS, __VA_ARGS__)
+
+#define CHECK_SAME_SHAPE(a, b) \
+  TORCH_CHECK(                 \
+      (a).sizes() == (b).sizes(), #a " and " #b " must have the same shape, got ", (a).sizes(), " vs ", (b).sizes())
+#define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
 
 // Use AT_DISPATCH_* for ATen/c10 types; SYCL_DISPATCH_* only when kernel
 // operations require SYCL types (e.g. sycl::vec), not merely because it runs on XPU.
@@ -318,78 +365,46 @@ static inline int64_t dpcppLocalMemSize(DeviceId dev_id = dpcppGetDeviceIdOfCurr
 template <typename T>
 uint32_t dpcppPrefVectorWidth(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
   auto* dev_prop = at::xpu::getDeviceProperties(dev_id);
-  if (std::is_same<T, char>::value) {
+  if constexpr (std::is_same_v<T, char>) {
     return dev_prop->preferred_vector_width_char;
-  }
-  if (std::is_same<T, short>::value) {
+  } else if constexpr (std::is_same_v<T, short>) {
     return dev_prop->preferred_vector_width_short;
-  }
-  if (std::is_same<T, int>::value) {
+  } else if constexpr (std::is_same_v<T, int>) {
     return dev_prop->preferred_vector_width_int;
-  }
-  if (std::is_same<T, int64_t>::value) {
+  } else if constexpr (std::is_same_v<T, int64_t>) {
     return dev_prop->preferred_vector_width_long;
-  }
-  if (std::is_same<T, float>::value) {
+  } else if constexpr (std::is_same_v<T, float>) {
     return dev_prop->preferred_vector_width_float;
-  }
-  if (std::is_same<T, double>::value) {
+  } else if constexpr (std::is_same_v<T, double>) {
     return dev_prop->preferred_vector_width_double;
-  }
-  if (std::is_same<T, sycl::half>::value) {
+  } else if constexpr (std::is_same_v<T, sycl::half>) {
     return dev_prop->preferred_vector_width_half;
+  } else {
+    throw std::invalid_argument("Invalid data type to fetch preferred vector width!");
   }
-  throw std::invalid_argument("Invalid data type to fetch preferred vector width!");
 }
 
 template <typename T>
 uint32_t dpcppNativeVectorWidth(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
   auto* dev_prop = at::xpu::getDeviceProperties(dev_id);
-  if (std::is_same<T, char>::value) {
+  if constexpr (std::is_same_v<T, char>) {
     return dev_prop->native_vector_width_char;
-  }
-  if (std::is_same<T, short>::value) {
+  } else if constexpr (std::is_same_v<T, short>) {
     return dev_prop->native_vector_width_short;
-  }
-  if (std::is_same<T, int>::value) {
+  } else if constexpr (std::is_same_v<T, int>) {
     return dev_prop->native_vector_width_int;
-  }
-  if (std::is_same<T, int64_t>::value) {
+  } else if constexpr (std::is_same_v<T, int64_t>) {
     return dev_prop->native_vector_width_long;
-  }
-  if (std::is_same<T, float>::value) {
+  } else if constexpr (std::is_same_v<T, float>) {
     return dev_prop->native_vector_width_float;
-  }
-  if (std::is_same<T, double>::value) {
+  } else if constexpr (std::is_same_v<T, double>) {
     return dev_prop->native_vector_width_double;
-  }
-  if (std::is_same<T, sycl::half>::value) {
+  } else if constexpr (std::is_same_v<T, sycl::half>) {
     return dev_prop->native_vector_width_half;
-  }
-  throw std::invalid_argument("Invalid data type to fetch native vector width!");
-}
-
-template <typename Func, typename... Args>
-int get_min(Func limit_func, int X, Args*... args) {
-  X = std::min({X, limit_func(X, args)...});
-  return X;
-}
-
-inline void check_shape(const at::Tensor& a, const at::Tensor& b, const char* a_name, const char* b_name) {
-  TORCH_CHECK(a.dim() == b.dim(), a_name, ".dim() != ", b_name, ".dim(). ", a.dim(), " vs ", b.dim());
-  for (int i = 0; i < a.dim(); ++i) {
-    TORCH_CHECK(a.size(i) == b.size(i), a_name, ".size(", i, ") != ", b_name, ".size(", i, ")");
+  } else {
+    throw std::invalid_argument("Invalid data type to fetch native vector width!");
   }
 }
-
-#define CHECK_SAME_SHAPE(a, b) check_shape(a, b, #a, #b)
-
-#define CHECK_DIM(d, x) TORCH_CHECK(x.dim() == d, #x " must be a " #d "D tensor")
-
-#define CHECK_LAST_DIM_CONTIGUOUS(x) \
-  TORCH_CHECK(x.strides()[x.strides().size() - 1] == 1, #x "must be contiguous at last dimension")
-
-#define CHECK_EQ(a, b) TORCH_CHECK((a) == (b), "CHECK_EQ(" #a ", " #b ") failed. ", a, " vs ", b)
 
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {
@@ -404,35 +419,6 @@ inline T safe_recip(T x) {
   const T inv = sycl::native::recip(safe_d);
   return sycl::select(T(0), inv, nz);
 }
-
-inline int nextPowerOf2(uint32_t a) {
-  if (a <= 1) return 1;
-  return 1 << (32 - __builtin_clz(a - 1));
-};
-inline int round_up_headdim(int head_size) {
-  if (head_size <= 64) return 64;
-  if (head_size <= 96) return 96;
-  if (head_size <= 128) return 128;
-  if (head_size <= 192) return 192;
-  if (head_size <= 256) return 256;
-  if (head_size <= 512) return 512;
-  return 512;
-};
-
-template <typename T>
-struct DtypeInfo;
-
-template <>
-struct DtypeInfo<int8_t> {
-  static constexpr float MIN = -128;
-  static constexpr float MAX = 127;
-};
-
-template <>
-struct DtypeInfo<c10::Float8_e4m3fn> {
-  static constexpr float MIN = -448;
-  static constexpr float MAX = 448;
-};
 
 template <typename scalar_t, int vec_size>
 struct alignas(sizeof(scalar_t) * vec_size) aligned_vec {

@@ -33,6 +33,17 @@ DTYPE_BYTES = {
     "fp8_e4m3fn": 1,
 }
 
+# cos_sin_cache dtype support is specific to fused_inplace_qknorm_rope (the
+# cache-based benchmark below); other ops here still assume an fp32 cache.
+ROPE_CACHE_DTYPE_MAP = {
+    "fp32": torch.float32,
+    "bf16": torch.bfloat16,
+}
+ROPE_CACHE_DTYPE_BYTES = {
+    "fp32": 4,
+    "bf16": 2,
+}
+
 
 def llama_rms_norm(x, w, eps=1e-6):
     """PyTorch reference implementation of RMS normalization."""
@@ -397,22 +408,29 @@ def logical_cache_bytes_per_call(
     rope_dim: int,
     dtype_name: str,
     position_dtype_name: str,
+    cache_dtype_name: str = "fp32",
 ) -> int:
     dtype_bytes = DTYPE_BYTES[dtype_name]
     position_dtype_bytes = 4 if position_dtype_name == "int32" else 8
 
     qk_bytes = flat_tokens * (num_heads_q + num_heads_k) * head_dim * dtype_bytes * 2
     weight_bytes = 2 * head_dim * dtype_bytes
-    cache_bytes = flat_tokens * rope_dim * 4
+    cache_bytes = flat_tokens * rope_dim * ROPE_CACHE_DTYPE_BYTES[cache_dtype_name]
     position_bytes = flat_tokens * position_dtype_bytes
     return qk_bytes + weight_bytes + cache_bytes + position_bytes
 
 
 CACHE_CONFIGS = [
-    (False, 3, 1, 4, 2, 64, 32, False, "bf16", "int32"),
-    (False, 5, 1, 8, 4, 128, 64, True, "fp16", "int64"),
-    (True, 2, 4, 16, 4, 128, 128, False, "bf16", "int32"),
-    (True, 1, 8, 32, 8, 256, 128, True, "fp16", "int64"),
+    (False, 3, 1, 4, 2, 64, 32, False, "bf16", "int32", "fp32"),
+    (False, 4, 1, 6, 2, 96, 96, False, "bf16", "int32", "fp32"),
+    (False, 5, 1, 8, 4, 128, 64, True, "fp16", "int64", "fp32"),
+    (True, 2, 4, 16, 4, 128, 128, False, "bf16", "int32", "fp32"),
+    (True, 1, 8, 32, 8, 256, 128, True, "fp16", "int64", "fp32"),
+    # bf16 cos_sin_cache coverage (fused_inplace_qknorm_rope-only feature):
+    # one 3D, one 4D config.
+    (False, 3, 1, 4, 2, 64, 32, False, "bf16", "int32", "bf16"),
+    (False, 4, 1, 6, 2, 96, 96, False, "bf16", "int32", "bf16"),
+    (True, 2, 4, 16, 4, 128, 128, False, "bf16", "int32", "bf16"),
 ]
 
 
@@ -429,6 +447,7 @@ CACHE_CONFIGS = [
             "is_neox",
             "dtype_name",
             "position_dtype_name",
+            "cache_dtype_name",
         ],
         x_vals=[list(config) for config in CACHE_CONFIGS],
         line_arg="provider",
@@ -451,6 +470,7 @@ def benchmark_cache(
     is_neox,
     dtype_name,
     position_dtype_name,
+    cache_dtype_name,
     provider,
 ):
     q, k, q_weight, k_weight, cos_sin_cache, positions = make_cache_inputs(
@@ -463,6 +483,7 @@ def benchmark_cache(
         rope_dim,
         dtype_name,
         position_dtype_name,
+        cache_dtype_name,
     )
 
     if provider == "native_split":
@@ -510,6 +531,7 @@ def benchmark_cache(
         rope_dim,
         dtype_name,
         position_dtype_name,
+        cache_dtype_name,
     )
     bandwidth_gbs = (logical_bytes / 1e9) / (ms / 1000.0)
 
@@ -526,6 +548,7 @@ def benchmark_cache(
             "is_neox": is_neox,
             "dtype": dtype_name,
             "position_dtype": position_dtype_name,
+            "cache_dtype": cache_dtype_name,
             "provider": provider,
             "time_us": 1000 * ms,
             "bandwidth_gbs": bandwidth_gbs,
@@ -720,7 +743,7 @@ CACHE_DTYPE_MAP = {
 
 
 def build_cache_configs() -> (
-    list[tuple[bool, int, int, int, int, int, int, bool, str, str]]
+    list[tuple[bool, int, int, int, int, int, int, bool, str, str, str]]
 ):
     return list(CACHE_CONFIGS)
 
@@ -739,6 +762,7 @@ def make_cache_inputs(
     rope_dim: int,
     dtype_name: str,
     position_dtype_name: str,
+    cache_dtype_name: str = "fp32",
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -765,7 +789,10 @@ def make_cache_inputs(
 
     q_weight = torch.randn(head_dim, device=device, dtype=dtype).contiguous()
     k_weight = torch.randn(head_dim, device=device, dtype=dtype).contiguous()
-    cos_sin_cache = create_cos_sin_cache(rope_dim, flat_tokens + 1, 10000.0)
+    cache_dtype = ROPE_CACHE_DTYPE_MAP[cache_dtype_name]
+    cos_sin_cache = create_cos_sin_cache(
+        rope_dim, flat_tokens + 1, 10000.0, dtype=cache_dtype
+    )
     positions = torch.arange(flat_tokens, device=device, dtype=position_dtype)
     return q, k, q_weight, k_weight, cos_sin_cache, positions
 

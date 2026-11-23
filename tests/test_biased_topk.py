@@ -12,7 +12,7 @@ device = utils.get_device()
 def biased_topk_torch_native(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
+    correction_bias: Optional[torch.Tensor],
     topk: int,
     renormalize: bool,
     scoring_func: str = "sigmoid",
@@ -30,7 +30,9 @@ def biased_topk_torch_native(
     num_token = scores.shape[0]
     num_experts = scores.shape[1]
 
-    scores_for_choice = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
+    scores_for_choice = scores.view(num_token, -1)
+    if correction_bias is not None:
+        scores_for_choice = scores_for_choice + correction_bias.unsqueeze(0)
     _, topk_ids = torch.topk(
         scores_for_choice,
         k=topk,
@@ -90,6 +92,7 @@ def _scatter_by_expert(
 @pytest.mark.parametrize("num_shared", [0, 1])
 @pytest.mark.parametrize("renormalize", [True, False])
 @pytest.mark.parametrize("apply_scale", [True, False])
+@pytest.mark.parametrize("has_bias", [True, False])
 def test_biased_topk(
     M: int,
     num_experts: int,
@@ -98,9 +101,12 @@ def test_biased_topk(
     num_shared: int,
     renormalize: bool,
     apply_scale: bool,
+    has_bias: bool,
 ) -> None:
     hidden_states = torch.randn(M, 100, device=device, dtype=torch.float32)
     scores, bias = _make_inputs(M, num_experts, seed=num_experts * 100 + topk)
+    if not has_bias:
+        bias = None
     scale = 2.5
 
     ref_weights, ref_indices = biased_topk_torch_native(

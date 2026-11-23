@@ -87,7 +87,7 @@ The configured hooks include YAML/TOML checks, whitespace checks, isort, ruff, c
 
 ## 8) Pull request checklist
 
-PRs should include:
+PRs fill in `.github/pull_request_template.md`. At minimum:
 
 - What changed and why
 - Build/test commands run locally and outcomes
@@ -98,7 +98,30 @@ Apply labels:
 - Always: `run-ci`
 - If perf-sensitive: `perf`
 
-## 9) Safety and quality bar
+## 9) Contributing with AI
+
+PR policy is in `CONTRIBUTING.md`: AI explores, the author decides and must
+understand what the change solves, how, its limitations, and its effect on
+untargeted cases. For agents this means:
+
+- Write only necessary code: no drive-by refactors, restating comments,
+  re-implemented helpers, defensive checks on internal paths, or single-use
+  abstractions.
+- Declare each op precondition at the entry (comment + `TORCH_CHECK` or
+  dispatch condition); reject inputs outside it, never return wrong results
+  silently. Test boundaries and rejected inputs against an independent
+  reference, with tolerances derived from the dtype path.
+- Keep accumulation and reductions in fp32; make every narrowing conversion
+  explicit and tell the user where it happens.
+- When a change adds, removes or moves synchronization, workspace reuse or
+  async work, tell the user who produces/consumes, what orders it, and when
+  buffers are reused.
+- When drafting a PR description, follow `.github/pull_request_template.md`
+  and state only facts verified in the session (commands run, real output).
+  Leave intent, trade-offs, risks and review focus to the author as
+  questions; never invent results.
+
+## 10) Safety and quality bar
 
 - Do not claim tests or benchmarks were run if they were not run.
 - Do not commit if pre-commit fails.

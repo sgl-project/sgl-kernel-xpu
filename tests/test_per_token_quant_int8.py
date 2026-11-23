@@ -26,11 +26,10 @@ def torch_per_token_quant_int8(
     return qweight, scale
 
 
-# num_tokens sweep spans both kernels: small batches (<=512) take the
-# work-group-per-token path; large batches (8192) take the sub-group-per-token
-# warp path. hidden_dims include non-16-divisible sizes to exercise the
-# vec-width fallback.
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+# num_tokens and hidden_dim sweep spans the cached warp kernel (large batch,
+# hidden_dim <= 1024), single-pass register-cached block kernels (WG 128/256/512),
+# and non-16-divisible tail handling.
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("scale_dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("cal_sum", [False, True])
 @pytest.mark.parametrize(
@@ -38,7 +37,7 @@ def torch_per_token_quant_int8(
     list(
         itertools.product(
             [1, 128, 256, 512, 8192],
-            [512, 1076, 1368, 2048, 4096, 5120, 8192],
+            [512, 1076, 1367, 2048, 4096, 5120, 8192, 65536],
         )
     ),
 )

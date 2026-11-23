@@ -82,7 +82,9 @@ def main(
         x = torch.randn(num_tokens, hidden_dim, dtype=torch.float16, device=DEVICE)
 
         ms = _bench(
-            lambda: sgl_per_token_quant_int8(x, scale_dtype=scale_dtype, cal_sum=cal_sum),
+            lambda: sgl_per_token_quant_int8(
+                x, scale_dtype=scale_dtype, cal_sum=cal_sum
+            ),
         )
         # bytes: read 2B input + write 1B output + write scale/row (+ optional sum/row)
         scale_bytes = torch.tensor([], dtype=scale_dtype).element_size()

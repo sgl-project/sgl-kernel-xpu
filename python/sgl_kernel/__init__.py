@@ -89,6 +89,7 @@ from sgl_kernel.elementwise import (
     qwen4_gate_value,
     qwen4_ngram_hash,
     rmsnorm,
+    rmsnorm_indexed_scale_shift,
     silu_and_mul,
     silu_and_mul_clamp,
     store_cache_xpu,

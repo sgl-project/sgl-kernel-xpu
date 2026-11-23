@@ -40,6 +40,29 @@ def rmsnorm(
     return out
 
 
+def rmsnorm_indexed_scale_shift(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    indices: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    r"""RMSNorm followed by indexed BF16 scale/shift, returning a new tensor.
+
+    Computes ``rms_norm(x, weight, eps) * (1 + scale[indices]) +
+    shift[indices]`` with the BF16 rounding of the eager XPU operations.
+    Inputs are two-dimensional BF16 XPU tensors with a positive hidden size;
+    ``x`` and ``weight`` must be contiguous, and the tables must have contiguous
+    last dimensions. ``indices`` must be int32/int64 with stride one, have one
+    entry per row, and contain values in ``[0, shift.shape[0])`` when rows exist.
+    Empty batches return a new empty tensor. This function never modifies ``x``.
+    """
+    return torch.ops.sgl_kernel.rmsnorm_indexed_scale_shift(
+        x, weight, shift, scale, indices, eps
+    )
+
+
 def fused_add_rmsnorm(
     input: torch.Tensor,
     residual: torch.Tensor,

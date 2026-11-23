@@ -48,6 +48,11 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("rmsnorm(Tensor! output, Tensor input, Tensor weight, float eps) -> ()");
   m.impl("rmsnorm", torch::kXPU, &at::native::xpu::rmsnorm);
 
+  m.def(
+      "rmsnorm_indexed_scale_shift(Tensor x, Tensor weight, Tensor shift, Tensor scale, Tensor indices, float eps) -> "
+      "Tensor");
+  m.impl("rmsnorm_indexed_scale_shift", torch::kXPU, &at::native::xpu::rmsnorm_indexed_scale_shift);
+
   m.def("fused_add_rmsnorm(Tensor! input, Tensor! residual, Tensor weight, float eps) -> ()");
   m.impl("fused_add_rmsnorm", torch::kXPU, &at::native::xpu::fused_add_rmsnorm);
 

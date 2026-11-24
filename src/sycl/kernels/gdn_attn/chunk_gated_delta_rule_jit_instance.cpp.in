@@ -27,9 +27,15 @@
 // change. To force every previously-cached .so to recompile, you MUST also
 // change THIS file whenever the included kernel headers change behaviorally:
 // bump the revision marker below (any text change to this file does it).
-#define SGL_GDN_CHUNK_JIT_HEADER_REVISION 2
+#define SGL_GDN_CHUNK_JIT_HEADER_REVISION 3
 // Revision history (behavioral changes to the included kernel headers that
 // required invalidating previously-cached .so's):
+//   3 -- chunk_fwd_o_kernel gained a work-group barrier between the W@S/Q@S
+//        (state READS from ssm_state) and the state-UPDATE (state READ+WRITE)
+//        phases, eliminating a write-after-read race on ssm_state that
+//        corrupted seeded initial states on some Xe2 parts
+//        (e.g. BMG-G21); fwd_o also gained the nullptr has_initial_state
+//        convention shared with chunk_compute_wu.
 //   2 -- chunk_prepare_kernel gained the `v_head_id >= num_v_heads` bounds
 //        guard, eliminating an out-of-range A_log/dt_bias/alpha read for
 //        value-head subgroup tails (see chunk_gated_delta_rule_kernels.hpp).

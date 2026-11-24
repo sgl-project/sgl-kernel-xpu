@@ -363,7 +363,9 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
   int pre_chunks = 0;
 
   for (int batch_id = 0; batch_id < batch_size; ++batch_id) {
-    const bool initial_state = has_initial_state[batch_id];
+    // Same nullptr convention as chunk_compute_wu_kernel: a null mask means
+    // "every sequence has an initial state".
+    const bool initial_state = has_initial_state == nullptr || has_initial_state[batch_id];
     const int seq_start_offset = query_start_loc[batch_id];
     const int seq_end_offset = query_start_loc[batch_id + 1];
     const int seq_len = seq_end_offset - seq_start_offset;
@@ -558,6 +560,26 @@ CUTE_DEVICE void chunk_fwd_o_kernel(
           reorder(tSrO_c, tCrO_c);
           copy(copy_O_c, tCrO_c, tCgO_c);
         }
+
+        // WAR fence: the fused WS+QS block above reads S_tensor (ssm_state)
+        // via sg.load for each (dv) tile, and the state-update loop below both
+        // reads S_tensor (as the S_prev seed) AND writes S_tensor (as S_new)
+        // for every (dv, dk) tile. The work ITEMS in this group execute these
+        // phases independently, so a load in this phase can still be in flight
+        // when a state-update store to the SAME gmem tile issues from a
+        // different work-item -- a classic WAR on ssm_state. Symptom on Xe2
+        // (B60/BMG-G21; also visible on other Xe2 without WAR-barrier flags):
+        // the S_prev seed ends up reading an already-stored tile (the feedback
+        // fixes S_new to S_new = g_last * S_new + ...) producing a large
+        // correlated state error at every chunk boundary, i.e. only when
+        // has_prev_state is true. B70 (BMG-210) does not show it because its
+        // default build emits the WAR-barrier (see the driver/igc option), and
+        // incidentally schedules loads to completion before the stores.
+        //
+        // A work-group barrier (matching the idiom already used for the
+        // analogous WAR on `u` above) guarantees every work-item's S reads
+        // have completed before any of them stores to S.
+        item.barrier(sycl::access::fence_space::local_space);
       }
 
       auto K_tensor_T_shape = make_shape(head_k_dim, chunk_size);

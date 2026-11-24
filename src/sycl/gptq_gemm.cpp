@@ -518,7 +518,7 @@ bool contiguous_groups(sycl::queue& queue, const int* g_idx, int K) {
   int* flag = sycl::malloc_device<int>(1, queue);
   queue.memset(flag, 0, sizeof(int)).wait();
   queue
-      .parallel_for(sycl::range<1>(static_cast<size_t>(K)), [=](sycl::id<1> id) {
+      .parallel_for<class GptqGroupScan>(sycl::range<1>(static_cast<size_t>(K)), [=](sycl::id<1> id) {
         const int k = static_cast<int>(id[0]);
         if (g_idx[k] != k / kGroup) {
           sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device> seen(flag[0]);
@@ -1641,7 +1641,7 @@ SGL_KERNEL_EXPORT torch::Tensor gptq_repack_weights(torch::Tensor b_q_weight, to
   const size_t total = static_cast<size_t>(words) * static_cast<size_t>(N);
   queue
       .submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(total), [=](sycl::id<1> id) {
+        cgh.parallel_for<class GptqRepackTranspose>(sycl::range<1>(total), [=](sycl::id<1> id) {
           const int idx = static_cast<int>(id);
           const int k8 = idx / N;
           const int col = idx - k8 * N;

@@ -111,5 +111,5 @@ int get_min_vec_size(int vec_size, Args*... args) {
     return can_vectorize_up_to<std::remove_pointer_t<decltype(data)>>(
         dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(data));
   };
-  return get_min(limit_func, vec_size, args...);
+  return std::min({vec_size, limit_func(vec_size, args)...});
 }

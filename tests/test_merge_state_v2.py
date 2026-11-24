@@ -140,7 +140,7 @@ def merge_state_torch(
 NUM_BATCH_TOKENS = [1, 128, 256, 512, 613, 1024, 1536]
 NUM_QUERY_HEADS = [8, 16, 32, 64]
 HEAD_SIZES = [32, 48, 64, 128, 256]
-DTYPES = [torch.half, torch.bfloat16]
+DTYPES = [torch.float32, torch.half, torch.bfloat16]
 
 all_case_info: list[tuple] = []
 

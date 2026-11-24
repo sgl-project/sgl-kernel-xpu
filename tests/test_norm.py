@@ -93,7 +93,7 @@ def fused_add_rms_norm(x, residual, weight, eps):
         ],
         # gpt-oss: bf16 input + bf16 weight, H = 2880, prefill batch.
         (4096, 2880, torch.bfloat16),
-        # fp32 correctness smoke test for rmsnorm. `SYCL_DISPATCH_FLOATING_TYPES`
+        # fp32 correctness smoke test for rmsnorm. `AT_DISPATCH_FLOATING_TYPES_AND2`
         # instantiates the kernel for Float, so fp32 is a distinct instantiation
         # that the fp16/bf16 sweep above never covers.
         (19, 1024, torch.float32),
@@ -898,6 +898,30 @@ def test_gemma_fused_add_rmsnorm_mixed_dtype(
     tol = 1e-2 if input_dtype == torch.bfloat16 else 1e-3
     torch.testing.assert_close(x_fused, x_native, rtol=tol, atol=tol)
     torch.testing.assert_close(residual_fused, residual_native, rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize(
+    "op", ["rmsnorm", "fused_add_rmsnorm", "gemma_rmsnorm", "gemma_fused_add_rmsnorm"]
+)
+@pytest.mark.parametrize(
+    "input_dtype,weight_dtype",
+    [
+        (torch.float16, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+        (torch.float32, torch.float16),
+        (torch.float32, torch.bfloat16),
+    ],
+)
+def test_norm_rejects_unsupported_weight_dtype(op, input_dtype, weight_dtype):
+    x = torch.randn(2, 128, device=device, dtype=input_dtype)
+    weight = torch.ones(128, device=device, dtype=weight_dtype)
+    with pytest.raises(
+        RuntimeError, match="weight dtype must match input dtype or be float32"
+    ):
+        if "fused_add" in op:
+            getattr(sgl_kernel, op)(x, torch.zeros_like(x), weight)
+        else:
+            getattr(sgl_kernel, op)(x, weight)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

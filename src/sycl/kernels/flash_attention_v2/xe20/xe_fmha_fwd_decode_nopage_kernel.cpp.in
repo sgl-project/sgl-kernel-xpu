@@ -54,6 +54,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
       params.softmax_sink_ptr == nullptr,
       "No-page attention does not support sink logits (softmax_sink_ptr must be null)");
   TORCH_CHECK(params.rel_bias_ptr == nullptr, "relative attention requires paged KV cache");
+  TORCH_CHECK(params.alibi_slopes_ptr == nullptr, "ALiBi requires paged KV cache");
   using TileShapeQK_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<sgl::fmha::decode_tiled_kv_np(@HEAD_DIM@)>, cute::_64>;
   using TileShapePV_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::_32, cute::Int<sgl::fmha::decode_tiled_kv_np(@HEAD_DIM@)>>;
   using TileShapeOutput_NP = cute::Shape<cute::Int<@QG_SZ@>, cute::Int<((@HEAD_DIM@ + 31) / 32) * 32>>;
@@ -72,7 +73,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
   // non-causal, so only the local axis fans out here (this path has no sink
   // support at all -- checked above).
   if (params.return_softmax_lse) {
-    AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+    SGL_DISPATCH_BOOL(params.is_local, LocalMask, [&] {
       using Element = @ELEM_TYPE@;
       dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;
@@ -98,7 +99,7 @@ __attribute__((visibility("default"))) void FmhaDecodeNpRunner<@QG_SZ@, @HEAD_DI
     return;
   }
   // No sink support for no_page path; always use Sink=false
-  AT_DISPATCH_BOOL_NO_RETURN(params.is_local, LocalMask, {
+  SGL_DISPATCH_BOOL(params.is_local, LocalMask, [&] {
     using Element = @ELEM_TYPE@;
     dispatch_softcap<@HEAD_DIM@, false>(params.softcap, [&](auto softcap_tag) {
       constexpr bool Softcap = decltype(softcap_tag)::value;

@@ -277,17 +277,13 @@ SGL_KERNEL_EXPORT torch::Tensor fp8_blockwise_scaled_mm(
               "K must be a multiple of 16 bytes for memory alignment");
 
   auto is_contiguous_vector = [](const torch::Tensor& t) {
-    auto s = t.sizes();
-    return t.is_contiguous() &&
-           (t.dim() == 1 || (t.dim() == 2 && *std::min_element(s.begin(), s.end()) == 1));
+    return t.is_contiguous() && std::min(t.size(0), t.size(1)) == 1;
   };
 
-  TORCH_CHECK(scales_a.dim() == 2 && scales_a.size(0) == M && scales_a.size(1) == K / 128,
-              "scales_a must have shape [M, K/128], got ", scales_a.sizes());
+  CHECK_SHAPE(scales_a, M, K / 128);
   TORCH_CHECK(scales_a.stride(0) == 1 || is_contiguous_vector(scales_a),
               "scales_a must be M-major (stride(0) == 1)");
-  TORCH_CHECK(scales_b.dim() == 2 && scales_b.size(0) == K / 128 && scales_b.size(1) == N / 128,
-              "scales_b must have shape [K/128, N/128], got ", scales_b.sizes());
+  CHECK_SHAPE(scales_b, K / 128, N / 128);
   TORCH_CHECK(scales_b.stride(0) == 1 || is_contiguous_vector(scales_b),
               "scales_b must be K-major (stride(0) == 1)");
 

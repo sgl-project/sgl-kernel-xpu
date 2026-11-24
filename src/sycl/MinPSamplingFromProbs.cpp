@@ -16,50 +16,6 @@
 #include "comm/Sampling.h"
 #include "sgl_kernel_export.h"
 
-template <typename T>
-struct ToSyclElementType {
-  using type = T;
-};
-
-template <>
-struct ToSyclElementType<at::Half> {
-  using type = sycl::half;
-};
-
-template <>
-struct ToSyclElementType<at::BFloat16> {
-  using type = sycl::ext::oneapi::bfloat16;
-};
-
-#define DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE_VAR, ...) \
-  switch (vec_size) {                                       \
-    case 16: {                                              \
-      constexpr uint32_t VEC_SIZE_VAR = 16;                 \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-    case 8: {                                               \
-      constexpr uint32_t VEC_SIZE_VAR = 8;                  \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-    case 4: {                                               \
-      constexpr uint32_t VEC_SIZE_VAR = 4;                  \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-    case 2: {                                               \
-      constexpr uint32_t VEC_SIZE_VAR = 2;                  \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-    default: {                                              \
-      constexpr uint32_t VEC_SIZE_VAR = 1;                  \
-      __VA_ARGS__;                                          \
-      break;                                                \
-    }                                                       \
-  }
-
 //----------------- min-p rejection sampling --------------------//
 // One work-group processes one request row.
 
@@ -182,7 +138,6 @@ struct MinPSamplingKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 };
 
-template <typename TensorDType>
 void launch_min_p_sampling(
     const at::Tensor& probs,
     int32_t* output,
@@ -195,19 +150,17 @@ void launch_min_p_sampling(
     uint64_t philox_offset,
     bool deterministic,
     sycl::queue& queue) {
-  using KernelDType = typename ToSyclElementType<TensorDType>::type;
-
-  const KernelDType* probs_ptr = reinterpret_cast<const KernelDType*>(probs.data_ptr<TensorDType>());
+  const float* probs_ptr = probs.data_ptr<float>();
 
   const int local_size = kMinPWgSize;
   const int global_size = batch_size * local_size;
 
-  const uint32_t preferred_vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(KernelDType));
+  const uint32_t preferred_vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(float));
   const uint32_t vec_size = std::gcd(preferred_vec_size, vocab_size);
 
-  DISPATCH_MINP_VEC_SIZE(vec_size, VEC_SIZE, {
-    AT_DISPATCH_BOOL_NO_RETURN(deterministic, DETERMINISTIC, {
-      auto kernel = MinPSamplingKernel<KernelDType, VEC_SIZE, DETERMINISTIC>(
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+    SGL_DISPATCH_BOOL(deterministic, DETERMINISTIC, [&] {
+      auto kernel = MinPSamplingKernel<float, VEC_SIZE, DETERMINISTIC>(
           probs_ptr,
           output,
           maybe_indices,
@@ -230,13 +183,8 @@ SGL_KERNEL_EXPORT void min_p_sampling_from_probs(
     double min_p_val,
     bool deterministic,
     const std::optional<at::Generator>& gen) {
-  CHECK_INPUT(probs);
-  CHECK_INPUT(output);
-  TORCH_CHECK(probs.dim() == 2, "probs must be a 2D tensor [batch_size, vocab_size]");
-  // kernel templated on DType so fp16/bf16 support can be re-enabled later.
-  TORCH_CHECK(probs.scalar_type() == torch::kFloat32, "probs must be float32");
-  TORCH_CHECK(output.dim() == 1, "output must be a 1D tensor [batch_size]");
-  TORCH_CHECK(output.scalar_type() == torch::kInt32, "output must be int32");
+  CHECK_INPUT(2, at::kFloat, probs);
+  CHECK_INPUT(1, at::kInt, output);
 
   const int batch_size = output.size(0);
   const int vocab_size = probs.size(1);
@@ -247,7 +195,7 @@ SGL_KERNEL_EXPORT void min_p_sampling_from_probs(
   if (maybe_indices.has_value()) {
     const at::Tensor& indices = maybe_indices.value();
     CHECK_INPUT(indices);
-    TORCH_CHECK(indices.scalar_type() == torch::kInt64, "maybe_indices must be int64");
+    CHECK_DTYPE(at::kLong, indices);
     TORCH_CHECK(indices.size(0) == batch_size, "maybe_indices size must match batch_size");
     indices_ptr = indices.data_ptr<int64_t>();
   } else {
@@ -258,9 +206,7 @@ SGL_KERNEL_EXPORT void min_p_sampling_from_probs(
   const float* min_p_ptr = nullptr;
   if (maybe_min_p_arr.has_value()) {
     const at::Tensor& min_p_arr = maybe_min_p_arr.value();
-    CHECK_INPUT(min_p_arr);
-    TORCH_CHECK(min_p_arr.dim() == 1, "maybe_min_p_arr must be a 1D tensor");
-    TORCH_CHECK(min_p_arr.scalar_type() == torch::kFloat32, "maybe_min_p_arr must be float32");
+    CHECK_INPUT(1, at::kFloat, min_p_arr);
     TORCH_CHECK(min_p_arr.size(0) == batch_size, "maybe_min_p_arr size must match batch_size");
     min_p_ptr = min_p_arr.data_ptr<float>();
   } else {
@@ -286,7 +232,7 @@ SGL_KERNEL_EXPORT void min_p_sampling_from_probs(
   SGL_KERNEL_PERF_SCOPE("min_p_sampling", queue, bytes, flops);
 #endif
 
-  launch_min_p_sampling<float>(
+  launch_min_p_sampling(
       probs,
       output.data_ptr<int32_t>(),
       indices_ptr,

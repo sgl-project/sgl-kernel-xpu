@@ -166,11 +166,11 @@ struct QSAMqaDecodeKernel {
 };
 
 void check_q(const at::Tensor& q) {
-  CHECK_INPUT(q);
+  CHECK_INPUT(3, q);
   TORCH_CHECK(
-      (q.scalar_type() == at::kBFloat16 || q.scalar_type() == at::kFloat8_e4m3fn) && q.dim() == 3 &&
-          q.size(1) == kHeads && q.size(2) == kDim,
+      q.scalar_type() == at::kBFloat16 || q.scalar_type() == at::kFloat8_e4m3fn,
       "QSA MQA requires BF16 or float8_e4m3fn q [rows, 4, 128]");
+  CHECK_SHAPE(q, q.size(0), kHeads, kDim);
   TORCH_CHECK(q.size(0) <= std::numeric_limits<int>::max(), "QSA MQA row count exceeds int32");
 }
 
@@ -196,12 +196,14 @@ SGL_KERNEL_EXPORT at::Tensor qsa_mqa_prefill(
   check_q(q);
   for (const auto* tensor : {&k, &row_starts, &row_ends})
     check_same_device(q, *tensor);
-  TORCH_CHECK(k.dim() == 3 && k.size(1) == 1 && k.size(2) == kDim, "QSA MQA prefill requires k [columns, 1, 128]");
+  CHECK_DIM(3, k);
+  CHECK_SHAPE(k, k.size(0), 1, kDim);
   TORCH_CHECK(k.scalar_type() == q.scalar_type(), "QSA MQA Q/K dtype mismatch: both must be BF16 or float8_e4m3fn");
   TORCH_CHECK(
-      row_starts.scalar_type() == at::kInt && row_ends.scalar_type() == at::kInt && row_starts.dim() == 1 &&
-          row_ends.dim() == 1 && row_starts.numel() == q.size(0) && row_ends.numel() == q.size(0),
+      row_starts.scalar_type() == at::kInt && row_ends.scalar_type() == at::kInt,
       "QSA MQA prefill requires int32 row ranges [rows]");
+  CHECK_SHAPE(row_starts, q.size(0));
+  CHECK_SHAPE(row_ends, q.size(0));
   TORCH_CHECK(k.size(0) <= std::numeric_limits<int>::max(), "QSA MQA column count exceeds int32");
   const float scale = inverse_scale(score_scale);
   c10::DeviceGuard guard(q.device());
@@ -245,15 +247,16 @@ SGL_KERNEL_EXPORT at::Tensor qsa_mqa_decode(
   check_q(q);
   for (const auto* tensor : {&k_cache, &page_table, &context_lens})
     check_same_device(q, *tensor);
-  TORCH_CHECK(
-      k_cache.dim() == 4 && k_cache.size(2) == 1 && k_cache.size(3) == kDim,
-      "QSA MQA decode requires k_cache [pages, page_size, 1, 128]");
+  CHECK_DIM(4, k_cache);
+  CHECK_SHAPE(k_cache, k_cache.size(0), k_cache.size(1), 1, kDim);
   TORCH_CHECK(
       k_cache.scalar_type() == q.scalar_type(), "QSA MQA Q/K dtype mismatch: both must be BF16 or float8_e4m3fn");
   TORCH_CHECK(
-      page_table.scalar_type() == at::kInt && page_table.dim() == 2 && page_table.size(0) == q.size(0) &&
-          context_lens.scalar_type() == at::kInt && context_lens.dim() == 1 && context_lens.numel() == q.size(0),
+      page_table.scalar_type() == at::kInt && context_lens.scalar_type() == at::kInt,
       "QSA MQA decode requires int32 page_table [rows, pages] and context_lens [rows]");
+  CHECK_DIM(2, page_table);
+  CHECK_SHAPE(page_table, q.size(0), page_table.size(1));
+  CHECK_SHAPE(context_lens, q.size(0));
   TORCH_CHECK(
       k_cache.size(0) <= std::numeric_limits<int>::max() && k_cache.size(1) > 0 &&
           k_cache.size(1) <= std::numeric_limits<int>::max() && page_table.size(1) <= std::numeric_limits<int>::max() &&

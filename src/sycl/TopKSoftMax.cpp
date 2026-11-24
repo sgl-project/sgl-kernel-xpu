@@ -589,7 +589,7 @@ topk_softmax(at::Tensor& topk_weights, at::Tensor& topk_indices, at::Tensor& gat
   SGL_KERNEL_PERF_SCOPE("topk_softmax", profiling_queue, bytes, flops);
 #endif
 
-  DISPATCH_FLOAT_TYPES(gating_output.scalar_type(), "fused_topk_softmax_kernel", [&]() {
+  AT_DISPATCH_FLOATING_TYPES_V2(gating_output.scalar_type(), "fused_topk_softmax_kernel", [&]() {
     TopKSoftmaxImpl::fused_topk_softmax<scalar_t>(
         gating_output.data_ptr<scalar_t>(),
         topk_weights.data_ptr<float>(),

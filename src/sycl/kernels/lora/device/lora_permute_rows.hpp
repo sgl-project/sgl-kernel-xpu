@@ -58,25 +58,9 @@
 #include <sycl/sycl.hpp>
 
 #include "sycl/SYCLHelpers.h"
+#include "sycl/Utils.h"
 
 namespace lora_permute_rows_impl {
-
-//----------------- torch dtype -> SYCL element type --------------------//
-
-template <typename T>
-struct ToSyclElementType {
-  using type = T;
-};
-
-template <>
-struct ToSyclElementType<at::Half> {
-  using type = sycl::half;
-};
-
-template <>
-struct ToSyclElementType<at::BFloat16> {
-  using type = sycl::ext::oneapi::bfloat16;
-};
 
 //----------------- Kernel definition --------------------//
 
@@ -130,7 +114,7 @@ void launch_permute_rows(
     const int64_t num_rows,
     const int64_t width,
     sycl::queue& queue) {
-  using ElemType = typename ToSyclElementType<TensorDType>::type;
+  using ElemType = sycl_type_t<TensorDType>;
   constexpr int WG = LoraPermuteRows<ElemType, GATHER>::WG;
 
   sycl::range<3> local(1, 1, WG);
@@ -156,19 +140,9 @@ void permute_rows_dispatch(
   if (num_rows == 0 || width == 0) {
     return;
   }
-  switch (src.scalar_type()) {
-    case torch::kFloat32:
-      launch_permute_rows<float, GATHER>(src, dst, perm_i64, num_rows, width, queue);
-      break;
-    case torch::kHalf:
-      launch_permute_rows<at::Half, GATHER>(src, dst, perm_i64, num_rows, width, queue);
-      break;
-    case torch::kBFloat16:
-      launch_permute_rows<at::BFloat16, GATHER>(src, dst, perm_i64, num_rows, width, queue);
-      break;
-    default:
-      TORCH_CHECK(false, "Unsupported dtype for lora gather/scatter: ", src.scalar_type());
-  }
+  AT_DISPATCH_FLOATING_TYPES_V2(src.scalar_type(), "lora gather/scatter", [&] {
+    launch_permute_rows<scalar_t, GATHER>(src, dst, perm_i64, num_rows, width, queue);
+  });
 }
 
 }  // namespace lora_permute_rows_impl

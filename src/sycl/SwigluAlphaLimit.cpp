@@ -180,35 +180,12 @@ void swiglu_gpt_oss_sigmoid_alpha_sycl(
   });
 }
 
-#define SYCL_DISPATCH_BY_SCALAR_DTYPE(scalar_dtype, fn)                    \
-  {                                                                        \
-    if (scalar_dtype == at::ScalarType::Float) {                           \
-      fn(float);                                                           \
-    } else if (scalar_dtype == at::ScalarType::Half) {                     \
-      fn(sycl::half);                                                      \
-    } else if (scalar_dtype == at::ScalarType::BFloat16) {                 \
-      fn(sycl::ext::oneapi::bfloat16);                                     \
-    } else {                                                               \
-      TORCH_CHECK(false, "Unsupported dtype for SYCL op: ", scalar_dtype); \
-    }                                                                      \
-  }
-
-#define CALL_SWIGLU_LAUNCHER_SYCL(scalar_t)                                                                \
-  {                                                                                                        \
-    swiglu_gpt_oss_sigmoid_alpha_sycl<scalar_t>(                                                           \
-        reinterpret_cast<const scalar_t*>(x_ptr), reinterpret_cast<scalar_t*>(y_ptr), B, H, alpha, limit); \
-  }
-
 SGL_KERNEL_EXPORT torch::Tensor swiglu_gpt_oss_sigmoid_alpha(
     torch::Tensor x,  // [B, 2H]
     double alpha,
     double limit) {
-  TORCH_CHECK(x.is_xpu(), "Unsupported device");
-  TORCH_CHECK(
-      x.dtype() == torch::kFloat32 || x.dtype() == torch::kFloat16 || x.dtype() == torch::kBFloat16,
-      "Only float32, float16, and bfloat16 are supported");
-  TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
-  TORCH_CHECK(x.dim() == 2, "x must be 2D [B, 2H]");
+  CHECK_INPUT(2, x);
+  CHECK_DTYPES(x, at::kFloat, at::kHalf, at::kBFloat16);
   TORCH_CHECK(x.size(1) % 2 == 0, "Last dim must be even");
 
   const int64_t B = x.size(0);
@@ -231,7 +208,10 @@ SGL_KERNEL_EXPORT torch::Tensor swiglu_gpt_oss_sigmoid_alpha(
   SGL_KERNEL_PERF_SCOPE("swiglu_gpt_oss_sigmoid_alpha", profiling_queue, bytes, flops);
 #endif
 
-  SYCL_DISPATCH_BY_SCALAR_DTYPE(x.scalar_type(), CALL_SWIGLU_LAUNCHER_SYCL);
+  SYCL_DISPATCH_FLOATING_TYPES_V2(x.scalar_type(), "swiglu_gpt_oss_sigmoid_alpha", [&] {
+    swiglu_gpt_oss_sigmoid_alpha_sycl<scalar_t>(
+        reinterpret_cast<const scalar_t*>(x_ptr), reinterpret_cast<scalar_t*>(y_ptr), B, H, alpha, limit);
+  });
 
   return y;
 }

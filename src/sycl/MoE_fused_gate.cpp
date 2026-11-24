@@ -558,52 +558,51 @@ SGL_KERNEL_EXPORT std::vector<at::Tensor> moe_fused_gate(
   SGL_KERNEL_PERF_SCOPE("moe_fused_gate", profiling_queue, bytes, flops);
 #endif
 
-  SYCL_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "moe_sum_reduce_impl", [&]() {
-        auto bias_ptr = bias.has_value() ? reinterpret_cast<const scalar_t*>(bias->data_ptr())
-                                         : static_cast<const scalar_t*>(nullptr);
-        switch (num_experts) {
-          case 512:
-            if (num_expert_group == 16) {
-              LAUNCH_MOE_GATE_CONFIG(scalar_t, 512, 16);
-            }
-            break;
-          case 256:
-            if (num_expert_group == 8) {
-              LAUNCH_MOE_GATE_CONFIG(scalar_t, 256, 8);
-            } else if (num_expert_group == 16) {
-              LAUNCH_MOE_GATE_CONFIG(scalar_t, 256, 16);
-            }
-            break;
-          case 128:
-            if (num_expert_group == 4) {
-              LAUNCH_MOE_GATE_CONFIG(scalar_t, 128, 4);
-            } else if (num_expert_group == 8) {
-              LAUNCH_MOE_GATE_CONFIG(scalar_t, 128, 8);
-            }
-            break;
-          default:
-            break;
+  SYCL_DISPATCH_FLOATING_TYPES_V3(input.scalar_type(), "moe_sum_reduce_impl", [&]() {
+    auto bias_ptr =
+        bias.has_value() ? reinterpret_cast<const scalar_t*>(bias->data_ptr()) : static_cast<const scalar_t*>(nullptr);
+    switch (num_experts) {
+      case 512:
+        if (num_expert_group == 16) {
+          LAUNCH_MOE_GATE_CONFIG(scalar_t, 512, 16);
         }
-        if (!dispatched) {
-          // Fallback to the dynamic kernel if none of the supported combinations match.
-          // currently only support num_experts / num_expert_group <= 32 for dynamic kernels
-          moe_fused_gate_kernel_dynamic<scalar_t>(
-              input,
-              bias_ptr,
-              output,
-              indices,
-              num_rows,
-              num_expert_group,
-              topk_group,
-              topk,
-              num_fused_shared_experts,
-              scoring_func,
-              renormalize,
-              routed_scaling_factor,
-              apply_routed_scaling_factor_on_output);
+        break;
+      case 256:
+        if (num_expert_group == 8) {
+          LAUNCH_MOE_GATE_CONFIG(scalar_t, 256, 8);
+        } else if (num_expert_group == 16) {
+          LAUNCH_MOE_GATE_CONFIG(scalar_t, 256, 16);
         }
-      });
+        break;
+      case 128:
+        if (num_expert_group == 4) {
+          LAUNCH_MOE_GATE_CONFIG(scalar_t, 128, 4);
+        } else if (num_expert_group == 8) {
+          LAUNCH_MOE_GATE_CONFIG(scalar_t, 128, 8);
+        }
+        break;
+      default:
+        break;
+    }
+    if (!dispatched) {
+      // Fallback to the dynamic kernel if none of the supported combinations match.
+      // currently only support num_experts / num_expert_group <= 32 for dynamic kernels
+      moe_fused_gate_kernel_dynamic<scalar_t>(
+          input,
+          bias_ptr,
+          output,
+          indices,
+          num_rows,
+          num_expert_group,
+          topk_group,
+          topk,
+          num_fused_shared_experts,
+          scoring_func,
+          renormalize,
+          routed_scaling_factor,
+          apply_routed_scaling_factor_on_output);
+    }
+  });
 
   return {output, indices};
 }

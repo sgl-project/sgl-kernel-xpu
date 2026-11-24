@@ -165,11 +165,9 @@ sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor outpu
   CHECK_INPUT(input);
   CHECK_INPUT(output_q);
   CHECK_INPUT(output_s);
-  TORCH_CHECK(
-      input.scalar_type() == at::ScalarType::BFloat16 || input.scalar_type() == at::ScalarType::Half,
-      "input must be BFloat16/Half tensor");
-  TORCH_CHECK(output_q.scalar_type() == at::ScalarType::Float8_e4m3fn, "output must be Float8_e4m3fn tensor");
-  TORCH_CHECK(output_s.scalar_type() == at::ScalarType::Float, "scale must be Float tensor");
+  CHECK_DTYPES(input, at::kHalf, at::kBFloat16);
+  CHECK_DTYPE(at::kFloat8_e4m3fn, output_q);
+  CHECK_DTYPE(at::kFloat, output_s);
 
   const int block_size = 256;
   const int64_t num_elements = input.numel();
@@ -207,30 +205,10 @@ sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor outpu
   } while (0)
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "sgl_per_tensor_quant_fp8", [&] {
-    using sycl_scalar_t = typename std::
-        conditional<std::is_same<scalar_t, at::Half>::value, sycl::half, sycl::ext::oneapi::bfloat16>::type;
+    using sycl_scalar_t = sycl_type_t<scalar_t>;
 
     int vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(sycl_scalar_t));
-
-    switch (vec_size) {
-      case 16:
-        LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, 16);
-        break;
-      case 8:
-        LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, 8);
-        break;
-      case 4:
-        LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, 4);
-        break;
-      case 2:
-        LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, 2);
-        break;
-      case 1:
-        LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, 1);
-        break;
-      default:
-        throw std::runtime_error("Unsupported vector size: " + std::to_string(vec_size));
-    }
+    SGL_DISPATCH_VEC_SIZE(vec_size, [&] { LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, VEC_SIZE); });
   });
 
 #undef LAUNCH_KERNEL

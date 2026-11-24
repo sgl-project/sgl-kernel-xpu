@@ -83,14 +83,6 @@ struct op_and_mul_functor {
   int64_t dim;
 };
 
-#define VEC_LAUNCH(KERNEL, N)                                                \
-  case N: {                                                                  \
-    op_and_mul_functor<T_to, KERNEL<T_to, accscalar_t>, N> kfn = {           \
-        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim}; \
-    sycl_kernel_submit(num_group* wg_size, wg_size, q, kfn);                 \
-    break;                                                                   \
-  }
-
 template <typename T = float>
 void get_config(
     [[maybe_unused]] const at::Tensor& input,
@@ -128,15 +120,11 @@ void silu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   get_config<T_to>(input, out, numel, dim, wg_size, num_group, vec_size);
 
   using accscalar_t = at::opmath_type<T_to>;
-  switch (vec_size) {
-    VEC_LAUNCH(silu_mul_dpcpp_functor, 1);
-    VEC_LAUNCH(silu_mul_dpcpp_functor, 2);
-    VEC_LAUNCH(silu_mul_dpcpp_functor, 4);
-    VEC_LAUNCH(silu_mul_dpcpp_functor, 8);
-    VEC_LAUNCH(silu_mul_dpcpp_functor, 16);
-    default:
-      TORCH_CHECK(false, "Unsupported vector size: ", vec_size);
-  }
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+    op_and_mul_functor<T_to, silu_mul_dpcpp_functor<T_to, accscalar_t>, VEC_SIZE> kfn = {
+        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim};
+    sycl_kernel_submit(num_group * wg_size, wg_size, q, kfn);
+  });
 
   return;
 }
@@ -153,11 +141,9 @@ SGL_KERNEL_EXPORT void silu_and_mul(at::Tensor& out, at::Tensor& input) {
   timer.start();
 #endif
 
-  if (input.scalar_type() == at::ScalarType::Half) {
-    silu_and_mul_sycl<sycl::half, at::Half>(queue, input, out);
-  } else {
-    silu_and_mul_sycl<sycl::ext::oneapi::bfloat16, at::BFloat16>(queue, input, out);
-  }
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "silu_and_mul", [&] {
+    silu_and_mul_sycl<sycl_type_t<scalar_t>, scalar_t>(queue, input, out);
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   queue.wait();
@@ -199,15 +185,11 @@ void gelu_tanh_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) 
   get_config<T_to>(input, out, numel, dim, wg_size, num_group, vec_size);
 
   using accscalar_t = at::opmath_type<T_to>;
-  switch (vec_size) {
-    VEC_LAUNCH(gelu_tanh_mul_dpcpp_functor, 1);
-    VEC_LAUNCH(gelu_tanh_mul_dpcpp_functor, 2);
-    VEC_LAUNCH(gelu_tanh_mul_dpcpp_functor, 4);
-    VEC_LAUNCH(gelu_tanh_mul_dpcpp_functor, 8);
-    VEC_LAUNCH(gelu_tanh_mul_dpcpp_functor, 16);
-    default:
-      TORCH_CHECK(false, "Unsupported vector size: ", vec_size);
-  }
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+    op_and_mul_functor<T_to, gelu_tanh_mul_dpcpp_functor<T_to, accscalar_t>, VEC_SIZE> kfn = {
+        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim};
+    sycl_kernel_submit(num_group * wg_size, wg_size, q, kfn);
+  });
 
   return;
 }
@@ -224,11 +206,9 @@ SGL_KERNEL_EXPORT void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input) {
   timer.start();
 #endif
 
-  if (input.scalar_type() == at::ScalarType::Half) {
-    gelu_tanh_and_mul_sycl<sycl::half, at::Half>(queue, input, out);
-  } else {
-    gelu_tanh_and_mul_sycl<sycl::ext::oneapi::bfloat16, at::BFloat16>(queue, input, out);
-  }
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gelu_tanh_and_mul", [&] {
+    gelu_tanh_and_mul_sycl<sycl_type_t<scalar_t>, scalar_t>(queue, input, out);
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   queue.wait();
@@ -270,15 +250,11 @@ void gelu_and_mul_sycl(sycl::queue& q, at::Tensor& input, at::Tensor& out) {
   get_config<T_to>(input, out, numel, dim, wg_size, num_group, vec_size);
 
   using accscalar_t = at::opmath_type<T_to>;
-  switch (vec_size) {
-    VEC_LAUNCH(gelu_erf_mul_dpcpp_functor, 1);
-    VEC_LAUNCH(gelu_erf_mul_dpcpp_functor, 2);
-    VEC_LAUNCH(gelu_erf_mul_dpcpp_functor, 4);
-    VEC_LAUNCH(gelu_erf_mul_dpcpp_functor, 8);
-    VEC_LAUNCH(gelu_erf_mul_dpcpp_functor, 16);
-    default:
-      TORCH_CHECK(false, "Unsupported vector size: ", vec_size);
-  }
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+    op_and_mul_functor<T_to, gelu_erf_mul_dpcpp_functor<T_to, accscalar_t>, VEC_SIZE> kfn = {
+        .input_ptr = _input, .output_ptr = _out, .num_ = numel, .dim = dim};
+    sycl_kernel_submit(num_group * wg_size, wg_size, q, kfn);
+  });
 
   return;
 }
@@ -295,11 +271,9 @@ SGL_KERNEL_EXPORT void gelu_and_mul(at::Tensor& out, at::Tensor& input) {
   timer.start();
 #endif
 
-  if (input.scalar_type() == at::ScalarType::Half) {
-    gelu_and_mul_sycl<sycl::half, at::Half>(queue, input, out);
-  } else {
-    gelu_and_mul_sycl<sycl::ext::oneapi::bfloat16, at::BFloat16>(queue, input, out);
-  }
+  AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "gelu_and_mul", [&] {
+    gelu_and_mul_sycl<sycl_type_t<scalar_t>, scalar_t>(queue, input, out);
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   queue.wait();

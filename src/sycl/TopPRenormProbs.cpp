@@ -319,32 +319,14 @@ void launch_top_p_renorm_kernel(
   // align vec_size with vocab_size
   vec_size = std::gcd(vec_size, vocab_size);
 
-#define LAUNCH_TOP_P(VEC_SIZE)           \
-  sycl_kernel_submit(                    \
-      global_size,                       \
-      local_size,                        \
-      queue,                             \
-      TopPRenormProbsRadixCTA<VEC_SIZE>( \
-          probs_ptr, renorm_probs_ptr, maybe_top_p_ptr, top_p_val, batch_size, vocab_size))
-
-  switch (vec_size) {
-    case 16:
-      LAUNCH_TOP_P(16);
-      break;
-    case 8:
-      LAUNCH_TOP_P(8);
-      break;
-    case 4:
-      LAUNCH_TOP_P(4);
-      break;
-    case 2:
-      LAUNCH_TOP_P(2);
-      break;
-    default:
-      LAUNCH_TOP_P(1);
-  }
-
-#undef LAUNCH_TOP_P
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+    sycl_kernel_submit(
+        global_size,
+        local_size,
+        queue,
+        TopPRenormProbsRadixCTA<VEC_SIZE>(
+            probs_ptr, renorm_probs_ptr, maybe_top_p_ptr, top_p_val, batch_size, vocab_size));
+  });
 }
 
 }  // namespace
@@ -354,19 +336,13 @@ SGL_KERNEL_EXPORT void top_p_renorm_probs(
     at::Tensor& renorm_probs,
     const std::optional<at::Tensor>& maybe_top_p_arr,
     double top_p_val) {
-  CHECK_INPUT(probs);
-  CHECK_INPUT(renorm_probs);
-  TORCH_CHECK(probs.dim() == 2, "probs must be a 2D tensor [batch_size, vocab_size]");
-  TORCH_CHECK(renorm_probs.dim() == 2, "renorm_probs must be a 2D tensor [batch_size, vocab_size]");
-  TORCH_CHECK(probs.sizes() == renorm_probs.sizes(), "Input tensors must have the same shape");
-  TORCH_CHECK(probs.scalar_type() == torch::kFloat32, "probs must be float32");
-  TORCH_CHECK(renorm_probs.scalar_type() == torch::kFloat32, "renorm_probs must be float32");
+  CHECK_INPUT(2, at::kFloat, probs);
+  CHECK_INPUT(2, at::kFloat, renorm_probs);
+  CHECK_SAME_SHAPE(probs, renorm_probs);
 
   if (maybe_top_p_arr.has_value()) {
-    CHECK_INPUT((*maybe_top_p_arr));
-    TORCH_CHECK(maybe_top_p_arr->dim() == 1, "maybe_top_p_arr must be a 1D tensor [batch_size]");
+    CHECK_INPUT(1, at::kFloat, (*maybe_top_p_arr));
     TORCH_CHECK(maybe_top_p_arr->size(0) == probs.size(0), "maybe_top_p_arr size must match batch_size");
-    TORCH_CHECK(maybe_top_p_arr->scalar_type() == torch::kFloat32, "maybe_top_p_arr must be float32");
   } else {
     TORCH_CHECK(top_p_val > 0.0 && top_p_val <= 1.0, "top_p_val must be in (0, 1]");
   }

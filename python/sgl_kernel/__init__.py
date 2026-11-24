@@ -40,7 +40,14 @@ cuda_path = f"/usr/local/cuda/targets/{SYSTEM_ARCH}-linux/lib/libcudart.so.12"
 if os.path.exists(cuda_path):
     ctypes.CDLL(cuda_path, mode=ctypes.RTLD_GLOBAL)
 
-from sgl_kernel import common_ops
+# Multi-architecture wheels ship one backend per arch (_xe20/_xe35) and choose
+# at import time; single-architecture builds keep common_ops at the package root.
+try:
+    from sgl_kernel import common_ops
+except ImportError:
+    from sgl_kernel._arch import load_backend
+
+    common_ops = load_backend()
 from sgl_kernel.allreduce import *
 from sgl_kernel.attention import (
     flash_mla_decode,
@@ -60,6 +67,7 @@ from sgl_kernel.compress_plan import (
     plan_compress_prefill,
     plan_compress_prefill_legacy,
 )
+from sgl_kernel.convrot import convrot_int8_linear_prequant, convrot_rotate_quantize
 from sgl_kernel.diffusion import fused_scale_residual_norm_scale_shift
 from sgl_kernel.elementwise import (
     apply_rope_with_cos_sin_cache_inplace,
@@ -116,6 +124,8 @@ from sgl_kernel.gemm import (
     dsv3_fused_a_gemm,
     dsv3_router_gemm,
     fp8_blockwise_scaled_mm,
+    fp8_linear,
+    fp8_linear_supported,
     fp8_scaled_mm,
     int8_scaled_mm,
     qserve_w4a8_per_chn_gemm,

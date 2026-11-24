@@ -7,13 +7,14 @@ Covers:
   - transfer_kv_all_layer_lf_ph / transfer_kv_per_layer_ph_lf
   - transfer_kv_all_layer_lf_pf / transfer_kv_per_layer_pf_lf (device kernels)
   - transfer_kv_all_layer_mla_lf_pf / transfer_kv_per_layer_mla_pf_lf
+  - row_stride: the lf/pf kernels with strided device rows (src/dst_row_stride)
   - transfer_kv_direct         (Python copy_ fallback, host↔device)
   - transfer_kv_all_layer_direct_lf_pf / transfer_kv_per_layer_direct_pf_lf
 
 Usage:
     python benchmark/bench_kvcacheio.py
     python benchmark/bench_kvcacheio.py --num-tokens 128 512 1024 4096 8192
-    python benchmark/bench_kvcacheio.py --suite per_layer all_layer host_device page_head page_first
+    python benchmark/bench_kvcacheio.py --suite per_layer all_layer host_device page_head page_first row_stride
 """
 
 import argparse
@@ -557,6 +558,148 @@ def bench_page_first(token_counts, item_sizes):
 
 
 # ---------------------------------------------------------------------------
+# Suite 6: row_stride  (strided device rows ↔ pinned host pf)
+# ---------------------------------------------------------------------------
+
+
+def _strided_rows(total, item_size, row_stride_mult):
+    """[total, item_size] device view whose rows sit row_stride_mult rows apart."""
+    full = torch.randn(total, row_stride_mult, item_size, dtype=DTYPE, device=DEVICE)
+    return full[:, 0, :]
+
+
+def bench_row_stride(token_counts, item_sizes, row_stride_mult=2):
+    """lf↔pf transfers whose device rows are strided, as in a unified-memory pool.
+
+    Each case is checked against a torch reference before it is timed; compare
+    with the packed rows of the page_first suite.
+    """
+    num_layers = 4
+    for mla in (False, True):
+        tag = "K only" if mla else "K+V"
+        name = (
+            "transfer_kv_all_layer_mla_lf_pf" if mla else "transfer_kv_all_layer_lf_pf"
+        )
+        _header(
+            f"{name}  [strided device lf_tbl (x{row_stride_mult} rows)→pinned host pf, "
+            f"{num_layers} layers, {tag}]"
+        )
+        for N in token_counts:
+            for item_size in item_sizes:
+                total = max(N * 4, 16384)
+                srcs = [
+                    [
+                        _strided_rows(total, item_size, row_stride_mult)
+                        for _ in range(num_layers)
+                    ]
+                    for _ in range(1 if mla else 2)
+                ]
+                dsts = [
+                    torch.zeros(total, num_layers, item_size, dtype=DTYPE).pin_memory()
+                    for _ in srcs
+                ]
+                tbls = [
+                    torch.tensor(
+                        [x.data_ptr() for x in src], dtype=torch.uint64, device=DEVICE
+                    )
+                    for src in srcs
+                ]
+                perm = torch.randperm(total, device=DEVICE)
+                si, di = perm[:N], perm[N : 2 * N]
+                ib = item_size * ELEM
+                layout_dim = item_size * num_layers * ELEM
+                stride = row_stride_mult * ib
+                if mla:
+                    fn = lambda: transfer_kv_all_layer_mla_lf_pf(
+                        tbls[0],
+                        dsts[0],
+                        si,
+                        di,
+                        ib,
+                        layout_dim,
+                        num_layers,
+                        src_row_stride=stride,
+                    )
+                else:
+                    fn = lambda: transfer_kv_all_layer_lf_pf(
+                        tbls[0],
+                        dsts[0],
+                        tbls[1],
+                        dsts[1],
+                        si,
+                        di,
+                        ib,
+                        layout_dim,
+                        num_layers,
+                        src_row_stride=stride,
+                    )
+                fn()
+                _sync()
+                for src, dst in zip(srcs, dsts):
+                    for layer in range(num_layers):
+                        assert torch.equal(
+                            dst[di.cpu(), layer], src[layer][si].cpu()
+                        ), f"{name}: strided backup mismatch at layer {layer}"
+                nbytes = (
+                    N * ib * 2 * num_layers * len(srcs)
+                )  # read+write over all layers
+                _row(N, item_size, nbytes, _bench(fn, warmup=5, rep=20))
+
+        name = (
+            "transfer_kv_per_layer_mla_pf_lf" if mla else "transfer_kv_per_layer_pf_lf"
+        )
+        _header(
+            f"{name}  [pinned host pf→strided device lf (x{row_stride_mult} rows), "
+            f"layer 0, {num_layers} layers, {tag}]"
+        )
+        for N in token_counts:
+            for item_size in item_sizes:
+                total = max(N * 4, 16384)
+                srcs = [
+                    torch.randn(total, num_layers, item_size, dtype=DTYPE).pin_memory()
+                    for _ in range(1 if mla else 2)
+                ]
+                dsts = [_strided_rows(total, item_size, row_stride_mult) for _ in srcs]
+                perm = torch.randperm(total, device=DEVICE)
+                si, di = perm[:N], perm[N : 2 * N]
+                ib = item_size * ELEM
+                layout_dim = item_size * num_layers * ELEM
+                stride = row_stride_mult * ib
+                if mla:
+                    fn = lambda: transfer_kv_per_layer_mla_pf_lf(
+                        srcs[0],
+                        dsts[0],
+                        si,
+                        di,
+                        0,
+                        ib,
+                        layout_dim,
+                        dst_row_stride=stride,
+                    )
+                else:
+                    fn = lambda: transfer_kv_per_layer_pf_lf(
+                        srcs[0],
+                        dsts[0],
+                        srcs[1],
+                        dsts[1],
+                        si,
+                        di,
+                        0,
+                        ib,
+                        layout_dim,
+                        dst_row_stride=stride,
+                    )
+                fn()
+                _sync()
+                for src, dst in zip(srcs, dsts):
+                    assert torch.equal(
+                        dst[di].cpu(), src[si.cpu(), 0]
+                    ), f"{name}: strided load mismatch"
+                nbytes = N * ib * 2 * len(srcs)  # read+write, single layer
+                _row(N, item_size, nbytes, _bench(fn, warmup=5, rep=20))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -566,6 +709,7 @@ SUITES = {
     "host_device": [bench_host_device],
     "page_head": [bench_page_head],
     "page_first": [bench_page_first],
+    "row_stride": [bench_row_stride],
 }
 
 
@@ -600,6 +744,12 @@ def parse_args():
         default=32,
         help="Number of layers for all_layer benchmarks (default: 32)",
     )
+    p.add_argument(
+        "--row-stride-mult",
+        type=int,
+        default=2,
+        help="row_stride suite: device row stride in rows (default: 2)",
+    )
     return p.parse_args()
 
 
@@ -624,6 +774,8 @@ def main():
         kwargs = {"token_counts": args.num_tokens, "item_sizes": args.item_sizes}
         if "num_layers" in params:
             kwargs["num_layers"] = args.num_layers
+        if "row_stride_mult" in params:
+            kwargs["row_stride_mult"] = args.row_stride_mult
         fn(**kwargs)
 
     print()

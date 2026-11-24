@@ -19,35 +19,6 @@ namespace {
 
 constexpr int kTopKTopPMaxRounds = 32;
 
-#define DISPATCH_TOPKTOPP_VEC_SIZE(vec_size, VEC_SIZE_VAR, ...) \
-  switch (vec_size) {                                           \
-    case 16: {                                                  \
-      constexpr uint32_t VEC_SIZE_VAR = 16;                     \
-      __VA_ARGS__;                                              \
-      break;                                                    \
-    }                                                           \
-    case 8: {                                                   \
-      constexpr uint32_t VEC_SIZE_VAR = 8;                      \
-      __VA_ARGS__;                                              \
-      break;                                                    \
-    }                                                           \
-    case 4: {                                                   \
-      constexpr uint32_t VEC_SIZE_VAR = 4;                      \
-      __VA_ARGS__;                                              \
-      break;                                                    \
-    }                                                           \
-    case 2: {                                                   \
-      constexpr uint32_t VEC_SIZE_VAR = 2;                      \
-      __VA_ARGS__;                                              \
-      break;                                                    \
-    }                                                           \
-    default: {                                                  \
-      constexpr uint32_t VEC_SIZE_VAR = 1;                      \
-      __VA_ARGS__;                                              \
-      break;                                                    \
-    }                                                           \
-  }
-
 //----------------- joint top-k / top-p rejection sampling --------------------//
 // One work-group processes one request row.
 
@@ -244,8 +215,8 @@ void launch_top_k_top_p_sampling(
 
   const uint32_t vec_size = std::gcd(16 / sizeof(float), static_cast<uint32_t>(vocab_size));
 
-  DISPATCH_TOPKTOPP_VEC_SIZE(vec_size, VEC_SIZE, {
-    AT_DISPATCH_BOOL_NO_RETURN(deterministic, DETERMINISTIC, {
+  SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
+    SGL_DISPATCH_BOOL(deterministic, DETERMINISTIC, [&] {
       auto kernel = TopKTopPSamplingKernel<VEC_SIZE, DETERMINISTIC>(
           probs,
           output,
@@ -275,12 +246,8 @@ SGL_KERNEL_EXPORT void top_k_top_p_sampling_from_probs(
     double top_p_val,
     bool deterministic,
     std::optional<at::Generator> gen) {
-  CHECK_INPUT(probs);
-  CHECK_INPUT(output);
-  TORCH_CHECK(probs.dim() == 2, "probs must be a 2D tensor [batch_size, vocab_size]");
-  TORCH_CHECK(probs.scalar_type() == torch::kFloat32, "probs must be float32");
-  TORCH_CHECK(output.dim() == 1, "output must be a 1D tensor [batch_size]");
-  TORCH_CHECK(output.scalar_type() == torch::kInt32, "output must be int32");
+  CHECK_INPUT(2, at::kFloat, probs);
+  CHECK_INPUT(1, at::kInt, output);
 
   const int batch_size = output.size(0);
   const int vocab_size = probs.size(1);
@@ -288,7 +255,7 @@ SGL_KERNEL_EXPORT void top_k_top_p_sampling_from_probs(
   const int64_t* indices_ptr = nullptr;
   if (maybe_indices.has_value()) {
     CHECK_INPUT((*maybe_indices));
-    TORCH_CHECK(maybe_indices->scalar_type() == torch::kInt64, "maybe_indices must be int64");
+    CHECK_DTYPE(at::kLong, (*maybe_indices));
     TORCH_CHECK(maybe_indices->size(0) == batch_size, "maybe_indices size must match batch_size");
     indices_ptr = maybe_indices->data_ptr<int64_t>();
   } else {
@@ -298,9 +265,7 @@ SGL_KERNEL_EXPORT void top_k_top_p_sampling_from_probs(
 
   const int32_t* top_k_ptr = nullptr;
   if (maybe_top_k_arr.has_value()) {
-    CHECK_INPUT((*maybe_top_k_arr));
-    TORCH_CHECK(maybe_top_k_arr->dim() == 1, "maybe_top_k_arr must be a 1D tensor");
-    TORCH_CHECK(maybe_top_k_arr->scalar_type() == torch::kInt32, "maybe_top_k_arr must be int32");
+    CHECK_INPUT(1, at::kInt, (*maybe_top_k_arr));
     TORCH_CHECK(maybe_top_k_arr->size(0) == batch_size, "maybe_top_k_arr size must match batch_size");
     top_k_ptr = maybe_top_k_arr->data_ptr<int32_t>();
   } else {
@@ -309,9 +274,7 @@ SGL_KERNEL_EXPORT void top_k_top_p_sampling_from_probs(
 
   const float* top_p_ptr = nullptr;
   if (maybe_top_p_arr.has_value()) {
-    CHECK_INPUT((*maybe_top_p_arr));
-    TORCH_CHECK(maybe_top_p_arr->dim() == 1, "maybe_top_p_arr must be a 1D tensor");
-    TORCH_CHECK(maybe_top_p_arr->scalar_type() == torch::kFloat32, "maybe_top_p_arr must be float32");
+    CHECK_INPUT(1, at::kFloat, (*maybe_top_p_arr));
     TORCH_CHECK(maybe_top_p_arr->size(0) == batch_size, "maybe_top_p_arr size must match batch_size");
     top_p_ptr = maybe_top_p_arr->data_ptr<float>();
   } else {

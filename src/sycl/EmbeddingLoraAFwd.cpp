@@ -36,23 +36,6 @@
 //
 // ============================================================
 
-//----------------- set element type options --------------------//
-
-template <typename T>
-struct ToSyclElementType {
-  using type = T;
-};
-
-template <>
-struct ToSyclElementType<at::Half> {
-  using type = sycl::half;
-};
-
-template <>
-struct ToSyclElementType<at::BFloat16> {
-  using type = sycl::ext::oneapi::bfloat16;
-};
-
 //----------------- Kernel definition --------------------//
 
 template <typename DType>
@@ -173,7 +156,6 @@ struct EmbeddingLoRAAFwd : public __SYCL_KER_CONFIG_CONVENTION__ {
 
 //----------------- Kernel launch --------------------//
 
-template <typename TensorDType>
 void launch_embedding_lora_a_fwd(
     const torch::Tensor& input_ids,
     const torch::Tensor& weights,
@@ -189,32 +171,32 @@ void launch_embedding_lora_a_fwd(
     const int num_extra_tokens,
     const int max_len,
     sycl::queue& queue) {
-  using KernelDType = typename ToSyclElementType<TensorDType>::type;
-  constexpr int BLOCK_TOK = EmbeddingLoRAAFwd<KernelDType>::BLOCK_TOK;
-  const int num_tok_blocks = (max_len + BLOCK_TOK - 1) / BLOCK_TOK;
+  SYCL_DISPATCH_FLOATING_TYPES_V2(weights.scalar_type(), "embedding_lora_a_fwd", [&] {
+    constexpr int BLOCK_TOK = EmbeddingLoRAAFwd<scalar_t>::BLOCK_TOK;
+    const int num_tok_blocks = (max_len + BLOCK_TOK - 1) / BLOCK_TOK;
 
-  sycl::range<3> local(1, 1, BLOCK_TOK);
-  sycl::range<3> global(
-      static_cast<size_t>(num_segments),
-      static_cast<size_t>(max_rank),
-      static_cast<size_t>(num_tok_blocks * BLOCK_TOK));
+    sycl::range<3> local(1, 1, BLOCK_TOK);
+    sycl::range<3> global(
+        static_cast<size_t>(num_segments),
+        static_cast<size_t>(max_rank),
+        static_cast<size_t>(num_tok_blocks * BLOCK_TOK));
 
-  auto kernel = EmbeddingLoRAAFwd<KernelDType>(
-      input_ids.data_ptr<int64_t>(),
-      reinterpret_cast<const KernelDType*>(weights.data_ptr<TensorDType>()),
-      seg_indptr.data_ptr<int>(),
-      weight_indices.data_ptr<int>(),
-      lora_ranks.data_ptr<int>(),
-      extra_embeddings.has_value() ? reinterpret_cast<const KernelDType*>(extra_embeddings->data_ptr<TensorDType>())
-                                   : nullptr,
-      nullptr,
-      reinterpret_cast<KernelDType*>(output.data_ptr<TensorDType>()),
-      vocab_size,
-      num_segments,
-      max_rank,
-      num_extra_tokens,
-      num_tokens);
-  sycl_kernel_submit(global, local, queue, kernel);
+    auto kernel = EmbeddingLoRAAFwd<scalar_t>(
+        input_ids.data_ptr<int64_t>(),
+        reinterpret_cast<const scalar_t*>(weights.data_ptr()),
+        seg_indptr.data_ptr<int>(),
+        weight_indices.data_ptr<int>(),
+        lora_ranks.data_ptr<int>(),
+        extra_embeddings.has_value() ? reinterpret_cast<const scalar_t*>(extra_embeddings->data_ptr()) : nullptr,
+        nullptr,
+        reinterpret_cast<scalar_t*>(output.data_ptr()),
+        vocab_size,
+        num_segments,
+        max_rank,
+        num_extra_tokens,
+        num_tokens);
+    sycl_kernel_submit(global, local, queue, kernel);
+  });
 }
 
 //----------------- Main API function --------------------//
@@ -232,23 +214,17 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
         seg_lens,  // [num_segments,] optional; currently unused, reserved for future per-segment optimizations
     std::optional<int64_t> max_len_opt  // upper bound on segment length; default: longest segment (one sync)
 ) {
-  CHECK_INPUT(input_ids);
-  CHECK_INPUT(weights);
-  CHECK_INPUT(seg_indptr);
-  CHECK_INPUT(weight_indices);
-  CHECK_INPUT(lora_ranks);
-  CHECK_INPUT(output);
+  CHECK_INPUT(1, input_ids);
+  CHECK_INPUT(3, weights);
+  CHECK_INPUT(1, seg_indptr);
+  CHECK_INPUT(1, weight_indices);
+  CHECK_INPUT(1, lora_ranks);
+  CHECK_INPUT(2, weights.scalar_type(), output);
   if (extra_embeddings.has_value()) {
-    CHECK_INPUT(extra_embeddings.value());
+    CHECK_INPUT(3, extra_embeddings.value());
   }
 
-  TORCH_CHECK(input_ids.dim() == 1, "input_ids must be a 1D tensor");
-  TORCH_CHECK(weights.dim() == 3, "weights must be a 3D tensor");
   TORCH_CHECK(weights.size(2) == vocab_size, "weights' vocab_size dimension must match the provided vocab_size");
-  TORCH_CHECK(seg_indptr.dim() == 1, "seg_indptr must be a 1D tensor");
-  TORCH_CHECK(weight_indices.dim() == 1, "weight_indices must be a 1D tensor");
-  TORCH_CHECK(lora_ranks.dim() == 1, "lora_ranks must be a 1D tensor");
-  TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
 
   const int64_t num_loras_i64 = weights.size(0);
   const int64_t max_rank_i64 = weights.size(1);
@@ -265,7 +241,6 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
   TORCH_CHECK(
       output.size(0) == num_tokens_i64 && output.size(1) == max_rank_i64,
       "Output tensor must have shape (num_tokens, max_rank)");
-  TORCH_CHECK(output.scalar_type() == weights.scalar_type(), "Output tensor dtype must match weights dtype");
   output.zero_();
   if (num_tokens_i64 == 0) {
     return;
@@ -288,20 +263,12 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
   }
 
   if (extra_embeddings.has_value()) {
-    TORCH_CHECK(extra_embeddings->dim() == 3, "extra_embeddings must be a 3D tensor");
     TORCH_CHECK(extra_embeddings->size(0) == num_loras_i64, "extra_embeddings.size(0) must equal weights.size(0)");
     TORCH_CHECK(
         extra_embeddings->size(2) == max_rank_i64, "extra_embeddings.size(2) must equal max_rank (weights.size(1))");
-    TORCH_CHECK(
-        extra_embeddings->scalar_type() == weights.scalar_type(), "extra_embeddings dtype must match weights dtype");
+    CHECK_DTYPE(weights.scalar_type(), extra_embeddings.value());
   }
   lora_debug_checks::check_lora_ranks(lora_ranks, max_rank_i64);
-
-  // Cast to int32 and validate the bounds
-  auto seg_indptr_i32 = seg_indptr.scalar_type() == torch::kInt32 ? seg_indptr : seg_indptr.to(torch::kInt32);
-  auto weight_indices_i32 =
-      weight_indices.scalar_type() == torch::kInt32 ? weight_indices : weight_indices.to(torch::kInt32);
-  auto lora_ranks_i32 = lora_ranks.scalar_type() == torch::kInt32 ? lora_ranks : lora_ranks.to(torch::kInt32);
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
@@ -321,56 +288,19 @@ SGL_KERNEL_EXPORT void embedding_lora_a_fwd(
   SGL_KERNEL_PERF_SCOPE("embedding_lora_a_fwd", profiling_queue, bytes, flops);
 #endif
 
-  // Dispatch kernel based on data type
-  if (weights.scalar_type() == torch::kFloat32) {
-    launch_embedding_lora_a_fwd<float>(
-        input_ids,
-        weights,
-        vocab_size,
-        seg_indptr,
-        weight_indices,
-        lora_ranks,
-        extra_embeddings,
-        output,
-        num_tokens,
-        max_rank,
-        num_segments,
-        num_extra_tokens,
-        static_cast<int>(max_len),
-        queue);
-  } else if (weights.scalar_type() == torch::kHalf) {
-    launch_embedding_lora_a_fwd<at::Half>(
-        input_ids,
-        weights,
-        vocab_size,
-        seg_indptr,
-        weight_indices,
-        lora_ranks,
-        extra_embeddings,
-        output,
-        num_tokens,
-        max_rank,
-        num_segments,
-        num_extra_tokens,
-        static_cast<int>(max_len),
-        queue);
-  } else if (weights.scalar_type() == torch::kBFloat16) {
-    launch_embedding_lora_a_fwd<at::BFloat16>(
-        input_ids,
-        weights,
-        vocab_size,
-        seg_indptr,
-        weight_indices,
-        lora_ranks,
-        extra_embeddings,
-        output,
-        num_tokens,
-        max_rank,
-        num_segments,
-        num_extra_tokens,
-        static_cast<int>(max_len),
-        queue);
-  } else {
-    TORCH_CHECK(false, "Unsupported data type for weights");
-  }
+  launch_embedding_lora_a_fwd(
+      input_ids,
+      weights,
+      vocab_size,
+      seg_indptr,
+      weight_indices,
+      lora_ranks,
+      extra_embeddings,
+      output,
+      num_tokens,
+      max_rank,
+      num_segments,
+      num_extra_tokens,
+      static_cast<int>(max_len),
+      queue);
 }

@@ -203,9 +203,8 @@ SGL_KERNEL_EXPORT void multimodal_rotary_embedding(
   TORCH_CHECK(positions.size(1) == num_tokens, "positions second dimension must equal num_tokens");
   TORCH_CHECK(mrope_interleaved_glm == false, "glm style rope is not supported");
   TORCH_CHECK(key.scalar_type() == query.scalar_type(), "query and key must have the same dtype");
-  const bool fp32_cache = cos_sin_cache.scalar_type() == at::kFloat;
   TORCH_CHECK(
-      fp32_cache || cos_sin_cache.scalar_type() == query.scalar_type(),
+      cos_sin_cache.scalar_type() == at::kFloat || cos_sin_cache.scalar_type() == query.scalar_type(),
       "cos_sin_cache must be float32 or have the query dtype");
 
   const int64_t num_q_heads = query.size(1) / head_size;
@@ -230,51 +229,25 @@ SGL_KERNEL_EXPORT void multimodal_rotary_embedding(
   SGL_KERNEL_PERF_SCOPE("multimodal_rotary_embedding", profiling_queue, bytes, flops);
 #endif
 
-#define LAUNCH_MROPE_KERNEL(IS_NEOX, IS_INTERLEAVED)                                                                 \
-  SYCL_DISPATCH_FLOATING_TYPES(at::kHalf, at::kBFloat16, query.scalar_type(), "multimodal_rotary_embedding", [&]() { \
-    if (fp32_cache) {                                                                                                \
-      launch_mrope<scalar_t, float, IS_NEOX, IS_INTERLEAVED>(                                                        \
-          query,                                                                                                     \
-          key,                                                                                                       \
-          cos_sin_cache,                                                                                             \
-          positions,                                                                                                 \
-          num_q_heads,                                                                                               \
-          num_k_heads,                                                                                               \
-          head_size,                                                                                                 \
-          rotary_dim,                                                                                                \
-          section_t,                                                                                                 \
-          section_h,                                                                                                 \
-          section_w);                                                                                                \
-    } else {                                                                                                         \
-      launch_mrope<scalar_t, scalar_t, IS_NEOX, IS_INTERLEAVED>(                                                     \
-          query,                                                                                                     \
-          key,                                                                                                       \
-          cos_sin_cache,                                                                                             \
-          positions,                                                                                                 \
-          num_q_heads,                                                                                               \
-          num_k_heads,                                                                                               \
-          head_size,                                                                                                 \
-          rotary_dim,                                                                                                \
-          section_t,                                                                                                 \
-          section_h,                                                                                                 \
-          section_w);                                                                                                \
-    }                                                                                                                \
+  AT_DISPATCH_FLOATING_TYPES_AND2(at::kHalf, at::kBFloat16, query.scalar_type(), "multimodal_rotary_embedding", [&] {
+    AT_DISPATCH_WEIGHT_TYPES(scalar_t, cos_sin_cache.scalar_type(), "mrope cache", [&] {
+      using cache_t = weight_t;
+      SGL_DISPATCH_BOOL2(is_neox_style, IS_NEOX, mrope_interleaved, IS_INTERLEAVED, [&] {
+        launch_mrope<scalar_t, cache_t, IS_NEOX, IS_INTERLEAVED>(
+            query,
+            key,
+            cos_sin_cache,
+            positions,
+            num_q_heads,
+            num_k_heads,
+            head_size,
+            rotary_dim,
+            section_t,
+            section_h,
+            section_w);
+      });
+    });
   });
-
-  if (is_neox_style) {
-    if (mrope_interleaved) {
-      LAUNCH_MROPE_KERNEL(true, true);
-    } else {
-      LAUNCH_MROPE_KERNEL(true, false);
-    }
-  } else {
-    if (mrope_interleaved) {
-      LAUNCH_MROPE_KERNEL(false, true);
-    } else {
-      LAUNCH_MROPE_KERNEL(false, false);
-    }
-  }
-#undef LAUNCH_MROPE_KERNEL
 }
 
 }  // namespace at::native::xpu

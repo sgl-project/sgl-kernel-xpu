@@ -48,6 +48,14 @@ using fptr_t = int64_t;
 // default visibility to remain exported and dynamically linkable.
 #pragma GCC visibility push(default)
 
+std::tuple<at::Tensor, at::Tensor> convrot_rotate_quantize(const at::Tensor& input, int64_t group_size);
+at::Tensor convrot_int8_linear_prequant(
+    const at::Tensor& input,
+    const at::Tensor& weight,
+    const at::Tensor& input_scale,
+    const at::Tensor& weight_scale,
+    const std::optional<at::Tensor>& bias);
+
 /*
  * From csrc/allreduce
  */
@@ -289,7 +297,7 @@ void sgl_per_token_group_quant_fp4(
 void store_cache(at::Tensor& k, at::Tensor& v, at::Tensor& k_cache, at::Tensor& v_cache, at::Tensor& indices);
 void biased_topk(
     const at::Tensor& input,
-    const at::Tensor& bias,
+    const std::optional<at::Tensor>& bias,
     at::Tensor& output,
     at::Tensor& indices,
     int64_t topk,
@@ -312,7 +320,9 @@ void transfer_kv_per_layer(
     const at::Tensor& dst_indices,
     int64_t item_size,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_per_layer_mla(
     const at::Tensor& src,
     at::Tensor& dst,
@@ -320,7 +330,9 @@ void transfer_kv_per_layer_mla(
     const at::Tensor& dst_indices,
     int64_t item_size,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_all_layer(
     const at::Tensor& src_k_layers,
     const at::Tensor& dst_k_layers,
@@ -331,7 +343,9 @@ void transfer_kv_all_layer(
     int64_t item_size,
     int64_t num_layers,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_all_layer_mla(
     const at::Tensor& src_layers,
     const at::Tensor& dst_layers,
@@ -340,7 +354,9 @@ void transfer_kv_all_layer_mla(
     int64_t item_size,
     int64_t num_layers,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_all_layer_lf_ph(
     const at::Tensor& src_k_layers,
     at::Tensor& dst_k,
@@ -354,7 +370,9 @@ void transfer_kv_all_layer_lf_ph(
     int64_t page_size,
     int64_t head_num,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_per_layer_ph_lf(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
@@ -368,7 +386,9 @@ void transfer_kv_per_layer_ph_lf(
     int64_t page_size,
     int64_t head_num,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_per_layer_pf_lf(
     const at::Tensor& src_k,
     at::Tensor& dst_k,
@@ -380,7 +400,9 @@ void transfer_kv_per_layer_pf_lf(
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_all_layer_lf_pf(
     const at::Tensor& src_k_layers,
     at::Tensor& dst_k,
@@ -392,7 +414,9 @@ void transfer_kv_all_layer_lf_pf(
     int64_t dst_layout_dim,
     int64_t num_layers,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_per_layer_mla_pf_lf(
     const at::Tensor& src,
     at::Tensor& dst,
@@ -402,7 +426,9 @@ void transfer_kv_per_layer_mla_pf_lf(
     int64_t item_size,
     int64_t src_layout_dim,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_all_layer_mla_lf_pf(
     const at::Tensor& src_layers,
     at::Tensor& dst,
@@ -412,7 +438,9 @@ void transfer_kv_all_layer_mla_lf_pf(
     int64_t dst_layout_dim,
     int64_t num_layers,
     int64_t block_quota,
-    int64_t sgs_per_wg);
+    int64_t sgs_per_wg,
+    int64_t src_row_stride,
+    int64_t dst_row_stride);
 void transfer_kv_mamba_pf_lf(
     const at::Tensor& src,
     at::Tensor& dst,
@@ -642,6 +670,16 @@ torch::Tensor fp8_blockwise_scaled_mm(
     const torch::Tensor& scales_a,
     const torch::Tensor& scales_b,
     const torch::Dtype& out_dtype);
+// Xe2 dense weight-only FP8 (W8A16) GEMM: output = input @ dequant(weight).T (+ bias).
+// input bf16 [M, K], weight float8_e4m3fn [N, K], output bf16 [M, N], bias float32 [N].
+// weight_scale is float32: one element (per-tensor), [N] (per-channel), or
+// [ceil(N/128), K/128] (128x128 block).
+void fp8_w8a16_mm_xe20(
+    torch::Tensor& output,
+    const torch::Tensor& input,
+    const torch::Tensor& weight,
+    const torch::Tensor& weight_scale,
+    const std::optional<at::Tensor>& bias);
 void scaled_fp4_quant(
     torch::Tensor& output, torch::Tensor const& input, torch::Tensor& output_scale, torch::Tensor const& input_scale);
 void sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor output_s, bool is_static);
@@ -1066,6 +1104,47 @@ void reconstruct_indices_from_tree_mask(
     at::Tensor& retrive_next_sibling,
     int64_t batch_size,
     int64_t draft_token_num);
+
+// Ngram embedding (LongCat-Flash): SYCL port of speculative/ngram_embedding.cuh.
+void compute_n_gram_ids(
+    int64_t ne_n,
+    int64_t ne_k,
+    const at::Tensor& ne_weights,
+    const at::Tensor& ne_mods,
+    const at::Tensor& exclusive_ne_embedder_size_sums,
+    const at::Tensor& tokens,
+    const at::Tensor& exclusive_req_len_sums,
+    const at::Tensor& ne_token_table,
+    const at::Tensor& row_indices,
+    const at::Tensor& column_starts,
+    at::Tensor& n_gram_ids,
+    int64_t eos_token_id);
+
+void compute_n_gram_ids_decode(
+    int64_t ne_n,
+    int64_t ne_k,
+    const at::Tensor& ne_weights,
+    const at::Tensor& ne_mods,
+    const at::Tensor& exclusive_ne_embedder_size_sums,
+    const at::Tensor& ne_token_table,
+    const at::Tensor& row_indices,
+    const at::Tensor& column_starts,
+    at::Tensor& n_gram_ids,
+    int64_t eos_token_id);
+
+void update_token_table(
+    const at::Tensor& tokens,
+    const at::Tensor& ne_token_table,
+    const at::Tensor& row_indices,
+    const at::Tensor& column_starts,
+    const at::Tensor& req_lens,
+    const at::Tensor& ignore_tokens);
+
+void update_token_table_decode(
+    const at::Tensor& tokens,
+    const at::Tensor& ne_token_table,
+    const at::Tensor& row_indices,
+    const at::Tensor& column_starts);
 
 void segment_packbits(
     at::Tensor x, at::Tensor input_indptr, at::Tensor output_indptr, at::Tensor y, int64_t sycl_stream);

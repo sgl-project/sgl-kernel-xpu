@@ -489,13 +489,10 @@ SGL_KERNEL_EXPORT void prepare_moe_input(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "prepare_moe_input", profiling_queue);
 #endif
 
   AT_DISPATCH_INDEX_TYPES(topk_ids.scalar_type(), "prepare_moe_input", [&] {
-    using index_t = index_t;
-
     auto options_type = torch::TensorOptions().dtype(topk_ids.dtype()).device(topk_ids.device());
     torch::Tensor atomic_buffer = torch::empty(num_experts + 1, options_type);
 
@@ -518,7 +515,7 @@ SGL_KERNEL_EXPORT void prepare_moe_input(
   const double flops = 3.0 * numel;
   const double bytes =
       3.0 * numel * static_cast<double>(topk_ids.element_size()) + static_cast<double>(num_experts) * 4.0;
-  ::sglkernel::report_kernel_perf("prepare_moe_input", profiling_queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
   return;
 }
@@ -727,33 +724,22 @@ SGL_KERNEL_EXPORT void prepare_moe_input_small(
     torch::Tensor& expert_counts,
     torch::Tensor& output_permutation,
     torch::Tensor& output) {
-  TORCH_CHECK(
-      input.is_xpu() && input.dim() == 2 && input.is_contiguous(), "input must be contiguous XPU [rows, hidden_dim]");
-  TORCH_CHECK(
-      topk_ids.is_xpu() && topk_ids.dim() == 2 && topk_ids.is_contiguous() && topk_ids.size(0) == input.size(0),
-      "topk_ids must be contiguous XPU [rows, topk] with rows matching input");
+  CHECK_INPUT(2, at::kBFloat16, input);
+  CHECK_INPUT(2, topk_ids);
+  CHECK_SHAPE(topk_ids, input.size(0), topk_ids.size(1));
   TORCH_CHECK(topk_ids.size(1) > 0 && topk_ids.size(1) <= 16, "topk must be in [1, 16]");
   TORCH_CHECK(
       topk_ids.numel() <= (PrepareMoeInputSmall<int32_t, c10::BFloat16>::MaxRoutes), "routed rows must be <= 64");
-  TORCH_CHECK(input.scalar_type() == at::kBFloat16, "input must be bfloat16");
-  TORCH_CHECK(
-      expert_counts.is_xpu() && expert_counts.dim() == 1 && expert_counts.numel() > 0 && expert_counts.is_contiguous(),
-      "expert_counts must be a non-empty contiguous XPU vector");
-  TORCH_CHECK(
-      output_permutation.is_xpu() && output_permutation.dim() == 1 && output_permutation.is_contiguous(),
-      "output_permutation must be a contiguous XPU vector");
-  TORCH_CHECK(
-      output.is_xpu() && output.dim() == 2 && output.is_contiguous(),
-      "output must be contiguous XPU [routes, hidden_dim]");
+  CHECK_INPUT(1, at::kInt, expert_counts);
+  TORCH_CHECK(expert_counts.numel() > 0, "expert_counts must be non-empty");
+  CHECK_INPUT(1, at::kInt, output_permutation);
+  CHECK_INPUT(2, input.scalar_type(), output);
   TORCH_CHECK(
       input.device() == topk_ids.device() && input.device() == expert_counts.device() &&
           input.device() == output_permutation.device() && input.device() == output.device(),
       "all tensors must be on the same device");
-  TORCH_CHECK(expert_counts.scalar_type() == at::kInt, "expert_counts must be int32");
-  TORCH_CHECK(output_permutation.scalar_type() == at::kInt, "output_permutation must be int32");
-  TORCH_CHECK(output.scalar_type() == input.scalar_type(), "output dtype must match input");
-  TORCH_CHECK(output.size(0) == topk_ids.numel() && output.size(1) == input.size(1), "output shape mismatch");
-  TORCH_CHECK(output_permutation.numel() == topk_ids.numel(), "output_permutation shape mismatch");
+  CHECK_SHAPE(output, topk_ids.numel(), input.size(1));
+  CHECK_SHAPE(output_permutation, topk_ids.numel());
   TORCH_CHECK(
       expert_counts.numel() <= std::numeric_limits<int32_t>::max() &&
           input.size(0) <= std::numeric_limits<int32_t>::max() && input.size(1) <= std::numeric_limits<int32_t>::max(),
@@ -762,8 +748,7 @@ SGL_KERNEL_EXPORT void prepare_moe_input_small(
   auto queue = at::xpu::getCurrentXPUStream().queue();
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "prepare_moe_input_small", queue);
 #endif
 
   AT_DISPATCH_INDEX_TYPES(topk_ids.scalar_type(), "prepare_moe_input_small", [&] {
@@ -797,7 +782,7 @@ SGL_KERNEL_EXPORT void prepare_moe_input_small(
   const double bytes = numel_input * static_cast<double>(input.element_size()) +
                        numel_output * static_cast<double>(output.element_size()) +
                        static_cast<double>(topk_ids.numel()) * static_cast<double>(topk_ids.element_size());
-  ::sglkernel::report_kernel_perf("prepare_moe_input_small", queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }
 
@@ -905,20 +890,16 @@ SGL_KERNEL_EXPORT void scatter_tokens_to_experts(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "scatter_tokens_to_experts", profiling_queue);
 #endif
 
   // Handle FP8 type separately
   if (input_tensor.scalar_type() == at::ScalarType::Float8_e4m3fn) {
     scatter_tokens_to_experts_impl<c10::Float8_e4m3fn>(input_tensor, src2dst_map, output_tensor);
   } else {
-    SYCL_DISPATCH_FLOATING_TYPES_AND2(
-        at::ScalarType::BFloat16,
-        at::ScalarType::Half,
-        input_tensor.scalar_type(),
-        "scatter_tokens_to_experts_impl",
-        [&]() { scatter_tokens_to_experts_impl<scalar_t>(input_tensor, src2dst_map, output_tensor); });
+    SYCL_DISPATCH_FLOATING_TYPES_V2(input_tensor.scalar_type(), "scatter_tokens_to_experts_impl", [&]() {
+      scatter_tokens_to_experts_impl<scalar_t>(input_tensor, src2dst_map, output_tensor);
+    });
   }
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
@@ -929,7 +910,7 @@ SGL_KERNEL_EXPORT void scatter_tokens_to_experts(
   const double bytes = numel_in * static_cast<double>(input_tensor.element_size()) +
                        numel_out * static_cast<double>(output_tensor.element_size()) +
                        static_cast<double>(src2dst_map.numel()) * static_cast<double>(src2dst_map.element_size());
-  ::sglkernel::report_kernel_perf("scatter_tokens_to_experts", profiling_queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
 }
 
@@ -1068,63 +1049,30 @@ SGL_KERNEL_EXPORT void apply_shuffle_mul_sum(
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
-  GPU_Clock timer;
-  timer.start();
+  SGL_KERNEL_PERF_BEGIN(perf, "apply_shuffle_mul_sum", profiling_queue);
 #endif
 
-  SYCL_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "apply_shuffle_mul_sum", [&]() {
-        using input_t = scalar_t;
-        if (factors.has_value()) {
-          SYCL_DISPATCH_FLOATING_TYPES_AND2(
-              at::ScalarType::BFloat16, at::ScalarType::Half, factors.value().scalar_type(), "factors dispatch", [&]() {
-                using factors_t = scalar_t;
-                if (use_routed_scaling) {
-                  apply_shuffle_mul_sum_impl<input_t, factors_t, true>(
-                      reinterpret_cast<input_t*>(input.data_ptr()),
-                      reinterpret_cast<input_t*>(output.data_ptr()),
-                      reinterpret_cast<int32_t*>(permutation.data_ptr()),
-                      reinterpret_cast<factors_t*>(factors->data_ptr()),
-                      output.size(0),
-                      output.size(1),
-                      topk,
-                      routed_scaling_factor);
-                } else {
-                  apply_shuffle_mul_sum_impl<input_t, factors_t, false>(
-                      reinterpret_cast<input_t*>(input.data_ptr()),
-                      reinterpret_cast<input_t*>(output.data_ptr()),
-                      reinterpret_cast<int32_t*>(permutation.data_ptr()),
-                      reinterpret_cast<factors_t*>(factors->data_ptr()),
-                      output.size(0),
-                      output.size(1),
-                      topk,
-                      routed_scaling_factor);
-                }
-              });
-        } else {
-          if (use_routed_scaling) {
-            apply_shuffle_mul_sum_impl<input_t, input_t, true>(
-                reinterpret_cast<input_t*>(input.data_ptr()),
-                reinterpret_cast<input_t*>(output.data_ptr()),
-                reinterpret_cast<int32_t*>(permutation.data_ptr()),
-                nullptr,
-                output.size(0),
-                output.size(1),
-                topk,
-                routed_scaling_factor);
-          } else {
-            apply_shuffle_mul_sum_impl<input_t, input_t, false>(
-                reinterpret_cast<input_t*>(input.data_ptr()),
-                reinterpret_cast<input_t*>(output.data_ptr()),
-                reinterpret_cast<int32_t*>(permutation.data_ptr()),
-                nullptr,
-                output.size(0),
-                output.size(1),
-                topk,
-                routed_scaling_factor);
-          }
-        }
+  AT_DISPATCH_FLOATING_TYPES_V2(input.scalar_type(), "apply_shuffle_mul_sum", [&] {
+    using input_t = sycl_type_t<scalar_t>;
+    const auto factors_dtype = factors.has_value() ? factors->scalar_type() : input.scalar_type();
+
+    AT_DISPATCH_WEIGHT_TYPES(scalar_t, factors_dtype, "apply_shuffle_mul_sum factors", [&] {
+      using factors_t = sycl_type_t<weight_t>;
+      const auto* factors_ptr = factors.has_value() ? reinterpret_cast<const factors_t*>(factors->data_ptr()) : nullptr;
+
+      SGL_DISPATCH_BOOL(use_routed_scaling, APPLY_ROUTED_SCALING, [&] {
+        apply_shuffle_mul_sum_impl<input_t, factors_t, APPLY_ROUTED_SCALING>(
+            reinterpret_cast<const input_t*>(input.data_ptr()),
+            reinterpret_cast<input_t*>(output.data_ptr()),
+            permutation.data_ptr<int32_t>(),
+            factors_ptr,
+            output.size(0),
+            output.size(1),
+            topk,
+            routed_scaling_factor);
       });
+    });
+  });
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // apply_shuffle_mul_sum: for each output row, weighted sum of topk source rows into hidden_dim.
@@ -1137,7 +1085,7 @@ SGL_KERNEL_EXPORT void apply_shuffle_mul_sum(
       static_cast<double>(permutation.numel()) * static_cast<double>(permutation.element_size()) +
       (factors.has_value() ? static_cast<double>(factors->numel()) * static_cast<double>(factors->element_size())
                            : 0.0);
-  ::sglkernel::report_kernel_perf("apply_shuffle_mul_sum", profiling_queue, timer, bytes, flops);
+  SGL_KERNEL_PERF_END(perf, bytes, flops);
 #endif
   return;
 }

@@ -12,23 +12,6 @@
 #include "Utils.h"
 #include "sgl_kernel_export.h"
 
-//----------------- set element type options --------------------//
-
-template <typename T>
-struct ToSyclElementType {
-  using type = T;
-};
-
-template <>
-struct ToSyclElementType<at::Half> {
-  using type = sycl::half;
-};
-
-template <>
-struct ToSyclElementType<at::BFloat16> {
-  using type = sycl::ext::oneapi::bfloat16;
-};
-
 //----------------- radix traits for bit-pattern transformation --------------------//
 
 template <typename T>
@@ -284,7 +267,7 @@ void launch_single_cta_kernel(
     int batch_size,
     int vocab_size,
     sycl::queue& queue) {
-  using KernelDType = typename ToSyclElementType<TensorDType>::type;
+  using KernelDType = sycl_type_t<TensorDType>;
 
   const KernelDType* probs_ptr = reinterpret_cast<const KernelDType*>(probs.data_ptr<TensorDType>());
   auto* renorm_probs_ptr = reinterpret_cast<KernelDType*>(renorm_probs.data_ptr<TensorDType>());
@@ -303,22 +286,14 @@ SGL_KERNEL_EXPORT void top_k_renorm_probs(
     at::Tensor& renorm_probs,
     const std::optional<at::Tensor>& maybe_top_k_arr,
     int64_t top_k_val) {
-  CHECK_INPUT(probs);
-  CHECK_INPUT(renorm_probs);
-  TORCH_CHECK(probs.dim() == 2, "probs must be a 2D tensor [batch_size, vocab_size]");
-  TORCH_CHECK(renorm_probs.dim() == 2, "renorm_probs must be a 2D tensor [batch_size, vocab_size]");
-  TORCH_CHECK(probs.sizes() == renorm_probs.sizes(), "Input tensors must have the same shape");
-  TORCH_CHECK(probs.scalar_type() == renorm_probs.scalar_type(), "Input tensors must have the same dtype");
-  TORCH_CHECK(
-      probs.scalar_type() == torch::kFloat32 || probs.scalar_type() == torch::kHalf ||
-          probs.scalar_type() == torch::kBFloat16,
-      "Input tensors must be float32, float16, or bfloat16");
+  CHECK_INPUT(2, probs);
+  CHECK_DTYPES(probs, at::kFloat, at::kHalf, at::kBFloat16);
+  CHECK_INPUT(2, probs.scalar_type(), renorm_probs);
+  CHECK_SAME_SHAPE(probs, renorm_probs);
 
   if (maybe_top_k_arr.has_value()) {
-    CHECK_INPUT((*maybe_top_k_arr));
-    TORCH_CHECK(maybe_top_k_arr->dim() == 1, "maybe_top_k_arr must be a 1D tensor [batch_size]");
+    CHECK_INPUT(1, at::kLong, (*maybe_top_k_arr));
     TORCH_CHECK(maybe_top_k_arr->size(0) == probs.size(0), "maybe_top_k_arr size must match batch_size");
-    TORCH_CHECK(maybe_top_k_arr->scalar_type() == torch::kInt64, "maybe_top_k_arr must be int64");
   } else {
     TORCH_CHECK(top_k_val > 0, "top_k_val must be positive");
   }
@@ -330,8 +305,6 @@ SGL_KERNEL_EXPORT void top_k_renorm_probs(
 
   const int64_t* maybe_top_k_ptr = maybe_top_k_arr.has_value() ? maybe_top_k_arr->data_ptr<int64_t>() : nullptr;
 
-  auto dtype = probs.scalar_type();
-
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   const double flops = 0.0;
   const double bytes = static_cast<double>(probs.numel()) * static_cast<double>(probs.element_size()) +
@@ -339,14 +312,8 @@ SGL_KERNEL_EXPORT void top_k_renorm_probs(
   SGL_KERNEL_PERF_SCOPE("top_k_renorm_probs", queue, bytes, flops);
 #endif
 
-  if (dtype == torch::kFloat32) {
-    launch_single_cta_kernel<float>(
+  AT_DISPATCH_FLOATING_TYPES_V2(probs.scalar_type(), "top_k_renorm_probs", [&] {
+    launch_single_cta_kernel<scalar_t>(
         probs, renorm_probs, maybe_top_k_ptr, static_cast<int>(top_k_val), batch_size, vocab_size, queue);
-  } else if (dtype == torch::kHalf) {
-    launch_single_cta_kernel<at::Half>(
-        probs, renorm_probs, maybe_top_k_ptr, static_cast<int>(top_k_val), batch_size, vocab_size, queue);
-  } else if (dtype == torch::kBFloat16) {
-    launch_single_cta_kernel<at::BFloat16>(
-        probs, renorm_probs, maybe_top_k_ptr, static_cast<int>(top_k_val), batch_size, vocab_size, queue);
-  }
+  });
 }

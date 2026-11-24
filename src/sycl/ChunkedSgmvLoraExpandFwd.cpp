@@ -129,23 +129,14 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_expand_fwd(
     const std::optional<torch::Tensor>&
         base_output  // [num_tokens, N_total] optional; the base model's output for a fused add
 ) {
-  CHECK_INPUT(x);
-  CHECK_INPUT(weights);
-  CHECK_INPUT(slice_offsets);
-  CHECK_INPUT(seg_indptr);
-  CHECK_INPUT(weight_indices);
-  CHECK_INPUT(lora_ranks);
-  CHECK_INPUT(scalings);
-  CHECK_INPUT(output);
-
-  TORCH_CHECK(x.dim() == 2, "x must be a 2D tensor");
-  TORCH_CHECK(weights.dim() == 3, "weights must be a 3D tensor");
-  TORCH_CHECK(slice_offsets.dim() == 1, "slice_offsets must be a 1D tensor");
-  TORCH_CHECK(seg_indptr.dim() == 1, "seg_indptr must be a 1D tensor");
-  TORCH_CHECK(weight_indices.dim() == 1, "weight_indices must be a 1D tensor");
-  TORCH_CHECK(lora_ranks.dim() == 1, "lora_ranks must be a 1D tensor");
-  TORCH_CHECK(scalings.dim() == 1, "scalings must be a 1D tensor");
-  TORCH_CHECK(output.dim() == 2, "output must be a 2D tensor");
+  CHECK_INPUT(2, x);
+  CHECK_INPUT(3, weights);
+  CHECK_INPUT(1, slice_offsets);
+  CHECK_INPUT(1, seg_indptr);
+  CHECK_INPUT(1, weight_indices);
+  CHECK_INPUT(1, lora_ranks);
+  CHECK_INPUT(1, scalings);
+  CHECK_INPUT(2, output);
 
   TORCH_CHECK(num_slices > 0, "num_slices must be > 0");
   TORCH_CHECK(slice_offsets.numel() == num_slices + 1, "slice_offsets must have num_slices + 1 elements");
@@ -176,8 +167,7 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_expand_fwd(
       "output must have shape (num_tokens, N_total)");
   TORCH_CHECK(output.scalar_type() == weights.scalar_type(), "output dtype must match weights dtype");
   if (base_output.has_value()) {
-    CHECK_INPUT(base_output.value());
-    TORCH_CHECK(base_output->dim() == 2, "base_output must be a 2D tensor");
+    CHECK_INPUT(2, base_output.value());
     TORCH_CHECK(
         base_output->size(0) == num_tokens_i64 && base_output->size(1) == n_total_i64,
         "base_output must have shape (num_tokens, N_total)");
@@ -234,8 +224,7 @@ SGL_KERNEL_EXPORT void chunked_sgmv_lora_expand_fwd(
   torch::Tensor perm_i64;
   if (permutation.has_value()) {
     const auto& perm = permutation.value();
-    CHECK_INPUT(perm);
-    TORCH_CHECK(perm.dim() == 1, "permutation must be a 1D tensor");
+    CHECK_INPUT(1, perm);
     TORCH_CHECK(perm.numel() == num_tokens_i64, "permutation.numel() must equal x.size(0)");
     lora_debug_checks::check_permutation(perm, num_tokens_i64);
     perm_i64 = perm.scalar_type() == torch::kInt64 ? perm : perm.to(torch::kInt64);

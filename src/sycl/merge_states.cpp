@@ -303,19 +303,6 @@ void merge_state_sycl(
   });
 }
 
-#define SYCL_DISPATCH_BY_SCALAR_DTYPE(scalar_dtype, fn)                                     \
-  {                                                                                         \
-    if (scalar_dtype == at::ScalarType::Float) {                                            \
-      fn(float);                                                                            \
-    } else if (scalar_dtype == at::ScalarType::Half) {                                      \
-      fn(sycl::half);                                                                       \
-    } else if (scalar_dtype == at::ScalarType::BFloat16) {                                  \
-      fn(sycl::ext::oneapi::bfloat16);                                                      \
-    } else {                                                                                \
-      TORCH_CHECK(false, "Unsupported dtype for SYCL merge_state_v2_sycl: ", scalar_dtype); \
-    }                                                                                       \
-  }
-
 template <typename scalar_t>
 void merge_attn_states_launcher_sycl(
     const at::Tensor& prefix_output,
@@ -342,29 +329,22 @@ void merge_attn_states_launcher_sycl(
       head_size);
 }
 
-#define CALL_MERGE_ATTN_STATES_LAUNCHER_SYCL(scalar_t) \
-  { merge_attn_states_launcher_sycl<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); }
-
 SGL_KERNEL_EXPORT void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
-  CHECK_INPUT(v_a);
-  CHECK_INPUT(s_a);
-  CHECK_INPUT(v_b);
-  CHECK_INPUT(s_b);
+  CHECK_INPUT(3, v_a);
+  CHECK_INPUT(2, s_a);
+  CHECK_INPUT(3, v_b);
+  CHECK_INPUT(2, s_b);
   CHECK_INPUT(v_merged);
   CHECK_INPUT(s_merged);
 
-  CHECK_DIM(3, v_a);
-  CHECK_DIM(2, s_a);
-  CHECK_DIM(3, v_b);
-  CHECK_DIM(2, s_b);
-
   CHECK_SAME_SHAPE(v_a, v_b);
   CHECK_SAME_SHAPE(s_a, s_b);
-  CHECK_EQ(v_a.size(0), s_a.size(0));
-  CHECK_EQ(v_a.size(1), s_b.size(1));
+  CHECK_SHAPE(s_a, v_a.size(0), v_a.size(1));
 
-  SYCL_DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_ATTN_STATES_LAUNCHER_SYCL);
+  SYCL_DISPATCH_FLOATING_TYPES_V2(v_merged.scalar_type(), "merge_state_v2", [&] {
+    merge_attn_states_launcher_sycl<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged);
+  });
 }
 
 template <typename scalar_t>
@@ -393,37 +373,22 @@ void merge_state_launcher_sycl(
       head_size);
 }
 
-#define CALL_MERGE_STATE_LAUNCHER_SYCL(scalar_t) \
-  { merge_state_launcher_sycl<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged); }
-
 SGL_KERNEL_EXPORT void
 merge_state(at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged) {
-  CHECK_INPUT(v_a);
-  CHECK_INPUT(s_a);
-  CHECK_INPUT(v_b);
-  CHECK_INPUT(s_b);
-  CHECK_INPUT(v_merged);
-  CHECK_INPUT(s_merged);
-
-  CHECK_DIM(3, v_a);
-  CHECK_DIM(2, s_a);
-  CHECK_DIM(3, v_b);
-  CHECK_DIM(2, s_b);
-  CHECK_DIM(3, v_merged);
-  CHECK_DIM(2, s_merged);
+  CHECK_INPUT(3, v_a);
+  CHECK_INPUT(2, at::ScalarType::Float, s_a);
+  CHECK_INPUT(3, v_a.scalar_type(), v_b);
+  CHECK_INPUT(2, at::ScalarType::Float, s_b);
+  CHECK_INPUT(3, v_a.scalar_type(), v_merged);
+  CHECK_INPUT(2, at::ScalarType::Float, s_merged);
 
   CHECK_SAME_SHAPE(v_a, v_b);
   CHECK_SAME_SHAPE(v_a, v_merged);
   CHECK_SAME_SHAPE(s_a, s_b);
   CHECK_SAME_SHAPE(s_a, s_merged);
-  CHECK_EQ(v_a.size(0), s_a.size(0));
-  CHECK_EQ(v_a.size(1), s_a.size(1));
+  CHECK_SHAPE(s_a, v_a.size(0), v_a.size(1));
 
-  TORCH_CHECK(v_a.scalar_type() == v_b.scalar_type(), "v_b dtype must match v_a dtype");
-  TORCH_CHECK(v_a.scalar_type() == v_merged.scalar_type(), "v_merged dtype must match v_a dtype");
-  TORCH_CHECK(s_a.scalar_type() == at::ScalarType::Float, "s_a must be float32");
-  TORCH_CHECK(s_b.scalar_type() == at::ScalarType::Float, "s_b must be float32");
-  TORCH_CHECK(s_merged.scalar_type() == at::ScalarType::Float, "s_merged must be float32");
-
-  SYCL_DISPATCH_BY_SCALAR_DTYPE(v_merged.dtype(), CALL_MERGE_STATE_LAUNCHER_SYCL);
+  SYCL_DISPATCH_FLOATING_TYPES_V2(v_merged.scalar_type(), "merge_state", [&] {
+    merge_state_launcher_sycl<scalar_t>(v_a, s_a, v_b, s_b, v_merged, s_merged);
+  });
 }

@@ -260,20 +260,9 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_fp4(
 
   TORCH_CHECK(group_size == 32, "sgl_per_token_group_quant_fp4: group_size must be 32 for MXFP4, got ", group_size);
 
-  TORCH_CHECK(
-      input.scalar_type() == at::ScalarType::Half || input.scalar_type() == at::ScalarType::BFloat16 ||
-          input.scalar_type() == at::ScalarType::Float,
-      "sgl_per_token_group_quant_fp4: input dtype must be Float16, BFloat16, or Float32, got ",
-      input.scalar_type());
-
-  TORCH_CHECK(
-      output_q.scalar_type() == at::ScalarType::Byte,
-      "output_q must be uint8 (packed FP4), got ",
-      output_q.scalar_type());
-  TORCH_CHECK(
-      output_s.scalar_type() == at::ScalarType::Byte,
-      "output_s must be uint8 (UE8M0 scales), got ",
-      output_s.scalar_type());
+  CHECK_DTYPES(input, at::ScalarType::Half, at::ScalarType::BFloat16, at::ScalarType::Float);
+  CHECK_DTYPE(at::ScalarType::Byte, output_q);
+  CHECK_DTYPE(at::ScalarType::Byte, output_s);
 
   TORCH_CHECK(input.dim() >= 1, "input must have at least 1 dimension");
   TORCH_CHECK(
@@ -289,10 +278,9 @@ SGL_KERNEL_EXPORT void sgl_per_token_group_quant_fp4(
   if (enable_fusion) {
     const auto& input_sec = input_secondary.value();
     CHECK_CONTIGUOUS(input_sec);
-    TORCH_CHECK(input_sec.dim() == input.dim(), "input_secondary must have same dimensions as input");
-    TORCH_CHECK(input_sec.sizes() == input.sizes(), "input_secondary must have same shape as input");
-    TORCH_CHECK(input_sec.scalar_type() == input.scalar_type(), "input_secondary must have same dtype as input");
-    TORCH_CHECK(input_sec.device() == input.device(), "input_secondary must be on same device as input");
+    CHECK_SAME_SHAPE(input_sec, input);
+    CHECK_DTYPE(input.scalar_type(), input_sec);
+    CHECK_EQ(input_sec.device(), input.device());
   }
 
   // Detect column-major stride for scales

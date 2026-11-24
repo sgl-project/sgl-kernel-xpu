@@ -127,8 +127,7 @@ SGL_KERNEL_EXPORT void moe_sum_reduce(at::Tensor& input, at::Tensor& output, dou
   SGL_KERNEL_PERF_SCOPE("moe_sum_reduce", profiling_queue, bytes, flops);
 #endif
 
-  SYCL_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::BFloat16, at::ScalarType::Half, input.scalar_type(), "moe_sum_reduce_impl", [&]() {
-        moe_sum_reduce_impl<scalar_t>(input, output, routed_scaling_factor);
-      });
+  SYCL_DISPATCH_FLOATING_TYPES_V3(input.scalar_type(), "moe_sum_reduce_impl", [&]() {
+    moe_sum_reduce_impl<scalar_t>(input, output, routed_scaling_factor);
+  });
 }

@@ -110,13 +110,13 @@ SGL_KERNEL_EXPORT torch::Tensor fp4_paged_mqa_logits(
   (void)clean_logits;
   CHECK_INPUT(q_fp4_input);
   CHECK_INPUT(q_scale_input);
-  CHECK_INPUT(kv_cache);
-  CHECK_INPUT(weights);
+  CHECK_INPUT(4, at::kByte, kv_cache);
+  CHECK_INPUT(2, at::kFloat, weights);
   CHECK_INPUT(seq_lens);
-  CHECK_INPUT(block_tables);
+  CHECK_DTYPE(at::kInt, seq_lens);
+  CHECK_INPUT(2, at::kInt, block_tables);
 
-  TORCH_CHECK(
-      q_fp4_input.scalar_type() == at::kByte || q_fp4_input.scalar_type() == at::kChar, "q_fp4 must be uint8 or int8");
+  CHECK_DTYPES(q_fp4_input, at::kByte, at::kChar);
   auto q_fp4 = q_fp4_input.scalar_type() == at::kChar ? q_fp4_input.view(at::kByte) : q_fp4_input;
   auto q_scale = q_scale_input;
   if (q_scale.scalar_type() != at::kByte) {
@@ -134,24 +134,15 @@ SGL_KERNEL_EXPORT torch::Tensor fp4_paged_mqa_logits(
   if (q_fp4.dim() == 4) q_fp4 = q_fp4.squeeze(1);
   if (q_scale.dim() == 4) q_scale = q_scale.squeeze(1);
 
-  TORCH_CHECK(q_fp4.is_xpu() && q_scale.is_xpu() && kv_cache.is_xpu(), "FP4 tensors must be on XPU");
-  TORCH_CHECK(q_fp4.dim() == 3 && q_scale.dim() == 3, "q_fp4/q_scale must be [B,H,D]");
-  TORCH_CHECK(q_fp4.size(2) == kPackedDim && q_scale.size(2) == kNumGroups, "invalid FP4 Q shape");
-  TORCH_CHECK(q_scale.size(0) == q_fp4.size(0) && q_scale.size(1) == q_fp4.size(1), "Q scale shape mismatch");
-  TORCH_CHECK(
-      kv_cache.dim() == 4 && kv_cache.size(2) == 1 && kv_cache.size(3) == kCacheBytesPerToken,
-      "kv_cache must be [pages,page,1,68]");
-  TORCH_CHECK(
-      weights.dim() == 2 && weights.size(0) == q_fp4.size(0) && weights.size(1) == q_fp4.size(1),
-      "weights must be [B,H]");
-  TORCH_CHECK(
-      seq_lens.scalar_type() == at::kInt && block_tables.scalar_type() == at::kInt,
-      "seq_lens/block_tables must be int32");
-  TORCH_CHECK(
-      q_fp4.scalar_type() == at::kByte && q_scale.scalar_type() == at::kByte && kv_cache.scalar_type() == at::kByte,
-      "FP4 buffers must be uint8 (q_fp4 may be provided as int8)");
-  TORCH_CHECK(weights.scalar_type() == at::kFloat, "weights must be float32");
-  TORCH_CHECK(block_tables.dim() == 2 && block_tables.size(0) == q_fp4.size(0), "block_tables shape mismatch");
+  CHECK_DIM(3, q_fp4);
+  CHECK_DIM(3, q_scale);
+  const int64_t batch = q_fp4.size(0);
+  const int64_t heads = q_fp4.size(1);
+  CHECK_SHAPE(q_fp4, batch, heads, kPackedDim);
+  CHECK_SHAPE(q_scale, batch, heads, kNumGroups);
+  CHECK_SHAPE(kv_cache, kv_cache.size(0), kv_cache.size(1), 1, kCacheBytesPerToken);
+  CHECK_SHAPE(weights, batch, heads);
+  CHECK_SHAPE(block_tables, batch, block_tables.size(1));
   TORCH_CHECK(
       max_seq_len > 0 && block_tables.size(1) * kv_cache.size(1) >= max_seq_len,
       "block table does not cover max_seq_len");
@@ -159,7 +150,7 @@ SGL_KERNEL_EXPORT torch::Tensor fp4_paged_mqa_logits(
   auto output = torch::empty({q_fp4.size(0), max_seq_len}, q_fp4.options().dtype(torch::kFloat32));
   if (q_fp4.numel() == 0) return output.zero_();
   auto seq_flat = seq_lens.contiguous().view({-1});
-  TORCH_CHECK(seq_flat.size(0) == q_fp4.size(0), "seq_lens must have B elements");
+  CHECK_SHAPE(seq_flat, batch);
   auto queue = c10::xpu::getCurrentXPUStream().queue();
   Fp4PagedMqaLogitsKernel kernel{
       q_fp4.data_ptr<uint8_t>(),

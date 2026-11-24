@@ -38,6 +38,7 @@ suites = {
         TestFile("test_mrope.py"),
         TestFile("test_per_tensor_quant_fp8.py"),
         TestFile("test_per_token_quant_fp8.py"),
+        TestFile("test_fp8_linear.py"),
         TestFile("test_fused_qk_norm_rope.py"),
         TestFile("test_fused_qk_rope_with_cache.py"),
         TestFile("test_merge_state.py"),
@@ -85,9 +86,11 @@ suites = {
         TestFile("test_topk_transform.py"),
         TestFile("test_inkling_attn_prologue.py"),
         TestFile("test_hisparse.py"),
+        TestFile("test_kvcacheio.py"),
         TestFile("speculative/test_build_eagle_tree.py"),
         TestFile("speculative/test_eagle_utils.py"),
         TestFile("speculative/test_ngram_utils.py"),
+        TestFile("speculative/test_ngram_embedding.py"),
         TestFile("test_gate_up_lora_b_fwd.py"),
         TestFile("test_chunked_sgmv_lora_shrink_fwd.py"),
         TestFile("test_chunked_sgmv_lora_expand_fwd.py"),
@@ -99,6 +102,7 @@ suites = {
         TestFile("test_qwen4_short_conv.py"),
         TestFile("test_qwen4_hyperconnection.py"),
         TestFile("test_sigmoid_mul.py"),
+        TestFile("test_convrot_int8.py"),
     ],
     # Nightly suite: exercises the wheel installed in the intel/sgl-kernel-xpu-dev
     # nightly image. Populate with longer-running or full-shape tests that are

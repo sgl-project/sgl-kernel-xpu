@@ -62,6 +62,7 @@ on the diff for tricky spots. -->
 - [ ] One logical change; source diff within ~500 lines, or the Summary explains why it cannot reasonably be split
 - [ ] No drive-by refactors, restating comments, duplicated helpers, single-use abstractions or artifacts
 - [ ] `pre-commit run --files <changed files>` is clean
+- [ ] `scan_op_rules.py --diff` and `scan_stride_overflow.py --diff` hits are fixed or explained
 - [ ] Preconditions declared at the op entry; tests cover boundaries and rejected inputs
 - [ ] New tests registered in `tests/run_suite.py`; benchmarks updated under `benchmark/` if perf-relevant
 - [ ] No hardware or software features covered by Intel(R) Protect IP exposed on `main`

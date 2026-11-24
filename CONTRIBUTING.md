@@ -308,8 +308,9 @@ rollout split. Implementation PRs link the issue.
   chunyuan-w, sunjiweiswift). Check `.github/CODEOWNERS` for owned paths.
 - For public pull requests on the SGLang repo, conduct an internal review
   first before requesting reviews from the community.
-- Before requesting review, self-check against this page: size, clutter,
-  boundaries, tests, description.
+- Before requesting review, run the self-check in the
+  [pr-review skill](.claude/skills/pr-review/SKILL.md) (scanners, size,
+  clutter, boundaries, tests, description).
 - Answer comments with code or reasoning, not just "done". Re-run the relevant
   validation after substantial updates and update the numbers in the
   description.
@@ -323,8 +324,10 @@ Review in this order and stop at the first step that fails:
    not, return the PR with the list of missing items.
 2. **Scope**: size guideline (or a reason for exceeding it), one logical
    change, no clutter.
-3. **Repository rules**: `.github/copilot-instructions.md`, pre-commit, no
-   Protect IP exposure on `main`.
+3. **Repository rules**: `.github/copilot-instructions.md` (op coding rules
+   OP-1..OP-7, TLA-1, int64 strides SO-1..SO-6) on new and changed lines,
+   the `scan_op_rules.py --diff` and `scan_stride_overflow.py --diff`
+   scanners, pre-commit, no Protect IP exposure on `main`.
 4. **Correctness**: synchronization, boundaries, numerics (including implicit
    downcasts), test quality.
 5. **Performance evidence**: before/after data, untargeted cases, size and
@@ -337,7 +340,8 @@ or the explanation does not match the code, pause the review and add the
 `need-author-clarification` label. Review resumes after the author updates the
 PR.
 
-AI review helps reviewers find issues; a human reviewer makes the decision.
+AI review (e.g. the pr-review skill) helps reviewers find issues; a human
+reviewer makes the decision.
 
 ### Merge readiness
 

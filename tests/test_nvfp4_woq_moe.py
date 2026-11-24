@@ -306,6 +306,83 @@ def test_fused_woq_matches_host_requantized_mxfp8(
     )
 
 
+MXFP8_TILES = ["m8", "m16", "m32", "m128", "m256"]
+
+
+@pytest.mark.parametrize("tile", MXFP8_TILES)
+@pytest.mark.parametrize(
+    "ms,n,k",
+    [
+        ([5, 0, 12, 3], 128, 192),       # K % 128 == 64: main 128-wide steps + 64 tail
+        ([8, 17, 0, 33], 192, 576),      # tail starts a new 512-wide c block
+        ([1, 70, 2], 256, 320),          # rows spill into a second M tile on small tiles
+        ([300, 9], 64, 128),             # 300 rows: two M tiles even on the 256-row tile
+        pytest.param([40, 0, 260], 320, 1344, marks=pytest.mark.skipif(
+            not LONG_TESTS, reason="set LONG_TESTS=1")),
+    ],
+)
+def test_mxfp8_tile_variants_match_host_requantized(tile, ms, n, k, monkeypatch):
+    """Every tile variant of the lane-local MXFP8 kernel is bit-exact.
+
+    SGLANG_NVFP4_WOQ_MXFP8_TILE forces the variant the host would otherwise
+    pick from rows / E.  The shapes cover the 64-wide K tail of the 128-wide
+    decode steps, c-block boundaries, empty experts, partially filled M tiles
+    (including subgroups with no live rows on the SLM-shared tile) and N that
+    is not a multiple of the workgroup N tile.
+    """
+    skip_if_no_cri()
+    from sgl_kernel import nvfp4_woq_mxfp8_scaled_grouped_mm, nvfp4_woq_prep
+
+    monkeypatch.setenv("SGLANG_NVFP4_WOQ_MXFP8_TILE", tile)
+    dev = "xpu"
+    m_total = sum(ms)
+    packed, sf, gs_dq, _ = make_nvfp4_weights(len(ms), n, k, dev, seed=7)
+    torch.manual_seed(8)
+    a_q, a_s = quantize_mxfp8(torch.randn(m_total, k) * 0.5)
+    a_q, a_s = a_q.to(dev), a_s.to(dev)
+    problem_sizes, expert_offsets = make_grouped_layout(ms, n, k, dev)
+    workspace = torch.zeros((WORKSPACE_BYTES,), dtype=torch.uint8, device=dev)
+
+    b_mx, b_smx = nvfp4_to_mxfp8_ref(packed.cpu(), sf.cpu(), gs_dq.cpu())
+    ref = run_mxfp8_reference(
+        a_q, a_s, b_mx.to(dev), b_smx.to(dev), problem_sizes, expert_offsets, workspace
+    )
+    c_b, sfmx_b = nvfp4_woq_prep(sf, gs_dq)
+    # NaN canary: every row must be written by the kernel.
+    out = torch.full((m_total, n), float("nan"), dtype=torch.float32, device=dev)
+    nvfp4_woq_mxfp8_scaled_grouped_mm(
+        out, a_q, packed, a_s, sfmx_b, c_b, problem_sizes, expert_offsets, workspace
+    )
+    torch.xpu.synchronize()
+    actual, oracle = out.cpu(), ref.cpu()
+    mismatch = (actual != oracle).sum().item()
+    assert torch.equal(actual, oracle), (
+        f"tile {tile}: {mismatch} mismatches, max diff "
+        f"{(actual - oracle).abs().nan_to_num(float('inf')).max().item()}"
+    )
+
+
+def test_mxfp8_tile_override_rejects_unknown_names(monkeypatch):
+    skip_if_no_cri()
+    from sgl_kernel import nvfp4_woq_mxfp8_scaled_grouped_mm
+
+    dev = "xpu"
+    e, m, n, k = 1, 8, 64, 64
+    monkeypatch.setenv("SGLANG_NVFP4_WOQ_MXFP8_TILE", "m7")
+    out = torch.zeros((m, n), dtype=torch.float32, device=dev)
+    with pytest.raises(RuntimeError, match="SGLANG_NVFP4_WOQ_MXFP8_TILE"):
+        nvfp4_woq_mxfp8_scaled_grouped_mm(
+            out,
+            torch.zeros((m, k), dtype=torch.float8_e4m3fn, device=dev),
+            torch.zeros((e, n, k // 2), dtype=torch.uint8, device=dev),
+            torch.full((m, k // 32), 127, dtype=torch.uint8, device=dev),
+            torch.full((e, k // 32, n), 127, dtype=torch.uint8, device=dev),
+            torch.ones((e, n, k // 16), dtype=torch.bfloat16, device=dev),
+            *make_grouped_layout([m], n, k, dev),
+            torch.empty((WORKSPACE_BYTES,), dtype=torch.uint8, device=dev),
+        )
+
+
 def test_mxfp8_gemm_covers_all_e2m1_codes():
     """Every nibble and packed-byte position must reach the right MXFP8 lane."""
     skip_if_no_cri()

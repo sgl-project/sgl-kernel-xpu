@@ -61,12 +61,26 @@ def _per_token_group_quant_fp8(x: torch.Tensor, group_size: int = 128):
     return out_q, out_s
 
 
+def _has_mxfp8_quant_rows() -> bool:
+    return hasattr(torch.ops.sgl_kernel, "mxfp8_quant_rows")
+
+
 def _per_token_group_quant_mxfp8(x: torch.Tensor, group_size: int = _MXFP8_BLOCK_SIZE):
     """MXFP8 per-token group quant. Returns (x_q float8_e4m3fn, x_s uint8 UE8M0).
 
-    Uses v1 (enable_v2=False): v2 does not support row-major UE8M0 output.
+    On Xe3P uses the dedicated row quant kernel (mxfp8_quant_rows), which is
+    bit-identical to the generic one for bf16/fp16 inputs. Elsewhere falls back
+    to v1 (enable_v2=False): v2 does not support row-major UE8M0 output.
     """
     assert x.shape[-1] % group_size == 0
+    if group_size == _MXFP8_BLOCK_SIZE and x.dim() == 2 and _has_mxfp8_quant_rows():
+        x = x.contiguous()
+        out_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
+        out_s = torch.empty(
+            (x.shape[0], x.shape[1] // group_size), device=x.device, dtype=torch.uint8
+        )
+        torch.ops.sgl_kernel.mxfp8_quant_rows(x, out_q, out_s, False)
+        return out_q, out_s
     out_q = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
     out_s_shape = (*x.shape[:-1], x.shape[-1] // group_size)
     out_s = torch.empty(out_s_shape, device=x.device, dtype=torch.uint8)
@@ -84,6 +98,53 @@ def _per_token_group_quant_mxfp8(x: torch.Tensor, group_size: int = _MXFP8_BLOCK
         False,  # enable_v2 (v1 supports row-major UE8M0; v2 does not)
     )
     return out_q, out_s
+
+
+def _scatter_quant_mxfp8(a: torch.Tensor, src2dst: torch.Tensor, topk: int):
+    """MXFP8-quantize the (M, K) tokens and scatter them to their top-k rows.
+
+    Equivalent to scatter_tokens_to_experts followed by a row quant of the
+    (M * topk, K) copy, but every token is quantized once instead of topk
+    times and only fp8 + scales are written to the expert-sorted layout.
+    """
+    m, k = a.shape
+    if _has_mxfp8_quant_rows():
+        a = a.contiguous()
+        out_q = torch.empty((m * topk, k), device=a.device, dtype=torch.float8_e4m3fn)
+        out_s = torch.empty(
+            (m * topk, k // _MXFP8_BLOCK_SIZE), device=a.device, dtype=torch.uint8
+        )
+        torch.ops.sgl_kernel.mxfp8_quant_rows(a, out_q, out_s, False, src2dst)
+        return out_q, out_s
+    # XPU scatter doesn't support uint8/fp8 scales; scatter in a.dtype then quantize.
+    rep_a = torch.empty((m * topk, k), dtype=a.dtype, device=a.device)
+    scatter_tokens_to_experts(a, src2dst, rep_a)
+    return _per_token_group_quant_mxfp8(rep_a, group_size=_MXFP8_BLOCK_SIZE)
+
+
+def _silu_and_mul_quant_mxfp8(gate_up: torch.Tensor, act_dtype: torch.dtype):
+    """MXFP8-quantize silu(gate) * up for a (M, 2N) [gate | up] GEMM output.
+
+    gate_up may be the fp32 GEMM output. With the fused Xe3P kernel the
+    activation is formed in fp32, rounded to bf16 (fp16 for fp16 models) as the
+    unfused path would materialize it, and quantized in the same pass, so the
+    fp32 -> act_dtype copy, silu_and_mul and the quant kernel collapse into one.
+    """
+    m, n2 = gate_up.shape
+    n = n2 // 2
+    if _has_mxfp8_quant_rows() and not (
+        gate_up.dtype == torch.float32 and act_dtype == torch.half
+    ):
+        gate_up = gate_up.contiguous()
+        out_q = torch.empty((m, n), device=gate_up.device, dtype=torch.float8_e4m3fn)
+        out_s = torch.empty(
+            (m, n // _MXFP8_BLOCK_SIZE), device=gate_up.device, dtype=torch.uint8
+        )
+        torch.ops.sgl_kernel.mxfp8_quant_rows(gate_up, out_q, out_s, True)
+        return out_q, out_s
+    intermediate = torch.empty((m, n), dtype=act_dtype, device=gate_up.device)
+    silu_and_mul(gate_up.to(act_dtype), intermediate)
+    return _per_token_group_quant_mxfp8(intermediate, group_size=_MXFP8_BLOCK_SIZE)
 
 
 def cutlass_fused_experts_fp8(
@@ -237,16 +298,17 @@ def cutlass_fused_experts_fp8(
 
     # Scatter then quantize. scatter_tokens_to_experts uses c_map (the
     # src->dst permutation) to gather per-expert rows.
-    rep_a = torch.empty((m * topk, k), dtype=a.dtype, device=device)
-    scatter_tokens_to_experts(a, c_map, rep_a)
     if use_mxfp8:
-        rep_a_q, rep_a1_scales = _per_token_group_quant_mxfp8(
-            rep_a, group_size=_MXFP8_BLOCK_SIZE
-        )
+        rep_a_q, rep_a1_scales = _scatter_quant_mxfp8(a, c_map, topk)
     else:
+        rep_a = torch.empty((m * topk, k), dtype=a.dtype, device=device)
+        scatter_tokens_to_experts(a, c_map, rep_a)
         rep_a_q, rep_a1_scales = _per_token_group_quant_fp8(rep_a, group_size=128)
 
-    c1 = torch.zeros((m * topk, n * 2), dtype=torch.float32, device=device)
+    # Every row of c1/c2 belongs to exactly one expert and the epilogue runs
+    # with beta = 0, so the outputs need no zero-fill on the MXFP8 path.
+    alloc = torch.empty if use_mxfp8 else torch.zeros
+    c1 = alloc((m * topk, n * 2), dtype=torch.float32, device=device)
 
     # Empty int64 sentinels select on-device pointer-table + scale-transpose.
     empty_ptrs = torch.empty((0,), dtype=torch.int64, device=device)
@@ -274,19 +336,16 @@ def cutlass_fused_experts_fp8(
         workspace,
     )
 
-    intermediate = torch.empty((m * topk, n), dtype=out_dtype, device=device)
-    silu_and_mul(c1.to(out_dtype), intermediate)
-
     if use_mxfp8:
-        intermediate_q, a2_scale = _per_token_group_quant_mxfp8(
-            intermediate, group_size=_MXFP8_BLOCK_SIZE
-        )
+        intermediate_q, a2_scale = _silu_and_mul_quant_mxfp8(c1, out_dtype)
     else:
+        intermediate = torch.empty((m * topk, n), dtype=out_dtype, device=device)
+        silu_and_mul(c1.to(out_dtype), intermediate)
         intermediate_q, a2_scale = _per_token_group_quant_fp8(
             intermediate, group_size=128
         )
 
-    c2 = torch.zeros((m * topk, k), dtype=torch.float32, device=device)
+    c2 = alloc((m * topk, k), dtype=torch.float32, device=device)
     fp8_blockwise_scaled_grouped_mm(
         c2,
         empty_ptrs,
@@ -561,8 +620,10 @@ def cutlass_fused_experts_nvfp4_woq(
     if workspace is None:
         workspace = torch.zeros((64 * 1024 * 1024,), dtype=torch.uint8, device=device)
 
-    c1 = torch.zeros((m * topk, n * 2), dtype=torch.float32, device=device)
-    c2 = torch.zeros((m * topk, k), dtype=torch.float32, device=device)
+    # Every row belongs to exactly one expert and both GEMMs overwrite their
+    # rows (beta = 0), so no zero-fill is needed.
+    c1 = torch.empty((m * topk, n * 2), dtype=torch.float32, device=device)
+    c2 = torch.empty((m * topk, k), dtype=torch.float32, device=device)
     if compute_mode == "bf16":
         # Both GEMMs consume BF16 directly. Convert FP16 inputs once before the
         # routing scatter and keep the intermediate activation in BF16.
@@ -593,12 +654,7 @@ def cutlass_fused_experts_nvfp4_woq(
             workspace,
         )
     else:
-        # XPU scatter doesn't support fp8; scatter in a.dtype then quantize.
-        rep_a = torch.empty((m * topk, k), dtype=a.dtype, device=device)
-        scatter_tokens_to_experts(a, c_map, rep_a)
-        rep_a_q, rep_a_s = _per_token_group_quant_mxfp8(
-            rep_a, group_size=_MXFP8_BLOCK_SIZE
-        )
+        rep_a_q, rep_a_s = _scatter_quant_mxfp8(a, c_map, topk)
         nvfp4_woq_mxfp8_scaled_grouped_mm(
             c1,
             rep_a_q,
@@ -611,11 +667,7 @@ def cutlass_fused_experts_nvfp4_woq(
             workspace,
         )
 
-        intermediate = torch.empty((m * topk, n), dtype=out_dtype, device=device)
-        silu_and_mul(c1.to(out_dtype), intermediate)
-        inter_q, inter_s = _per_token_group_quant_mxfp8(
-            intermediate, group_size=_MXFP8_BLOCK_SIZE
-        )
+        inter_q, inter_s = _silu_and_mul_quant_mxfp8(c1, out_dtype)
         nvfp4_woq_mxfp8_scaled_grouped_mm(
             c2,
             inter_q,

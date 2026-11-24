@@ -5,22 +5,17 @@
 /*! \file
     \brief NVFP4 weight-only-quantized MXFP8 grouped GEMM for MoE on Intel XPU (xe35).
 
-    B arrives as NVFP4 (packed E2M1 payload) and is dequantized to BF16 and
-    requantized to MXFP8 inside the mainloop; A is already MXFP8.  See
-    nvfp4_woq_mxfp8_mainloop.hpp for the numerics and the register-level layout
-    reasoning, and src/sycl/nvfp4_woq.cpp for the one-time scale prep that
-    produces the (c, sfmx) pair this kernel consumes.
+    MXFP8 activations: B arrives as NVFP4 (packed E2M1 payload) and is
+    requantized to MXFP8 in registers by a hand-written, lane-local SYCL kernel
+    (nvfp4_woq_mxfp8_mainloop.hpp: numerics, register layouts, tile menu); one
+    launch per call, no metadata/transpose prep kernel.  src/sycl/nvfp4_woq.cpp
+    holds the one-time scale prep that produces the (c, sfmx) pair it consumes.
+
+    BF16 activations: CUTLASS grouped GEMM with nvfp4_woq_bf16_mainloop.hpp.
 
     NOTE: unlike blockwise_moe_mxfp4.cpp this TU does NOT define
-    CUTE_ENABLE_XE_BLOCK_2D_ASSERT.  Those asserts are active in device code
-    even in Release builds, and two of them fire on inputs this kernel handles
-    correctly by construction: the A-scale surface width is the per-expert token
-    count, which MoE routing makes arbitrary (the traits code rounds it up, and
-    the scratch buffer is padded to match), and the base-pointer check flags
-    scale strides the host side now guarantees explicitly.  Leaving them on
-    floods stderr with hundreds of failures per launch on ordinary ragged-M
-    shapes.  The epilogue is still the MXFP4-style one (ElementC=float with
-    explicit copy atoms) since that pairing is known good for a 4-bit B operand.
+    CUTE_ENABLE_XE_BLOCK_2D_ASSERT (device asserts fire per work-item on
+    ragged-M shapes this code handles by construction).
 */
 
 // clang-format off
@@ -60,7 +55,6 @@
 using namespace cute;
 using namespace cutlass::gemm;
 
-class NvFp4WoqMxFp8BuildMetadataAndTransposeScales;
 class NvFp4WoqBf16BuildMetadata;
 
 namespace at::native::xpu {
@@ -92,153 +86,97 @@ int cached_device_multiprocessor_count(int device_id) {
   return thread_count;
 }
 
-// NVFP4-B x MXFP8-A: E2M1 payload for B, E4M3 for A, UE8M0 block scales for
-// both (B's are the requantization exponents produced by nvfp4_woq_prep).
-template <bool QuantizeInKLoop>
-struct NvFp4WoqTypesBase {
-  using ElementInputA = cutlass::float_e4m3_t;
-  using ElementInputB = cutlass::float_e2m1_t;
-  using ElementScale  = typename cutlass::mx_float8_t<cutlass::float_e4m3_t>::ScaleFactorType;
-  using ElementMult   = cutlass::bfloat16_t;
+// NVFP4-B x MXFP8-A grouped GEMM: see nvfp4_woq_mxfp8_mainloop.hpp.
+//
+// Tile menu (measured on CRI, see the sweep notes in the agent report).
+//
+//   m8 / m16 / m32  one 1x4 subgroup row per workgroup, SG tile SG_M x 16,
+//                   128-wide k steps.  B is converted once per subgroup, i.e.
+//                   once per SG_M rows; that is the right trade while the GEMM
+//                   is memory bound (few rows per expert).  The 16-column
+//                   subgroup keeps each subgroup's L1 working set small: with
+//                   32 subgroups per Xe-core, 64-column subgroups thrash L1 and
+//                   lose up to 4x at K = 2048.
+//   m128 / m256     4x4 subgroups of 32x64 / 64x64 sharing converted B through
+//                   a double-buffered SLM stage (split barrier per 64-wide k
+//                   step), so B is converted once per 128 / 256 rows.  Needed
+//                   once the conversion, not memory, bounds the kernel.
+//
+// GRF budget: this TU is compiled with -cl-intel-512-GRF-per-thread (see
+// src/BuildOnLinux.cmake), i.e. 4 hardware threads per EU, 32 per Xe-core.
+//
+//                                                       BM   BN SGM SGN  KT   CB PF SHARE
+using NvFp4WoqMxfp8M8Kernel   = sgl_xpu::NvFp4WoqMxfp8Kernel<  8,  64, 1, 4, 128, 512, 2>;
+using NvFp4WoqMxfp8M16Kernel  = sgl_xpu::NvFp4WoqMxfp8Kernel< 16,  64, 1, 4, 128, 512, 2>;
+using NvFp4WoqMxfp8M32Kernel  = sgl_xpu::NvFp4WoqMxfp8Kernel< 32,  64, 1, 4, 128, 512, 2>;
+using NvFp4WoqMxfp8M128Kernel = sgl_xpu::NvFp4WoqMxfp8Kernel<128, 256, 4, 4,  64,  64, 2, true>;
+using NvFp4WoqMxfp8M256Kernel = sgl_xpu::NvFp4WoqMxfp8Kernel<256, 256, 4, 4,  64,  64, 2, true>;
 
-  using ElementAccumulator     = float;
-  using ElementComputeEpilogue = float;
-  using ElementOutput          = float;
+enum class NvFp4WoqMxfp8Tile { M8, M16, M32, M128, M256 };
 
-  using LayoutA = cutlass::layout::RowMajor;
-  // B is (N, K) K-contiguous; ColumnMajor reproduces the CUTLASS example's
-  // RowMajor (K, N) access pattern without a transpose.
-  using LayoutB = cutlass::layout::ColumnMajor;
-  using LayoutC = cutlass::layout::RowMajor;
-  using LayoutD = cutlass::layout::RowMajor;
+constexpr int kNvFp4WoqThreadsPerXeCore = 32;  // 8 EUs x 4 threads at 512 GRF
 
-  // Both scale tensors are MN-major, matching the Xe block-2D scale atoms.
-  using StrideScaleA = cute::Stride<cute::_1, int64_t, int64_t>;
-  using StrideScaleB = cute::Stride<cute::_1, int64_t, int64_t>;
+/// Host-side tile choice from the flat row count only (problem_sizes stays on
+/// the device, so no D2H sync): rows / E approximates rows per active expert
+/// from above once most experts are active, and from below at decode where
+/// most are empty.  Thresholds fitted on qwen3-30b, gpt-oss-120b and dsv3-ep8
+/// (up and down projections, T = 1 .. 4096).
+NvFp4WoqMxfp8Tile select_nvfp4_woq_mxfp8_tile(int64_t total_rows, int num_groups, int k) {
+  const int64_t rows_per_group = (total_rows + num_groups - 1) / num_groups;
+  if (rows_per_group <= 8) return NvFp4WoqMxfp8Tile::M8;
+  // Long-K experts with ~17 rows prefer two 16-row tiles over one 32-row tile.
+  if (rows_per_group <= 16 || (rows_per_group <= 24 && k >= 4096)) return NvFp4WoqMxfp8Tile::M16;
+  if (rows_per_group <= 48) return NvFp4WoqMxfp8Tile::M32;
+  if (rows_per_group <= 384) return NvFp4WoqMxfp8Tile::M128;
+  return NvFp4WoqMxfp8Tile::M256;
+}
 
-  static constexpr int BlockSize     = 32;  // MXFP8 / bdpas block
-  static constexpr int MultBlockSize = 16;  // NVFP4 block
+/// Optional override for benchmarking / tests: SGLANG_NVFP4_WOQ_MXFP8_TILE in
+/// {m8, m16, m32, m128, m256}.
+bool nvfp4_woq_mxfp8_tile_override(NvFp4WoqMxfp8Tile& tile) {
+  const char* value = std::getenv("SGLANG_NVFP4_WOQ_MXFP8_TILE");
+  if (value == nullptr || value[0] == '\0') return false;
+  static const std::pair<const char*, NvFp4WoqMxfp8Tile> names[] = {
+      {"m8", NvFp4WoqMxfp8Tile::M8},     {"m16", NvFp4WoqMxfp8Tile::M16},
+      {"m32", NvFp4WoqMxfp8Tile::M32},   {"m128", NvFp4WoqMxfp8Tile::M128},
+      {"m256", NvFp4WoqMxfp8Tile::M256}};
+  for (auto const& [name, t] : names) {
+    if (std::strcmp(value, name) == 0) {
+      tile = t;
+      return true;
+    }
+  }
+  TORCH_CHECK(false, "SGLANG_NVFP4_WOQ_MXFP8_TILE must be one of m8/m16/m32/m128/m256; got '",
+              value, "'");
+  return false;
+}
 
-  // Void selects CUTLASS's block-2D auto-detection path.
-  using GmemTiledCopyA      = void;
-  using GmemTiledCopyB      = void;
-  using GmemTiledCopyScaleA = void;
-  using GmemTiledCopyScaleB = void;
-
-  // 256x256x64 with a 4x4 subgroup layout gives SG_M=64, SG_N=64, SG_K=64.
-  //
-  // SG_N must stay at 64. With SG_N=32 the block-scaled scale copy narrows to
-  // MXFP_SCALE_LOAD_2D<8, H, 32, 32> (scale_traits_num = 1), a configuration the
-  // working MXFP8 kernel never selects, and (E=4, ragged M=16, N=256, K=64)
-  // then produced a non-deterministic all-zero 32-column block — a different
-  // (expert, subgroup) on each launch. SG_N=64 is bit-exact and deterministic on
-  // the same shape. Do not narrow N without re-running that case.
-  //
-  // GRF budget. The grf_size<512> in run_large_grf below is a no-op: that SYCL
-  // property is dropped before SPIR-V, so it never reaches IGC (the sibling
-  // sub_group_size<16> does survive, as !intel_reqd_sub_group_size). The thread
-  // register file is selected by the build instead — this TU is listed in
-  // XE35_GEMM_KERNEL_PATTERNS (src/BuildOnLinux.cmake), which compiles it with
-  // -cl-intel-512-GRF-per-thread; IGC's auto-large-GRF heuristic used elsewhere
-  // only ever picks 128 or 256.
-  //
-  // At 512 GRF this mainloop no longer spills (verified in the IGC asm dump:
-  // no `.spill size`, RA drops from GRAPH_COLORING_SPILL_FF_BC_RA to
-  // GRAPH_COLORING_FF_BC_RA, and sends in the k-tile body fall 651 -> 114).
-  // Measured effect on the grouped GEMM, device time, E=2 N=1536 K=2048 M=1024:
-  // 4669 us -> 3720 us.
-  //
-  // SG_M=64 is what 512 GRF buys. The B operand is dequantized and requantized
-  // per subgroup, so that cost is paid once per SG_M rows of A: doubling SG_M
-  // halves the conversion work per MAC. At 256 GRF the 64x64 FP32 accumulator
-  // alone (256 GRFs) filled the budget, which is why every earlier attempt at
-  // SG_M=64 spilled and lost. At 512 GRF none of these variants spill, and
-  // SG_M=64 via 4x4 wins. Grouped-GEMM device time, N=1536 K=2048 unless noted:
-  //
-  //                              8x4 <256,..>   8x4 <512,..>   4x4 <256,..>
-  //                                 SG_M=32       SG_M=64        SG_M=64
-  //   E=2 m/g=512                    3719 us       3895 us      2972 us  -20%
-  //   E=2 m/g=1750                  11103        [ 7742 ]       8866     -20%
-  //   E=2 m/g=512 N=2048 K=768       1434         1597          1228     -14%
-  //   E=8 m/g=64                     7420         7711          5913     -20%
-  //   E=8 m/g=8                      7420         7707          5912     -20%
-  //
-  // 4x4 keeps BLK_M at 256; the 8x4 <512,...> column doubles it, which only pays
-  // off at large per-expert M (bracketed) and wastes most of the tile at decode
-  // sizes, where B conversion is charged for rows that do not exist.
-  //
-  // Superseded numbers, all taken at 256 GRF while spilling -- kept only so they
-  // are not re-derived as evidence against SG_M=64:
-  //   CRI simulator, E=2, N=256, K=64 (CUTLASS GPU_Clock)
-  //     SG_M=32: decode 0.0485 ms, prefill 0.0504 ms
-  //     SG_M=64: decode 0.1004 ms, prefill 0.1016 ms
-  //   IGC output: SG_M=32 12,928-byte spill / 8,171 instr
-  //               SG_M=64 19,840-byte spill / 10,434 instr
-  //   <256,256,64> 8x4  SG_M=32              29.9
-  //   <256,256,64> 4x4  SG_M=64  308 spills  33.0
-  //   <512,256,64> 8x4  SG_M=64  309 spills  41.1
-  //   <256,256,64> 8x4  + Stages=3           30.0   (within noise)
-  using TileShape    = Shape<_256, _256, _64>;
-  using ThreadLayout = cute::Layout<cute::Shape<cute::_4, cute::_4, cute::_1>,
-                                    cute::Stride<cute::_4, cute::_1, cute::_0>>;
-
-  using TiledMma = typename cute::TiledMMAHelper<
-      cute::MMA_Atom<cute::XE_BDPAS_TT<8, float, ElementInputA>>,
-      cute::Layout<TileShape>,
-      ThreadLayout>::TiledMMA;
-
-  static constexpr int PipelineStages = 2;
-  using GEMMDispatchPolicy = sgl_xpu::MainloopXeNvFp4WoqMxFp8Group<
-      PipelineStages, QuantizeInKLoop>;
-  using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeXMX16Group;
-
-  using EpilogueOp = cutlass::epilogue::fusion::LinearCombination<
-      ElementOutput, ElementComputeEpilogue, ElementAccumulator, ElementAccumulator,
-      cutlass::FloatRoundStyle::round_to_nearest>;
-  using FusionCallBacks = cutlass::epilogue::fusion::FusionCallbacks<
-      EpilogueDispatchPolicy, EpilogueOp, TileShape, decltype(cute::tile_shape(TiledMma()))>;
-
-  using CollectiveEpilogue = cutlass::epilogue::collective::CollectiveEpilogue<
-      EpilogueDispatchPolicy,
-      TileShape,
-      ElementAccumulator,
-      cutlass::gemm::TagToStrideC_t<LayoutC*>,
-      ElementOutput,
-      cutlass::gemm::TagToStrideC_t<LayoutD*>,
-      FusionCallBacks,
-      XE_2D_U32x8x16_LD_N,
-      void,
-      void,
-      XE_2D_U32x8x16_ST_N,
-      void,
-      void>;
-
-  using CollectiveMainloop = cutlass::gemm::collective::CollectiveMma<
-      GEMMDispatchPolicy,
-      TileShape,
-      cute::tuple<ElementInputA, ElementScale>,
-      cute::tuple<cutlass::gemm::TagToStrideA_t<LayoutA*>, StrideScaleA*>,
-      cute::tuple<ElementInputB, ElementScale>,
-      cute::tuple<cutlass::gemm::TagToStrideB_t<LayoutB*>, StrideScaleB*>,
-      TiledMma,
-      // cute::type_list (not cute/std::tuple) — see blockwise_moe_mxfp8.cpp.
-      cute::type_list<GmemTiledCopyA, GmemTiledCopyScaleA>,
-      void, void, cute::identity,
-      cute::type_list<GmemTiledCopyB, GmemTiledCopyScaleB>,
-      void, void, cute::identity>;
-
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
-      NvFp4GroupedProblemShape, CollectiveMainloop, CollectiveEpilogue, cutlass::gemm::GroupScheduler>;
-  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
-
-  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
-  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
-  using StrideC = typename Gemm::GemmKernel::InternalStrideC;
-  using StrideD = typename Gemm::GemmKernel::InternalStrideD;
-};
-
-using NvFp4WoqTypes = NvFp4WoqTypesBase<false>;
-using NvFp4WoqKLoopTypes = NvFp4WoqTypesBase<true>;
+template <class Kernel>
+void launch_nvfp4_woq_mxfp8(sgl_xpu::NvFp4WoqMxfp8Params const& params, sycl::queue& queue,
+                            int xe_cores) {
+  // Upper bound on the tile count without reading problem_sizes: an expert with
+  // m > 0 rows has ceil(m / BM) <= m / BM + 1 m-tiles, and at most
+  // min(E, total_m) experts are non-empty.
+  const int64_t n_tiles = (params.n + Kernel::BLK_N - 1) / Kernel::BLK_N;
+  const int64_t m_tiles_bound =
+      params.total_m / Kernel::BLK_M +
+      std::min<int64_t>(params.num_experts, params.total_m);
+  const int64_t tiles_bound = std::max<int64_t>(1, m_tiles_bound * n_tiles);
+  // Persistent grid: as many workgroups as fit at 512 GRF (no more, or the
+  // round-robin tile assignment leaves the queued ones a tail of work).
+  const int64_t wgs_per_core =
+      std::max(1, kNvFp4WoqThreadsPerXeCore / (Kernel::WG_SIZE / 16));
+  const int64_t groups = std::min<int64_t>(tiles_bound, wgs_per_core * xe_cores);
+  queue.submit([&](sycl::handler& cgh) {
+    sycl::local_accessor<uint32_t, 1> slm;
+    if constexpr (Kernel::SHARE) {
+      slm = sycl::local_accessor<uint32_t, 1>(Kernel::SLM_DWORDS, cgh);
+    }
+    cgh.parallel_for(
+        sycl::nd_range<1>(static_cast<size_t>(groups) * Kernel::WG_SIZE, Kernel::WG_SIZE),
+        Kernel{params, slm});
+  });
+}
 
 constexpr char NvFp4WoqQuantizeInKLoopEnv[] =
     "SGLANG_NVFP4_WOQ_QUANTIZE_IN_K_LOOP";
@@ -262,125 +200,6 @@ bool nvfp4_woq_quantize_in_k_loop_enabled() {
       value,
       "'");
   return false;
-}
-
-template <class GemmAdapter>
-cutlass::Status run_large_grf(
-    GemmAdapter const& gemm_op,
-    sycl::queue& queue) {
-  using Kernel = typename GemmAdapter::GemmKernel;
-  auto params = gemm_op.params();
-  compat::dim3 const block = Kernel::get_block_shape();
-  compat::dim3 const grid = Kernel::get_grid_shape(params);
-  constexpr int smem_size = Kernel::SharedStorageSize;
-
-  namespace syclex = sycl::ext::oneapi::experimental;
-  namespace intelex = sycl::ext::intel::experimental;
-  compat::experimental::launch_properties launch_props{
-      syclex::work_group_scratch_size(smem_size)};
-  compat::experimental::kernel_properties kernel_props{
-      syclex::sub_group_size<16>, intelex::grf_size<512>};
-  compat::experimental::launch_policy policy{
-      grid, block, launch_props, kernel_props};
-
-#if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  auto event = compat::experimental::launch<
-      cutlass::device_kernel<Kernel>,
-      Kernel>(policy, queue, params);
-  EventManager::getInstance().addEvent(event);
-#else
-  compat::experimental::launch<
-      cutlass::device_kernel<Kernel>,
-      Kernel,
-      false>(policy, queue, params);
-#endif
-  return cutlass::Status::kSuccess;
-}
-
-/// Launch the grouped GEMM. All pointer arrays are device-resident.
-template <class Types>
-void run_nvfp4_woq_gemm(
-    int num_groups,
-    const torch::Tensor& problem_sizes,
-    const torch::Tensor& ptr_table,
-    const torch::Tensor& cb_ptrs,
-    const torch::Tensor& cb_ld,
-    const torch::Tensor& stride_a,
-    const torch::Tensor& stride_b,
-    const torch::Tensor& stride_cd,
-    const torch::Tensor& stride_sfa,
-    const torch::Tensor& stride_sfb,
-    const torch::Tensor& workspace,
-    at::Device device) {
-  using Gemm = typename Types::Gemm;
-  using GemmKernel = typename Types::GemmKernel;
-  auto row = [&](int i) { return ptr_table[i].data_ptr(); };
-
-  cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = static_cast<int>(device.index());
-  hw_info.sm_count = cached_device_multiprocessor_count(hw_info.device_id);
-
-  auto stream = at::xpu::getCurrentXPUStream(device.index());
-  sycl::queue& queue = stream.queue();
-
-  typename Gemm::Arguments arguments;
-  decltype(arguments.epilogue.thread) fusion_args;
-  fusion_args.alpha = 1.0f;
-  fusion_args.beta = 0.0f;
-  fusion_args.alpha_ptr = nullptr;
-  fusion_args.beta_ptr = nullptr;
-  fusion_args.alpha_ptr_array = nullptr;
-  fusion_args.beta_ptr_array = nullptr;
-  fusion_args.dAlpha = {cute::_0{}, cute::_0{}, 0};
-  fusion_args.dBeta = {cute::_0{}, cute::_0{}, 0};
-
-  using RasterOrderOptions = typename cutlass::gemm::kernel::detail::
-      PersistentTileSchedulerXeGroup<NvFp4GroupedProblemShape>::RasterOrderOptions;
-
-  using ElementInputA = typename Types::ElementInputA;
-  using ElementInputB = typename Types::ElementInputB;
-  using ElementScale = typename Types::ElementScale;
-  using ElementMult = typename Types::ElementMult;
-  using ElementOutput = typename Types::ElementOutput;
-
-  typename GemmKernel::Arguments gemm_args{
-      cutlass::gemm::GemmUniversalMode::kGrouped,
-      typename GemmKernel::ProblemShape{
-          num_groups,
-          reinterpret_cast<NvFp4UnderlyingProblemShapeType*>(problem_sizes.data_ptr<int32_t>()),
-          nullptr},
-      typename GemmKernel::MainloopArguments{
-          reinterpret_cast<ElementInputA const**>(row(0)),
-          reinterpret_cast<typename Types::StrideA*>(stride_a.data_ptr<int64_t>()),
-          reinterpret_cast<ElementInputB const**>(row(1)),
-          reinterpret_cast<typename Types::StrideB*>(stride_b.data_ptr<int64_t>()),
-          reinterpret_cast<ElementScale const**>(row(3)),
-          reinterpret_cast<typename Types::StrideScaleA*>(stride_sfa.data_ptr<int64_t>()),
-          reinterpret_cast<ElementScale const**>(row(4)),
-          reinterpret_cast<typename Types::StrideScaleB*>(stride_sfb.data_ptr<int64_t>()),
-          reinterpret_cast<ElementMult const**>(cb_ptrs.data_ptr()),
-          cb_ld.data_ptr<int64_t>()},
-      typename GemmKernel::EpilogueArguments{
-          fusion_args,
-          reinterpret_cast<ElementOutput const**>(row(2)),
-          reinterpret_cast<typename Types::StrideC*>(stride_cd.data_ptr<int64_t>()),
-          reinterpret_cast<ElementOutput**>(row(2)),
-          reinterpret_cast<typename Types::StrideD*>(stride_cd.data_ptr<int64_t>())},
-      hw_info,
-      typename GemmKernel::TileSchedulerArguments{1, RasterOrderOptions::AlongN}};
-
-  Gemm gemm_op;
-  // can_implement is intentionally skipped: it dereferences the host
-  // problem-shape pointer (we pass nullptr to keep dispatch async) and rejects
-  // M == 0 groups, which MoE decode produces constantly and the Xe group tile
-  // scheduler already skips. Same rationale as blockwise_moe_runner.hpp.
-  size_t workspace_size = Gemm::get_workspace_size(gemm_args);
-  TORCH_CHECK(static_cast<size_t>(workspace.numel()) >= workspace_size,
-              "nvfp4_woq_mxfp8_scaled_grouped_mm: workspace insufficient, need ", workspace_size, " bytes");
-  TORCH_CHECK(gemm_op.initialize(gemm_args, workspace.data_ptr()) == cutlass::Status::kSuccess,
-              "nvfp4_woq_mxfp8_scaled_grouped_mm: failed to initialize");
-  TORCH_CHECK(run_large_grf(gemm_op, queue) == cutlass::Status::kSuccess,
-              "nvfp4_woq_mxfp8_scaled_grouped_mm: failed to run");
 }
 
 // NVFP4-B x BF16-A: B is converted and scaled to BF16 in registers, then a
@@ -608,10 +427,9 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
     const torch::Tensor& problem_sizes,
     const torch::Tensor& expert_offsets,
     const torch::Tensor& workspace) {
-  using Types = at::native::xpu::NvFp4WoqTypes;
-  constexpr int BS = Types::BlockSize;
-  constexpr int MBS = Types::MultBlockSize;
-  constexpr int BLK_K = cute::get<2>(Types::TileShape{});
+  constexpr int BS = 32;   // MXFP8 / bdpas block
+  constexpr int MBS = 16;  // NVFP4 block
+  constexpr int BLK_K = 64;
 
   TORCH_CHECK(a.device().is_xpu(), "nvfp4_woq: A must be on XPU");
   const auto device = a.device();
@@ -676,140 +494,60 @@ void nvfp4_woq_mxfp8_scaled_grouped_mm(
               "64-byte aligned for the Xe block-2D load; got N=", N, " K=", K,
               " (per-expert stride ", sfmx_b.stride(0), " bytes)");
 
-  auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
-  auto opts_u8 = torch::TensorOptions().dtype(torch::kUInt8).device(device);
-
-  // Keep one scale-major scratch surface for all routed rows. Each expert gets
-  // an aligned row offset within that surface; the extra 64 rows per expert
-  // make those offsets non-overlapping without a D->H scan of problem_sizes.
-  // This bounds scratch by O((sum_m + E) * K/32), rather than O(E * sum_m *
-  // K/32), while keeping dispatch asynchronous.
   const int64_t total_m = a.size(0);
   TORCH_CHECK(total_m > 0, "nvfp4_woq: flat A must have at least one row");
-  constexpr int scale_align = 64;
-  const int64_t padded_total_m =
-      (total_m + static_cast<int64_t>(E + 1) * scale_align +
-       scale_align - 1) &
-      ~static_cast<int64_t>(scale_align - 1);
+  TORCH_CHECK(output.size(0) == total_m && scales_a.size(0) == total_m,
+              "nvfp4_woq: A, scales_a and output flat row counts must match");
+  TORCH_CHECK(total_m < (int64_t{1} << 24) && static_cast<int64_t>(E) * N < (int64_t{1} << 24),
+              "nvfp4_woq: row counts exceed the Xe block-2D surface height limit");
+  (void)workspace;
 
-  auto ptr_table = torch::empty({5, E}, opts_i64);
-  auto cb_ptrs = torch::empty({E}, opts_i64);
-  auto cb_ld = torch::empty({E}, opts_i64);
-  auto stride_a = torch::empty({E}, opts_i64);
-  auto stride_b = torch::empty({E}, opts_i64);
-  auto stride_cd = torch::empty({E}, opts_i64);
-  auto stride_sfa = torch::empty({E, 2}, opts_i64);
-  auto stride_sfb = torch::empty({E, 2}, opts_i64);
-  auto scales_a_t = torch::empty({scale_k, padded_total_m}, opts_u8);
+  sgl_xpu::NvFp4WoqMxfp8Params params{
+      problem_sizes.data_ptr<int32_t>(),
+      expert_offsets.data_ptr<int32_t>(),
+      reinterpret_cast<const uint8_t*>(a.data_ptr()),
+      scales_a.data_ptr<uint8_t>(),
+      b.data_ptr<uint8_t>(),
+      sfmx_b.data_ptr<uint8_t>(),
+      reinterpret_cast<const uint8_t*>(c_b.data_ptr()),
+      output.data_ptr<float>(),
+      E,
+      N,
+      K,
+      static_cast<int>(total_m)};
 
-  const int32_t* problem_sizes_ptr = problem_sizes.data_ptr<int32_t>();
-  const int32_t* expert_offsets_ptr = expert_offsets.data_ptr<int32_t>();
-  const uint8_t* scales_a_ptr = scales_a.data_ptr<uint8_t>();
-  uint8_t* scales_a_t_ptr = scales_a_t.data_ptr<uint8_t>();
-  int64_t* ptrs = ptr_table.data_ptr<int64_t>();
-  int64_t* cb_ptrs_ptr = cb_ptrs.data_ptr<int64_t>();
-  int64_t* cb_ld_ptr = cb_ld.data_ptr<int64_t>();
-  int64_t* stride_a_ptr = stride_a.data_ptr<int64_t>();
-  int64_t* stride_b_ptr = stride_b.data_ptr<int64_t>();
-  int64_t* stride_cd_ptr = stride_cd.data_ptr<int64_t>();
-  int64_t* stride_sfa_ptr = stride_sfa.data_ptr<int64_t>();
-  int64_t* stride_sfb_ptr = stride_sfb.data_ptr<int64_t>();
-  const int64_t a_base = reinterpret_cast<int64_t>(a.data_ptr());
-  const int64_t b_base = reinterpret_cast<int64_t>(b.data_ptr());
-  const int64_t out_base = reinterpret_cast<int64_t>(output.data_ptr());
-  const int64_t scale_a_base = reinterpret_cast<int64_t>(scales_a_t.data_ptr());
-  const int64_t scale_b_base = reinterpret_cast<int64_t>(sfmx_b.data_ptr());
-  const int64_t cb_base = reinterpret_cast<int64_t>(c_b.data_ptr());
-  const int64_t b_expert_bytes = b.stride(0) * b.element_size();
-  const int64_t scale_b_expert_bytes = sfmx_b.stride(0);
-  const int64_t cb_expert_bytes = c_b.stride(0) * c_b.element_size();
-  const int64_t scales_a_row_stride = scales_a.stride(0);
-  const int64_t cb_ld_value = c_b.stride(1);
+  // The lane-local kernel converts each K=32 MMA step right before its bdpas,
+  // so the legacy "quantize in k loop" switch selects the same kernel; it is
+  // still parsed so that invalid values keep failing loudly.
+  (void)at::native::xpu::nvfp4_woq_quantize_in_k_loop_enabled();
 
-  auto& q = at::xpu::getCurrentXPUStream(device.index()).queue();
-  q.submit([&](sycl::handler& cgh) {
-    cgh.parallel_for<NvFp4WoqMxFp8BuildMetadataAndTransposeScales>(
-        sycl::range<2>(
-            static_cast<size_t>(E), static_cast<size_t>(64)),
-        [=](sycl::id<2> id) {
-          const int e = static_cast<int>(id[0]);
-          const int lane = static_cast<int>(id[1]);
-          const int64_t ei = static_cast<int64_t>(e);
-          const int64_t row_offset = static_cast<int64_t>(expert_offsets_ptr[e]);
-          // align_up(row_offset, 64) + e*64 leaves enough room for the
-          // preceding expert's rounded-up tail and keeps every block-2D scale
-          // surface base 64-byte aligned.
-          const int64_t scale_row_offset =
-              ((row_offset + 63) & ~static_cast<int64_t>(63)) + ei * 64;
-
-          if (lane == 0) {
-            ptrs[0 * E + e] = a_base + row_offset * K;
-            ptrs[1 * E + e] = b_base + ei * b_expert_bytes;
-            ptrs[2 * E + e] =
-                out_base + row_offset * N * static_cast<int64_t>(sizeof(float));
-            ptrs[3 * E + e] =
-                scale_a_base + scale_row_offset;
-            ptrs[4 * E + e] =
-                scale_b_base + ei * scale_b_expert_bytes;
-            cb_ptrs_ptr[e] = cb_base + ei * cb_expert_bytes;
-            cb_ld_ptr[e] = cb_ld_value;
-            stride_a_ptr[e] = K;
-            stride_b_ptr[e] = K;
-            stride_cd_ptr[e] = N;
-            stride_sfa_ptr[2 * e] = padded_total_m;
-            stride_sfa_ptr[2 * e + 1] = 0;
-            stride_sfb_ptr[2 * e] = N;
-            stride_sfb_ptr[2 * e + 1] = 0;
-          }
-
-          const int expert_m = problem_sizes_ptr[e * 3];
-          const int padded_expert_m = (expert_m + 63) & ~63;
-          for (int row = lane; row < padded_expert_m; row += 64) {
-            const bool live_row = row < expert_m;
-            const int64_t src =
-                (row_offset + row) * scales_a_row_stride;
-            for (int s = 0; s < scale_k; ++s) {
-              scales_a_t_ptr[
-                  scale_row_offset +
-                  static_cast<int64_t>(s) * padded_total_m + row] =
-                  live_row ? scales_a_ptr[src + s] : 0;
-            }
-          }
-        });
-  });
-  // Order the preparation writes before the direct CUTLASS submission.
-  q.ext_oneapi_submit_barrier();
-
-  if (at::native::xpu::nvfp4_woq_quantize_in_k_loop_enabled()) {
-    at::native::xpu::run_nvfp4_woq_gemm<
-        at::native::xpu::NvFp4WoqKLoopTypes>(
-        E,
-        problem_sizes,
-        ptr_table,
-        cb_ptrs,
-        cb_ld,
-        stride_a,
-        stride_b,
-        stride_cd,
-        stride_sfa,
-        stride_sfb,
-        workspace,
-        device);
-  } else {
-    at::native::xpu::run_nvfp4_woq_gemm<
-        at::native::xpu::NvFp4WoqTypes>(
-        E,
-        problem_sizes,
-        ptr_table,
-        cb_ptrs,
-        cb_ld,
-        stride_a,
-        stride_b,
-        stride_cd,
-        stride_sfa,
-        stride_sfb,
-        workspace,
-        device);
+  auto tile = at::native::xpu::select_nvfp4_woq_mxfp8_tile(total_m, E, K);
+  at::native::xpu::nvfp4_woq_mxfp8_tile_override(tile);
+  auto& queue = at::xpu::getCurrentXPUStream(device.index()).queue();
+  const int xe_cores =
+      at::native::xpu::cached_device_multiprocessor_count(static_cast<int>(device.index()));
+  using at::native::xpu::NvFp4WoqMxfp8Tile;
+  switch (tile) {
+    case NvFp4WoqMxfp8Tile::M8:
+      at::native::xpu::launch_nvfp4_woq_mxfp8<at::native::xpu::NvFp4WoqMxfp8M8Kernel>(
+          params, queue, xe_cores);
+      break;
+    case NvFp4WoqMxfp8Tile::M16:
+      at::native::xpu::launch_nvfp4_woq_mxfp8<at::native::xpu::NvFp4WoqMxfp8M16Kernel>(
+          params, queue, xe_cores);
+      break;
+    case NvFp4WoqMxfp8Tile::M32:
+      at::native::xpu::launch_nvfp4_woq_mxfp8<at::native::xpu::NvFp4WoqMxfp8M32Kernel>(
+          params, queue, xe_cores);
+      break;
+    case NvFp4WoqMxfp8Tile::M128:
+      at::native::xpu::launch_nvfp4_woq_mxfp8<at::native::xpu::NvFp4WoqMxfp8M128Kernel>(
+          params, queue, xe_cores);
+      break;
+    case NvFp4WoqMxfp8Tile::M256:
+      at::native::xpu::launch_nvfp4_woq_mxfp8<at::native::xpu::NvFp4WoqMxfp8M256Kernel>(
+          params, queue, xe_cores);
+      break;
   }
 }
 

@@ -72,8 +72,11 @@ def nvfp4_woq_mxfp8_scaled_grouped_mm(
 ) -> None:
     """Fused NVFP4 weight-only-quantized MXFP8 grouped GEMM (Xe3P / CRI only).
 
-    B stays NVFP4 in memory; the mainloop dequantizes it to BF16 and
-    requantizes to MXFP8 in registers, then runs a normal MXFP8 ``bdpas``.
+    B stays NVFP4 in memory; the kernel requantizes it to MXFP8 in registers
+    (w = e4m3_rne(c * e2m1), bit-exact with host requantization) and runs a
+    normal MXFP8 ``bdpas``.  The tile variant is chosen on the host from
+    ``a.shape[0] / E`` (no device sync); ``SGLANG_NVFP4_WOQ_MXFP8_TILE`` in
+    {m8, m16, m32, m128, m256} overrides it for benchmarking.
 
     Args:
         output: (sum_m, N) float32, ragged over experts. Zero-initialized.
@@ -84,7 +87,8 @@ def nvfp4_woq_mxfp8_scaled_grouped_mm(
         c_b: (E, N, K/16) bfloat16 per-16 multiplier — from :func:`nvfp4_woq_prep`.
         problem_sizes: (E, 3) int32 per-expert (M, N, K).
         expert_offsets: (E,) int32 cumulative row starts into the flat A/output.
-        workspace: uint8 scratch for the grouped GEMM.
+        workspace: uint8 scratch; unused by the current kernel, kept for API
+            compatibility.
 
     Shape constraints (checked in C++): ``K`` must be a multiple of the 64-wide
     workgroup K tile, and ``N * (K // 32)`` must be a multiple of 64 so that each

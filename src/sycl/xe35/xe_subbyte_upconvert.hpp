@@ -3,367 +3,252 @@
  * SPDX-License-Identifier: Apache-2.0
  **************************************************************************************************/
 /*! \file
-    \brief Sub-byte -> wider-type subgroup fragment conversion for Xe, with
-           optional relayout and a fused per-element scale.
+    \brief Lane-local register primitives for the Xe3P NVFP4 -> MXFP8 WoQ mainloop.
 
-    Why this exists: `cute::reorder` cannot upconvert a sub-byte fragment. For an
-    E2M1 (or INT4) source whose relayout isn't classified UU / UV / VU /
-    VV-with-atom, `ReorderDispatchConvertRelayout` re-enters the same
-    instantiation — it picks `NewSrcType = upcast_subbyte_t<E2M1> = half_t` and
-    recurses on the identical `(E2M1 -> half, same layout)` call — and the SYCL
-    front end rejects it with
+    Register layout facts these primitives are built on.
 
-        reorder.hpp:385: error: SYCL kernel cannot call a recursive function
+    A SIMT work-item value of a 32-bit type maps 1:1 onto a hardware lane:
+    element w of a per-lane `uint` vector lives in GRF w, dword lane t.  8/16-bit
+    SIMT vectors do NOT (they are stored structure-of-arrays, value v of lane t
+    at byte 16*v + t), which is what made the old byte-fragment conversion pay
+    thousands of cross-lane movs.  Everything here therefore moves 32-bit lane
+    arrays between inline-vISA statements and only reinterprets them as bytes /
+    halves *inside* vISA, where the physical layout is explicit.
 
-    The asymmetry is deliberate upstream: sycl-tla ships optimized `Xe_Reorder`
-    atoms only for the *quantize* direction (bf16/half -> E2M1/INT4, see
-    cute/arch/reorder_xe35.hpp); dequantize falls back to the generic UU path,
-    which only covers relayouts that are already unit-stride.
+    * DPAS/BDPAS B operand (8-bit, K=32 per atom): 8 GRFs; GRF w, lane n holds
+      the four bytes B[k = 4w .. 4w+3][n] (lowest k in the lowest byte).
+    * Packed NVFP4 B is (N, K/2) K-contiguous.  A transposed d32 block-2D load
+      of H=16 rows x W=8 dwords puts row n in lane n with GRF j = packed dword j,
+      i.e. nibbles k = 8j .. 8j+7 of column n (low nibble = even k).
+    * Hence each lane converts *its own* column; no data crosses lanes.
 
-    Adding an `Xe_Reorder<Generic, ...>` specialization would not fix it: the
-    atom-based `reorder_impl` assumes a register-to-register mapping with no
-    permutation, so it is only sound for UU-class relayouts. The fix instead
-    splits the job along the line where each half *is* well supported:
+    Per input dword j (8 nibbles of one column, 128 values per subgroup):
+      4 x shfl_idx4 (16 lanes)  E2M1 byte -> fp16 pair, LUT shuffle
+      4 x mul (32 x hf)         times the per-16 multiplier c (exact in fp16)
+      4 x fcvt (32 x hf->hf8)   RNE, written with a byte stride of 4 straight
+                                into the B-operand dwords
+    = 12 instructions / 128 values.  The bytes of output dword w = 2j' (k0..k3)
+    and 2j'+1 (k4..k7) come from the decoded pairs of input bytes {0,1} and
+    {2,3}; pairing byte 0 with byte 2 (and 1 with 3) in adjacent GRFs lets one
+    32-wide fcvt with dst stride 4 fill the same byte slot of both dwords.
 
-      1. the type conversion is index-preserving (a 4-bit copy fragment already
-         describes work-item ownership at element granularity), so do it here;
-      2. what remains is a same-type relayout, which `cute::reorder` handles.
-
-    When the two fragments already share a TV layout, step 2 drops out.  The
-    NVFP4 MMA-B pairing cannot share a layout: each loaded byte belongs to one
-    lane, while its two nibbles belong to different MMA lanes.  Its fallback is
-    therefore a fused subgroup gather that converts and scales directly into
-    MMA-B, without allocating a wider staging fragment.
-
-    Conversion goes through FP32.  The relayout path decodes E2M1 directly to
-    binary16 bits and uses Xe's packed half-to-E4M3 builtin after the multiply,
-    avoiding the large scalar conversion expansion produced by the generic
-    CUTLASS types.
+    Exactness: E2M1 has 2 significant bits and c (BF16) 8, so c*e2m1 is exact
+    in binary16 (|c*e2m1| <= 448 by prep construction).  Products below the
+    binary16 normal range are below half the smallest E4M3 subnormal, so they
+    round to zero either way, and the subsequent fcvt is the same RNE the host
+    reference applies.  No saturation/inf/nan fixups are needed: values are
+    finite and in range by construction.
 */
 
 #pragma once
 
 // clang-format off
+#include <cstdint>
 #include <sycl/sycl.hpp>
-#include <sycl/ext/oneapi/experimental/float_8bit/types.hpp>
-#include <sycl/ext/oneapi/experimental/float_4bit/types.hpp>
 
-#include <cute/tensor.hpp>
-#include <cute/algorithm/reorder.hpp>
+#include <cute/util/sycl_vec.hpp>
+#include <cute/atom/copy_traits_xe_2d.hpp>
 
-#include "cutlass/array.h"
-#include "cutlass/numeric_conversion.h"
+#include "cutlass/cutlass.h"
 
-namespace sgl_xpu {
+namespace sgl_xpu::xe {
 
-using namespace cute;
+using u32 = uint32_t;
+using cute::intel::uint2;
+using cute::intel::uint4;
+using cute::intel::uint8;
+using cute::intel::float8;
+template <int N>
+using uintv = cute::intel::vector_t<u32, N>;
 
-/// Identity scale: leaves the converted value untouched.
-struct NoScale {
-  CUTLASS_DEVICE float operator()(int) const { return 1.0f; }
+/// fp16(e2m1(i)) replicated in both halves of the dword; lane i of the LUT GRF.
+CUTLASS_DEVICE u32 e2m1_fp16x2_lut_entry(int i) {
+  const u32 e = (static_cast<u32>(i) >> 1) & 3u;
+  const u32 m = static_cast<u32>(i) & 1u;
+  const u32 s = (static_cast<u32>(i) >> 3) & 1u;
+  const u32 mag = e == 0 ? (m ? 0x3800u : 0u) : (((e + 14u) << 10) | (m << 9));
+  const u32 h = (s << 15) | mag;
+  return h | (h << 16);
+}
+
+// ---------------------------------------------------------------------------
+// Block-2D payloads
+// ---------------------------------------------------------------------------
+
+/// A block-2D address payload.  `x` is in elements of the message data size
+/// (bytes for d8, dwords for d32); width and pitch are always bytes.
+struct Block2D {
+  int* payload;
+
+  CUTLASS_DEVICE void init(const void* base, uint32_t width_bytes, uint32_t height,
+                           uint32_t pitch_bytes, int block_w, int block_h, int blocks) {
+#ifdef __SYCL_DEVICE_ONLY__
+    payload = __builtin_IB_subgroup_createBlock2DAddressPayload(
+        reinterpret_cast<long>(base), static_cast<int>(width_bytes) - 1,
+        static_cast<int>(height) - 1, static_cast<int>(pitch_bytes) - 1, 0, 0,
+        block_w, block_h, blocks);
+#endif
+  }
+  CUTLASS_DEVICE void set_xy(int x, int y) const {
+#ifdef __SYCL_DEVICE_ONLY__
+    __builtin_IB_subgroup_setBlock2DAddressPayloadBlockX(payload, x);
+    __builtin_IB_subgroup_setBlock2DAddressPayloadBlockY(payload, y);
+#endif
+  }
+  CUTLASS_DEVICE void set_x(int x) const {
+#ifdef __SYCL_DEVICE_ONLY__
+    __builtin_IB_subgroup_setBlock2DAddressPayloadBlockX(payload, x);
+#endif
+  }
+  CUTLASS_DEVICE void set_y(int y) const {
+#ifdef __SYCL_DEVICE_ONLY__
+    __builtin_IB_subgroup_setBlock2DAddressPayloadBlockY(payload, y);
+#endif
+  }
 };
 
-namespace detail {
+#ifdef __SYCL_DEVICE_ONLY__
+#define SGL_XE_ASM asm volatile
+#define SGL_XE_ASM_PURE asm
+#endif
 
-/// Convert `Count` sub-byte elements starting at `base` into `dst`, scaling each
-/// by `scale(base + j)`. Src storage is assumed contiguous in the fragment's
-/// flat index, which holds for the compact register fragments cute builds.
-template <int Chunk, class Src, class Dst, class Scale>
-CUTLASS_DEVICE void
-convert_chunked(Src const& src, Dst& dst, Scale const& scale) {
-  using SrcType = typename Src::value_type;
-  using DstType = typename Dst::value_type;
-  constexpr int kSize = cute::size_v<typename Src::layout_type>;
-  static_assert(kSize == cute::size_v<typename Dst::layout_type>,
-                "Source and destination fragments must hold the same element count");
-  static_assert(kSize % Chunk == 0, "Fragment size must be a whole number of chunks");
-
-  using SrcArray = cutlass::Array<SrcType, Chunk>;
-  using MidArray = cutlass::Array<float, Chunk>;
-  using DstArray = cutlass::Array<DstType, Chunk>;
-  cutlass::NumericArrayConverter<float, SrcType, Chunk> to_float;
-  cutlass::NumericArrayConverter<DstType, float, Chunk> from_float;
-
-  auto const* src_raw = reinterpret_cast<SrcArray const*>(raw_pointer_cast(src.data()));
-  auto* dst_raw = reinterpret_cast<DstArray*>(raw_pointer_cast(dst.data()));
-
-  CUTLASS_PRAGMA_UNROLL
-  for (int c = 0; c < kSize / Chunk; ++c) {
-    MidArray mid = to_float(src_raw[c]);
-    CUTLASS_PRAGMA_UNROLL
-    for (int j = 0; j < Chunk; ++j) {
-      mid[j] *= scale(c * Chunk + j);
-    }
-    dst_raw[c] = from_float(mid);
-  }
+/// d32 transposed load, W dwords x H rows at (x + DX, y + DY);
+/// lane n <- row (y + DY + n), GRF j <- dword (x + DX + j).
+template <int W, int H, int DY = 0, int DX = 0, class T>
+CUTLASS_DEVICE void load_d32_t(Block2D const& p, T& dst) {
+  static_assert(int(sizeof(T)) * 16 == W * H * 4, "destination size must match the block");
+#ifdef __SYCL_DEVICE_ONLY__
+  SGL_XE_ASM("lsc_load_block2d.ugm.ca.ca.uc (M1, 1)  %0:d32.%2x%3tn flat[%1+(%5,%4)]"
+             : "=rw"(dst)
+             : "rw.u"(p.payload), "P"(W), "P"(H), "P"(DY), "P"(DX));
+#endif
 }
 
-/// Compress eight selected nibbles from byte lanes into one packed E2M1 word.
-CUTLASS_DEVICE uint32_t
-pack_selected_nibbles(uint64_t bytes, int nibble_shift) {
-  uint64_t x = (bytes >> nibble_shift) & 0x0f0f0f0f0f0f0f0full;
-  x = (x | (x >> 4)) & 0x00ff00ff00ff00ffull;
-  x = (x | (x >> 8)) & 0x0000ffff0000ffffull;
-  return static_cast<uint32_t>(x | (x >> 16));
+/// d8 load, `Count` blocks of BW bytes x H rows at (x + DX, y + DY), row-major per block.
+template <int Count, int BW, int H, int DY = 0, int DX = 0, class T>
+CUTLASS_DEVICE void load_d8(Block2D const& p, T& dst) {
+#ifdef __SYCL_DEVICE_ONLY__
+  SGL_XE_ASM("lsc_load_block2d.ugm.ca.ca.uc (M1, 1)  %0:d8.%2x%3x%4nn flat[%1+(%6,%5)]"
+             : "=rw"(dst)
+             : "rw.u"(p.payload), "P"(Count), "P"(BW), "P"(H), "P"(DY), "P"(DX));
+#endif
 }
+
+/// d32 store of one 8x16 fp32 accumulator (GRF r = row r, lane n = column n),
+/// at (x + DX, y + DY) in dwords / rows.  Out-of-surface rows/columns are dropped.
+template <int DX, int DY>
+CUTLASS_DEVICE void store_d32_16x8(Block2D const& p, float8 const& src) {
+#ifdef __SYCL_DEVICE_ONLY__
+  SGL_XE_ASM("lsc_store_block2d.ugm (M1, 1)  flat[%1+(%2,%3)]  %0:d32.16x8nn"
+             :: "rw"(src), "rw.u"(p.payload), "P"(DX), "P"(DY));
+#endif
+}
+
+/// Prefetch (no destination) at the payload's (x + DX, y + DY).
+template <int Bits, int W, int H, int DY = 0, int DX = 0>
+CUTLASS_DEVICE void prefetch_2d(Block2D const& p) {
+#ifdef __SYCL_DEVICE_ONLY__
+  SGL_XE_ASM("lsc_load_block2d.ugm.ca.ca.uc (M1, 1)  %%null:d%1.%2x%3nn flat[%0+(%5,%4)]"
+             :: "rw.u"(p.payload), "P"(Bits), "P"(W), "P"(H), "P"(DY), "P"(DX));
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// NVFP4 column -> E4M3 bdpas B operand (one K=32 atom of one 16-column slice)
+// ---------------------------------------------------------------------------
 
 #ifdef __SYCL_DEVICE_ONLY__
-CUTLASS_DEVICE sycl::detail::float16_vec2
-mul_fp16x2_visa(
-    sycl::detail::float16_vec2 values,
-    sycl::detail::float16_vec2 scales) {
-  uint32_t value_bits = sycl::bit_cast<uint32_t>(values);
-  uint32_t scale_bits = sycl::bit_cast<uint32_t>(scales);
-  asm volatile(
+// One packed input dword (operand %R = its GRF row in RAW) -> output dwords W, W+1.
+#define SGL_NVFP4_J(J, R, CH, W)                                                             \
+  "shfl_idx4 (M1_NM, 16) HA" #J ".0  LUT_UD(0,0)<1;1,0> RAW_UB(%" #R ",0)<4;1,0>\n"          \
+  "shfl_idx4 (M1_NM, 16) HA" #J ".64 LUT_UD(0,0)<1;1,0> RAW_UB(%" #R ",2)<4;1,0>\n"          \
+  "shfl_idx4 (M1_NM, 16) HB" #J ".0  LUT_UD(0,0)<1;1,0> RAW_UB(%" #R ",1)<4;1,0>\n"          \
+  "shfl_idx4 (M1_NM, 16) HB" #J ".64 LUT_UD(0,0)<1;1,0> RAW_UB(%" #R ",3)<4;1,0>\n"          \
+  "mul (M1_NM, 32) HA" #J "_HF(0,0)<1> HA" #J "_HF(0,0)<1;1,0> CH(" #CH ",0)<1;1,0>\n"       \
+  "mul (M1_NM, 32) HA" #J "_HF(1,0)<1> HA" #J "_HF(1,0)<1;1,0> CH(" #CH ",0)<1;1,0>\n"       \
+  "mul (M1_NM, 32) HB" #J "_HF(0,0)<1> HB" #J "_HF(0,0)<1;1,0> CH(" #CH ",0)<1;1,0>\n"       \
+  "mul (M1_NM, 32) HB" #J "_HF(1,0)<1> HB" #J "_HF(1,0)<1;1,0> CH(" #CH ",0)<1;1,0>\n"       \
+  "fcvt (M1_NM, 32) OUT_B(" #W ",0)<4> HA" #J "_HF(0,0)<2;1,0>\n"                            \
+  "fcvt (M1_NM, 32) OUT_B(" #W ",1)<4> HA" #J "_HF(0,1)<2;1,0>\n"                            \
+  "fcvt (M1_NM, 32) OUT_B(" #W ",2)<4> HB" #J "_HF(0,0)<2;1,0>\n"                            \
+  "fcvt (M1_NM, 32) OUT_B(" #W ",3)<4> HB" #J "_HF(0,1)<2;1,0>\n"
+
+#define SGL_NVFP4_DECL_J(J)                                                                  \
+  ".decl HA" #J " v_type=G type=UD num_elts=32 align=GRF\n"                                  \
+  ".decl HB" #J " v_type=G type=UD num_elts=32 align=GRF\n"                                  \
+  ".decl HA" #J "_HF v_type=G type=HF num_elts=64 alias=<HA" #J ",0>\n"                      \
+  ".decl HB" #J "_HF v_type=G type=HF num_elts=64 alias=<HB" #J ",0>\n"
+#endif
+
+/// Decode/scale/requantize dwords 4*KK .. 4*KK+3 of a transposed packed-B load.
+///
+///   raw : uintv<8|16> per lane, GRF j lane n = packed dword j of column n
+///   cc  : uintv<*> per lane; GRF CROW lane n = bf16 (c[n][2a], c[n][2a+1]),
+///         the two 16-block multipliers of this K=32 atom
+///   lut : uint per lane (1 GRF), lane i = e2m1_fp16x2_lut_entry(i)
+///   ret : uint8 per lane (8 GRFs) = E4M3 bdpas B operand for the atom
+template <int KK, int CROW, class RawV, class CcV>
+CUTLASS_DEVICE uint8 nvfp4_to_e4m3_atom(RawV const& raw, CcV const& cc, u32 lut) {
+  static_assert(int(sizeof(RawV)) >= 16 * (KK + 1), "raw too small for this atom");
+  static_assert(int(sizeof(CcV)) >= 4 * (CROW + 1), "cc too small for this atom");
+  uint8 out;
+#ifdef __SYCL_DEVICE_ONLY__
+  SGL_XE_ASM_PURE(
       "{\n"
-      ".decl VALUE_HF v_type=G type=HF num_elts=32 alias=<%0,0>\n"
-      ".decl SCALE_HF v_type=G type=HF num_elts=32 alias=<%1,0>\n"
-      "mul (M1_NM, 32) VALUE_HF(0,0)<1> "
-      "VALUE_HF(0,0)<1;1,0> SCALE_HF(0,0)<1;1,0>\n"
+      ".decl RAW_UB v_type=G type=UB num_elts=%9 alias=<%1,0>\n"
+      ".decl CC_BF v_type=G type=BF num_elts=%10 alias=<%2,0>\n"
+      ".decl LUT_UD v_type=G type=UD num_elts=16 alias=<%3,0>\n"
+      ".decl OUT_B v_type=G type=B num_elts=512 alias=<%0,0>\n"
+      ".decl TF0 v_type=G type=F num_elts=16 align=GRF\n"
+      ".decl TF1 v_type=G type=F num_elts=16 align=GRF\n"
+      ".decl CH v_type=G type=HF num_elts=64 align=GRF\n"
+      SGL_NVFP4_DECL_J(0) SGL_NVFP4_DECL_J(1) SGL_NVFP4_DECL_J(2) SGL_NVFP4_DECL_J(3)
+      // c for the two 16-blocks of this atom, bf16 -> f32 -> fp16, replicated
+      // into both halves of each lane's dword.
+      "mov (M1_NM, 16) TF0(0,0)<1> CC_BF(%4,0)<2;1,0>\n"
+      "mov (M1_NM, 16) TF1(0,0)<1> CC_BF(%4,1)<2;1,0>\n"
+      "mov (M1_NM, 16) CH(0,0)<2> TF0(0,0)<1;1,0>\n"
+      "mov (M1_NM, 16) CH(0,1)<2> TF0(0,0)<1;1,0>\n"
+      "mov (M1_NM, 16) CH(1,0)<2> TF1(0,0)<1;1,0>\n"
+      "mov (M1_NM, 16) CH(1,1)<2> TF1(0,0)<1;1,0>\n"
+      SGL_NVFP4_J(0, 5, 0, 0)
+      SGL_NVFP4_J(1, 6, 0, 2)
+      SGL_NVFP4_J(2, 7, 1, 4)
+      SGL_NVFP4_J(3, 8, 1, 6)
       "}\n"
-      : "+rw"(value_bits)
-      : "rw"(scale_bits));
-  return sycl::bit_cast<sycl::detail::float16_vec2>(value_bits);
-}
+      : "=rw"(out)
+      : "rw"(raw), "rw"(cc), "rw"(lut), "P"(CROW), "P"(4 * KK + 0), "P"(4 * KK + 1),
+        "P"(4 * KK + 2), "P"(4 * KK + 3), "P"(int(sizeof(RawV)) * 16),
+        "P"(int(sizeof(CcV)) * 8));
 #endif
+  return out;
+}
 
-template <class Dst, class Scale>
-CUTLASS_DEVICE void
-convert_native_e2m1x8(
-    uint32_t packed,
-    Dst& dst,
-    Scale const& scale,
-    int r,
-    int s,
-    int parity,
-    int c_base) {
-  using DstType = typename Dst::value_type;
-
+/// acc(8x16 f32) += A(8x32 e4m3) * B(32x16 e4m3), block-scaled by UE8M0 sfa/sfb.
+///
+/// `a` is the raw A register block, OFFA the byte offset of this 8x32 atom
+/// (row-major, 256 bytes).  `sa`/`sb` are raw UE8M0 scale registers; OFFSA /
+/// OFFSB are byte offsets of the 8 row scales / 16 column scales.
+template <int OFFA, int OFFSA, int OFFSB, class AV, class SAV, class SBV>
+CUTLASS_DEVICE void bdpas_e4m3(float8& acc, AV const& a, uint8 const& b, SAV const& sa,
+                               SBV const& sb) {
+  static_assert(OFFA % 64 == 0 && OFFA + 256 <= int(sizeof(AV)) * 16, "A atom out of range");
+  static_assert(OFFSA + 8 <= int(sizeof(SAV)) * 16, "A scale out of range");
+  static_assert(OFFSB + 16 <= int(sizeof(SBV)) * 16, "B scale out of range");
 #ifdef __SYCL_DEVICE_ONLY__
-  // E2M1 and the prepared BF16 multiplier have at most 2 and 8 significant
-  // bits, respectively, and prep bounds the multiplier by 448 / 6. Both the
-  // multiplier and product therefore fit exactly in binary16. Values below
-  // binary16's range are also below E4M3's zero-rounding threshold after the
-  // largest E2M1 multiplier, so converting the scale before multiplication
-  // preserves the E4M3 result while avoiding FP32 promotion.
-  CUTLASS_PRAGMA_UNROLL
-  for (int pair = 0; pair < 4; ++pair) {
-    sycl::detail::fp4_uint8_vec1 packed_pair{
-        static_cast<uint8_t>(packed >> (8 * pair))};
-    auto decoded =
-        __builtin_spirv_ConvertE2M1ToFP16INTEL(packed_pair);
-    sycl::detail::float16_vec2 scales;
-    CUTLASS_PRAGMA_UNROLL
-    for (int j = 0; j < 2; ++j) {
-      const int local = 2 * pair + j;
-      const int c = c_base + (local >> 2);
-      const int p = local & 3;
-      const int q = parity + 2 * c;
-      const int dst_idx = p + 4 * q + 32 * r + 128 * s;
-      scales[j] = static_cast<_Float16>(scale(dst_idx));
-    }
-    auto scaled = detail::mul_fp16x2_visa(decoded, scales);
-
-    auto converted = __builtin_spirv_ClampConvertFP16ToE4M3INTEL(scaled);
-    CUTLASS_PRAGMA_UNROLL
-    for (int j = 0; j < 2; ++j) {
-      const int local = 2 * pair + j;
-      const int c = c_base + (local >> 2);
-      const int p = local & 3;
-      const int q = parity + 2 * c;
-      const int dst_idx = p + 4 * q + 32 * r + 128 * s;
-      dst(dst_idx) = DstType::bitcast(converted[j]);
-    }
-  }
-#else
-  using SrcType = cutlass::float_e2m1_t;
-  CUTLASS_PRAGMA_UNROLL
-  for (int local = 0; local < 8; ++local) {
-    const int c = c_base + (local >> 2);
-    const int p = local & 3;
-    const int q = parity + 2 * c;
-    const int dst_idx = p + 4 * q + 32 * r + 128 * s;
-    SrcType value = SrcType::bitcast((packed >> (4 * local)) & 0xf);
-    dst(dst_idx) =
-        static_cast<DstType>(static_cast<float>(value) * scale(dst_idx));
-  }
+  SGL_XE_ASM_PURE(
+      "{\n"
+      ".decl DST v_type=G type=F num_elts=128 alias=<%0,0>\n"
+      ".decl SRC1_UD v_type=G type=UD num_elts=128 alias=<%2,0>\n"
+      ".decl SRC2_UD v_type=G type=UD num_elts=64 alias=<%1,%5>\n"
+      ".decl SRC3_UB v_type=G type=UB num_elts=%9 alias=<%4,%7>\n"
+      ".decl SRC4_UB v_type=G type=UB num_elts=%8 alias=<%3,%6>\n"
+      "bdpas.hf8.hf8.8.8 (M1, 16) DST.0 DST.0 SRC1_UD.0 SRC2_UD.0 SRC3_UB(0,0) SRC4_UB(0,0)\n"
+      "}\n"
+      : "+rw"(acc)
+      : "rw"(a), "rw"(b), "rw"(sa), "rw"(sb), "P"(OFFA), "P"(OFFSA), "P"(OFFSB),
+        "P"(int(sizeof(SAV)) * 16 - OFFSA), "P"(int(sizeof(SBV)) * 16 - OFFSB));
 #endif
 }
 
-/// Fused relayout, upconversion, and scaling for the Xe3P NVFP4 MMA-B tile.
-///
-/// The native D32 transpose load owns source coordinates as
-///
-///   n = lane/4 + 4*b + 16*d,  k = 2*(lane%4) + a + 8*c,
-///
-/// while E4M3 MMA-B owns them as
-///
-///   n = lane/4 + 4*p + 16*r,  k = lane%4 + 4*q + 32*s.
-///
-/// For fixed (q,r,s), all lanes need the same four-byte source span. Selecting
-/// a 16-byte span handles four q values of one parity at once, reducing the
-/// whole 64x64 subgroup tile to 16 cross-lane selects. Each receiver then takes
-/// the low or high nibble selected by its MMA K lane and writes MMA-B directly.
-template <class Src, class Dst, class Scale>
-CUTLASS_DEVICE void
-convert_relayout_mma_b(Src const& src, Dst& dst, Scale const& scale) {
-  using SrcTv = remove_cvref_t<decltype(src.tv_layout())>;
-  using DstTv = remove_cvref_t<decltype(dst.tv_layout())>;
-
-  using ExpectedSrcTv = decltype(make_layout(
-      make_shape(make_shape(_4{}, _4{}),
-                 make_shape(make_shape(_2{}, _4{}, _8{}), _4{}),
-                 make_shape(_1{}, _1{})),
-      make_stride(make_stride(_2{} * E<1>{}, E<0>{}),
-                  make_stride(make_stride(E<1>{}, _4{} * E<0>{}, _8{} * E<1>{}),
-                              _16{} * E<0>{}),
-                  make_stride(_0{}, _0{}))));
-  using ExpectedDstTv = decltype(make_layout(
-      make_shape(make_shape(_4{}, _4{}),
-                 make_shape(make_shape(_4{}, _8{}), make_shape(_4{}, _2{}))),
-      make_stride(make_stride(E<1>{}, E<0>{}),
-                  make_stride(make_stride(_4{} * E<0>{}, _4{} * E<1>{}),
-                              make_stride(_16{} * E<0>{}, _32{} * E<1>{})))));
-
-  static_assert(cute::is_same_v<decltype(project_strides(SrcTv{})),
-                                decltype(project_strides(ExpectedSrcTv{}))>,
-                "NVFP4 copy fragment layout changed; update the fused MMA-B mapping");
-  static_assert(cute::is_same_v<decltype(project_strides(DstTv{})),
-                                decltype(project_strides(ExpectedDstTv{}))>,
-                "E4M3 MMA-B fragment layout changed; update the fused mapping");
-  static_assert(cute::size_v<typename Src::layout_type> == 256 &&
-                cute::size_v<typename Dst::layout_type> == 256,
-                "Fused NVFP4 mapping requires 256 values per lane");
-
-  auto const* packed = reinterpret_cast<intel::uchar16 const*>(raw_pointer_cast(src.data()));
-  auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-  const int lane = static_cast<int>(sg.get_local_linear_id());
-  const int lane_n = lane >> 2;
-  const int lane_k = lane & 3;
-  const int nibble_shift = (lane_k & 1) * 4;
-
-  CUTLASS_PRAGMA_UNROLL
-  for (int r = 0; r < 4; ++r) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int s = 0; s < 2; ++s) {
-      CUTLASS_PRAGMA_UNROLL
-      for (int parity = 0; parity < 2; ++parity) {
-        const int src_lane = 4 * lane_n + 2 * parity + (lane_k >> 1);
-        intel::uchar16 remote = sycl::select_from_group(sg, packed[2 * r + s], src_lane);
-        intel::ulong2 words = sycl::bit_cast<intel::ulong2>(remote);
-        detail::convert_native_e2m1x8(
-            detail::pack_selected_nibbles(words[0], nibble_shift),
-            dst, scale, r, s, parity, 0);
-        detail::convert_native_e2m1x8(
-            detail::pack_selected_nibbles(words[1], nibble_shift),
-            dst, scale, r, s, parity, 2);
-      }
-    }
-  }
-}
-
-/// Convert one 32-wide MMA-K slice of the Xe3P NVFP4 MMA-B tile.
-///
-/// Keeping conversion adjacent to the consuming BDPAS shortens the live range
-/// of both the converted E4M3 values and their per-16 multipliers. `dst` keeps
-/// the full fragment layout so the mapping remains identical to
-/// convert_relayout_mma_b; only the selected 128-value K slice is written.
-template <class Src, class Dst, class Scale>
-CUTLASS_DEVICE void
-convert_relayout_mma_b_k(
-    Src const& src, Dst& dst, Scale const& scale, int k_step) {
-  using SrcTv = remove_cvref_t<decltype(src.tv_layout())>;
-  using DstTv = remove_cvref_t<decltype(dst.tv_layout())>;
-
-  using ExpectedSrcTv = decltype(make_layout(
-      make_shape(make_shape(_4{}, _4{}),
-                 make_shape(make_shape(_2{}, _4{}, _8{}), _4{}),
-                 make_shape(_1{}, _1{})),
-      make_stride(make_stride(_2{} * E<1>{}, E<0>{}),
-                  make_stride(make_stride(E<1>{}, _4{} * E<0>{}, _8{} * E<1>{}),
-                              _16{} * E<0>{}),
-                  make_stride(_0{}, _0{}))));
-  using ExpectedDstTv = decltype(make_layout(
-      make_shape(make_shape(_4{}, _4{}),
-                 make_shape(make_shape(_4{}, _8{}), make_shape(_4{}, _2{}))),
-      make_stride(make_stride(E<1>{}, E<0>{}),
-                  make_stride(make_stride(_4{} * E<0>{}, _4{} * E<1>{}),
-                              make_stride(_16{} * E<0>{}, _32{} * E<1>{})))));
-
-  static_assert(cute::is_same_v<decltype(project_strides(SrcTv{})),
-                                decltype(project_strides(ExpectedSrcTv{}))>);
-  static_assert(cute::is_same_v<decltype(project_strides(DstTv{})),
-                                decltype(project_strides(ExpectedDstTv{}))>);
-  static_assert(cute::size_v<typename Src::layout_type> == 256 &&
-                cute::size_v<typename Dst::layout_type> == 256);
-
-  auto const* packed =
-      reinterpret_cast<intel::uchar16 const*>(raw_pointer_cast(src.data()));
-  auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-  const int lane = static_cast<int>(sg.get_local_linear_id());
-  const int lane_n = lane >> 2;
-  const int lane_k = lane & 3;
-  const int nibble_shift = (lane_k & 1) * 4;
-
-  CUTLASS_PRAGMA_UNROLL
-  for (int r = 0; r < 4; ++r) {
-    CUTLASS_PRAGMA_UNROLL
-    for (int parity = 0; parity < 2; ++parity) {
-      const int src_lane = 4 * lane_n + 2 * parity + (lane_k >> 1);
-      intel::uchar16 remote =
-          sycl::select_from_group(sg, packed[2 * r + k_step], src_lane);
-      intel::ulong2 words = sycl::bit_cast<intel::ulong2>(remote);
-      detail::convert_native_e2m1x8(
-          detail::pack_selected_nibbles(words[0], nibble_shift),
-          dst, scale, r, k_step, parity, 0);
-      detail::convert_native_e2m1x8(
-          detail::pack_selected_nibbles(words[1], nibble_shift),
-          dst, scale, r, k_step, parity, 2);
-    }
-  }
-}
-
-}  // namespace detail
-
-/// True when two subgroup fragments already agree on (thread, value) -> coord,
-/// so a conversion by flat index needs no relayout.
-template <class SrcTv, class DstTv>
-static constexpr bool tv_layouts_match_v =
-    cute::is_same_v<decltype(cute::project_strides(SrcTv{})),
-                    decltype(cute::project_strides(DstTv{}))>;
-
-/// Upconvert a sub-byte subgroup fragment into a wider-type one, relaying out if
-/// their TV layouts differ, and scaling each value (in FP32) by `scale(i)` where
-/// `i` is the *destination* fragment's flat index.
-///
-/// See the file header for why cute::reorder cannot do this directly.
-template <int Chunk = 8, class Src, class Dst, class Scale = NoScale>
-CUTLASS_DEVICE void
-reorder_upconvert(Src const& src, Dst& dst, Scale const& scale = {}) {
-  using SrcType = typename Src::value_type;
-  using DstType = typename Dst::value_type;
-  static_assert(sizeof_bits_v<SrcType> < 8, "Source must be a sub-byte type");
-  static_assert(sizeof_bits_v<DstType> >= 8, "Destination must be at least a byte wide");
-
-  if constexpr (tv_layouts_match_v<decltype(src.tv_layout()), decltype(dst.tv_layout())>) {
-    // No relayout: flat indices already agree, so convert and scale in one pass
-    // and keep the staging fragment out of the register budget.
-    detail::convert_chunked<Chunk>(src, dst, scale);
-  } else {
-    detail::convert_relayout_mma_b(src, dst, scale);
-  }
-}
-
-/// Fused relayout/upconvert for one MMA-K step of the NVFP4 Xe MMA-B layout.
-template <class Src, class Dst, class Scale = NoScale>
-CUTLASS_DEVICE void
-reorder_upconvert_mma_b_k(
-    Src const& src, Dst& dst, int k_step, Scale const& scale = {}) {
-  using SrcType = typename Src::value_type;
-  using DstType = typename Dst::value_type;
-  static_assert(sizeof_bits_v<SrcType> < 8, "Source must be a sub-byte type");
-  static_assert(sizeof_bits_v<DstType> >= 8, "Destination must be at least a byte wide");
-  detail::convert_relayout_mma_b_k(src, dst, scale, k_step);
-}
-
-}  // namespace sgl_xpu
+}  // namespace sgl_xpu::xe

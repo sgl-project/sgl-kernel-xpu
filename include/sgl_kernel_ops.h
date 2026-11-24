@@ -212,6 +212,16 @@ void nvfp4_woq_prep(
     torch::Tensor& out_sfmx,
     const torch::Tensor& w_s,
     const torch::Tensor& w_gs);
+#if SYCL_INTEL_TARGET == 35
+// Row-major MXFP8 activation quant (group 32, UE8M0), optional fused
+// silu_and_mul (see src/sycl/xe35/mxfp8_quant_rows.cpp).
+void mxfp8_quant_rows(
+    at::Tensor input,
+    at::Tensor output_q,
+    at::Tensor output_s,
+    bool fuse_silu_and_mul,
+    const std::optional<at::Tensor>& src2dst);
+#endif
 }  // namespace at::native::xpu
 void silu_and_mul(torch::Tensor& out, torch::Tensor& input);
 void gelu_tanh_and_mul(torch::Tensor& out, torch::Tensor& input);

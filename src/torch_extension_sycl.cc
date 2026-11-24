@@ -243,6 +243,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("sgl_per_token_group_quant_fp4", torch::kXPU, &at::native::xpu::sgl_per_token_group_quant_fp4);
   m.def("nvfp4_woq_prep(Tensor! out_c, Tensor! out_sfmx, Tensor w_s, Tensor w_gs) -> ()");
   m.impl("nvfp4_woq_prep", torch::kXPU, &at::native::xpu::nvfp4_woq_prep);
+#if SYCL_INTEL_TARGET == 35
+  m.def("mxfp8_quant_rows(Tensor input, Tensor! output_q, Tensor! output_s, bool fuse_silu_and_mul, Tensor? src2dst=None) -> ()");
+  m.impl("mxfp8_quant_rows", torch::kXPU, &at::native::xpu::mxfp8_quant_rows);
+#endif
   m.def("sgl_per_tensor_quant_fp8(Tensor input, Tensor output_q, Tensor output_s, bool is_static) -> ()");
   m.impl("sgl_per_tensor_quant_fp8", torch::kXPU, &sgl_per_tensor_quant_fp8);
 

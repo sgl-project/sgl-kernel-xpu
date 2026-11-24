@@ -4,7 +4,9 @@ import torch
 if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
     pytest.skip("XPU not available", allow_module_level=True)
 
-from sgl_kernel import gptq_gemm
+from sgl_kernel import gptq_gemm, gptq_repack_weights
+
+DEVICE = torch.device("xpu")
 
 
 def pack_rows(q_uint8):
@@ -54,33 +56,104 @@ def reference(act, q, stored, scales, g_idx, zero_format):
     return act @ ((q - eff) * scales[g_idx])
 
 
-@pytest.mark.parametrize("m", [1, 8])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("zero_format", [1, 2])
-@pytest.mark.parametrize("index_name", ["contiguous", "noncontiguous"])
-def test_gptq_gemm(m, dtype, zero_format, index_name):
-    k, n = 256, 32
+def make_g_idx(kind, k):
     groups = k // 128
     contiguous = torch.arange(k) // 128
-    g_idx = contiguous if index_name == "contiguous" else (groups - 1) - contiguous
+    if kind == "contiguous":
+        return contiguous
+    if kind == "reversed":
+        return (groups - 1) - contiguous
+    if kind == "interleaved":
+        return torch.arange(k) % groups
+    raise ValueError(kind)
+
+
+def run_case(m, k, n, dtype, zero_format, g_idx_kind, packed):
+    g_idx = make_g_idx(g_idx_kind, k)
     weight = torch.randn(k, n)
     act = torch.randn(m, k)
     q, stored, scales = quantize(weight, g_idx, zero_format)
     act_q = act.to(dtype)
     scales_q = scales.to(dtype)
     ref = reference(act_q.float(), q, stored, scales_q.float(), g_idx, zero_format).to(dtype)
-    device = torch.device("xpu")
+    qweight = pack_rows(q.to(torch.uint8)).to(DEVICE)
+    qweight_before = qweight.clone()
+    if packed:
+        packed_qweight = gptq_repack_weights(
+            qweight, g_idx.to(device=DEVICE, dtype=torch.int32)
+        )
+        # The repack must never modify the caller's tensor.
+        assert torch.equal(qweight, qweight_before)
+        qweight = packed_qweight
     out = gptq_gemm(
-        act_q.to(device),
-        pack_rows(q.to(torch.uint8)).to(device),
-        pack_cols(stored.to(torch.uint8)).to(device),
-        scales_q.to(device),
-        g_idx.to(device=device, dtype=torch.int32),
+        act_q.to(DEVICE),
+        qweight,
+        pack_cols(stored.to(torch.uint8)).to(DEVICE),
+        scales_q.to(DEVICE),
+        g_idx.to(device=DEVICE, dtype=torch.int32),
         False,
         4,
         zero_format,
+        packed,
     )
     torch.xpu.synchronize()
+    if not packed:
+        # The unpacked path must never modify the caller's weights either.
+        assert torch.equal(qweight, qweight_before)
     diff = (out.float().cpu() - ref.float()).abs()
     limit = torch.maximum(0.01 * ref.float().abs(), torch.full_like(ref.float(), 0.02))
     assert torch.all(diff <= limit)
+
+
+@pytest.mark.parametrize("m", [1, 2, 4, 8])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("zero_format", [1, 2])
+@pytest.mark.parametrize("g_idx_kind", ["contiguous", "reversed", "interleaved"])
+def test_gptq_gemm_small(m, dtype, zero_format, g_idx_kind):
+    run_case(m, 256, 32, dtype, zero_format, g_idx_kind, packed=False)
+
+
+# The larger GEMM shapes this file carried before the packed work: they
+# exercise the unrolled loops and, for bf16, the aligned XMX path.
+@pytest.mark.parametrize(
+    "m,k,n",
+    [
+        (1, 2048, 2048),
+        (8, 2048, 4096),
+        (128, 4096, 2048),
+        (128, 2048, 2048),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_gptq_gemm_large(m, k, n, dtype):
+    run_case(m, k, n, dtype, 1, "contiguous", packed=False)
+
+
+@pytest.mark.parametrize("m", [1, 2, 4, 8, 128])
+@pytest.mark.parametrize("zero_format", [1, 2])
+def test_gptq_packed(m, zero_format):
+    run_case(m, 4096, 1024, torch.bfloat16, zero_format, "contiguous", packed=True)
+
+
+@pytest.mark.parametrize("k,n", [(4096, 1024), (1024, 4096)])
+def test_gptq_packed_m4_column_layouts(k, n):
+    # M=4 dispatches to the pair kernel when K >= N and the quad kernel
+    # when K < N; cover both.
+    run_case(4, k, n, torch.float16, 1, "contiguous", packed=True)
+
+
+# Regression for the tail bug the review caught: with K=1664 the packed
+# kernels have 208 words, a count where the old tail loop restarted at the
+# block boundary and processed the main loop's words a second time.
+@pytest.mark.parametrize("m", [1, 2, 4])
+@pytest.mark.parametrize("zero_format", [1, 2])
+def test_gptq_packed_tail_regression(m, zero_format):
+    run_case(m, 1664, 512, torch.float16, zero_format, "contiguous", packed=True)
+
+
+def test_gptq_repack_rejects_permuted_g_idx():
+    k, n = 256, 32
+    g_idx = make_g_idx("reversed", k)
+    qweight = torch.zeros(k // 8, n, dtype=torch.int32, device=DEVICE)
+    with pytest.raises(RuntimeError):
+        gptq_repack_weights(qweight, g_idx.to(device=DEVICE, dtype=torch.int32))

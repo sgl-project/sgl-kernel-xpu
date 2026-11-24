@@ -10,12 +10,6 @@ def awq_dequantize(
     return torch.ops.sgl_kernel.awq_dequantize.default(qweight, scales, qzeros)
 
 
-def gptq_entry_probe() -> None:
-    # A tensor argument is required so the dispatcher selects the XPU kernel.
-    device_index = torch.empty((), device="xpu")
-    torch.ops.sgl_kernel.gptq_entry_probe.default(device_index)
-
-
 def gptq_gemm(
     a: torch.Tensor,
     b_q_weight: torch.Tensor,
@@ -25,6 +19,7 @@ def gptq_gemm(
     use_shuffle: bool,
     bit: int,
     zero_format: int = 1,
+    packed: bool = False,
 ) -> torch.Tensor:
     return torch.ops.sgl_kernel.gptq_gemm.default(
         a,
@@ -35,7 +30,21 @@ def gptq_gemm(
         use_shuffle,
         bit,
         zero_format,
+        packed,
     )
+
+
+def gptq_repack_weights(
+    b_q_weight: torch.Tensor,
+    b_g_idx: torch.Tensor,
+) -> torch.Tensor:
+    """Repack GPTQ weights once at load time into the packed [N, K/8] layout.
+
+    Returns a new tensor; the input is never modified. The packed layout
+    requires contiguous groups (g_idx[k] == k/128) and is what
+    gptq_gemm(..., packed=True) consumes.
+    """
+    return torch.ops.sgl_kernel.gptq_repack_weights.default(b_q_weight, b_g_idx)
 
 
 def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):

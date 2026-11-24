@@ -512,16 +512,9 @@ bool dpas_enabled() {
 }
 #endif
 
-// This checkpoint stores g_idx[k] == k/128. The pointer is stable after load,
-// so the device scan runs once per weight and the decode loop skips it.
-bool cached_contiguous_groups(sycl::queue& queue, const int* g_idx, int K, const void* key) {
-  static std::mutex mu;
-  static std::unordered_map<const void*, bool> cache;
-  std::lock_guard<std::mutex> lock(mu);
-  const auto it = cache.find(key);
-  if (it != cache.end()) {
-    return it->second;
-  }
+// The packed layout assumes g_idx[k] == k / kGroup. The repack op runs this
+// scan once at load time; the gemm itself never re-checks or caches by pointer.
+bool contiguous_groups(sycl::queue& queue, const int* g_idx, int K) {
   int* flag = sycl::malloc_device<int>(1, queue);
   queue.memset(flag, 0, sizeof(int)).wait();
   queue
@@ -536,9 +529,7 @@ bool cached_contiguous_groups(sycl::queue& queue, const int* g_idx, int K, const
   int host = 0;
   queue.memcpy(&host, flag, sizeof(int)).wait();
   sycl::free(flag, queue);
-  const bool ok = host == 0;
-  cache.emplace(key, ok);
-  return ok;
+  return host == 0;
 }
 
 struct BandwidthStats {
@@ -647,9 +638,9 @@ struct GptqBandwidthGemv {
   }
 };
 
-// lm_head hits about half of device bandwidth by giving one work-group a
-// contiguous row. qweight is [K/8, N], so decode transposes it once and then
-// uses that same pattern. Prefill keeps the original layout.
+// The packed layout is [N, K/8]: one output column's words are contiguous,
+// which is what gptq_repack_weights produces at load time. One work-group
+// owns one column and streams its words. Prefill keeps the original layout.
 template <typename T>
 struct GptqPackedGemv {
   static constexpr int kWork = 64;
@@ -673,7 +664,8 @@ struct GptqPackedGemv {
     if (n < N) {
       const int words = K >> 3;
       const int* row = packed + static_cast<int64_t>(n) * words;
-      for (int word = lid; word + 3 * kWork < words; word += 4 * kWork) {
+      int word = lid;
+      for (; word + 3 * kWork < words; word += 4 * kWork) {
         const int w0 = row[word];
         const int w1 = row[word + kWork];
         const int w2 = row[word + 2 * kWork];
@@ -702,7 +694,7 @@ struct GptqPackedGemv {
                   ((static_cast<float>((w3 >> (nib * 4)) & 0x0F) - z3) * s3);
         }
       }
-      for (int word = lid + ((words / (4 * kWork)) * 4 * kWork); word < words; word += kWork) {
+      for (; word < words; word += kWork) {
         const int group = word >> 4;
         const float scale = static_cast<float>(scales[group * N + n]);
         const float zero = static_cast<float>(effective_zero(load_z(qzeros, group, n, N), zero_format));
@@ -860,7 +852,8 @@ struct GptqPackedRows {
     if (n < N) {
       const int words = K >> 3;
       const int* row = qweight + static_cast<int64_t>(n) * words;
-      for (int word = lid; word + 3 * kWork < words; word += 4 * kWork) {
+      int word = lid;
+      for (; word + 3 * kWork < words; word += 4 * kWork) {
         const int w0 = row[word];
         const int w1 = row[word + kWork];
         const int w2 = row[word + 2 * kWork];
@@ -940,7 +933,7 @@ struct GptqPackedRows {
           }
         }
       }
-      for (int word = lid + ((words / (4 * kWork)) * 4 * kWork); word < words; word += kWork) {
+      for (; word < words; word += kWork) {
         const int group = word >> 4;
         const float scale = static_cast<float>(scales[group * N + n]);
         const float zero = static_cast<float>(effective_zero(load_z(qzeros, group, n, N), zero_format));
@@ -1022,7 +1015,8 @@ struct GptqPackedPair4 {
       const T* r1 = a + static_cast<int64_t>(K);
       const T* r2 = a + static_cast<int64_t>(2) * K;
       const T* r3 = a + static_cast<int64_t>(3) * K;
-      for (int word = lid; word + 3 * kWork < words; word += 4 * kWork) {
+      int word = lid;
+      for (; word + 3 * kWork < words; word += 4 * kWork) {
         const int u0 = row0[word];
         const int u1 = row0[word + kWork];
         const int u2 = row0[word + 2 * kWork];
@@ -1113,7 +1107,7 @@ struct GptqPackedPair4 {
         b3[2] += gptq_dot_ready<T>(p23, dw);
         b3[3] += gptq_dot_ready<T>(p33, dw);
       }
-      for (int word = lid + ((words / (4 * kWork)) * 4 * kWork); word < words; word += kWork) {
+      for (; word < words; word += kWork) {
         const int group = word >> 4;
         const float su = static_cast<float>(scales[group * N + n0]);
         const float sv = static_cast<float>(scales[group * N + (live1 ? n1 : n0)]);
@@ -1200,12 +1194,13 @@ struct GptqPackedQuad4 {
           a + static_cast<int64_t>(K),
           a + static_cast<int64_t>(2) * K,
           a + static_cast<int64_t>(3) * K};
-      for (int word = lid; word + kWork < words; word += 2 * kWork) {
+      int word = lid;
+      for (; word + kWork < words; word += 2 * kWork) {
         gptq_quad_step<T>(rows, safe, act, scales, qzeros, word, N, zero_format, a0, b0, c0, d0);
         gptq_quad_step<T>(
             rows, safe, act, scales, qzeros, word + kWork, N, zero_format, a0, b0, c0, d0);
       }
-      for (int word = lid + ((words / (2 * kWork)) * 2 * kWork); word < words; word += kWork) {
+      for (; word < words; word += kWork) {
         gptq_quad_step<T>(rows, safe, act, scales, qzeros, word, N, zero_format, a0, b0, c0, d0);
       }
     }
@@ -1222,78 +1217,6 @@ struct GptqPackedQuad4 {
     }
   }
 };
-
-struct PackEntry {
-  int words = 0;
-  int N = 0;
-  int head = 0;
-  int tail = 0;
-  at::Tensor packed;
-};
-
-void ensure_transposed(sycl::queue& queue, int* qweight, int K, int N, const void* key) {
-  const int words = K >> 3;
-  static std::mutex mu;
-  static std::unordered_map<const void*, std::pair<int, int>> done;
-  std::lock_guard<std::mutex> lock(mu);
-  const auto it = done.find(key);
-  if (it != done.end() && it->second.first == words && it->second.second == N) {
-    return;
-  }
-  auto scratch = torch::empty(
-      {static_cast<int64_t>(words) * N}, torch::TensorOptions().dtype(torch::kInt).device(torch::kXPU));
-  int* dst = scratch.data_ptr<int>();
-  const int* src = qweight;
-  const size_t total = static_cast<size_t>(words) * static_cast<size_t>(N);
-  queue
-      .submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(total), [=](sycl::id<1> id) {
-          const int idx = static_cast<int>(id);
-          const int k8 = idx / N;
-          const int col = idx - k8 * N;
-          dst[(static_cast<int64_t>(col) * words) + k8] = src[idx];
-        });
-      })
-      .wait();
-  queue.memcpy(qweight, dst, total * sizeof(int)).wait();
-  done[key] = {words, N};
-}
-
-const int* repacked_qweight(sycl::queue& queue, const int* qweight, int K, int N, const void* key) {
-  const int words = K >> 3;
-  static std::mutex mu;
-  static std::unordered_map<const void*, PackEntry> cache;
-  std::lock_guard<std::mutex> lock(mu);
-  auto& entry = cache[key];
-  if (entry.packed.defined() && entry.words == words && entry.N == N) {
-    return entry.packed.data_ptr<int>();
-  }
-  int head = 0;
-  int tail = 0;
-  queue.memcpy(&head, qweight, sizeof(int));
-  queue.memcpy(&tail, qweight + static_cast<int64_t>(words) * N - 1, sizeof(int)).wait();
-  auto packed = torch::empty(
-      {static_cast<int64_t>(N) * words}, torch::TensorOptions().dtype(torch::kInt).device(torch::kXPU));
-  const int* src = qweight;
-  int* dst = packed.data_ptr<int>();
-  const size_t total = static_cast<size_t>(words) * static_cast<size_t>(N);
-  queue
-      .submit([&](sycl::handler& cgh) {
-        cgh.parallel_for(sycl::range<1>(total), [=](sycl::id<1> id) {
-          const int idx = static_cast<int>(id);
-          const int k8 = idx / N;
-          const int col = idx - k8 * N;
-          dst[(static_cast<int64_t>(col) * words) + k8] = src[idx];
-        });
-      })
-      .wait();
-  entry.words = words;
-  entry.N = N;
-  entry.head = head;
-  entry.tail = tail;
-  entry.packed = std::move(packed);
-  return entry.packed.data_ptr<int>();
-}
 
 // Prefill keeps one K-group of every row in SLM, then every column reads it.
 // Reloading those activations from global memory once per column made the
@@ -1456,14 +1379,12 @@ void launch_gptq(
     int K,
     int N,
     int zero_format,
-    const void* weight_key,
-    const void* gidx_key) {
+    bool packed) {
   const bool scalar = env_flag("SGL_GPTQ_SCALAR");
-  const bool contiguous = !scalar && cached_contiguous_groups(queue, g_idx, K, gidx_key);
-  if (contiguous) {
-    ensure_transposed(queue, const_cast<int*>(qweight), K, N, weight_key);
+  if (scalar) {
+    packed = false;
   }
-  // DPAS atom is 8 rows. Contiguous bf16 M>=8 (speculative verify and
+  // DPAS atom is 8 rows. Packed bf16 M>=8 (speculative verify and
   // prefill) takes the one-pass XMX GEMM. M==1 stays the packed GEMV, which
   // is also the draft-model forward. M==2 and M==4 stay the multi-row EU GEMV.
 #if defined(SGL_GPTQ_DPAS)
@@ -1471,7 +1392,7 @@ void launch_gptq(
 #else
   const bool xmx_rows = false;
 #endif
-  if (contiguous && M == 1) {
+  if (packed && M == 1) {
     constexpr int kWork = GptqPackedGemv<T>::kWork;
     auto& stats = bandwidth_stats();
     if (stats.gemv.fetch_add(1) == 0) {
@@ -1486,7 +1407,7 @@ void launch_gptq(
     note_profile(queue, true);
     return;
   }
-  if (contiguous && !xmx_rows && (M == 2 || M == 4 || M == 8)) {
+  if (packed && !xmx_rows && (M == 2 || M == 4 || M == 8)) {
     bandwidth_stats().gemm.fetch_add(1);
     auto launch_rows = [&](auto kernel) {
       constexpr int kWork = decltype(kernel)::kWork;
@@ -1525,7 +1446,7 @@ void launch_gptq(
     note_profile(queue, true);
     return;
   }
-  if (contiguous) {
+  if (packed) {
 #if defined(SGL_GPTQ_DPAS)
     if constexpr (std::is_same_v<T, sycl::ext::oneapi::bfloat16>) {
       launch_gptq_xmx<T>(queue, a, qweight, qzeros, scales, out, M, K, N, zero_format);
@@ -1598,288 +1519,7 @@ void launch_gptq(
       sycl::nd_range<2>(sycl::range<2>(grid_m, grid_n), sycl::range<2>(kLocalM, kLocalN)), fn);
 }
 
-// lm_head weight is [vocab, hidden] row-major, so a vocabulary row is contiguous
-// and neighboring rows are not. One work-group owns one row and the threads
-// stream that row together, then reduce. A thread-per-row walk was uncoalesced
-// and no faster than torch.matmul.
-template <typename T>
-struct LmHeadGemv {
-  static constexpr int kWork = 64;
-
-  const T* hidden;
-  const T* weight;
-  T* out;
-  int K;
-  int N;
-
-  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
-    const int n = static_cast<int>(item.get_group(0));
-    const int lid = static_cast<int>(item.get_local_id(0));
-    float acc0 = 0.f;
-    float acc1 = 0.f;
-    float acc2 = 0.f;
-    float acc3 = 0.f;
-    if (n < N) {
-      const T* row = weight + static_cast<int64_t>(n) * K;
-      constexpr int kVec = 4;
-      const int step = kVec * kWork;
-      int k = lid * kVec;
-      if (k + 3 < K) {
-        T h0 = hidden[k];
-        T h1 = hidden[k + 1];
-        T h2 = hidden[k + 2];
-        T h3 = hidden[k + 3];
-        T w0 = row[k];
-        T w1 = row[k + 1];
-        T w2 = row[k + 2];
-        T w3 = row[k + 3];
-        for (int next = k + step; next + 3 < K; next += step) {
-          const T nh0 = hidden[next];
-          const T nh1 = hidden[next + 1];
-          const T nh2 = hidden[next + 2];
-          const T nh3 = hidden[next + 3];
-          const T nw0 = row[next];
-          const T nw1 = row[next + 1];
-          const T nw2 = row[next + 2];
-          const T nw3 = row[next + 3];
-          acc0 += static_cast<float>(w0) * static_cast<float>(h0);
-          acc1 += static_cast<float>(w1) * static_cast<float>(h1);
-          acc2 += static_cast<float>(w2) * static_cast<float>(h2);
-          acc3 += static_cast<float>(w3) * static_cast<float>(h3);
-          k = next;
-          h0 = nh0;
-          h1 = nh1;
-          h2 = nh2;
-          h3 = nh3;
-          w0 = nw0;
-          w1 = nw1;
-          w2 = nw2;
-          w3 = nw3;
-        }
-        acc0 += static_cast<float>(w0) * static_cast<float>(h0);
-        acc1 += static_cast<float>(w1) * static_cast<float>(h1);
-        acc2 += static_cast<float>(w2) * static_cast<float>(h2);
-        acc3 += static_cast<float>(w3) * static_cast<float>(h3);
-        k += step;
-      }
-      for (; k < K; k += kWork) {
-        acc0 += static_cast<float>(row[k]) * static_cast<float>(hidden[k]);
-      }
-    }
-    const float acc = sycl::reduce_over_group(item.get_group(), acc0 + acc1 + acc2 + acc3, sycl::plus<float>());
-    if (n < N && lid == 0) {
-      out[n] = static_cast<T>(acc);
-    }
-  }
-};
-
-template <typename T>
-void launch_lm_head_row(sycl::queue& queue, const T* hidden, const T* weight, T* out, int K, int N) {
-  constexpr int kWork = LmHeadGemv<T>::kWork;
-  const size_t rows = static_cast<size_t>(N);
-  queue.submit([&](sycl::handler& cgh) {
-    LmHeadGemv<T> fn{hidden, weight, out, K, N};
-    cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * kWork), sycl::range<1>(kWork)), fn);
-  });
-}
-
-// Same 4-wide software pipeline as LmHeadGemv. Each hidden row keeps its own
-// accumulator, and each vocabulary row is loaded once for the rows in the tile.
-template <typename T, int kSlots>
-struct LmHeadPipelined {
-  static constexpr int kWork = 64;
-
-  const T* hidden;
-  const T* weight;
-  T* out;
-  int M;
-  int K;
-  int N;
-
-  [[sycl::reqd_sub_group_size(16)]] void operator()(sycl::nd_item<1> item) const {
-    const int n = static_cast<int>(item.get_group(0));
-    const int lid = static_cast<int>(item.get_local_id(0));
-    float acc[kSlots];
-#pragma unroll
-    for (int slot = 0; slot < kSlots; ++slot) {
-      acc[slot] = 0.f;
-    }
-    if (n < N) {
-      const T* row = weight + static_cast<int64_t>(n) * K;
-      constexpr int kVec = 4;
-      const int step = kVec * kWork;
-      int k = lid * kVec;
-      if (k + 3 < K) {
-        T w0 = row[k];
-        T w1 = row[k + 1];
-        T w2 = row[k + 2];
-        T w3 = row[k + 3];
-        T h0[kSlots];
-        T h1[kSlots];
-        T h2[kSlots];
-        T h3[kSlots];
-#pragma unroll
-        for (int slot = 0; slot < kSlots; ++slot) {
-          if (slot < M) {
-            const T* hs = hidden + static_cast<int64_t>(slot) * K + k;
-            h0[slot] = hs[0];
-            h1[slot] = hs[1];
-            h2[slot] = hs[2];
-            h3[slot] = hs[3];
-          }
-        }
-        for (int next = k + step; next + 3 < K; next += step) {
-          const T nw0 = row[next];
-          const T nw1 = row[next + 1];
-          const T nw2 = row[next + 2];
-          const T nw3 = row[next + 3];
-          T nh0[kSlots];
-          T nh1[kSlots];
-          T nh2[kSlots];
-          T nh3[kSlots];
-#pragma unroll
-          for (int slot = 0; slot < kSlots; ++slot) {
-            if (slot < M) {
-              const T* hs = hidden + static_cast<int64_t>(slot) * K + next;
-              nh0[slot] = hs[0];
-              nh1[slot] = hs[1];
-              nh2[slot] = hs[2];
-              nh3[slot] = hs[3];
-            }
-          }
-#pragma unroll
-          for (int slot = 0; slot < kSlots; ++slot) {
-            if (slot < M) {
-              acc[slot] += static_cast<float>(w0) * static_cast<float>(h0[slot]);
-              acc[slot] += static_cast<float>(w1) * static_cast<float>(h1[slot]);
-              acc[slot] += static_cast<float>(w2) * static_cast<float>(h2[slot]);
-              acc[slot] += static_cast<float>(w3) * static_cast<float>(h3[slot]);
-            }
-          }
-          k = next;
-          w0 = nw0;
-          w1 = nw1;
-          w2 = nw2;
-          w3 = nw3;
-#pragma unroll
-          for (int slot = 0; slot < kSlots; ++slot) {
-            h0[slot] = nh0[slot];
-            h1[slot] = nh1[slot];
-            h2[slot] = nh2[slot];
-            h3[slot] = nh3[slot];
-          }
-        }
-#pragma unroll
-        for (int slot = 0; slot < kSlots; ++slot) {
-          if (slot < M) {
-            acc[slot] += static_cast<float>(w0) * static_cast<float>(h0[slot]);
-            acc[slot] += static_cast<float>(w1) * static_cast<float>(h1[slot]);
-            acc[slot] += static_cast<float>(w2) * static_cast<float>(h2[slot]);
-            acc[slot] += static_cast<float>(w3) * static_cast<float>(h3[slot]);
-          }
-        }
-        k += step;
-      }
-      for (; k < K; k += kWork) {
-        const float w = static_cast<float>(row[k]);
-#pragma unroll
-        for (int slot = 0; slot < kSlots; ++slot) {
-          if (slot < M) {
-            acc[slot] += w * static_cast<float>(hidden[static_cast<int64_t>(slot) * K + k]);
-          }
-        }
-      }
-    }
-#pragma unroll
-    for (int slot = 0; slot < kSlots; ++slot) {
-      const float sum = sycl::reduce_over_group(item.get_group(), acc[slot], sycl::plus<float>());
-      if (n < N && lid == 0 && slot < M) {
-        out[static_cast<int64_t>(slot) * N + n] = static_cast<T>(sum);
-      }
-    }
-  }
-};
-
-template <typename T, int kSlots>
-void launch_lm_head_slots(
-    sycl::queue& queue,
-    const T* hidden,
-    const T* weight,
-    T* out,
-    int M,
-    int K,
-    int N) {
-  constexpr int kWork = LmHeadPipelined<T, kSlots>::kWork;
-  const size_t rows = static_cast<size_t>(N);
-  queue.submit([&](sycl::handler& cgh) {
-    LmHeadPipelined<T, kSlots> fn{hidden, weight, out, M, K, N};
-    cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(rows * kWork), sycl::range<1>(kWork)), fn);
-  });
-}
-
-// One vocabulary pass covers up to 8 hidden rows. A 4-row verify is one pass.
-template <typename T>
-void launch_lm_head_rows(sycl::queue& queue, const T* hidden, const T* weight, T* out, int M, int K, int N) {
-  for (int m0 = 0; m0 < M;) {
-    const int left = M - m0;
-    const T* h = hidden + static_cast<int64_t>(m0) * K;
-    T* o = out + static_cast<int64_t>(m0) * N;
-    if (left >= 8) {
-      launch_lm_head_slots<T, 8>(queue, h, weight, o, 8, K, N);
-      m0 += 8;
-    } else if (left > 4) {
-      launch_lm_head_slots<T, 8>(queue, h, weight, o, left, K, N);
-      m0 += left;
-    } else {
-      launch_lm_head_slots<T, 4>(queue, h, weight, o, left, K, N);
-      m0 += left;
-    }
-  }
-}
-
 }  // namespace
-
-SGL_KERNEL_EXPORT torch::Tensor lm_head_gemv(torch::Tensor hidden, torch::Tensor weight) {
-  TORCH_CHECK(hidden.is_xpu() && weight.is_xpu(), "lm_head_gemv tensors must be XPU");
-  TORCH_CHECK(hidden.dim() == 2 && weight.dim() == 2, "lm_head_gemv expects hidden[M,K] and weight[N,K]");
-  TORCH_CHECK(hidden.is_contiguous() && weight.is_contiguous(), "lm_head_gemv tensors must be contiguous");
-  TORCH_CHECK(hidden.size(1) == weight.size(1), "lm_head_gemv K mismatch");
-  TORCH_CHECK(
-      hidden.scalar_type() == weight.scalar_type() &&
-          (hidden.scalar_type() == at::kHalf || hidden.scalar_type() == at::kBFloat16),
-      "lm_head_gemv dtype must be fp16 or bf16");
-  const int M = static_cast<int>(hidden.size(0));
-  const int K = static_cast<int>(hidden.size(1));
-  const int N = static_cast<int>(weight.size(0));
-  auto out = torch::empty({hidden.size(0), weight.size(0)}, hidden.options());
-  auto queue = at::xpu::getCurrentXPUStream().queue();
-  static std::atomic<int> once{0};
-  if (once.fetch_add(1) == 0) {
-    std::fprintf(stderr, "SGL_GPTQ_LMHEAD\n");
-    std::fflush(stderr);
-  }
-  if (hidden.scalar_type() == at::kHalf) {
-    const auto* h = reinterpret_cast<const sycl::half*>(hidden.data_ptr<at::Half>());
-    const auto* w = reinterpret_cast<const sycl::half*>(weight.data_ptr<at::Half>());
-    auto* o = reinterpret_cast<sycl::half*>(out.data_ptr<at::Half>());
-    if (M == 1) {
-      launch_lm_head_row<sycl::half>(queue, h, w, o, K, N);
-    } else {
-      launch_lm_head_rows<sycl::half>(queue, h, w, o, M, K, N);
-    }
-  } else {
-    using bf16 = sycl::ext::oneapi::bfloat16;
-    const auto* h = reinterpret_cast<const bf16*>(hidden.data_ptr<at::BFloat16>());
-    const auto* w = reinterpret_cast<const bf16*>(weight.data_ptr<at::BFloat16>());
-    auto* o = reinterpret_cast<bf16*>(out.data_ptr<at::BFloat16>());
-    if (M == 1) {
-      launch_lm_head_row<bf16>(queue, h, w, o, K, N);
-    } else {
-      launch_lm_head_rows<bf16>(queue, h, w, o, M, K, N);
-    }
-  }
-  return out;
-}
 
 SGL_KERNEL_EXPORT torch::Tensor gptq_gemm(
     torch::Tensor a,
@@ -1889,7 +1529,8 @@ SGL_KERNEL_EXPORT torch::Tensor gptq_gemm(
     torch::Tensor b_g_idx,
     bool use_shuffle,
     int64_t bit,
-    int64_t zero_format) {
+    int64_t zero_format,
+    bool packed) {
   TORCH_CHECK(!use_shuffle, "gptq_gemm use_shuffle=true is not supported");
   TORCH_CHECK(bit == 4, "gptq_gemm bit must be 4, got ", bit);
   TORCH_CHECK(
@@ -1901,7 +1542,7 @@ SGL_KERNEL_EXPORT torch::Tensor gptq_gemm(
               "gptq_gemm weight tensors must be XPU tensors");
   TORCH_CHECK(a.dim() == 2 && b_q_weight.dim() == 2 && b_gptq_qzeros.dim() == 2 && b_gptq_scales.dim() == 2 &&
                   b_g_idx.dim() == 1,
-              "gptq_gemm ranks must be a[M,K], qweight[K/8,N], qzeros[K/128,N/8], scales[K/128,N], g_idx[K]");
+              "gptq_gemm ranks must be a[M,K], qweight[K/8,N] (or [N,K/8] when packed), qzeros[K/128,N/8], scales[K/128,N], g_idx[K]");
   TORCH_CHECK(a.is_contiguous() && b_q_weight.is_contiguous() && b_gptq_qzeros.is_contiguous() &&
                   b_gptq_scales.is_contiguous() && b_g_idx.is_contiguous(),
               "gptq_gemm tensors must be contiguous");
@@ -1914,10 +1555,16 @@ SGL_KERNEL_EXPORT torch::Tensor gptq_gemm(
 
   const int64_t M = a.size(0);
   const int64_t K = a.size(1);
-  const int64_t N = b_q_weight.size(1);
+  const int64_t N = packed ? b_q_weight.size(0) : b_q_weight.size(1);
   TORCH_CHECK(K % kGroup == 0, "gptq_gemm K must be divisible by 128, got ", K);
   TORCH_CHECK(N % 8 == 0, "gptq_gemm N must be divisible by 8, got ", N);
-  TORCH_CHECK(b_q_weight.size(0) == K / 8, "gptq_gemm qweight rows must be K/8");
+  if (packed) {
+    TORCH_CHECK(
+        b_q_weight.size(1) == K / 8,
+        "gptq_gemm packed qweight must be [N, K/8] as produced by gptq_repack_weights");
+  } else {
+    TORCH_CHECK(b_q_weight.size(0) == K / 8, "gptq_gemm qweight rows must be K/8");
+  }
   TORCH_CHECK(b_gptq_scales.size(0) == K / kGroup && b_gptq_scales.size(1) == N, "gptq_gemm scales shape must be [K/128, N]");
   TORCH_CHECK(
       b_gptq_qzeros.size(0) == K / kGroup && b_gptq_qzeros.size(1) == N / 8,
@@ -1928,8 +1575,6 @@ SGL_KERNEL_EXPORT torch::Tensor gptq_gemm(
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
   const int zf = static_cast<int>(zero_format);
-  const void* weight_key = b_q_weight.storage().unsafeGetStorageImpl();
-  const void* gidx_key = b_g_idx.storage().unsafeGetStorageImpl();
   if (a.scalar_type() == at::kHalf) {
     launch_gptq<sycl::half>(
         queue,
@@ -1943,8 +1588,7 @@ SGL_KERNEL_EXPORT torch::Tensor gptq_gemm(
         static_cast<int>(K),
         static_cast<int>(N),
         zf,
-        weight_key,
-        gidx_key);
+        packed);
   } else {
     using bf16 = sycl::ext::oneapi::bfloat16;
     launch_gptq<bf16>(
@@ -1959,8 +1603,51 @@ SGL_KERNEL_EXPORT torch::Tensor gptq_gemm(
         static_cast<int>(K),
         static_cast<int>(N),
         zf,
-        weight_key,
-        gidx_key);
+        packed);
   }
   return out;
+}
+
+SGL_KERNEL_EXPORT torch::Tensor gptq_repack_weights(torch::Tensor b_q_weight, torch::Tensor b_g_idx) {
+  TORCH_CHECK(
+      b_q_weight.is_xpu() && b_g_idx.is_xpu(), "gptq_repack_weights tensors must be XPU tensors");
+  TORCH_CHECK(
+      b_q_weight.dim() == 2 && b_g_idx.dim() == 1,
+      "gptq_repack_weights ranks must be qweight[K/8,N], g_idx[K]");
+  TORCH_CHECK(
+      b_q_weight.is_contiguous() && b_g_idx.is_contiguous(),
+      "gptq_repack_weights tensors must be contiguous");
+  TORCH_CHECK(
+      b_q_weight.scalar_type() == at::kInt && b_g_idx.scalar_type() == at::kInt,
+      "gptq_repack_weights qweight and g_idx must be int32");
+  const int K = static_cast<int>(b_q_weight.size(0)) * 8;
+  const int N = static_cast<int>(b_q_weight.size(1));
+  TORCH_CHECK(b_g_idx.size(0) == K, "gptq_repack_weights g_idx length must be K, got ", b_g_idx.size(0));
+  TORCH_CHECK(K % kGroup == 0, "gptq_repack_weights K must be divisible by 128, got ", K);
+
+  auto queue = at::xpu::getCurrentXPUStream().queue();
+  TORCH_CHECK(
+      contiguous_groups(queue, b_g_idx.data_ptr<int>(), K),
+      "gptq_repack_weights requires g_idx[k] == k/128 (contiguous groups); "
+      "the packed layout does not encode a permutation");
+
+  // Transpose [K/8, N] -> [N, K/8] into a separate tensor. The caller's
+  // qweight is never modified.
+  const int words = K >> 3;
+  auto packed = torch::empty(
+      {static_cast<int64_t>(N), static_cast<int64_t>(words)}, b_q_weight.options());
+  const int* src = b_q_weight.data_ptr<int>();
+  int* dst = packed.data_ptr<int>();
+  const size_t total = static_cast<size_t>(words) * static_cast<size_t>(N);
+  queue
+      .submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(sycl::range<1>(total), [=](sycl::id<1> id) {
+          const int idx = static_cast<int>(id);
+          const int k8 = idx / N;
+          const int col = idx - k8 * N;
+          dst[(static_cast<int64_t>(col) * words) + k8] = src[idx];
+        });
+      })
+      .wait();
+  return packed;
 }

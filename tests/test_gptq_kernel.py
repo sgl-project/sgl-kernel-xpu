@@ -49,11 +49,16 @@ def quantize(weight, g_idx, zero_format):
     return q, stored, scales
 
 
-def reference(act, q, stored, scales, g_idx, zero_format):
+def reference(act, q, stored, scales, g_idx, zero_format, round_bf16=False):
     eff = stored[g_idx].to(torch.float32)
     if zero_format == 1:
         eff = eff + 1
-    return act @ ((q - eff) * scales[g_idx])
+    dequant = (q - eff) * scales[g_idx]
+    if round_bf16:
+        # The XMX path stages dequantized weights in bf16; compare against
+        # the precision the path is designed to produce.
+        dequant = dequant.to(torch.bfloat16).to(torch.float32)
+    return act @ dequant
 
 
 def make_g_idx(kind, k):
@@ -75,7 +80,11 @@ def run_case(m, k, n, dtype, zero_format, g_idx_kind, packed):
     q, stored, scales = quantize(weight, g_idx, zero_format)
     act_q = act.to(dtype)
     scales_q = scales.to(dtype)
-    ref = reference(act_q.float(), q, stored, scales_q.float(), g_idx, zero_format).to(dtype)
+    xmx_path = packed and dtype == torch.bfloat16 and m >= 8
+    ref = reference(
+        act_q.float(), q, stored, scales_q.float(), g_idx, zero_format,
+        round_bf16=xmx_path,
+    ).to(dtype)
     qweight = pack_rows(q.to(torch.uint8)).to(DEVICE)
     qweight_before = qweight.clone()
     if packed:
@@ -101,14 +110,6 @@ def run_case(m, k, n, dtype, zero_format, g_idx_kind, packed):
         # The unpacked path must never modify the caller's weights either.
         assert torch.equal(qweight, qweight_before)
     diff = (out.float().cpu() - ref.float()).abs()
-    if packed and dtype == torch.bfloat16 and m >= 8:
-        # The bf16 XMX path (DPAS) accumulates at bf16-grade precision:
-        # measured on a B70, its outputs deviate from the fp32 reference by
-        # up to ~0.3% of the output full scale, roughly independent of K,
-        # while single-row probes show the staged weights are exact. Assert
-        # that full-scale bound instead of the elementwise one.
-        assert diff.max() <= 0.01 * ref.float().abs().max()
-        return
     limit = torch.maximum(0.01 * ref.float().abs(), torch.full_like(ref.float(), 0.02))
     assert torch.all(diff <= limit)
 
@@ -157,6 +158,36 @@ def test_gptq_packed_m4_column_layouts(k, n):
 @pytest.mark.parametrize("zero_format", [1, 2])
 def test_gptq_packed_tail_regression(m, zero_format):
     run_case(m, 1664, 512, torch.float16, zero_format, "contiguous", packed=True)
+
+
+def test_gemm_rejects_out_of_range_g_idx():
+    # The unpacked kernels index scales/qzeros with g_idx; an out-of-range
+    # group ID must be rejected instead of reading outside those tensors.
+    k, n = 256, 32
+    g_idx = make_g_idx("contiguous", k)
+    g_idx[0] = k // 128  # one past the last group
+    weight = torch.randn(k, n)
+    q, stored, scales = quantize(weight, make_g_idx("contiguous", k), 1)
+    with pytest.raises(RuntimeError):
+        gptq_gemm(
+            torch.randn(1, k, dtype=torch.float16).to(DEVICE),
+            pack_rows(q.to(torch.uint8)).to(DEVICE),
+            pack_cols(stored.to(torch.uint8)).to(DEVICE),
+            scales.to(torch.float16).to(DEVICE),
+            g_idx.to(device=DEVICE, dtype=torch.int32),
+            False,
+            4,
+            1,
+            False,
+        )
+
+
+def test_scalar_override_rejected_on_packed(monkeypatch):
+    # SGL_GPTQ_SCALAR=1 selects the unpacked indexing path; on packed input
+    # it must be rejected rather than silently misindexing the packed tensor.
+    monkeypatch.setenv("SGL_GPTQ_SCALAR", "1")
+    with pytest.raises(RuntimeError):
+        run_case(1, 256, 32, torch.float16, 1, "contiguous", packed=True)
 
 
 def test_gptq_repack_rejects_permuted_g_idx():

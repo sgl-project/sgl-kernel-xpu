@@ -532,6 +532,29 @@ bool contiguous_groups(sycl::queue& queue, const int* g_idx, int K) {
   return host == 0;
 }
 
+// The unpacked kernels index scales and qzeros with g_idx directly, so an
+// out-of-range group ID would read outside those tensors. The gemm checks
+// the range once per call (a K-element scan next to a K*N gemm); the packed
+// path needs no such check because gptq_repack_weights constrains g_idx
+// exactly.
+bool valid_group_ids(sycl::queue& queue, const int* g_idx, int K, int groups) {
+  int* flag = sycl::malloc_device<int>(1, queue);
+  queue.memset(flag, 0, sizeof(int)).wait();
+  queue
+      .parallel_for<class GptqGroupRangeScan>(sycl::range<1>(static_cast<size_t>(K)), [=](sycl::id<1> id) {
+        const int k = static_cast<int>(id[0]);
+        if (g_idx[k] < 0 || g_idx[k] >= groups) {
+          sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device> seen(flag[0]);
+          seen.store(1);
+        }
+      })
+      .wait();
+  int host = 0;
+  queue.memcpy(&host, flag, sizeof(int)).wait();
+  sycl::free(flag, queue);
+  return host == 0;
+}
+
 struct BandwidthStats {
   std::atomic<long> gemv{0};
   std::atomic<long> gemm{0};
@@ -1381,9 +1404,9 @@ void launch_gptq(
     int zero_format,
     bool packed) {
   const bool scalar = env_flag("SGL_GPTQ_SCALAR");
-  if (scalar) {
-    packed = false;
-  }
+  TORCH_CHECK(
+      !(scalar && packed),
+      "SGL_GPTQ_SCALAR=1 selects the unpacked indexing path and cannot be used with packed weights");
   // DPAS atom is 8 rows. Packed bf16 M>=8 (speculative verify and
   // prefill) takes the one-pass XMX GEMM. M==1 stays the packed GEMV, which
   // is also the draft-model forward. M==2 and M==4 stay the multi-row EU GEMV.
@@ -1574,6 +1597,11 @@ SGL_KERNEL_EXPORT torch::Tensor gptq_gemm(
   auto out = torch::empty({M, N}, a.options());
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
+  if (!packed) {
+    TORCH_CHECK(
+        valid_group_ids(queue, b_g_idx.data_ptr<int>(), static_cast<int>(K), static_cast<int>(K / kGroup)),
+        "gptq_gemm g_idx entries must be in [0, K/128)");
+  }
   const int zf = static_cast<int>(zero_format);
   if (a.scalar_type() == at::kHalf) {
     launch_gptq<sycl::half>(

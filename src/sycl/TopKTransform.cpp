@@ -627,14 +627,6 @@ struct TopKTransformPagedKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
   }
 };
 
-struct TopKAmongBlocksState {
-  uint32_t prefix;
-  int32_t remaining_rank;
-  int32_t selected_count;
-  int32_t greater_written;
-  int32_t equal_seen;
-};
-
 template <typename score_t>
 struct TopKAmongBlocksKernel {
   const score_t* scores;
@@ -665,18 +657,20 @@ struct TopKAmongBlocksKernel {
     const int candidates = block_count * block_size;
     auto group = item.get_group();
     int32_t* hist = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[2 * kHistStride]>(group);
-    TopKAmongBlocksState& state = *sycl::ext::oneapi::group_local_memory_for_overwrite<TopKAmongBlocksState>(group);
+    int32_t* state = *sycl::ext::oneapi::group_local_memory_for_overwrite<int32_t[5]>(group);
     if (tid == 0) {
-      state.prefix = 0;
-      state.remaining_rank = topk;
+      state[0] = 0;
+      state[1] = topk;
     }
+    item.barrier(sycl::access::fence_space::local_space);
     for (int round = 0; round < kRadixRounds; ++round) {
       if (tid < kRadix + 1) {
         hist[tid] = 0;
         hist[kHistStride + tid] = 0;
       }
       item.barrier(sycl::access::fence_space::local_space);
-      const uint32_t prefix = state.prefix;
+      const int32_t prefix_state = sycl::group_broadcast(group, tid == 0 ? state[0] : 0, 0);
+      const uint32_t prefix = sycl::bit_cast<uint32_t>(prefix_state);
       for (int index = tid; index < candidates; index += kThreadsPerBlock) {
         int64_t position;
         uint32_t key;
@@ -689,30 +683,32 @@ struct TopKAmongBlocksKernel {
       run_cumsum(item, hist);
       if (tid == 0) {
         if (round == 0) {
-          state.remaining_rank = sycl::min(topk, hist[0]);
-          state.selected_count = state.remaining_rank;
+          state[1] = sycl::min(topk, hist[0]);
+          state[2] = state[1];
         }
-        if (state.remaining_rank > 0) {
+        if (state[1] > 0) {
           int bin = kRadix - 1;
-          while (bin > 0 && hist[bin] < state.remaining_rank)
+          while (bin > 0 && hist[bin] < state[1])
             --bin;
-          state.prefix = (prefix << kRadixBits) | static_cast<uint32_t>(bin);
-          state.remaining_rank -= hist[bin + 1];
+          state[0] = sycl::bit_cast<int32_t>((prefix << 8) | static_cast<uint32_t>(bin));
+          state[1] -= hist[bin + 1];
         }
       }
       item.barrier(sycl::access::fence_space::local_space);
       if (round == 0) {
-        const int32_t selected_count = state.selected_count;
+        const int32_t selected_count = sycl::group_broadcast(group, tid == 0 ? state[2] : 0, 0);
         for (int index = selected_count + tid; index < topk; index += kThreadsPerBlock)
           output[row * topk + index] = -1;
+        item.barrier(sycl::access::fence_space::global_and_local);
         if (selected_count == 0) return;
       }
     }
-    if (tid == 0) state.greater_written = state.equal_seen = 0;
+    if (tid == 0) state[3] = state[4] = 0;
     item.barrier(sycl::access::fence_space::local_space);
-    const uint32_t threshold = state.prefix;
-    const int32_t selected_count = state.selected_count;
-    const int32_t threshold_count = state.remaining_rank;
+    const int32_t threshold_state = sycl::group_broadcast(group, tid == 0 ? state[0] : 0, 0);
+    const int32_t selected_count = sycl::group_broadcast(group, tid == 0 ? state[2] : 0, 0);
+    const int32_t threshold_count = sycl::group_broadcast(group, tid == 0 ? state[1] : 0, 0);
+    const uint32_t threshold = sycl::bit_cast<uint32_t>(threshold_state);
     const int iterations = (candidates + kThreadsPerBlock - 1) / kThreadsPerBlock;
     for (int iteration = 0; iteration < iterations; ++iteration) {
       const int index = iteration * kThreadsPerBlock + tid;
@@ -721,8 +717,8 @@ struct TopKAmongBlocksKernel {
       const bool valid = index < candidates && candidate(row, index, position, key);
       const int greater = valid && key > threshold;
       const int equal = valid && key == threshold;
-      const int greater_pos = wg_reserve(item, state.greater_written, greater);
-      const int equal_pos = wg_reserve(item, state.equal_seen, equal);
+      const int greater_pos = wg_reserve(item, state[3], greater);
+      const int equal_pos = wg_reserve(item, state[4], equal);
       if (greater || (equal && equal_pos < threshold_count)) {
         const int output_index = greater ? greater_pos : selected_count - threshold_count + equal_pos;
         output[row * topk + output_index] = position;

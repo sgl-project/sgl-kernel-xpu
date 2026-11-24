@@ -183,9 +183,14 @@ def _run_op(i, token_indx=None):
         token_indx,
         i["cache_indices"],
         i["has_initial_state"],
-        # num_prefills/num_decodes only affect an internal fast-path/kernel
-        # selection heuristic, not correctness, per gdn::gated_delta_rule;
-        # pass conservative values covering "there might be either".
+        # num_prefills/num_decodes are CALLER scalars that must be consistent
+        # with query_start_loc: the chunk fast path (gated by gdn::kChunkMinTokens)
+        # is taken only when the scalar counts AND the tensor shapes both agree
+        # on a single prefill sequence. Here we pass num_prefills = (number of
+        # sequences) and num_decodes = 0, which matches query_start_loc: one
+        # sequence correctly enables the chunk path (when long enough), while
+        # multi-sequence batches correctly stay on the sequential kernel and
+        # are validated for correctness against the reference below.
         i["query_start_loc"].numel() - 1,
         0,
     )
@@ -215,13 +220,19 @@ def test_long_prefill_matches_sequential_without_mutating_inputs(
     }
     original = {key: inputs[key].clone() for key in ("q", "k", "v", "a", "b")}
     identity = torch.arange(length, device="xpu", dtype=torch.int32)
+    # expected -> sequential kernel (token_indx forces it); inputs -> chunk
+    # kernel (no remap, single long sequence). Both are bf16, so this is a
+    # chunk-vs-sequential comparison. Tolerances are kept well above the
+    # observed per-element error (~1e-3) -- an earlier (rtol=3e-2, atol=5e-2)
+    # pair was ~50x that and would let a common-mode scale/offset error of a
+    # few percent pass undetected -- while still comfortably below it.
     _run_op(expected, token_indx=identity)
     _run_op(inputs)
     torch.testing.assert_close(
-        inputs["core_attn_out"], expected["core_attn_out"], rtol=3e-2, atol=5e-2
+        inputs["core_attn_out"], expected["core_attn_out"], rtol=2e-2, atol=5e-3
     )
     torch.testing.assert_close(
-        inputs["ssm_state"], expected["ssm_state"], rtol=3e-2, atol=2e-2
+        inputs["ssm_state"], expected["ssm_state"], rtol=2e-2, atol=1e-2
     )
     for key, value in original.items():
         torch.testing.assert_close(inputs[key], value, rtol=0, atol=0)
@@ -248,6 +259,168 @@ def test_long_prefill_selects_chunk_kernel(tmp_path):
     }
     assert any("ChunkFwdOKernel" in name for name in kernels), kernels
     assert not any("gated_delta_rule_kernel<" in name for name in kernels), kernels
+
+
+@pytest.mark.arch("xe20")
+@pytest.mark.parametrize(
+    "length,expect_chunk",
+    [(511, False), (512, True)],
+    ids=["just-below-threshold", "at-threshold"],
+)
+def test_dispatch_boundary_selects_expected_kernel(length, expect_chunk, tmp_path):
+    """Pin the chunk/sequential dispatch BOUNDARY. A single long sequence at
+    length == gdn::kChunkMinTokens - 1 must NOT run the chunk kernel; at length
+    == gdn::kChunkMinTokens it must. Keep the two lengths in sync with
+    gdn::kChunkMinTokens (src/sycl/gdn_attn/gdn_attn_utils.h). Catches someone
+    silently widening or narrowing the fast-path guard's token gate."""
+    inputs = _make_inputs([length], torch.bfloat16, torch.device("xpu"), nk=4, nv=12)
+    inputs["ssm_state"] = inputs["ssm_state"].float()
+    _run_op(inputs)
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.XPU,
+        ]
+    ) as profiler:
+        _run_op(inputs)
+    path = tmp_path / "boundary.json"
+    profiler.export_chrome_trace(str(path))
+    kernels = {
+        event["name"]
+        for event in json.loads(path.read_text())["traceEvents"]
+        if event.get("cat") == "kernel"
+    }
+    has_chunk = any("ChunkFwdOKernel" in name for name in kernels)
+    has_seq = any("gated_delta_rule_kernel<" in name for name in kernels)
+    if expect_chunk:
+        assert has_chunk, f"expected chunk kernel at length {length}: {kernels}"
+        assert (
+            not has_seq
+        ), f"unexpected sequential kernel at length {length}: {kernels}"
+    else:
+        assert not has_chunk, f"unexpected chunk kernel at length {length}: {kernels}"
+        assert has_seq, f"expected sequential kernel at length {length}: {kernels}"
+
+
+def test_long_prefill_matches_fp32_reference():
+    """The chunk-selected bf16 output/state must also agree with an independent
+    fp32 sequential reference, not just with the bf16 sequential kernel. A
+    chunk-vs-sequential comparison (same op, same dtype) can share a
+    common-mode scale/offset error between the two paths and thus miss it; an
+    fp32 re-derivation cannot. Tolerances are looser than the tight
+    chunk-vs-sequential gate (bf16 op vs fp32 ref) but still catch a ~2%
+    common-mode error."""
+    device = torch.device("xpu")
+    i = _make_inputs([2048], torch.bfloat16, device, nk=4, nv=12)
+    i["ssm_state"] = i["ssm_state"].float()
+    ssm_state_before = i["ssm_state"].clone()
+    _run_op(i)  # single long sequence -> chunk path
+
+    ref_out, ref_state = _reference(
+        i["q"],
+        i["k"],
+        i["v"],
+        i["b"],
+        i["a"],
+        i["A_log"],
+        i["dt_bias"],
+        ssm_state_before,
+        i["query_start_loc"],
+        i["cache_indices"],
+        has_initial_state=i["has_initial_state"],
+    )
+    torch.testing.assert_close(
+        i["core_attn_out"].float(), ref_out, rtol=2e-2, atol=1e-2
+    )
+    got_state = torch.stack(
+        [i["ssm_state"][int(row)].float() for row in i["cache_indices"]]
+    )
+    exp_state = torch.stack([ref_state[int(row)] for row in i["cache_indices"]])
+    torch.testing.assert_close(got_state, exp_state, rtol=2e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[300, 300], [1024, 1024], [2048, 5]],
+    ids=["total-600-below-old-above-new", "total-2048-balanced", "total-2053-ragged"],
+)
+def test_multiseq_long_total_stays_correct(seq_lens):
+    """A MULTI-sequence batch whose TOTAL token count is at/above the chunk
+    threshold must still be correct. The chunk path is single-sequence-only in
+    this PR, so these calls must route to the sequential kernel and must NOT
+    (a) take the single-sequence chunk path (which mis-handles >1 sequence) or
+    (b) produce NaN. The totals span the newly-changed [512, 2048) band as well
+    as above the old 2048 cutoff, so this guards against the widened threshold
+    ever leaking the multi-sequence case into the single-sequence chunk path.
+    (previously nothing exercised a >= threshold multi-sequence batch)."""
+    device = torch.device("xpu")
+    i = _make_inputs(seq_lens, torch.bfloat16, device, nk=4, nv=12)
+    i["ssm_state"] = i["ssm_state"].float()
+    ssm_state_before = i["ssm_state"].clone()
+    _run_op(i)
+    ref_out, ref_state = _reference(
+        i["q"],
+        i["k"],
+        i["v"],
+        i["b"],
+        i["a"],
+        i["A_log"],
+        i["dt_bias"],
+        ssm_state_before,
+        i["query_start_loc"],
+        i["cache_indices"],
+    )
+    torch.testing.assert_close(
+        i["core_attn_out"].float(), ref_out, rtol=2e-2, atol=1e-2
+    )
+    got_state = torch.stack(
+        [i["ssm_state"][int(row)].float() for row in i["cache_indices"]]
+    )
+    exp_state = torch.stack([ref_state[int(row)] for row in i["cache_indices"]])
+    torch.testing.assert_close(got_state, exp_state, rtol=2e-2, atol=1e-2)
+
+
+def test_prefill_count_mismatch_is_not_corrupted():
+    """Regression guard for the review finding that num_prefills=1 with a
+    query_start_loc describing MORE than one sequence used to silently select
+    the single-sequence chunk path: the chunk kernel re-derives batch_size from
+    query_start_loc, reads has_initial_state out of bounds, and emitted NaN in
+    ~8% of the outputs. The fast path is now only taken when the scalar counts
+    AND the tensor shapes agree on a single sequence, so this mismatch must
+    fall back to the sequential kernel and stay finite (no NaN). We assert
+    finiteness / no crash only, because the mismatch is a caller-contract
+    violation and the sequential kernel defines its (tolerable) numeric
+    behavior for it, not the op."""
+    device = torch.device("xpu")
+    # Two sequences, but the caller claims num_prefills=1.
+    i = _make_inputs([2048, 2048], torch.bfloat16, device, nk=4, nv=12)
+    i["ssm_state"] = i["ssm_state"].float()
+    # token_indx=None, has_initial_state=None so the ONLY inconsistency is the
+    # scalar-vs-tensor sequence count (the thing under test).
+    torch.ops.sgl_kernel.gated_delta_rule(
+        i["core_attn_out"],
+        i["q"],
+        i["k"],
+        i["v"],
+        i["b"],
+        i["a"],
+        i["A_log"],
+        i["dt_bias"],
+        i["ssm_state"],
+        i["query_start_loc"],
+        None,
+        i["cache_indices"],
+        None,
+        1,
+        0,
+    )
+    torch.xpu.synchronize()
+    assert torch.isfinite(
+        i["core_attn_out"].float()
+    ).all(), "mismatched num_prefills/query_start_loc produced non-finite outputs"
+    assert torch.isfinite(
+        i["ssm_state"].float()
+    ).all(), "mismatched num_prefills/query_start_loc produced non-finite state"
 
 
 @pytest.mark.parametrize("length,remap", [(37, False), (2048, True)])

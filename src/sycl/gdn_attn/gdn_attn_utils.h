@@ -13,6 +13,25 @@ static constexpr float l2norm_eps = 0.000001f;
 static constexpr int chunk_size_xe2 = 64;
 static constexpr int A_block_size_xe2 = 16;
 
+// Minimum single-sequence token count the standalone `gated_delta_rule` op
+// requires before it selects the chunk (parallel) kernel over the sequential
+// (token-serial) kernel. The sequential kernel is token-serial, so it stays
+// competitive -- or even faster -- for short prompts: the chunk path pays a
+// fixed cost per call (padded-buffer allocation + per-chunk launch overheads)
+// that only amortizes once the sequence is long enough, below which the
+// serial recurrence's lack of chunking overheads wins.
+//
+// Provenance: tuned from a device-time crossover sweep of the two production
+// head geometries (see benchmark/bench_gdn_chunk_dispatch.py) -- the measured
+// crossover is roughly one order of magnitude below the previous hardcoded
+// 2048 (on the order of a few hundred tokens for nk=16/nv=32 and well under
+// 512 for nk=4/nv=12 at TP4). 512 is a round value safely ABOVE both measured
+// crossovers, so the chunk kernel is only selected when it wins; it also keeps
+// the old 2048-tested region entirely inside the chunk path. The crossover is
+// geometry- and device-dependent, so this is ONE global heuristic knob, not a
+// tight optimum -- re-run the sweep per target before changing it.
+static constexpr int64_t kChunkMinTokens = 512;
+
 enum class ActMode {
   silu = 0,
   swish = 1,

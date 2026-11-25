@@ -1,5 +1,5 @@
 """Two-card (TP2) checks of the mono decode layers, one process per card with
-the mailboxes shared through Level Zero IPC as in SGLang:
+the mailboxes in torch symmetric memory as in SGLang:
 
 * the two ranks' outputs are bitwise equal, and swapping the ranks' weight
   shards gives bitwise the same outputs (the all-reduces add the two partial
@@ -19,7 +19,6 @@ import torch.multiprocessing as mp
 from mono_decode_utils import (
     attn_tensors,
     cos,
-    exchange_fd,
     gdn_caches,
     gdn_tensors,
     kv_caches,
@@ -27,6 +26,7 @@ from mono_decode_utils import (
     recv_from,
     requires_two_cards,
     rows,
+    tp2_mailboxes,
 )
 
 
@@ -37,14 +37,7 @@ def _worker(rank, path, conn):
     torch.xpu.set_device(rank)
     dev = f"xpu:{rank}"
     nl = 64
-    h = ops.mono_ipc_create(nl * ops.mono_mbox_bytes())
-    info = ops.mono_ipc_export(h)
-    conn.send(info)
-    peer_info = conn.recv()
-    peer_fd = exchange_fd(rank, path, int(info[1]))
-    ops.mono_ipc_open(h, peer_info, peer_fd)
-    own, peer = ops.mono_ipc_ptr(h, False), ops.mono_ipc_ptr(h, True)
-    mb = ops.mono_mbox_bytes()
+    region, own, peer, mb = tp2_mailboxes(rank, path, nl)  # noqa: F841
     slot = iter(range(nl))
     out = {}
 
@@ -196,7 +189,7 @@ def _worker(rank, path, conn):
 def _run_pair():
     ctx = mp.get_context("spawn")
     with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "mono_tp2.sock")
+        path = os.path.join(tmp, "mono_tp2.pg")
         c0, c1 = ctx.Pipe(), ctx.Pipe()
         procs = [
             ctx.Process(target=_worker, args=(0, path, c0[1])),
@@ -207,10 +200,6 @@ def _run_pair():
                 p.start()
             c0[1].close()  # the parent's copies: a worker that dies is an EOF
             c1[1].close()
-            i0 = recv_from(c0[0], procs[0])
-            i1 = recv_from(c1[0], procs[1])
-            c0[0].send(i1)
-            c1[0].send(i0)
             r0, r1 = (
                 torch.load(io.BytesIO(recv_from(c, p)))
                 for c, p in ((c0[0], procs[0]), (c1[0], procs[1]))

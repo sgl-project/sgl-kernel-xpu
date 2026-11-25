@@ -831,14 +831,6 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("mono_fault_inject", c10::DispatchKey::BackendSelect, &mono_fault_inject);
   m.def("mono_layer_counters(int layer) -> Tensor");
   m.impl("mono_layer_counters", c10::DispatchKey::BackendSelect, &mono_layer_counters);
-  m.def("mono_ipc_create(int bytes) -> int");
-  m.impl("mono_ipc_create", c10::DispatchKey::BackendSelect, &mono_ipc_create);
-  m.def("mono_ipc_export(int handle) -> int[]");
-  m.impl("mono_ipc_export", c10::DispatchKey::BackendSelect, &mono_ipc_export);
-  m.def("mono_ipc_open(int handle, int[] peer_info, int local_fd) -> int");
-  m.impl("mono_ipc_open", c10::DispatchKey::BackendSelect, &mono_ipc_open);
-  m.def("mono_ipc_ptr(int handle, bool peer) -> int");
-  m.impl("mono_ipc_ptr", c10::DispatchKey::BackendSelect, &mono_ipc_ptr);
   m.def("mono_mbox_bytes() -> int");
   m.impl("mono_mbox_bytes", c10::DispatchKey::BackendSelect, &mono_mbox_bytes);
   m.def("mono_register_layer(int layer, bool attn, int mbox, int peer, Tensor[] tensors) -> ()");

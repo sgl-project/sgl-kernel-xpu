@@ -1,6 +1,6 @@
 """Benchmark the mono decode layer kernels (Qwen3.5 / Qwen3.6 MoE 35B-A3B, TP2)
 on two Intel GPUs: device time per layer call, one process per card, the
-mailboxes shared through Level Zero IPC as in SGLang.
+mailboxes in torch symmetric memory as in SGLang.
 
 Each case registers NCP copies of a layer (distinct random weights and
 caches, so the weights stream from memory as in a 40-layer step rather than
@@ -21,7 +21,7 @@ import torch.multiprocessing as mp
 
 
 def _fixtures():
-    """The tests' fixtures (random layers, mailboxes, the fd exchange), loaded
+    """The tests' fixtures (random layers, mailboxes), loaded
     by path: no pytest and no change of sys.path."""
     path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
@@ -46,12 +46,7 @@ def _worker(rank, path, conn, args):
     dev = f"xpu:{rank}"
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     nl = args.ncp * len(args.rows) * (1 + len(args.ctx))  # one mailbox per layer copy
-    h = ops.mono_ipc_create(nl * ops.mono_mbox_bytes())
-    info = ops.mono_ipc_export(h)
-    conn.send(info)
-    ops.mono_ipc_open(h, conn.recv(), fx.exchange_fd(rank, path, int(info[1])))
-    own, peer = ops.mono_ipc_ptr(h, False), ops.mono_ipc_ptr(h, True)
-    mb = ops.mono_mbox_bytes()
+    region, own, peer, mb = fx.tp2_mailboxes(rank, path, nl)  # noqa: F841
     slot = iter(range(nl))
     lid = iter(range(1000, 3000))
     out = []
@@ -153,7 +148,7 @@ def main():
     p.add_argument("--rounds", type=int, default=5)
     args = p.parse_args()
     ctx = mp.get_context("spawn")
-    path = os.path.join(tempfile.mkdtemp(), "mono_bench.sock")
+    path = os.path.join(tempfile.mkdtemp(), "mono_bench.pg")
     c0, c1 = ctx.Pipe(), ctx.Pipe()
     procs = [
         ctx.Process(target=_worker, args=(r, path, c[1], args))
@@ -166,9 +161,6 @@ def main():
     ].close()  # the parent's copies of the workers' ends: a worker that dies is an EOF
     c1[1].close()
     try:
-        i0, i1 = fx.recv_from(c0[0], procs[0]), fx.recv_from(c1[0], procs[1])
-        c0[0].send(i1)
-        c1[0].send(i0)
         r0, r1 = (fx.recv_from(c[0], pr) for c, pr in ((c0, procs[0]), (c1, procs[1])))
         r0, r1 = list(r0), list(r1)
         for pr in procs:

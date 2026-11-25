@@ -323,26 +323,22 @@ def test_forward_refuses_arguments_it_does_not_serve():
         runtime._require(False, "no kernel")
 
 
-def test_fd_exchange_gives_up_when_the_peer_never_connects(tmp_path):
-    import os
-
+def test_peer_region_refuses_without_ptrace(monkeypatch):
+    """Without ptrace permission every rank fails before the symmetric-memory
+    rendezvous (which would otherwise fail inside the driver), with the fix in
+    the message."""
     import torch.distributed as dist
 
     peer = pytest.importorskip("sgl_kernel.monokernel.peer")
+    monkeypatch.setattr(peer, "ptrace_problem", lambda: "no CAP_SYS_PTRACE")
     dist.init_process_group(
-        "gloo", store=dist.HashStore(), rank=0, world_size=1, group_name="fd_test"
+        "gloo", store=dist.HashStore(), rank=0, world_size=1, group_name="ptrace_test"
     )
     try:
-        r, w = os.pipe()
-        with pytest.raises(TimeoutError):
-            peer._exchange_fd(r, 0, dist.group.WORLD, timeout=0.5)
-        os.close(r)
-        os.close(w)
+        group = types.SimpleNamespace(
+            cpu_group=dist.group.WORLD, device_group=dist.group.WORLD
+        )
+        with pytest.raises(RuntimeError, match="ptrace"):
+            peer.PeerRegion(["layer0"], 0, group)
     finally:
         dist.destroy_process_group()
-    import glob
-    import tempfile
-
-    assert not glob.glob(
-        os.path.join(tempfile.gettempdir(), f"sgl_xpu_mono_{os.getpid()}.sock")
-    )

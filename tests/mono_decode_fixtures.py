@@ -6,8 +6,6 @@ here: the benchmark loads this module too (the skip markers are in
 mono_decode_utils). The 16-bit tensors take a dtype (fp16 or bf16); the same seed gives
 the same values rounded to either."""
 
-import os
-import socket
 import time
 
 import torch
@@ -315,40 +313,25 @@ def layer_tensors(attn, shard_seed, dev, dtype, rep_seed=0):
     return [rep[i] if i in keep else own[i] for i in range(len(rep))]
 
 
-def exchange_fd(rank, path, fd, timeout=60.0):
-    """Swaps the dma-buf fds of the two ranks over a unix socket
-    (SCM_RIGHTS). Every wait is bounded by ``timeout`` seconds, so a peer that
-    died before it ends the call with a TimeoutError instead of blocking it."""
-    srv = None
-    try:
-        if rank == 0:
-            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            srv.settimeout(timeout)
-            srv.bind(path)
-            srv.listen(1)
-            conn, _ = srv.accept()
-        else:
-            conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            deadline = time.monotonic() + timeout
-            while True:
-                try:
-                    conn.connect(path)
-                    break
-                except OSError:
-                    if time.monotonic() > deadline:
-                        conn.close()
-                        raise TimeoutError(f"rank 0 never listened on {path}")
-                    time.sleep(0.05)
-        with conn:
-            conn.settimeout(timeout)
-            socket.send_fds(conn, [b"f"], [fd])
-            _, fds, _, _ = socket.recv_fds(conn, 1, 1)
-        return fds[0]
-    finally:
-        if srv is not None:
-            srv.close()
-            if os.path.exists(path):
-                os.unlink(path)
+def tp2_mailboxes(rank, path, n):
+    """``n`` mailboxes in torch symmetric memory shared by two worker processes
+    (one per card), as in SGLang: returns (region, own, peer, mailbox bytes),
+    own / peer the addresses of mailbox 0 (mailbox i is ``i * bytes`` past it).
+    ``path`` is a file both workers name for the process-group rendezvous;
+    keep the region alive while the kernels run."""
+    import torch.distributed as dist
+    from types import SimpleNamespace
+
+    from sgl_kernel.monokernel.peer import PeerRegion
+
+    dist.init_process_group(
+        "xccl", init_method=f"file://{path}", rank=rank, world_size=2
+    )
+    group = SimpleNamespace(
+        device_group=dist.group.WORLD, cpu_group=dist.new_group(backend="gloo")
+    )
+    region = PeerRegion([str(i) for i in range(n)], rank, group)
+    return region, region.own, region.peer, region.mbox_bytes
 
 
 def recv_from(conn, proc, timeout=600.0):

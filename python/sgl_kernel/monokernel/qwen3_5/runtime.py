@@ -118,7 +118,7 @@ class MonoQwen35:
         self.deadline = deadline_s(context.deadline_s)
         mono_decode.set_deadline(self.deadline)
         names = [f"layer{i}" for i in range(len(self.layers))]
-        self.peer = PeerRegion(names, self.rank, group.cpu_group)
+        self.peer = PeerRegion(names, self.rank, group)
         self.ids = [7000 + i for i in range(len(self.layers))]
         ok = True
         try:
@@ -264,7 +264,7 @@ class MonoQwen35MTP:
         self.rank = group.rank_in_group
         mono_decode.set_deadline(deadline_s(context.deadline_s))
         names = ["mtp_prologue", "mtp_layer"]
-        self.peer = PeerRegion(names, self.rank, group.cpu_group)
+        self.peer = PeerRegion(names, self.rank, group)
         ok = True
         try:
             own, peer = self.peer.mailbox(names[0])

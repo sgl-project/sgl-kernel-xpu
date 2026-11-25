@@ -14,7 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 // Host side of the mono decode layers (Qwen3.5 / Qwen3.6 MoE, TP2, Xe2): the
-// device check, the IPC mailbox regions, the per-layer registry (SGLang
+// device check, the per-layer registry (SGLang
 // weights registered once, caches bound separately and again whenever the
 // pools move, one scratch per layer) and the per-step launch on the current
 // torch XPU queue. The kernels are in kernels/mono_decode/xe20/, one
@@ -22,19 +22,14 @@ limitations under the License.
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUFunctions.h>
 #include <c10/xpu/XPUStream.h>
-#include <level_zero/ze_api.h>
-#include <sys/syscall.h>
 #include <torch/all.h>
-#include <unistd.h>
 
 #include <array>
 #include <atomic>
-#include <cerrno>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <sycl/sycl.hpp>
 #include <unordered_map>
 #include <vector>
@@ -65,12 +60,6 @@ using sgl_mono::e16;
 using sgl_mono::Ptrs;
 using sgl_mono::Scratch;
 using sgl_mono::ScratchB;
-
-#define ZE_CHECK(call)                                                                                        \
-  do {                                                                                                        \
-    ze_result_t _r = (call);                                                                                  \
-    TORCH_CHECK(_r == ZE_RESULT_SUCCESS, #call " failed: ze_result 0x", std::hex, static_cast<uint32_t>(_r)); \
-  } while (0)
 
 // -----------------------------------------------------------------------------
 // device check: Xe2 (Battlemage) with at least 32 Xe cores. The layer kernels
@@ -104,32 +93,6 @@ void check_device(const char* op, int64_t device = -1) {
       op,
       ": unsupported device (the mono decode kernels need an Xe2 (Battlemage) GPU with at least 32 Xe cores; "
       "check mono_decode_supported() first).");
-}
-
-// -----------------------------------------------------------------------------
-// IPC regions
-constexpr int64_t kCookieOff = 0;  // first 64 B of a region: cookie (mailboxes start at 64 B)
-constexpr int64_t kHdr = 64;
-
-struct Region {
-  ze_context_handle_t ctx = nullptr;
-  ze_device_handle_t dev = nullptr;
-  int device = -1;  // the torch XPU device that created it: its queue serves every later use
-  char* own = nullptr;
-  char* peer = nullptr;
-  int64_t bytes = 0;
-  ze_ipc_mem_handle_t ipc{};
-  bool exported = false;
-  uint64_t cookie = 0;
-  int imported_fd = -1;
-};
-std::mutex g_mu;
-std::vector<std::unique_ptr<Region>> g_regions;
-
-Region& region(int64_t h) {
-  std::lock_guard<std::mutex> lk(g_mu);
-  TORCH_CHECK(h >= 0 && h < (int64_t)g_regions.size() && g_regions[h], "mono: invalid IPC handle ", h);
-  return *g_regions[h];
 }
 
 // wait deadline of the in-kernel mailbox waits, in cycles of the sub-group
@@ -420,119 +383,6 @@ void mono_set_deadline(double seconds) {
     sycl::queue& q = c10::xpu::getCurrentXPUStream(kv.second.device).queue();
     q.memcpy(kv.second.S.cnt + sgl_mono::DEADLINE, &dl, sizeof(dl)).wait();
   }
-}
-
-int64_t mono_ipc_create(int64_t bytes) {
-  check_device("mono_ipc_create");
-  auto r = std::make_unique<Region>();
-  r->device = (int)c10::xpu::current_device();
-  sycl::queue& q = c10::xpu::getCurrentXPUStream(r->device).queue();
-  r->ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
-  r->dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
-  r->bytes = kHdr + bytes;
-  ze_device_mem_alloc_desc_t desc{ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC, nullptr, 0, 0};
-  void* p = nullptr;
-  ZE_CHECK(zeMemAllocDevice(r->ctx, &desc, r->bytes, 4096, r->dev, &p));
-  r->own = static_cast<char*>(p);
-  q.memset(r->own, 0, r->bytes).wait();
-  r->cookie = ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)r->own ^ 0x9e3779b97f4a7c15ull;
-  q.memcpy(r->own + kCookieOff, &r->cookie, sizeof(uint64_t)).wait();
-  std::lock_guard<std::mutex> lk(g_mu);
-  g_regions.push_back(std::move(r));
-  return (int64_t)g_regions.size() - 1;
-}
-
-// [pid, fd, cookie lo, cookie hi, raw ze_ipc_mem_handle_t words]
-std::vector<int64_t> mono_ipc_export(int64_t h) {
-  Region& r = region(h);
-  if (!r.exported) {
-    ZE_CHECK(zeMemGetIpcHandle(r.ctx, r.own, &r.ipc));
-    r.exported = true;
-  }
-  uint64_t fd = 0;
-  if (zeMemGetFileDescriptorFromIpcHandleExp(r.ctx, r.ipc, &fd) != ZE_RESULT_SUCCESS) {
-    int fd32 = 0;  // the Intel handle starts with the dma-buf fd
-    std::memcpy(&fd32, r.ipc.data, sizeof(fd32));
-    fd = (uint64_t)fd32;
-  }
-  std::vector<int64_t> out{
-      (int64_t)getpid(), (int64_t)fd, (int64_t)(r.cookie & 0xffffffffu), (int64_t)(r.cookie >> 32)};
-  uint32_t w[ZE_MAX_IPC_HANDLE_SIZE / 4];
-  std::memcpy(w, r.ipc.data, sizeof(w));
-  for (uint32_t v : w)
-    out.push_back(v);
-  return out;
-}
-
-// local_fd >= 0: the peer's dma-buf fd, already passed into this process (unix
-// socket SCM_RIGHTS); the handle is opened with its fd field patched. Otherwise
-// tries (0) the raw peer handle (the driver imports the fd itself), then (1)
-// pidfd_getfd (needs ptrace permission). A mapping is accepted only if the
-// peer's cookie reads back.
-int64_t mono_ipc_open(int64_t h, std::vector<int64_t> peer, int64_t local_fd) {
-  Region& r = region(h);
-  TORCH_CHECK(r.peer == nullptr, "mono: peer already opened");
-  TORCH_CHECK(peer.size() == 4 + ZE_MAX_IPC_HANDLE_SIZE / 4, "mono: bad peer handle info");
-  const uint64_t peer_cookie = (uint64_t)(uint32_t)peer[2] | ((uint64_t)(uint32_t)peer[3] << 32);
-  sycl::queue& q = c10::xpu::getCurrentXPUStream(r.device).queue();  // the region's own device
-  auto verify = [&](void* p) {
-    uint64_t c = 0;
-    q.memcpy(&c, static_cast<char*>(p) + kCookieOff, sizeof(c)).wait();
-    if (c == peer_cookie) return true;
-    zeMemCloseIpcHandle(r.ctx, p);
-    return false;
-  };
-  ze_ipc_mem_handle_t raw{};
-  uint32_t w[ZE_MAX_IPC_HANDLE_SIZE / 4];
-  for (size_t i = 0; i < ZE_MAX_IPC_HANDLE_SIZE / 4; ++i)
-    w[i] = (uint32_t)peer[4 + i];
-  std::memcpy(raw.data, w, sizeof(w));
-  void* p = nullptr;
-  int64_t mode = -1;
-  // the handle with its fd (and the exporter pid) patched to a local fd
-  auto open_with_fd = [&](int fd) {
-    ze_ipc_mem_handle_t ph = raw;
-    int fd32 = fd;
-    std::memcpy(ph.data, &fd32, sizeof(fd32));
-    uint32_t pw[ZE_MAX_IPC_HANDLE_SIZE / 4];
-    std::memcpy(pw, ph.data, sizeof(pw));
-    for (int i = 1; i < ZE_MAX_IPC_HANDLE_SIZE / 4; ++i)
-      if (pw[i] == (uint32_t)peer[0]) pw[i] = (uint32_t)getpid();
-    std::memcpy(ph.data + 4, pw + 1, sizeof(pw) - 4);
-    const ze_result_t rr = zeMemOpenIpcHandle(r.ctx, r.dev, ph, 0, &p);
-    return rr == ZE_RESULT_SUCCESS && verify(p);
-  };
-  if (local_fd >= 0) {  // fd received over a unix socket: no ptrace permission needed
-    TORCH_CHECK(open_with_fd((int)local_fd), "mono: could not open the peer IPC handle with the received fd");
-    r.imported_fd = (int)local_fd;
-    r.peer = static_cast<char*>(p);
-    return 2;
-  }
-  ze_result_t r0 = zeMemOpenIpcHandle(r.ctx, r.dev, raw, 0, &p);
-  if (r0 == ZE_RESULT_SUCCESS && verify(p)) mode = 0;
-  if (mode < 0) {
-    int pidfd = (int)syscall(SYS_pidfd_open, (pid_t)peer[0], 0);
-    TORCH_CHECK(pidfd >= 0, "mono: pidfd_open(", peer[0], ") failed, errno ", errno);
-    int fd = (int)syscall(SYS_pidfd_getfd, pidfd, (int)peer[1], 0);
-    const int err = errno;
-    close(pidfd);
-    TORCH_CHECK(fd >= 0, "mono: pidfd_getfd failed, errno ", err);
-    if (open_with_fd(fd)) {
-      mode = 1;
-      r.imported_fd = fd;
-    } else
-      close(fd);
-    TORCH_CHECK(mode >= 0, "mono: could not open the peer IPC handle (raw 0x", std::hex, (uint32_t)r0, ")");
-  }
-  r.peer = static_cast<char*>(p);
-  return mode;
-}
-
-int64_t mono_ipc_ptr(int64_t h, bool peer) {
-  Region& r = region(h);
-  char* p = peer ? r.peer : r.own;
-  TORCH_CHECK(p != nullptr, "mono: region not opened");
-  return (int64_t)(uintptr_t)(p + kHdr);
 }
 
 int64_t mono_mbox_bytes() {

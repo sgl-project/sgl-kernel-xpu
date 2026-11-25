@@ -8,7 +8,7 @@ kernel (MTP_SPEC); every other step runs the model's own forward."""
 from typing import Any
 
 import torch
-from sgl_kernel import mono_decode
+from sgl_kernel import qwen35_decode
 
 from sglang.kernels.plugin_kernels.xpu.spec import (
     MONOKERNEL_API_VERSION,
@@ -43,7 +43,7 @@ TEXT_CONFIG = {
     "hidden_act": "silu",
 }
 ROPE_THETA = 10_000_000
-# the kernel ids of the target are 7000 + layer; the MTP drafter's are 7100 / 7101
+# decoder layers the runtime serves (one kernel, counters row and mailbox each)
 MAX_LAYERS = 100
 WIDTHS = (1, 2, 3, 4, 6, 8)
 # tokens a request of a verify step (1 + draft tokens) the verify kernels have
@@ -141,9 +141,13 @@ def config_disable_reasons(cfg: Any, hf_config: Any) -> list:
     ) != [128, 128]:
         reasons.append("the kernels need the block-FP8 (128x128) checkpoint")
     context = getattr(cfg, "context_length", None)
-    if context and mono_decode.is_available() and context > mono_decode.max_context():
+    if (
+        context
+        and qwen35_decode.is_available()
+        and context > qwen35_decode.max_context()
+    ):
         reasons.append(
-            f"context length {context} is above the kernels' {mono_decode.max_context()}"
+            f"context length {context} is above the kernels' {qwen35_decode.max_context()}"
         )
     algo = getattr(cfg, "speculative_algorithm", None)
     if algo is not None:
@@ -190,12 +194,12 @@ def _conv_dtype():
 def model_disable_reasons(model: torch.nn.Module, hf_config: Any, copies: dict) -> list:
     """Per-rank checks of the loaded model (the kernels check every tensor again
     at registration)."""
-    if not mono_decode.is_available():
+    if not qwen35_decode.is_available():
         return [
             "this sgl-kernel-xpu build has no mono decode kernels (USE_MONO_DECODE)"
         ]
     device = next(model.parameters()).device
-    if not mono_decode.supports(device):
+    if not qwen35_decode.is_supported(device):
         return [f"{device} is not an Xe2 GPU with at least 32 Xe cores"]
     from .runtime import layer_modules
 
@@ -249,12 +253,12 @@ def mtp_model_disable_reasons(
 ) -> list:
     """Per-rank checks of the loaded MTP drafter (the kernels check every
     tensor again at registration)."""
-    if not mono_decode.is_available():
+    if not qwen35_decode.is_available():
         return [
             "this sgl-kernel-xpu build has no mono decode kernels (USE_MONO_DECODE)"
         ]
     device = next(model.parameters()).device
-    if not mono_decode.supports(device):
+    if not qwen35_decode.is_supported(device):
         return [f"{device} is not an Xe2 GPU with at least 32 Xe cores"]
     from .runtime import is_attention, layer_modules
 

@@ -18,6 +18,17 @@
 
 namespace sgl_kernel::stage::xe20 {
 
+// Launch geometry of a decode kernel, a compile-time type the model's shape
+// traits derive from: NWG work-groups (one a Xe core, all resident) of WGS
+// work-items in sub-groups of 16, at most MAXR rows (tokens) a launch.
+template <int kNwg, int kWgs, int kMaxRows>
+struct Launch {
+  static constexpr int NWG = kNwg;
+  static constexpr int WGS = kWgs;
+  static constexpr int NSG = kWgs / 16;  // sub-groups a work-group
+  static constexpr int MAXR = kMaxRows;
+};
+
 using half = sycl::half;
 using h2 = sycl::vec<half, 2>;
 using bf16 = sycl::ext::oneapi::bfloat16;

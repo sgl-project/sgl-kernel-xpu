@@ -12,7 +12,6 @@ import time
 from typing import Callable, Optional
 
 import torch
-from sgl_kernel import mono_decode
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +45,7 @@ def describe(
         layer = layer_of(words[7]) or "an unknown layer"
         what = (
             f"a wait for the peer card in {layer} gave up after {deadline:g} s "
-            f"(tag {words[3]}, mailbox word {words[6]})"
+            f"(tag {words[3]}, mailbox word at 0x{words[6] & 0xFFFFFFFF:08x})"
         )
     return (
         f"XPU monokernel: rank {rank}: {what}. The outputs of the failed step are NaN and the "
@@ -65,20 +64,21 @@ def stop_server() -> None:
 
 
 class FailureWatch:
-    """Polls the host copy of a device's health words; ``check`` raises in the
-    caller's thread, and the polling thread stops the server, so a failure in a
-    replayed graph (no Python runs) stops it too."""
+    """Polls the host copy of a workspace's health words (``health_host``,
+    pinned); ``check`` raises in the caller's thread, and the polling thread
+    stops the server, so a failure in a replayed graph (no Python runs) stops it
+    too."""
 
     def __init__(
         self,
-        device: int,
+        health_host: torch.Tensor,
         rank: int,
         deadline: float,
         layer_of: Callable[[int], Optional[str]],
         on_failure: Callable[[], None] = stop_server,
         poll_s: float = POLL_S,
     ):
-        self.words = mono_decode.health_host(device)
+        self.words = health_host
         self.rank, self.deadline, self.layer_of = rank, deadline, layer_of
         self.on_failure, self.poll_s = on_failure, poll_s
         self.message: Optional[str] = None
@@ -114,8 +114,9 @@ class FailureWatch:
         self._thread.join(timeout=1.0)
 
 
-def schedule_fault(rank: int, device: int, layer: int) -> None:
-    """Arms the ``SGLANG_XPU_MONO_FAULT_INJECT`` test hook on this rank, if set."""
+def schedule_fault(rank: int, device: int, counters: torch.Tensor) -> None:
+    """Arms the ``SGLANG_XPU_MONO_FAULT_INJECT`` test hook on this rank, if set:
+    it shifts the tags of the kernel whose counters row is ``counters``."""
     value = os.environ.get(FAULT_ENV)
     if not value:
         return
@@ -126,12 +127,11 @@ def schedule_fault(rank: int, device: int, layer: int) -> None:
     def inject():
         time.sleep(float(after))
         torch.xpu.set_device(device)
-        torch.ops.sgl_kernel.mono_fault_inject(layer, 7)
+        torch.ops.sgl_kernel.qwen35_fault_inject(counters, 7)
         logger.warning(
-            "XPU monokernel: rank %d: %s: shifted the mailbox tags of kernel %d",
+            "XPU monokernel: rank %d: %s: shifted the mailbox tags of the first layer",
             rank,
             FAULT_ENV,
-            layer,
         )
 
     threading.Thread(target=inject, daemon=True, name="xpu-monokernel-fault").start()

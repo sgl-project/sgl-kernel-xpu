@@ -1,5 +1,6 @@
 """Two-card (TP2) checks of the mono decode layers, one process per card with
-the mailboxes in torch symmetric memory as in SGLang:
+the mailboxes in torch symmetric memory as in SGLang (a Qwen35Workspace a
+rank; each case is its own one-row layer table on mailbox and counters row i):
 
 * the two ranks' outputs are bitwise equal, and swapping the ranks' weight
   shards gives bitwise the same outputs (the all-reduces add the two partial
@@ -17,31 +18,77 @@ import pytest
 import torch
 import torch.multiprocessing as mp
 from mono_decode_utils import (
-    attn_tensors,
+    LayerTable,
     cos,
     gdn_caches,
-    gdn_tensors,
     kv_caches,
     layer_tensors,
     recv_from,
     requires_two_cards,
     rows,
-    tp2_mailboxes,
+    tp2_workspace,
 )
+
+# (case, attention, rows, tokens a request, dtype) of the split-mode checks
+SPLIT_TP2 = [
+    ("sgdn1", False, 1, 1, torch.bfloat16),
+    ("sattn1", True, 1, 1, torch.float16),
+    ("sgdn8", False, 8, 1, torch.float16),
+    ("sattn8", True, 8, 1, torch.bfloat16),
+    ("sgdn_v82", False, 8, 2, torch.bfloat16),
+    ("sattn_v63", True, 6, 3, torch.bfloat16),
+]
 
 
 def _worker(rank, path, conn):
-    import sgl_kernel  # noqa: F401
+    from sgl_kernel import qwen35_decode as q35
 
-    ops = torch.ops.sgl_kernel
     torch.xpu.set_device(rank)
     dev = f"xpu:{rank}"
-    nl = 64
-    region, own, peer, mb = tp2_mailboxes(rank, path, nl)  # noqa: F841
+    nl = 96
+    ws = tp2_workspace(rank, path, nl, dev)
     slot = iter(range(nl))
     out = {}
 
-    def layer_case(name, attn, nb, swap=False, dtype=torch.float16, reps=1, tokens=1):
+    def kernel(i, kind, t):
+        """Kernel i of the workspace (mailbox i) as a one-row layer table."""
+        return LayerTable([(kind, t)], [ws.mailbox(i)], rank)
+
+    def step(i, k, *args, mode=0, **meta):
+        """One launch of k's layer, on counters row i of the workspace; mode 1:
+        one kernel a segment; mode 2: also the all-reduces on ar, by
+        torch.distributed between the plan ranges (fp32 sum of the ranks)."""
+        c = ws.counters[i : i + 1]
+        if mode != 2:
+            return q35.qwen35_decode_step(
+                ws, k.table, 0, 1, *args, counters=c, mode=mode, **meta
+            )
+        ar = torch.zeros(args[0].shape[0], 2048, dtype=torch.float32, device=dev)
+        cuts = q35.qwen35_split_ar_slots(k.table, 0, 1)
+        i0 = 0
+        for n, cut in enumerate(cuts):
+            if not q35.qwen35_decode_step(
+                ws,
+                k.table,
+                0,
+                1,
+                *args,
+                counters=c,
+                mode=2,
+                i0=i0,
+                i1=cut,
+                ar=ar,
+                **meta,
+            ):
+                return False
+            if n + 1 < len(cuts):  # the last entry is the plan length
+                torch.distributed.all_reduce(ar)
+            i0 = cut + 1
+        return True
+
+    def layer_case(
+        name, attn, nb, swap=False, dtype=torch.float16, reps=1, tokens=1, mode=0
+    ):
         i = next(slot)
         seed = (2 if rank == 0 else 1) if swap else (1 if rank == 0 else 2)
         t = layer_tensors(attn, seed, dev, dtype)
@@ -62,8 +109,8 @@ def _worker(rank, path, conn):
                         (4096 * (tokens + 2), 1, tokens + 2, 1),
                     ),
                 )
-        ops.mono_register_layer(100 + i, attn, own + i * mb, peer + i * mb, t)
-        ops.mono_bind_caches(100 + i, list(caches), 64)
+        k = kernel(i, "attn" if attn else "gdn", t)
+        k.bind(0, caches, 64)
         gen = torch.Generator().manual_seed(5)
         hs, rs = rows(nb, gen, dev, dtype)
         ho, ro = torch.empty_like(hs), torch.empty_like(rs)
@@ -92,14 +139,34 @@ def _worker(rank, path, conn):
                     seq = torch.full(
                         (nrq,), ctx + tokens, dtype=torch.int32, device=dev
                     )
-                    assert ops.mono_decode_layer_verify(
-                        100 + i, tokens, hs, rs, ho, ro, pos, pt, seq, slots
+                    assert step(
+                        i,
+                        k,
+                        hs,
+                        rs,
+                        ho,
+                        ro,
+                        pos,
+                        tokens=tokens,
+                        page_table=pt,
+                        seq_lens=seq,
+                        out_loc=slots,
+                        mode=mode,
                     )
                 else:
                     zero = torch.zeros(nb, dtype=torch.int64, device=dev)
                     idx = torch.arange(nrq, dtype=torch.int32, device=dev) + 1
-                    assert ops.mono_decode_layer_verify(
-                        100 + i, tokens, hs, rs, ho, ro, zero, idx, None, None
+                    assert step(
+                        i,
+                        k,
+                        hs,
+                        rs,
+                        ho,
+                        ro,
+                        zero,
+                        tokens=tokens,
+                        state_idx=idx,
+                        mode=mode,
                     )
             elif attn:
                 ctx = 150
@@ -109,11 +176,23 @@ def _worker(rank, path, conn):
                     [(1 + b * 4) * 64 + ctx for b in range(nb)], device=dev
                 )
                 seq = torch.full((nb,), ctx + 1, dtype=torch.int32, device=dev)
-                ops.mono_decode_layer(100 + i, hs, rs, ho, ro, pos, pt, seq, slots)
+                assert step(
+                    i,
+                    k,
+                    hs,
+                    rs,
+                    ho,
+                    ro,
+                    pos,
+                    page_table=pt,
+                    seq_lens=seq,
+                    out_loc=slots,
+                    mode=mode,
+                )
             else:
                 zero = torch.zeros(nb, dtype=torch.int64, device=dev)
                 idx = torch.arange(nb, dtype=torch.int32, device=dev) + 1
-                ops.mono_decode_layer(100 + i, hs, rs, ho, ro, zero, idx, None, None)
+                assert step(i, k, hs, rs, ho, ro, zero, state_idx=idx, mode=mode)
         torch.xpu.synchronize()
         out[name] = (ho.cpu(), ro.cpu())
 
@@ -130,6 +209,20 @@ def _worker(rank, path, conn):
         layer_case(f"attn_v63_{s}", True, 6, swap=swap, tokens=3, dtype=torch.bfloat16)
         layer_case(f"gdn3_{s}", False, 3, swap=swap)
         layer_case(f"attn6_{s}", True, 6, swap=swap)
+    # modes 1 / 2 (one kernel a segment; mode 2 with the all-reduces by
+    # torch.distributed): two calls each (the second on the counters and states
+    # the first left), compared bitwise with mode 0
+    for case, attn, nb, tokens, dtype in SPLIT_TP2:
+        for mode in (0, 1, 2):
+            layer_case(
+                f"{case}_m{mode}",
+                attn,
+                nb,
+                tokens=tokens,
+                dtype=dtype,
+                reps=2,
+                mode=mode,
+            )
     # many calls on one mailbox region (tags, torn words): the last outputs
     layer_case("gdn2_repeat", False, 2, reps=300)
     layer_case("gdn_v44_repeat", False, 4, reps=100, tokens=4)
@@ -144,10 +237,10 @@ def _worker(rank, path, conn):
         nh = (torch.randn(2048, generator=gen) * 0.1).to(dtype).to(dev)
         e = torch.randn(nb, 2048, generator=gen).to(dtype).to(dev)
         hh = (torch.randn(nb, 2048, generator=gen) * 3).to(dtype).to(dev)
-        ops.mono_register_mtp(100 + i, own + i * mb, peer + i * mb, [fc, ne, nh], rank)
+        k = kernel(i, "mtp", [fc, ne, nh])
         o = torch.empty_like(e)
         for _ in range(3):
-            assert ops.mono_mtp_prologue(100 + i, e, hh, o)
+            assert q35.qwen35_mtp_prologue(ws, k.table[0], e, hh, o, i)
         torch.xpu.synchronize()
         out[name] = (o.cpu(), fc.cpu(), ne.cpu(), nh.cpu(), e.cpu(), hh.cpu())
 
@@ -158,28 +251,38 @@ def _worker(rank, path, conn):
     # fail-stop: no wait gave up so far; then rank 1's tags skip ahead, so
     # neither rank ever sees the words it waits for: both give up within the
     # deadline, record it, and a later call exits at once (sticky)
-    health = ops.mono_health(rank)
+    # (the deadline change re-initialises every counters row: between steps, on
+    # both ranks; the fault case's mailbox was never used)
+    health = ws.health
     out["health_ok"] = health.cpu().clone()
-    ops.mono_set_deadline(3.0)
+    ws.set_deadline(3.0)
     i = next(slot)
     t = layer_tensors(False, 1 if rank == 0 else 2, dev, torch.float16)
     conv, ssm = gdn_caches(torch.Generator().manual_seed(3), dev, 2, torch.float16)
-    ops.mono_register_layer(100 + i, False, own + i * mb, peer + i * mb, t)
-    ops.mono_bind_caches(100 + i, [conv, ssm], 64)
+    k = kernel(i, "gdn", t)
+    k.bind(0, [conv, ssm], 64)
     hs, rs = rows(1, torch.Generator().manual_seed(5), dev)
     ho, ro = torch.empty_like(hs), torch.empty_like(rs)
     zero = torch.zeros(1, dtype=torch.int32, device=dev)
     if rank == 1:
-        ops.mono_fault_inject(100 + i, 7)
+        q35.qwen35_fault_inject(ws, i, 7)
     times = []
     for _ in range(2):
         t0 = time.monotonic()
-        ops.mono_decode_layer(100 + i, hs, rs, ho, ro, zero.long(), zero, None, None)
+        assert step(i, k, hs, rs, ho, ro, zero.long(), state_idx=zero)
         torch.xpu.synchronize()
         times.append(time.monotonic() - t0)
     out["fault"] = (health.cpu().clone(), times)
-    out["fault_host"] = ops.mono_health_host(rank).clone()
+    out["fault_host"] = ws.health_host.clone()
     out["fault_out"] = ho.cpu()
+    # the record's word 6 (the mailbox word's address when no region is set)
+    # and word 7 (the kernel's counters row), low 32 bits
+    own, _ = ws.mailbox(i)
+    out["fault_where"] = (
+        own.data_ptr(),
+        own.numel() * own.element_size(),
+        ws.counters[i].data_ptr(),
+    )
     buf = io.BytesIO()  # bytes: the process may exit before the tensors are
     torch.save(out, buf)  # read back from shared memory
     conn.send(buf.getvalue())
@@ -282,6 +385,12 @@ def test_fail_stop(pair):
         host = r["fault_host"]
         assert int(host[0]) == 1 and int(host[1]) >= 1
         assert torch.isnan(r["fault_out"].float()).all()
+        # which wait: a word of this kernel's own mailbox, its counters row
+        own, nbytes, cnt = r["fault_where"]
+        if not int(health[2]):  # it timed out itself (not told by the peer)
+            word = int(health[6]) & 0xFFFFFFFF
+            assert (word - own) & 0xFFFFFFFF < nbytes, hex(word)
+            assert int(health[7]) & 0xFFFFFFFF == cnt & 0xFFFFFFFF
 
 
 @requires_two_cards
@@ -299,3 +408,17 @@ def test_mtp_prologue_tp2(pair, case):
     ref = (z @ fc.float().t()).to(dtype)
     for b in range(o0.shape[0]):
         assert cos(o0[b], ref[b]) > 0.9999
+
+
+@requires_two_cards
+@pytest.mark.parametrize("case", [c[0] for c in SPLIT_TP2])
+def test_split_modes_tp2(pair, case):
+    """Modes 1 and 2 (the all-reduces by torch.distributed on ar) give bitwise
+    the outputs of mode 0 on both ranks."""
+    for r in pair:
+        ho, ro = r[f"{case}_m0"]
+        assert torch.isfinite(ho.float()).all() and ho.float().abs().max() > 0
+        for mode in (1, 2):
+            h2, r2 = r[f"{case}_m{mode}"]
+            assert torch.equal(ho, h2), f"mode {mode}: hid_out"
+            assert torch.equal(ro, r2), f"mode {mode}: res_out"

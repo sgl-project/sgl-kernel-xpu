@@ -1,18 +1,14 @@
-"""The P2P mailboxes of the in-kernel TP all-reduces: one buffer in torch
-symmetric memory of the TP group, holding one mailbox per mono kernel, mapped
-on both ranks; and the TP agreement that precedes it.
+"""The TP agreement before the P2P mailboxes of the in-kernel TP all-reduces
+are mapped (the mailboxes are the workspace's, ``Qwen35Workspace``: one buffer
+in torch symmetric memory of the TP group, one mailbox a kernel).
 
 Mapping the peer's buffer (``_SymmetricMemory.rendezvous``) imports the peer's
 IPC handle, which needs ptrace permission over the peer
 process: with ``kernel.yama.ptrace_scope`` 1 a container needs
 ``--cap-add SYS_PTRACE`` (or the host ``ptrace_scope`` 0)."""
 
-import logging
-
 import torch
 import torch.distributed as dist
-
-logger = logging.getLogger(__name__)
 
 _CAP_SYS_PTRACE = 19
 
@@ -50,57 +46,13 @@ def ptrace_problem() -> str:
     )
 
 
-def _addr(t: torch.Tensor) -> int:
-    """Device address of t as the ops' int (int64: USM addresses can be above
-    2**63)."""
-    p = t.data_ptr()
-    return p - (1 << 64) if p >= 1 << 63 else p
-
-
-class PeerRegion:
-    """This rank's mailboxes and the peer's, mapped, one mailbox per name, in
-    torch symmetric memory of ``group`` (a GroupCoordinator of two ranks: its
-    device group names the symmetric memory, its CPU group agrees on errors).
-    Every mailbox word starts as mono_mailbox_never() (matches no tag). The
-    constructor is collective."""
-
-    def __init__(self, names: list, rank: int, group):
-        from torch._C._distributed_c10d import _SymmetricMemory
-
-        problem = ptrace_problem()
-        if not tp_agree(not problem, group.cpu_group):
-            # every rank leaves here together: none waits in the rendezvous
-            raise RuntimeError(
-                "XPU monokernel: mapping the peer's mailboxes needs ptrace "
-                f"permission: {problem or 'the peer rank lacks it'}"
-            )
-        self.rank = rank
-        self.mbox_bytes = int(torch.ops.sgl_kernel.mono_mbox_bytes())
-        self.slots = {name: i for i, name in enumerate(names)}
-        name = group.device_group.group_name
-        dev = torch.device("xpu", torch.xpu.current_device())
-        words = len(names) * self.mbox_bytes // 8
-        self._buf = _SymmetricMemory.empty_strided_p2p(
-            (words * 8,), [1], torch.uint8, dev, name
+def require_ptrace(group) -> None:
+    """Raises on every rank of ``group`` (a GroupCoordinator: its CPU group
+    agrees) when a rank cannot map the peer's symmetric memory, so none waits
+    in the rendezvous. Collective."""
+    problem = ptrace_problem()
+    if not tp_agree(not problem, group.cpu_group):
+        raise RuntimeError(
+            "XPU monokernel: mapping the peer's mailboxes needs ptrace "
+            f"permission: {problem or 'the peer rank lacks it'}"
         )
-        self._handle = _SymmetricMemory.rendezvous(self._buf, name)
-        if self._handle.world_size != 2:
-            raise RuntimeError("XPU monokernel: the TP group must have two ranks")
-        me = self._handle.rank
-        self._own = self._handle.get_buffer(me, (words,), torch.int64, 0)
-        self._peer = self._handle.get_buffer(1 - me, (words,), torch.int64, 0)
-        self._own.fill_(int(torch.ops.sgl_kernel.mono_mailbox_never()))
-        # the peer may write into the mailboxes only after they were filled
-        torch.xpu.synchronize(dev)
-        self._handle.barrier()
-        self.own = _addr(self._own)
-        self.peer = _addr(self._peer)
-        logger.info(
-            "XPU monokernel: P2P mailboxes for %d kernels in symmetric memory",
-            len(names),
-        )
-
-    def mailbox(self, name: str) -> tuple:
-        """(own, peer) addresses of the mailbox of ``name``."""
-        off = self.slots[name] * self.mbox_bytes
-        return self.own + off, self.peer + off

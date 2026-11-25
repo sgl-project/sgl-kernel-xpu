@@ -814,41 +814,42 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 #endif  // USE_GDN
 
 #if SYCL_INTEL_TARGET == 20 && defined(USE_MONO_DECODE)
-  /* Qwen3.5 / Qwen3.6 MoE decode (sgl_kernel.mono_decode, TP2) */
-  m.def("mono_decode_supported(int device) -> bool");
-  m.impl("mono_decode_supported", c10::DispatchKey::BackendSelect, &mono_decode_supported);
-  m.def("mono_max_context() -> int");
-  m.impl("mono_max_context", c10::DispatchKey::BackendSelect, &mono_max_context);
-  m.def("mono_health(int device) -> Tensor");
-  m.impl("mono_health", c10::DispatchKey::BackendSelect, &mono_health);
-  m.def("mono_health_host(int device) -> Tensor");
-  m.impl("mono_health_host", c10::DispatchKey::BackendSelect, &mono_health_host);
-  m.def("mono_set_deadline(float seconds) -> ()");
-  m.impl("mono_set_deadline", c10::DispatchKey::BackendSelect, &mono_set_deadline);
-  m.def("mono_fault_inject(int layer, int delta) -> ()");
-  m.impl("mono_fault_inject", c10::DispatchKey::BackendSelect, &mono_fault_inject);
-  m.def("mono_layer_counters(int layer) -> Tensor");
-  m.impl("mono_layer_counters", c10::DispatchKey::BackendSelect, &mono_layer_counters);
-  m.def("mono_mbox_bytes() -> int");
-  m.impl("mono_mbox_bytes", c10::DispatchKey::BackendSelect, &mono_mbox_bytes);
-  m.def("mono_mailbox_never() -> int");
-  m.impl("mono_mailbox_never", c10::DispatchKey::BackendSelect, &mono_mailbox_never);
-  m.def("mono_register_layer(int layer, bool attn, int mbox, int peer, Tensor[] tensors) -> ()");
-  m.impl("mono_register_layer", torch::kXPU, &mono_register_layer);
-  m.def("mono_register_mtp(int layer, int mbox, int peer, Tensor[] tensors, int rank) -> ()");
-  m.impl("mono_register_mtp", torch::kXPU, &mono_register_mtp);
-  m.def("mono_mtp_prologue(int layer, Tensor embed, Tensor hidden, Tensor! out) -> bool");
-  m.impl("mono_mtp_prologue", torch::kXPU, &mono_mtp_prologue);
-  m.def("mono_bind_caches(int layer, Tensor[] caches, int page_size) -> ()");
-  m.impl("mono_bind_caches", torch::kXPU, &mono_bind_caches);
+  /* Qwen3.5 / Qwen3.6 MoE decode (sgl_kernel.qwen35_decode, TP2) */
+  m.def("qwen35_supported(int device) -> bool");
+  m.impl("qwen35_supported", c10::DispatchKey::BackendSelect, &qwen35_supported);
+  m.def("qwen35_max_context() -> int");
+  m.impl("qwen35_max_context", c10::DispatchKey::BackendSelect, &qwen35_max_context);
+  m.def("qwen35_sizes() -> int[]");
+  m.impl("qwen35_sizes", c10::DispatchKey::BackendSelect, &qwen35_sizes);
+  m.def("qwen35_mailbox_never() -> int");
+  m.impl("qwen35_mailbox_never", c10::DispatchKey::BackendSelect, &qwen35_mailbox_never);
+  m.def("qwen35_prepare_layer(bool attn, Tensor[] tensors) -> Tensor[]");
+  m.impl("qwen35_prepare_layer", torch::kXPU, &qwen35_prepare_layer);
+  m.def("qwen35_layer_desc(bool attn, Tensor[] tensors, Tensor mailbox, Tensor peer_mailbox) -> Tensor");
+  m.impl("qwen35_layer_desc", torch::kXPU, &qwen35_layer_desc);
+  m.def("qwen35_mtp_desc(Tensor[] tensors, Tensor mailbox, Tensor peer_mailbox, int rank) -> Tensor");
+  m.impl("qwen35_mtp_desc", torch::kXPU, &qwen35_mtp_desc);
   m.def(
-      "mono_decode_layer(int layer, Tensor hidden, Tensor residual, Tensor! hid_out, Tensor! res_out, "
-      "Tensor positions, Tensor m0, Tensor? m1, Tensor? m2) -> ()");
-  m.impl("mono_decode_layer", torch::kXPU, &mono_decode_layer);
+      "qwen35_bind_gdn_caches(Tensor(a!) desc, Tensor conv, Tensor ssm, Tensor? inter_ssm, Tensor? inter_conv) -> ()");
+  m.impl("qwen35_bind_gdn_caches", torch::kXPU, &qwen35_bind_gdn_caches);
+  m.def("qwen35_bind_attn_caches(Tensor(a!) desc, Tensor k, Tensor v, int page_size) -> ()");
+  m.impl("qwen35_bind_attn_caches", torch::kXPU, &qwen35_bind_attn_caches);
+  m.def("qwen35_init_counters(Tensor(a!) counters, Tensor(b!) health, Tensor(c!) health_host, float deadline_s) -> ()");
+  m.impl("qwen35_init_counters", torch::kXPU, &qwen35_init_counters);
   m.def(
-      "mono_decode_layer_verify(int layer, int tokens, Tensor hidden, Tensor residual, Tensor! hid_out, "
-      "Tensor! res_out, Tensor positions, Tensor m0, Tensor? m1, Tensor? m2) -> bool");
-  m.impl("mono_decode_layer_verify", torch::kXPU, &mono_decode_layer_verify);
+      "qwen35_decode_step(int mode, int i0, int i1, Tensor(e!)? ar, Tensor layers, int l0, int l1, Tensor hidden, "
+      "Tensor residual, Tensor(a!) hid_out, "
+      "Tensor(b!) res_out, Tensor positions, Tensor(c!) workspace, Tensor(d!) counters, int tokens=1, "
+      "Tensor? state_idx=None, Tensor? page_table=None, Tensor? seq_lens=None, Tensor? out_loc=None) -> bool");
+  m.impl("qwen35_decode_step", torch::kXPU, &qwen35_decode_step);
+  m.def(
+      "qwen35_mtp_prologue(Tensor desc, Tensor embed, Tensor hidden, Tensor(a!) out, Tensor(b!) workspace, "
+      "Tensor(c!) counters) -> bool");
+  m.impl("qwen35_mtp_prologue", torch::kXPU, &qwen35_mtp_prologue);
+  m.def("qwen35_split_ar_slots(Tensor layers, int l0, int l1) -> int[]");
+  m.impl("qwen35_split_ar_slots", torch::kCPU, &qwen35_split_ar_slots);
+  m.def("qwen35_fault_inject(Tensor(a!) counters, int delta) -> ()");
+  m.impl("qwen35_fault_inject", torch::kXPU, &qwen35_fault_inject);
 #endif  // Xe20 only Qwen3.5 decode (USE_MONO_DECODE)
 
   /*

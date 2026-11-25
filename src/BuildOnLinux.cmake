@@ -303,7 +303,7 @@ endif()
 # The Qwen3.5 decode ops call the layer launchers (each launcher source is its
 # own library).
 if(TARGET sgl-ops-sycl-qwen35_decode)
-  foreach(_launch gdn attn gdn_verify attn_verify mtp)
+  foreach(_launch gdn attn gdn_verify attn_verify mtp gdn_split attn_split gdn_verify_split attn_verify_split)
     foreach(_dt fp16 bf16)
       target_link_libraries(sgl-ops-sycl-qwen35_decode PUBLIC sgl-ops-sycl-qwen35_${_launch}_launch_${_dt})
     endforeach()

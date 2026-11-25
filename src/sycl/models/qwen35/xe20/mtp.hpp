@@ -14,7 +14,7 @@
 // - in_norm_w / post_norm_w: pre_fc_norm_embedding / pre_fc_norm_hidden;
 //   fc_w: fc [2048][4096].
 #pragma once
-#include "layers_b.hpp"
+#include "common.hpp"
 
 namespace sgl_mono {
 

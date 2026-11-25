@@ -111,9 +111,14 @@ def test_deadline(monkeypatch):
         failure.deadline_s()
 
 
+# health word 6: the low 32 bits of the mailbox word's address (int32: may be
+# negative)
+WORD_AT = 0x9ABCDEF0 - (1 << 32)
+
+
 def _words(failed=0, peer=0, tag=7, layer=0x1234):
     w = torch.zeros(16, dtype=torch.int32)
-    w[0], w[1], w[2], w[3], w[6], w[7] = failed, failed, peer, tag, 42, layer
+    w[0], w[1], w[2], w[3], w[6], w[7] = failed, failed, peer, tag, WORD_AT, layer
     return w
 
 
@@ -122,29 +127,30 @@ def test_describe():
         _words(1).tolist(), 1, 5.0, lambda a: "layer 3" if a == 0x1234 else None
     )
     assert "rank 1" in text and "layer 3" in text and "5 s" in text and "tag 7" in text
+    assert "mailbox word at 0x9abcdef0" in text
     assert "--mem-fraction-static" in text and "NaN" in text
     peer = failure.describe(_words(1, peer=1).tolist(), 0, 5.0, lambda a: None)
     assert "peer rank gave up" in peer
 
 
-def _watch(monkeypatch, words, stopped):
-    monkeypatch.setattr(failure.mono_decode, "health_host", lambda device: words)
+def _watch(words, stopped):
+    # words: the host copy of the health words (a workspace's health_host)
     return failure.FailureWatch(
-        0, 0, 5.0, lambda a: None, on_failure=stopped.set, poll_s=0.01
+        words, 0, 5.0, lambda a: None, on_failure=stopped.set, poll_s=0.01
     )
 
 
-def test_watch_quiet_while_healthy(monkeypatch):
+def test_watch_quiet_while_healthy():
     stopped = threading.Event()
-    w = _watch(monkeypatch, _words(0), stopped)
+    w = _watch(_words(0), stopped)
     w.check()
     assert not stopped.wait(0.1)
     w.close()
 
 
-def test_watch_stops_the_server(monkeypatch):
+def test_watch_stops_the_server():
     words, stopped = _words(0), threading.Event()
-    w = _watch(monkeypatch, words, stopped)
+    w = _watch(words, stopped)
     words.copy_(_words(1))  # a kernel marks the device failed
     assert stopped.wait(2.0)
     with pytest.raises(RuntimeError, match="gave up"):
@@ -295,7 +301,7 @@ def test_spec_auto_dtype_follows_the_checkpoint(monkeypatch):
 
 
 def test_spec_layer_count_has_an_upper_bound(monkeypatch):
-    # kernel ids: target 7000 + layer, the MTP drafter 7100 / 7101
+    # one kernel (layer table and counters row) per layer
     spec = _spec()
     monkeypatch.setattr(spec, "_conv_dtype", lambda: None)
     for layers, ok in (
@@ -323,10 +329,10 @@ def test_forward_refuses_arguments_it_does_not_serve():
         runtime._require(False, "no kernel")
 
 
-def test_peer_region_refuses_without_ptrace(monkeypatch):
+def test_require_ptrace_refuses_without_ptrace(monkeypatch):
     """Without ptrace permission every rank fails before the symmetric-memory
-    rendezvous (which would otherwise fail inside the driver), with the fix in
-    the message."""
+    rendezvous of the workspace (which would otherwise fail inside the driver),
+    with the fix in the message."""
     import torch.distributed as dist
 
     peer = pytest.importorskip("sgl_kernel.monokernel.peer")
@@ -339,6 +345,8 @@ def test_peer_region_refuses_without_ptrace(monkeypatch):
             cpu_group=dist.group.WORLD, device_group=dist.group.WORLD
         )
         with pytest.raises(RuntimeError, match="ptrace"):
-            peer.PeerRegion(["layer0"], 0, group)
+            peer.require_ptrace(group)
+        monkeypatch.setattr(peer, "ptrace_problem", lambda: "")
+        peer.require_ptrace(group)  # every rank can: no error
     finally:
         dist.destroy_process_group()

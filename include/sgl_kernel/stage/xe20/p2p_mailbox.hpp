@@ -12,7 +12,8 @@ namespace sgl_kernel::stage::xe20 {
 // [2] FAILED of the peer (written through P2P by a rank that gave up), and of
 // the first wait that gave up: [3] the tag it waited for, [4] / [5] the word it
 // last read (low / high half), [6] the word's offset in the mailbox region (in
-// words from the region start), [7] the low half of the address of the
+// words from the region start; the low half of the word's address when the
+// region is not set), [7] the low half of the address of the
 // user's counters (which user); [8] / [9] the address of the host copy of
 // words 0 .. 7 (host memory, written once by the wait that marks the device
 // failed, for a host thread to poll), or 0
@@ -34,7 +35,8 @@ enum {
 // [0..1] the address of the device's health words (0: not registered),
 // [2..3] the wait deadline in cycles of the sub-group clock (0: the default),
 // [4..5] the address of the peer's health words (P2P; 0: not flagged),
-// [6..7] the address of the user's mailbox region (for the health record).
+// [6..7] the address of the user's mailbox region (for the health record; 0:
+// the record keeps the word's address).
 enum { CTL_HEALTH_PTR = 0, CTL_DEADLINE = 2, CTL_PEER_HEALTH_PTR = 4, CTL_MBOX_PTR = 6, CTL_WORDS = 12 };
 constexpr uint64_t WAIT_CYCLES_DEFAULT = 5600000000ull;  // 2 s
 
@@ -115,12 +117,13 @@ inline bool mailbox_wait_slow(const uint64_t* mine, uint32_t tag, uint64_t& w, c
             h_ref(h[H_TAG]).store((int)(tag & 0xffffu));
             h_ref(h[H_SEEN_LO]).store((int)(uint32_t)w);
             h_ref(h[H_SEEN_HI]).store((int)(uint32_t)(w >> 32));
-            const uint64_t* region =
-                reinterpret_cast<const uint64_t*>(*reinterpret_cast<const volatile uint64_t*>(cnt + CTL + CTL_MBOX_PTR));
-            h_ref(h[H_SLOT]).store(region ? (int)(mine - region) : -1);
+            const uint64_t* region = reinterpret_cast<const uint64_t*>(
+                *reinterpret_cast<const volatile uint64_t*>(cnt + CTL + CTL_MBOX_PTR));
+            h_ref(h[H_SLOT]).store(region ? (int)(mine - region) : (int)(uint32_t) reinterpret_cast<uintptr_t>(mine));
             h_ref(h[H_LAYER]).store((int)(uint32_t) reinterpret_cast<uintptr_t>(cnt));
             // the peer's health words (P2P), so its waits give up at once
-            int* ph = reinterpret_cast<int*>(*reinterpret_cast<const volatile uint64_t*>(cnt + CTL + CTL_PEER_HEALTH_PTR));
+            int* ph =
+                reinterpret_cast<int*>(*reinterpret_cast<const volatile uint64_t*>(cnt + CTL + CTL_PEER_HEALTH_PTR));
             if (ph != nullptr) hs_ref(ph[H_PEER_FAILED]).store(1);
           }
           int* host = reinterpret_cast<int*>(

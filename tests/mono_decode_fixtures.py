@@ -1,10 +1,12 @@
 """Shared helpers of the mono decode kernel tests: random Qwen3.5 / Qwen3.6 MoE
 (35B-A3B shapes, one TP2 rank) decoder layers in SGLang's layouts (block-FP8
 128x128 weights, FusedMoE [E][N][K] experts, separate K / V buffers, channel
-major conv state), a torch reference of a layer step and mailboxes. No pytest
-here: the benchmark loads this module too (the skip markers are in
-mono_decode_utils). The 16-bit tensors take a dtype (fp16 or bf16); the same seed gives
-the same values rounded to either."""
+major conv state), a torch reference of a layer step, and the caller-owned
+state of the ``torch.ops.sgl_kernel.qwen35_*`` ops (layer table, mailboxes,
+workspace, counters, health words). No pytest here: the benchmark loads this
+module too (the skip markers are in mono_decode_utils). The 16-bit tensors take
+a dtype (fp16 or bf16); the same seed gives the same values rounded to
+either."""
 
 import time
 
@@ -27,24 +29,133 @@ def _ops():
     return torch.ops.sgl_kernel
 
 
+def _q35():
+    """The Python wrapper of the ops (importing it registers them)."""
+    from sgl_kernel import qwen35_decode
+
+    return qwen35_decode
+
+
 def mailbox(device) -> torch.Tensor:
-    """One layer's mailbox (every word mono_mailbox_never()): pass its address
-    as both the own and the peer mailbox for a single-card loopback (the
-    all-reduces then return twice this rank's partial sums)."""
-    ops = _ops()
+    """One kernel's mailbox (every word qwen35_mailbox_never()): pass it as both
+    the own and the peer mailbox for a single-card loopback (the all-reduces
+    then return twice this rank's partial sums)."""
+    q35 = _q35()
     return torch.full(
-        (ops.mono_mbox_bytes() // 8,),
-        ops.mono_mailbox_never(),
+        (q35.qwen35_sizes()["mailbox_words"],),
+        q35.qwen35_mailbox_never(),
         dtype=torch.int64,
         device=device,
     )
 
 
-def addr(t: torch.Tensor) -> int:
-    """Device address of t as the ops' int (int64: USM addresses can be above
-    2**63)."""
-    p = t.data_ptr()
-    return p - (1 << 64) if p >= 1 << 63 else p
+class LocalState:
+    """The device state of single-card kernels without a peer (Qwen35Workspace
+    needs two ranks): the zeroed workspace shared by all launches of the
+    device, the counters (one int32 row a kernel: row l is the table's kernel
+    l), the health words and their pinned host copy, initialised by
+    qwen35_init_counters. Duck-types Qwen35Workspace for the qwen35_decode
+    wrappers (``workspace``, ``counters``)."""
+
+    def __init__(self, device, n_kernels: int, deadline_s: float = 2.0):
+        s = _q35().qwen35_sizes()
+        self.device = torch.device(device)
+        self.workspace = torch.zeros(
+            s["workspace_bytes"], dtype=torch.uint8, device=device
+        )
+        self.counters = torch.zeros(
+            (n_kernels, s["counter_words"]), dtype=torch.int32, device=device
+        )
+        self.health = torch.zeros(s["health_words"], dtype=torch.int32, device=device)
+        self.health_host = torch.zeros(
+            s["health_words"], dtype=torch.int32
+        ).pin_memory()
+        self.set_deadline(deadline_s)
+
+    def set_deadline(self, deadline_s: float) -> None:
+        """Re-initialises the counters and health words (every kernel's tags
+        restart) with the wait deadline ``deadline_s``."""
+        self.deadline_s = float(deadline_s)
+        _ops().qwen35_init_counters(
+            self.counters, self.health, self.health_host, self.deadline_s
+        )
+
+
+class LayerTable:
+    """Kernels as a caller of the qwen35 ops owns them (as
+    sgl_kernel.monokernel.qwen3_5.runtime does): ``kernels`` is a list of
+    (kind, tensors), kind "gdn" / "attn" (the SGLang tensor list, prepared with
+    qwen35_prepare_layer) or "mtp" ([fc, pre_fc_norm_embedding,
+    pre_fc_norm_hidden], for ``rank``); ``mailboxes`` one (own, peer) int64
+    pair a kernel. Keeps every tensor a descriptor points to alive; ``table``
+    is the CPU uint8 [kernels, desc_bytes] layer table, and the caches are
+    bound on its rows (torch.stack copies: binding a descriptor after stacking
+    would not reach the table)."""
+
+    def __init__(self, kernels, mailboxes, rank: int = 0):
+        q35 = _q35()
+        self.kinds = [kind for kind, _ in kernels]
+        self.attn = [kind == "attn" for kind in self.kinds]
+        self.keep, descs = [], []
+        for (kind, t), (own, peer) in zip(kernels, mailboxes):
+            if kind == "mtp":
+                t = list(t)
+                desc = q35.qwen35_mtp_desc(t, own, peer, rank)
+            else:
+                t = q35.qwen35_prepare_layer(kind == "attn", t)
+                desc = q35.qwen35_layer_desc(kind == "attn", t, own, peer)
+            self.keep.append((t, own, peer))
+            descs.append(desc)
+        self.table = q35.stack_descs(descs)
+        self.caches = [None] * len(descs)
+
+    def bind(self, l: int, caches, page_size: int = 64) -> None:
+        """Binds kernel l's caches: attention [k, v] with ``page_size``,
+        GatedDeltaNet [conv, ssm] (+ [intermediate ssm, intermediate conv
+        windows] for verify steps)."""
+        q35 = _q35()
+        caches = list(caches)
+        if self.attn[l]:
+            q35.qwen35_bind_attn_caches(self.table[l], *caches, page_size)
+        else:
+            q35.qwen35_bind_gdn_caches(self.table[l], *caches)
+        self.caches[l] = caches
+
+
+class LocalLayers(LayerTable):
+    """A LayerTable on one card: a loopback mailbox a kernel (own = peer) and
+    a LocalState with one counters row a kernel."""
+
+    def __init__(self, device, kernels, deadline_s: float = 2.0, rank: int = 0):
+        boxes = [mailbox(device) for _ in kernels]
+        super().__init__(kernels, [(m, m) for m in boxes], rank)
+        self.state = LocalState(device, len(kernels), deadline_s)
+
+    def step(self, l0, l1, hidden, residual, hid_out, res_out, positions, **meta):
+        """qwen35_decode_step of kernels [l0, l1) (meta: tokens, state_idx,
+        page_table, seq_lens, out_loc). False: the shape has no kernel."""
+        return _q35().qwen35_decode_step(
+            self.state,
+            self.table,
+            l0,
+            l1,
+            hidden,
+            residual,
+            hid_out,
+            res_out,
+            positions,
+            **meta,
+        )
+
+    def mtp(self, l, embed, hidden, out) -> bool:
+        """The MTP prologue of kernel l (counters row l)."""
+        return _q35().qwen35_mtp_prologue(
+            self.state, self.table[l], embed, hidden, out, l
+        )
+
+    def counters(self, l) -> torch.Tensor:
+        """Kernel l's counters row (int32 [counter_words], device)."""
+        return self.state.counters[l]
 
 
 def _fp8(shape, gen, device):
@@ -96,7 +207,7 @@ def common_tensors(gen, device, attn: bool, dtype=torch.float16) -> list:
 
 
 def gdn_tensors(gen, device, dtype=torch.float16) -> list:
-    """The 21 weights of a GatedDeltaNet layer (mono_register_layer order)."""
+    """The 21 weights of a GatedDeltaNet layer (qwen35_prepare_layer order)."""
     qkvz, qkvz_s = _lin(QKVZ, HID, gen, device)
     a_log = torch.log(torch.rand(NVH, generator=gen) * 15 + 1).to(device)
     return common_tensors(gen, device, False, dtype) + [
@@ -117,7 +228,7 @@ def gdn_caches(gen, device, slots, dtype=torch.float16, taps=3):
 
 
 def attn_tensors(gen, device, dtype=torch.float16) -> list:
-    """The 18 weights of a full-attention layer (mono_register_layer order)."""
+    """The 18 weights of a full-attention layer (qwen35_prepare_layer order)."""
     qkv, qkv_s = _lin(QKV_ROWS, HID, gen, device)
     return common_tensors(gen, device, True, dtype) + [
         qkv,
@@ -319,25 +430,19 @@ def layer_tensors(attn, shard_seed, dev, dtype, rep_seed=0):
     return [rep[i] if i in keep else own[i] for i in range(len(rep))]
 
 
-def tp2_mailboxes(rank, path, n):
-    """``n`` mailboxes in torch symmetric memory shared by two worker processes
-    (one per card), as in SGLang: returns (region, own, peer, mailbox bytes),
-    own / peer the addresses of mailbox 0 (mailbox i is ``i * bytes`` past it).
-    ``path`` is a file both workers name for the process-group rendezvous;
-    keep the region alive while the kernels run."""
+def tp2_workspace(rank, path, n, device, deadline_s=2.0):
+    """A Qwen35Workspace with ``n`` mailboxes in torch symmetric memory shared
+    by two worker processes (one per card), as in SGLang: mailbox i is
+    ``ws.mailbox(i)``, counters row i ``ws.counters[i]``. ``path`` is a file
+    both workers name for the process-group rendezvous. Collective."""
     import torch.distributed as dist
-    from types import SimpleNamespace
-
-    from sgl_kernel.monokernel.peer import PeerRegion
 
     dist.init_process_group(
         "xccl", init_method=f"file://{path}", rank=rank, world_size=2
     )
-    group = SimpleNamespace(
-        device_group=dist.group.WORLD, cpu_group=dist.new_group(backend="gloo")
+    return _q35().Qwen35Workspace(
+        dist.group.WORLD.group_name, n, torch.device(device), deadline_s
     )
-    region = PeerRegion([str(i) for i in range(n)], rank, group)
-    return region, region.own, region.peer, region.mbox_bytes
 
 
 def recv_from(conn, proc, timeout=600.0):

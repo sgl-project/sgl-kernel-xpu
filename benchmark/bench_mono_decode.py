@@ -1,10 +1,12 @@
 """Benchmark the mono decode layer kernels (Qwen3.5 / Qwen3.6 MoE 35B-A3B, TP2)
 on two Intel GPUs: device time per layer call, one process per card, the
-mailboxes in torch symmetric memory as in SGLang.
+mailboxes in torch symmetric memory as in SGLang (a Qwen35Workspace a rank).
 
-Each case registers NCP copies of a layer (distinct random weights and
-caches, so the weights stream from memory as in a 40-layer step rather than
-from L2) and times back-to-back calls over the copies with XPU events.
+Each case builds a layer table of NCP copies of a layer (distinct random
+weights and caches, so the weights stream from memory as in a 40-layer step
+rather than from L2) and times back-to-back one-layer launches
+(torch.ops.sgl_kernel.qwen35_decode_step over rows (k, k + 1)) over the copies
+with XPU events.
 
 Run (two cards):
   ZE_AFFINITY_MASK=2,3 python benchmark/bench_mono_decode.py
@@ -17,11 +19,12 @@ import os
 import tempfile
 
 import torch
+import torch.distributed
 import torch.multiprocessing as mp
 
 
 def _fixtures():
-    """The tests' fixtures (random layers, mailboxes), loaded
+    """The tests' fixtures (random layers, layer tables, the workspace), loaded
     by path: no pytest and no change of sys.path."""
     path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
@@ -46,9 +49,8 @@ def _worker(rank, path, conn, args):
     dev = f"xpu:{rank}"
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
     nl = args.ncp * len(args.rows) * (1 + len(args.ctx))  # one mailbox per layer copy
-    region, own, peer, mb = fx.tp2_mailboxes(rank, path, nl)  # noqa: F841
-    slot = iter(range(nl))
-    lid = iter(range(1000, 3000))
+    ws = fx.tp2_workspace(rank, path, nl, dev)
+    slot = iter(range(0, nl, args.ncp))  # each case: NCP mailboxes / counters rows
     out = []
     weights = {}  # kind -> NCP weight sets, shared by the cases
 
@@ -61,44 +63,74 @@ def _worker(rank, path, conn, args):
                 fx.layer_tensors(attn, 1000 * (rank + 1) + c, dev, dtype, rep_seed=c)
                 for c in range(args.ncp)
             ]
+        base = next(slot)
+        kind = "attn" if attn else "gdn"
+        table = fx.LayerTable(
+            [(kind, weights[attn][c]) for c in range(args.ncp)],
+            [ws.mailbox(base + c) for c in range(args.ncp)],
+            rank,
+        )
+        counters = ws.counters[base : base + args.ncp]  # row k: table row k
         layers = []
         for c in range(args.ncp):
-            t = weights[attn][c]
-            i, layer = next(slot), next(lid)
-            ops.mono_register_layer(layer, attn, own + i * mb, peer + i * mb, t)
             if attn:
                 ps = 64
                 npr = (ctx + 1 + ps - 1) // ps + 1
                 kc, vc = fx.kv_caches(gen, dev, (nb * npr + 1) * ps, dtype)
-                ops.mono_bind_caches(layer, [kc, vc], ps)
+                table.bind(c, [kc, vc], ps)
                 pt = (torch.arange(nb * npr, dtype=torch.int32) + 1).view(nb, npr)
                 loc = torch.tensor(
                     [int(pt[b, ctx // ps]) * ps + ctx % ps for b in range(nb)]
                 )
                 m = (
+                    None,
                     pt.to(dev),
                     torch.full((nb,), ctx + 1, dtype=torch.int32, device=dev),
                     loc.to(dev),
                 )
-                keep = (t, kc, vc)
             else:
                 conv, ssm = fx.gdn_caches(gen, dev, nb + 1, dtype)
-                ops.mono_bind_caches(layer, [conv, ssm], 64)
-                m = (torch.arange(nb, dtype=torch.int32, device=dev) + 1, None, None)
-                keep = (t, conv, ssm)
+                table.bind(c, [conv, ssm], 64)
+                m = (
+                    torch.arange(nb, dtype=torch.int32, device=dev) + 1,
+                    None,
+                    None,
+                    None,
+                )
             hs, rs = fx.rows(
                 nb, torch.Generator().manual_seed(5), dev, dtype
             )  # the same on both ranks
-            layers.append(
-                (layer, keep, m, hs, rs, torch.empty_like(hs), torch.empty_like(rs))
-            )
+            layers.append((m, hs, rs, torch.empty_like(hs), torch.empty_like(rs)))
         pos = torch.full((nb,), ctx, dtype=torch.int64, device=dev)
 
         def run(n):
             for k in range(n):
-                layer, _, m, hs, rs, ho, ro = layers[k % args.ncp]
-                ops.mono_decode_layer(layer, hs, rs, ho, ro, pos, m[0], m[1], m[2])
+                c = k % args.ncp
+                m, hs, rs, ho, ro = layers[c]
+                # the op itself (state_idx, page_table, seq_lens, out_loc = m)
+                ops.qwen35_decode_step(
+                    0,  # mode 0: one kernel a layer
+                    0,
+                    0,
+                    None,
+                    table.table,
+                    c,
+                    c + 1,
+                    hs,
+                    rs,
+                    ho,
+                    ro,
+                    pos,
+                    ws.workspace,
+                    counters,
+                    1,
+                    *m,
+                )
 
+        # both ranks enter the first launch together: the in-kernel waits give up
+        # after the deadline (2 s), and building a case takes longer than that
+        torch.xpu.synchronize()
+        torch.distributed.barrier()
         run(2 * args.ncp)
         torch.xpu.synchronize()
         times = []
@@ -112,11 +144,12 @@ def _worker(rank, path, conn, args):
             torch.xpu.synchronize()
             # a failed kernel gives up its waits and the later calls are fast:
             # never report such a round as a speedup
-            if int(ops.mono_health(rank)[0]) != 0 or not all(
-                bool(torch.isfinite(c[5].float()).all()) for c in layers
-            ):
+            health = ws.health.tolist()
+            finite = [bool(torch.isfinite(c[3].float()).all()) for c in layers]
+            if health[0] != 0 or not all(finite):
                 raise RuntimeError(
-                    f"{'attn' if attn else 'gdn'} rows {nb}: a wait gave up or an output is not finite"
+                    f"{'attn' if attn else 'gdn'} rows {nb}: a wait gave up or an output "
+                    f"is not finite (health {health[:8]}, finite copies {finite})"
                 )
             times.append(e0.elapsed_time(e1) * 1000.0 / args.iters)
         times.sort()

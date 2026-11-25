@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Speculative-decoding verify: Linear-attention (GatedDeltaNet) + MoE layer for NB = requests x T
-// tokens (see layers_s.hpp), bf16. Its own translation unit and library,
+// tokens (see gdn.hpp), bf16. Its own translation unit and library,
 // like the decode kernels.
-#include "layers_s.hpp"
+#include "launch.hpp"
 
 namespace sgl_mono {
 template __attribute__((visibility("default"))) bool

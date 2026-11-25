@@ -11,11 +11,11 @@ import logging
 from typing import Any
 
 import torch
-from sgl_kernel import mono_decode
+from sgl_kernel import qwen35_decode as q35
 
 from .. import memory
 from ..failure import FailureWatch, deadline_s, schedule_fault
-from ..peer import PeerRegion, tp_agree
+from ..peer import require_ptrace, tp_agree
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +59,7 @@ def is_attention(layer: torch.nn.Module) -> bool:
 
 
 def layer_weights(layer: torch.nn.Module) -> list:
-    """The kernel's weight list (mono_register_layer order): norms, router,
+    """The kernel's weight list (qwen35_prepare_layer order): norms, router,
     shared gate, the mixer's output projection, routed and shared experts, then
     the mixer."""
     mlp = layer.mlp
@@ -116,36 +116,46 @@ class MonoQwen35:
         dev = next(model.parameters()).device
         self.budget = memory.apply(dev)  # before SGLang sizes its pools
         self.deadline = deadline_s(context.deadline_s)
-        mono_decode.set_deadline(self.deadline)
-        names = [f"layer{i}" for i in range(len(self.layers))]
-        self.peer = PeerRegion(names, self.rank, group)
-        self.ids = [7000 + i for i in range(len(self.layers))]
+        require_ptrace(group)
+        self.ws = q35.Qwen35Workspace(
+            group.device_group.group_name, len(self.layers), dev, self.deadline
+        )
+        logger.info(
+            "XPU monokernel: P2P mailboxes for %d kernels in symmetric memory",
+            len(self.layers),
+        )
+        self.keep = []  # the tensors the descriptors point to
+        descs = []
         ok = True
         try:
             for i, layer in enumerate(self.layers):
-                own, peer = self.peer.mailbox(names[i])
-                torch.ops.sgl_kernel.mono_register_layer(
-                    self.ids[i], self.attn[i], own, peer, layer_weights(layer)
+                t = q35.qwen35_prepare_layer(self.attn[i], layer_weights(layer))
+                self.keep.append(t)
+                descs.append(
+                    q35.qwen35_layer_desc(self.attn[i], t, *self.ws.mailbox(i))
                 )
         except Exception:
             ok = False
-            logger.exception("XPU monokernel: registering the layers failed")
+            logger.exception("XPU monokernel: building the layer descriptors failed")
         if not tp_agree(ok, group.cpu_group):
             raise RuntimeError(
-                "XPU monokernel: a rank could not register the layers (see its log)"
+                "XPU monokernel: a rank could not build the layer descriptors (see its log)"
             )
+        self.table = q35.stack_descs(descs)  # CPU [layers, desc_bytes]
         self.bound = None  # (pool identities) the caches were bound for
         self.mrope = bool(getattr(model, "is_mrope_enabled", False))
         self.pressure = memory.PressureWatch(dev, self.budget)
-        addr = {}
-        for i, lid in enumerate(self.ids):
-            addr[
-                torch.ops.sgl_kernel.mono_layer_counters(lid).data_ptr() & 0xFFFFFFFF
-            ] = f"layer {i}"
+        addr = {
+            self.ws.counters[i].data_ptr() & 0xFFFFFFFF: f"layer {i}"
+            for i in range(len(self.layers))
+        }
         self.watch = FailureWatch(
-            dev.index, self.rank, self.deadline, lambda a: addr.get(a & 0xFFFFFFFF)
+            self.ws.health_host,
+            self.rank,
+            self.deadline,
+            lambda a: addr.get(a & 0xFFFFFFFF),
         )
-        schedule_fault(self.rank, dev.index, self.ids[0])
+        schedule_fault(self.rank, dev.index, self.ws.counters[0])
         logger.info(
             "XPU monokernel: %d layers (%d full attention), %s, wait deadline %g s",
             len(self.layers),
@@ -174,9 +184,12 @@ class MonoQwen35:
                     caches += [scratch, state.intermediate_conv_window[0]]
             key.append(tuple(c.data_ptr() for c in caches))
             if self.bound is None or self.bound[i] != key[-1]:
-                torch.ops.sgl_kernel.mono_bind_caches(
-                    self.ids[i], caches, int(pool.page_size)
-                )
+                if self.attn[i]:
+                    q35.qwen35_bind_attn_caches(
+                        self.table[i], *caches, int(pool.page_size)
+                    )
+                else:
+                    q35.qwen35_bind_gdn_caches(self.table[i], *caches)
         self.bound = key
 
     def forward(
@@ -206,36 +219,25 @@ class MonoQwen35:
             pos = forward_batch.mrope_positions[0]  # decode: the three axes agree
         else:
             pos = positions
-        m_attn = (fmd.page_table, fmd.cache_seqlens_int32, forward_batch.out_cache_loc)
-        m_gdn = (lmd.mamba_cache_indices, None, None)
+        meta = dict(
+            tokens=tokens if verify else 1,
+            state_idx=lmd.mamba_cache_indices,
+            page_table=fmd.page_table,
+            seq_lens=fmd.cache_seqlens_int32,
+            out_loc=forward_batch.out_cache_loc,
+        )
         if input_embeds is None:
             hidden = self.lm.embed_tokens(input_ids[:rows])
         else:
             hidden = input_embeds[:rows]
         residual = torch.zeros_like(hidden)
-        ops = torch.ops.sgl_kernel
         for i in range(len(self.layers)):
             out, res = torch.empty_like(hidden), torch.empty_like(hidden)
-            m = m_attn if self.attn[i] else m_gdn
-            if verify:
-                # the spec covers only the widths the verify kernels have
-                ok = ops.mono_decode_layer_verify(
-                    self.ids[i],
-                    tokens,
-                    hidden,
-                    residual,
-                    out,
-                    res,
-                    pos,
-                    m[0],
-                    m[1],
-                    m[2],
-                )
-                _require(ok, f"no verify kernel for {rows} rows x {tokens} tokens")
-            else:
-                ops.mono_decode_layer(
-                    self.ids[i], hidden, residual, out, res, pos, m[0], m[1], m[2]
-                )
+            # one kernel a layer; the spec covers only the widths the kernels have
+            ok = q35.qwen35_decode_step(
+                self.ws, self.table, i, i + 1, hidden, residual, out, res, pos, **meta
+            )
+            _require(ok, f"no kernel for {rows} rows x {tokens} tokens")
             hidden, residual = out, res
         hidden, _ = self.lm.norm(hidden, residual)
         return self.model.logits_processor(
@@ -253,7 +255,7 @@ class MonoQwen35MTP:
     attends causally). The target's runtime owns the fail-stop watch and the
     memory budget of the device."""
 
-    PROLOGUE, LAYER = 7100, 7101  # kernel ids (the target's are 7000 + layer)
+    PROLOGUE, LAYER = 0, 1  # kernels (rows of the drafter's table and counters)
 
     def __init__(self, model: torch.nn.Module, hf_config: Any, context: Any):
         from sglang.srt.runtime_context import get_parallel
@@ -262,31 +264,49 @@ class MonoQwen35MTP:
         self.layer = layer_modules(model)[0]
         group = get_parallel().tp_group
         self.rank = group.rank_in_group
-        mono_decode.set_deadline(deadline_s(context.deadline_s))
-        names = ["mtp_prologue", "mtp_layer"]
-        self.peer = PeerRegion(names, self.rank, group)
+        dev = next(model.parameters()).device
+        self.deadline = deadline_s(context.deadline_s)
+        require_ptrace(group)
+        self.ws = q35.Qwen35Workspace(
+            group.device_group.group_name, 2, dev, self.deadline
+        )
+        logger.info("XPU monokernel: P2P mailboxes for 2 kernels in symmetric memory")
         ok = True
+        descs = []
         try:
-            own, peer = self.peer.mailbox(names[0])
-            prologue = [
+            self.keep = [
                 model.fc.weight,
                 model.pre_fc_norm_embedding.weight,
                 model.pre_fc_norm_hidden.weight,
             ]
-            torch.ops.sgl_kernel.mono_register_mtp(
-                self.PROLOGUE, own, peer, prologue, self.rank
+            descs.append(
+                q35.qwen35_mtp_desc(
+                    self.keep, *self.ws.mailbox(self.PROLOGUE), self.rank
+                )
             )
-            own, peer = self.peer.mailbox(names[1])
-            torch.ops.sgl_kernel.mono_register_layer(
-                self.LAYER, True, own, peer, layer_weights(self.layer)
-            )
+            t = q35.qwen35_prepare_layer(True, layer_weights(self.layer))
+            self.keep += t
+            descs.append(q35.qwen35_layer_desc(True, t, *self.ws.mailbox(self.LAYER)))
         except Exception:
             ok = False
-            logger.exception("XPU monokernel: registering the MTP drafter failed")
+            logger.exception(
+                "XPU monokernel: building the MTP drafter descriptors failed"
+            )
         if not tp_agree(ok, group.cpu_group):
             raise RuntimeError(
-                "XPU monokernel: a rank could not register the MTP drafter (see its log)"
+                "XPU monokernel: a rank could not build the MTP drafter (see its log)"
             )
+        self.table = q35.stack_descs(descs)
+        addr = {
+            self.ws.counters[self.PROLOGUE].data_ptr() & 0xFFFFFFFF: "the MTP prologue",
+            self.ws.counters[self.LAYER].data_ptr() & 0xFFFFFFFF: "the MTP layer",
+        }
+        self.watch = FailureWatch(
+            self.ws.health_host,
+            self.rank,
+            self.deadline,
+            lambda a: addr.get(a & 0xFFFFFFFF),
+        )
         self.bound = None
         self.seen = set()  # the (mode, rows) steps this forward has run, logged once
         logger.info(
@@ -302,8 +322,8 @@ class MonoQwen35MTP:
         caches = [pool.get_key_buffer(lid), pool.get_value_buffer(lid)]
         key = tuple(c.data_ptr() for c in caches)
         if key != self.bound:
-            torch.ops.sgl_kernel.mono_bind_caches(
-                self.LAYER, caches, int(pool.page_size)
+            q35.qwen35_bind_attn_caches(
+                self.table[self.LAYER], *caches, int(pool.page_size)
             )
             self.bound = key
 
@@ -340,43 +360,36 @@ class MonoQwen35MTP:
         else:
             embed = input_embeds[:rows]
         x = torch.empty_like(embed)
-        ops = torch.ops.sgl_kernel
-        ok = ops.mono_mtp_prologue(
-            self.PROLOGUE, embed, forward_batch.spec_info.hidden_states, x
+        ok = q35.qwen35_mtp_prologue(
+            self.ws,
+            self.table[self.PROLOGUE],
+            embed,
+            forward_batch.spec_info.hidden_states,
+            x,
+            self.PROLOGUE,
         )
         _require(ok, f"no MTP prologue kernel for {rows} rows")
         out, res = torch.empty_like(x), torch.empty_like(x)
-        if plan.key.forward_mode == "draft_extend":
-            # seq_lens already counts the extend rows, as a verify step's do
-            ok = ops.mono_decode_layer_verify(
-                self.LAYER,
-                plan.key.tokens_per_request,
-                x,
-                torch.zeros_like(x),
-                out,
-                res,
-                positions,
-                fmd.page_table,
-                fmd.cache_seqlens_int32,
-                forward_batch.out_cache_loc,
-            )
-            _require(
-                ok,
-                f"no verify kernel for {rows} rows x "
-                f"{plan.key.tokens_per_request} tokens (draft extend)",
-            )
-        else:
-            ops.mono_decode_layer(
-                self.LAYER,
-                x,
-                torch.zeros_like(x),
-                out,
-                res,
-                positions,
-                fmd.page_table,
-                fmd.cache_seqlens_int32,
-                forward_batch.out_cache_loc,
-            )
+        extend = plan.key.forward_mode == "draft_extend"
+        tokens = plan.key.tokens_per_request if extend else 1
+        # a draft extend step attends causally over its rows (the verify
+        # kernel); seq_lens already counts them, as a verify step's do
+        ok = q35.qwen35_decode_step(
+            self.ws,
+            self.table,
+            self.LAYER,
+            self.LAYER + 1,
+            x,
+            torch.zeros_like(x),
+            out,
+            res,
+            positions,
+            tokens=tokens,
+            page_table=fmd.page_table,
+            seq_lens=fmd.cache_seqlens_int32,
+            out_loc=forward_batch.out_cache_loc,
+        )
+        _require(ok, f"no kernel for {rows} rows x {tokens} tokens (MTP drafter)")
         hidden, _ = lm.norm(out, res)
         return self.model.logits_processor(
             input_ids, hidden, self.model.lm_head, forward_batch

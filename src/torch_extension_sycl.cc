@@ -833,6 +833,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("mono_layer_counters", c10::DispatchKey::BackendSelect, &mono_layer_counters);
   m.def("mono_mbox_bytes() -> int");
   m.impl("mono_mbox_bytes", c10::DispatchKey::BackendSelect, &mono_mbox_bytes);
+  m.def("mono_mailbox_never() -> int");
+  m.impl("mono_mailbox_never", c10::DispatchKey::BackendSelect, &mono_mailbox_never);
   m.def("mono_register_layer(int layer, bool attn, int mbox, int peer, Tensor[] tensors) -> ()");
   m.impl("mono_register_layer", torch::kXPU, &mono_register_layer);
   m.def("mono_register_mtp(int layer, int mbox, int peer, Tensor[] tensors, int rank) -> ()");

@@ -389,6 +389,11 @@ int64_t mono_mbox_bytes() {
   return (int64_t)(sgl_mono::MBOX_WORDS_B * sizeof(uint64_t));
 }
 
+// the initial value of every mailbox word (it matches no tag)
+int64_t mono_mailbox_never() {
+  return (int64_t)sgl_mono::MB_NEVER;
+}
+
 // Registers layer `layer`'s weights (SGLang tensors, used in place; checked).
 // Registering a layer again keeps its scratch (and so its mailbox tags).
 void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, const std::vector<at::Tensor>& t) {

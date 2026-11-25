@@ -282,14 +282,15 @@ inline bool mb_match(uint64_t w, uint32_t tag) {
 inline uint32_t mb_val(uint64_t w) {
   return ((uint32_t)(w >> 32) << 16) | ((uint32_t)w & 0xffffu);
 }
+// initial value of every mailbox word (mono_mailbox_never): its two halves
+// carry different tags, so it matches no tag
+constexpr uint64_t MB_NEVER = 0x00000000ffff0000ull;
+static_assert(((MB_NEVER >> 48) & 0xffffu) != ((MB_NEVER >> 16) & 0xffffu), "MB_NEVER must match no tag");
 // A read-modify-write, not a store: it completes at the peer card's memory, so
 // the word cannot linger in this card's cache (a store to the peer's memory may
 // stay there until evicted and miss the peer's wait).
 inline void mb_put(uint64_t* peer, uint64_t w) {
   (void)mb_ref(*peer).exchange(w);
-}
-inline void mb_send(uint64_t* peer, float v, uint32_t tag) {
-  mb_put(peer, mb_word(sycl::bit_cast<uint32_t>(v), tag));
 }
 using h_ref = sycl::
     atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>;
@@ -354,8 +355,16 @@ inline uint64_t mb_wait(const uint64_t* mine, uint32_t tag, const uint32_t* cnt)
   if (!mb_match(w, tag) && !mb_wait_slow(mine, tag, w, cnt)) w = ~0ull;
   return w;
 }
-inline float mb_recv(uint64_t* mine, uint32_t tag, const uint32_t* cnt) {
-  return sycl::bit_cast<float>(mb_val(mb_wait(mine, tag, cnt)));
+// all-reduce of two values: one mailbox word of two bf16 + tag. Both ranks add
+// the same bf16-rounded partials (a + b == b + a), so their sums are bitwise
+// equal. A failed wait gives NaN (0xffff halves).
+inline void mb_ar2(uint64_t* peer, uint64_t* mine, float& v0, float& v1, uint32_t tag, const uint32_t* cnt) {
+  const bf16 a0 = (bf16)v0, a1 = (bf16)v1;
+  const uint32_t v = (uint32_t)sycl::bit_cast<uint16_t>(a0) | ((uint32_t)sycl::bit_cast<uint16_t>(a1) << 16);
+  mb_put(peer, mb_word(v, tag));
+  const uint32_t p = mb_val(mb_wait(mine, tag, cnt));
+  v0 = (float)a0 + (float)sycl::bit_cast<bf16>((uint16_t)(p & 0xffffu));
+  v1 = (float)a1 + (float)sycl::bit_cast<bf16>((uint16_t)(p >> 16));
 }
 
 inline uint32_t fp8x2_lo(uint32_t w) {  // bytes 0,2 -> two fp16 = e4m3 / 256

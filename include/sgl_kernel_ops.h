@@ -1776,6 +1776,7 @@ void mono_set_deadline(double seconds);
 void mono_fault_inject(int64_t layer, int64_t delta);
 at::Tensor mono_layer_counters(int64_t layer);
 int64_t mono_mbox_bytes();
+int64_t mono_mailbox_never();
 void mono_register_layer(int64_t layer, bool attn, int64_t mbox, int64_t peer, const std::vector<at::Tensor>& tensors);
 void mono_bind_caches(int64_t layer, const std::vector<at::Tensor>& caches, int64_t page_size);
 void mono_decode_layer(

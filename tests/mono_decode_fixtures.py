@@ -28,10 +28,16 @@ def _ops():
 
 
 def mailbox(device) -> torch.Tensor:
-    """One layer's mailbox (zeroed): pass its address as both the own and the
-    peer mailbox for a single-card loopback (the all-reduces then return twice
-    this rank's partial sums)."""
-    return torch.zeros(_ops().mono_mbox_bytes(), dtype=torch.uint8, device=device)
+    """One layer's mailbox (every word mono_mailbox_never()): pass its address
+    as both the own and the peer mailbox for a single-card loopback (the
+    all-reduces then return twice this rank's partial sums)."""
+    ops = _ops()
+    return torch.full(
+        (ops.mono_mbox_bytes() // 8,),
+        ops.mono_mailbox_never(),
+        dtype=torch.int64,
+        device=device,
+    )
 
 
 def addr(t: torch.Tensor) -> int:

@@ -61,7 +61,8 @@ class PeerRegion:
     """This rank's mailboxes and the peer's, mapped, one mailbox per name, in
     torch symmetric memory of ``group`` (a GroupCoordinator of two ranks: its
     device group names the symmetric memory, its CPU group agrees on errors).
-    The mailboxes start zeroed. The constructor is collective."""
+    Every mailbox word starts as mono_mailbox_never() (matches no tag). The
+    constructor is collective."""
 
     def __init__(self, names: list, rank: int, group):
         from torch._C._distributed_c10d import _SymmetricMemory
@@ -88,8 +89,8 @@ class PeerRegion:
         me = self._handle.rank
         self._own = self._handle.get_buffer(me, (words,), torch.int64, 0)
         self._peer = self._handle.get_buffer(1 - me, (words,), torch.int64, 0)
-        self._own.zero_()
-        # the peer may write into the mailboxes only after they were zeroed
+        self._own.fill_(int(torch.ops.sgl_kernel.mono_mailbox_never()))
+        # the peer may write into the mailboxes only after they were filled
         torch.xpu.synchronize(dev)
         self._handle.barrier()
         self.own = _addr(self._own)

@@ -307,17 +307,11 @@ inline void input_norm_b(sycl::nd_item<1> it, const Ptrs& P, const SlmB& L) {
   }
 }
 
-// all-reduce of two values per work-item: one mailbox word of two fp16 + call
-// tag, half the PCIe writes of one fp32 per word. Both ranks add the same
-// fp16-rounded partials (a + b == b + a).
+// all-reduce of two values per work-item: one mailbox word of two bf16 + call
+// tag, half the PCIe writes of one fp32 per word (mb_ar2).
 inline void
 ar_two(uint64_t* peer, uint64_t* mine, size_t word, float& v0, float& v1, uint32_t call, const uint32_t* cnt) {
-  const half a0 = (half)v0, a1 = (half)v1;
-  mb_put(peer + word, mb_word(pack_h2(a0, a1), call));
-  const uint64_t w = mb_wait(mine + word, call, cnt);
-  const h2 b = sycl::bit_cast<h2>(mb_val(w));
-  v0 = (float)a0 + (float)b[0];
-  v1 = (float)a1 + (float)b[1];
+  mb_ar2(peer + word, mine + word, v0, v1, call, cnt);
 }
 
 // -------------------------------------------------------------- tail (batched)

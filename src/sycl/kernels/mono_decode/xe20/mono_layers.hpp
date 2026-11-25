@@ -80,11 +80,11 @@ inline void tail(
       float* ob = reinterpret_cast<float*>(L.ao + 1536);
       if (lane < 2) ob[s * 2 + lane] = ov;
       wg_bar(grp);
-      if (lid < 64) {
-        float v = ob[lid];
-        mb_send(S.peer + wg * 64 + lid, v, mtag);
-        v += mb_recv(S.mbox + wg * 64 + lid, mtag, S.cnt);
-        ob[lid] = v;
+      if (lid < 32) {  // two rows a word
+        float v0 = ob[2 * lid], v1 = ob[2 * lid + 1];
+        mb_ar2(S.peer + wg * 32 + lid, S.mbox + wg * 32 + lid, v0, v1, mtag, S.cnt);
+        ob[2 * lid] = v0;
+        ob[2 * lid + 1] = v1;
       }
       wg_bar(grp);
       if (lane < 2) ov = ob[s * 2 + lane];
@@ -315,10 +315,14 @@ inline void tail(
 #pragma unroll
       for (int k = 0; k < TOPK; ++k)
         a += L.mr[k * 64 + lid];
-      a += L.red[lid];
-      mb_send(S.peer + HID + wg * 64 + lid, a, mtag);  // all-reduce #2
-      a += mb_recv(S.mbox + HID + wg * 64 + lid, mtag, S.cnt);
-      st16<DT>(P.hid_out, wg * 64 + lid, a);
+      L.red[lid] += a;  // this row's partial (each work-item its own element)
+    }
+    wg_bar(grp);
+    if (lid < 32) {  // all-reduce #2, two rows a word
+      float a0 = L.red[2 * lid], a1 = L.red[2 * lid + 1];
+      mb_ar2(S.peer + HID + wg * 32 + lid, S.mbox + HID + wg * 32 + lid, a0, a1, mtag, S.cnt);
+      st16<DT>(P.hid_out, wg * 64 + 2 * lid, a0);
+      st16<DT>(P.hid_out, wg * 64 + 2 * lid + 1, a1);
     }
   }
 }

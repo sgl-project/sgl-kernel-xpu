@@ -3,13 +3,13 @@
  * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
 
-// FP8 E4M3 weight, BF16 activation grouped GEMM for Xe2 (BMG). Activation is
-// applied externally between GEMM1 and GEMM2.
+// 8-bit weight (FP8 E4M3 or INT8/UINT8), BF16 activation grouped GEMM for Xe2
+// (BMG). Weights use column-major inner layout `(N, K)` with `Stride<_1, int>`
+// so LSC hardware performs native 64B VNNI loads (`XE_LOAD_2D_VNNI`).
 
 #pragma once
 
 #include "../common/block_2d_copy_d.hpp"
-#include "../common/xe_gemm.hpp"
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
 #include "cutlass/float8.h"
@@ -34,11 +34,11 @@ template <
     typename TensorBPacked,
     typename TensorD,
     typename TiledMMA,
-    bool WeightScalePerExpert = false,
-    bool WeightScaleBlocked = false>
+    bool IsInt8 = false>
 class W8A16Kernel {
  public:
   using ElementA = cutlass::bfloat16_t;
+  using ElementBPacked = typename TensorBPacked::element_type;
   using ElementD = cutlass::bfloat16_t;
   using TiledCopyA = decltype(make_block_2d_copy_A(TiledMMA{}, TensorA{}));
   using TiledCopyBPacked = decltype(make_block_2d_copy_B(TiledMMA{}, TensorBPacked{}));
@@ -56,13 +56,13 @@ class W8A16Kernel {
       TensorBPacked,
       TensorD,
       TiledMMA,
-      WeightScalePerExpert,
-      WeightScaleBlocked>;
+      IsInt8>;
 
   struct Params {
     const uint8_t* Activations;    // [M_total, K] bf16 bytes
-    const uint8_t* PackedWeights;  // [num_experts, N, K] fp8 e4m3 raw bytes
-    const void* WeightScales;      // Per-expert scalar, block scales, or uint8 MXFP8 scales
+    const uint8_t* PackedWeights;  // [num_experts, N, K] with stride (expert_stride_b, 1, ld_b)
+    const void* WeightScales;      // Scalar, per-channel, 128x128 block, K-group, or MXFP8 scales
+    const uint8_t* WeightZeros;    // Optional [num_experts, N, K/group_size] uint8 zero-points
     const float* Bias;
     ElementD* Outputs;
     const int32_t* M_per_group;
@@ -72,7 +72,11 @@ class W8A16Kernel {
     int32_t* workspace;
     TiledMMA mma;
     int32_t ld_b;
+    int64_t expert_stride_b;
     int32_t scale_mode;
+    int32_t group_size;
+    bool scale_is_bf16 = false;
+    bool is_signed_int8 = true;
     bool static_scheduler = false;
   };
 
@@ -82,14 +86,10 @@ class W8A16Kernel {
   }
 
   auto make_B_tensors(uint8_t* ptr_B, int N, int K, int ld_b) {
-    auto* e4m3_ptr = reinterpret_cast<cutlass::float_e4m3_t*>(ptr_B);
-    auto B = make_tensor(make_gmem_ptr(e4m3_ptr), make_layout(make_shape(N, K), make_stride(ld_b, _1{})));
-    return B;
+    auto* b_ptr = reinterpret_cast<ElementBPacked*>(ptr_B);
+    return make_tensor(make_gmem_ptr(b_ptr), make_layout(make_shape(N, K), make_stride(_1{}, ld_b)));
   }
 
-  // Per-expert weight-scale pointers + row stride. Mirrors MXFP4's
-  // make_scale_ptrs exactly (same gate/up split conventions), just with
-  // K_scale = K / FP8_GROUP_SIZE_K instead of K / MXFP4_GROUP_SIZE.
   auto make_D_tensors(ElementD* ptr_D, int pre_rows, int M, int N) {
     return make_tensor(
         make_gmem_ptr<ElementD>(ptr_D + pre_rows * N), make_layout(make_shape(M, N), make_stride(N, _1{})));
@@ -113,9 +113,29 @@ class W8A16Kernel {
     int group_range = item.get_group_range(1);
     int32_t thr_id = int32_t(item.get_local_linear_id());
 
-    const bool is_mxfp8 = (params.scale_mode == static_cast<int32_t>(ScaleMode::BlockMXFP8));
-    const int64_t K_scale = is_mxfp8 ? (K / 32) : (K / FP8_GROUP_SIZE_K);
-    int64_t scale_n = WeightScalePerExpert ? params.scale_mode : (is_mxfp8 ? N : (N + 127) / 128);
+    const int32_t mode = params.scale_mode;
+    const bool is_mxfp8 = !IsInt8 && (mode == static_cast<int32_t>(ScaleMode::BlockMXFP8));
+    const int scale_elem_bytes = is_mxfp8 ? 1 : (params.scale_is_bf16 ? 2 : 4);
+    int scale_row_stride = 1;
+    int64_t expert_scale_elems = 1;
+    if (mode == static_cast<int32_t>(ScaleMode::ScalarSingle)) {
+      scale_row_stride = 1;
+      expert_scale_elems = 1;
+    } else if (mode == static_cast<int32_t>(ScaleMode::ScalarGateUp)) {
+      scale_row_stride = 2;
+      expert_scale_elems = 2;
+    } else if (mode == static_cast<int32_t>(ScaleMode::PerChannelN)) {
+      scale_row_stride = 1;
+      expert_scale_elems = N;
+    } else if (mode == static_cast<int32_t>(ScaleMode::BlockFP32)) {
+      scale_row_stride = K / FP8_GROUP_SIZE_K;
+      expert_scale_elems = static_cast<int64_t>((N + 127) / 128) * scale_row_stride;
+    } else {
+      // BlockMXFP8 (group_size=32) or GroupNK (arbitrary power-of-two group_size)
+      scale_row_stride = K / params.group_size;
+      expert_scale_elems = static_cast<int64_t>(N) * scale_row_stride;
+    }
+    const int64_t expert_zero_elems = static_cast<int64_t>(N) * scale_row_stride;
 
     int pre_rows = 0;
     int pre_tiles = 0;
@@ -132,14 +152,15 @@ class W8A16Kernel {
 
       int expert_id = i;
       int ld_b = params.ld_b;
-      int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(N) * static_cast<int64_t>(ld_b);
-      int64_t S_offset = static_cast<int64_t>(expert_id) * scale_n * (WeightScalePerExpert ? 1 : K_scale);
+      int64_t B_offset = static_cast<int64_t>(expert_id) * params.expert_stride_b;
+      int64_t S_byte_offset = static_cast<int64_t>(expert_id) * expert_scale_elems * scale_elem_bytes;
 
       uint8_t* ptr_A_curr_batch = const_cast<uint8_t*>(params.Activations) + pre_rows * K * sizeof(ElementA);
       uint8_t* ptr_B_curr_batch = const_cast<uint8_t*>(params.PackedWeights) + B_offset;
-      const void* ptr_S_curr_batch =
-          is_mxfp8 ? static_cast<const void*>(static_cast<const uint8_t*>(params.WeightScales) + S_offset)
-                   : static_cast<const void*>(static_cast<const float*>(params.WeightScales) + S_offset);
+      const uint8_t* ptr_S_curr_batch = static_cast<const uint8_t*>(params.WeightScales) + S_byte_offset;
+      const uint8_t* ptr_Z_curr_batch =
+          params.WeightZeros == nullptr ? nullptr
+                                        : (params.WeightZeros + static_cast<int64_t>(expert_id) * expert_zero_elems);
       const float* ptr_Bias_curr_batch =
           params.Bias == nullptr ? nullptr : params.Bias + static_cast<int64_t>(expert_id) * N;
 
@@ -152,46 +173,23 @@ class W8A16Kernel {
         int m_coord = (group_m_id - pre_tiles);
 
         auto tile_coord = make_coord(m_coord, n_coord, _, 0);
-        if constexpr (WeightScalePerExpert) {
-          if (params.scale_mode == static_cast<int32_t>(ScaleMode::ScalarSingle)) {
-            moe_xe20::xe_gemm<void, void, void>(
-                A_tensor,
-                B_tensor,
-                static_cast<const float*>(ptr_S_curr_batch),
-                ptr_Bias_curr_batch,
-                D_tensor,
-                tile_coord,
-                mma);
-          } else {
-            CollectiveMainloop mainloop;
-            mainloop(
-                A_tensor,
-                B_tensor,
-                ptr_S_curr_batch,
-                scale_n,
-                D_tensor,
-                tile_coord,
-                mma,
-                thr_id,
-                ptr_Bias_curr_batch,
-                N,
-                params.scale_mode);
-          }
-        } else {
-          CollectiveMainloop mainloop;
-          mainloop(
-              A_tensor,
-              B_tensor,
-              ptr_S_curr_batch,
-              K_scale,
-              D_tensor,
-              tile_coord,
-              mma,
-              thr_id,
-              ptr_Bias_curr_batch,
-              N,
-              params.scale_mode);
-        }
+        CollectiveMainloop mainloop;
+        mainloop(
+            A_tensor,
+            B_tensor,
+            ptr_S_curr_batch,
+            ptr_Z_curr_batch,
+            scale_row_stride,
+            D_tensor,
+            tile_coord,
+            mma,
+            thr_id,
+            ptr_Bias_curr_batch,
+            N,
+            params.scale_mode,
+            params.group_size,
+            params.scale_is_bf16,
+            params.is_signed_int8);
 
         if (params.static_scheduler) {
           group_id += group_range;

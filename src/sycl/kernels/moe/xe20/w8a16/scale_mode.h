@@ -10,14 +10,22 @@
 namespace moe_w8a16 {
 
 enum class ScaleMode : int32_t {
-  ScalarSingle = 1,  // [E, 1] scalar scale per expert
+  ScalarSingle = 1,  // [E] or [E, 1] per-expert scalar scale
   ScalarGateUp = 2,  // [E, 2] separate scalar scale for gate and up projections
-  BlockFP32 = 3,     // [E, ceil(N/128), K/128] 128x128 FP32 block scales
+  BlockFP32 = 3,     // [E, ceil(N/128), K/128] 128x128 block scales
   BlockMXFP8 = 4,    // [E, N, K/32] 1x32 UE8M0 uint8 block scales
+  PerChannelN = 5,   // [E, N] or [E, N, 1] per-output-channel scales
+  GroupNK = 6,       // [E, N, K/group_size] per-channel K-grouped scales
 };
 
-inline bool is_block_scale_mode(int32_t mode) {
-  return mode == static_cast<int32_t>(ScaleMode::BlockFP32) || mode == static_cast<int32_t>(ScaleMode::BlockMXFP8);
+inline constexpr bool is_block_scale_mode(int32_t mode) {
+  return mode == static_cast<int32_t>(ScaleMode::BlockFP32) || mode == static_cast<int32_t>(ScaleMode::BlockMXFP8) ||
+         mode == static_cast<int32_t>(ScaleMode::GroupNK);
+}
+
+inline constexpr bool is_epilogue_scale_mode(int32_t mode) {
+  return mode == static_cast<int32_t>(ScaleMode::ScalarSingle) ||
+         mode == static_cast<int32_t>(ScaleMode::ScalarGateUp) || mode == static_cast<int32_t>(ScaleMode::PerChannelN);
 }
 
 inline bool is_block_scale_mode(ScaleMode mode) {

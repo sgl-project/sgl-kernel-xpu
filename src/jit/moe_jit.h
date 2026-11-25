@@ -35,6 +35,7 @@ bool grouped_gemm_launch(
     float gemm1_alpha,
     float gemm1_limit,
     int ld_b,
+    int64_t expert_stride_b,
     int arch = 0,  // sgl::jit::Arch code (0=BMG/Xe20, 1=XE3P/Xe35)
     std::string* err = nullptr);
 
@@ -69,10 +70,12 @@ bool w4a16_grouped_gemm_launch(
 bool w8a16_grouped_gemm_launch(
     int avg_m,
     int scale_mode,
+    bool is_int8,
     void* queue,
     const void* activations,
     const void* weights,
     const void* weight_scales,
+    const void* weight_zeros,
     const void* bias,
     void* outputs,
     int gemm_n,
@@ -81,6 +84,10 @@ bool w8a16_grouped_gemm_launch(
     int num_experts,
     int* workspace,
     int ld_b,
+    int64_t expert_stride_b,
+    int group_size,
+    bool scale_is_bf16,
+    bool is_signed_int8,
     bool static_scheduler,
     int arch = 0,
     std::string* err = nullptr);

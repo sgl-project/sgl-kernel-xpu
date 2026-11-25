@@ -172,6 +172,27 @@ def _quantize_w8_weights(weights, scale_layout):
             .reshape_as(weights)
         )
         return quantized.contiguous(), scale_biased.contiguous()
+    elif scale_layout == "int8_channel":
+        scales = (
+            weights.float().abs().amax(dim=2, keepdim=True).clamp_min(1e-12) / 127.0
+        )
+        quantized = (weights.float() / scales).round().clamp(-128, 127).to(torch.int8)
+        return quantized.contiguous(), scales.squeeze(-1).contiguous()
+    elif scale_layout == "int8_group128":
+        experts, rows, columns = weights.shape
+        grouped = weights.float().reshape(experts, rows, columns // 128, 128)
+        scales = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / 127.0
+        quantized = (
+            (grouped / scales)
+            .round()
+            .clamp(-128, 127)
+            .to(torch.int8)
+            .reshape_as(weights)
+        )
+        return (
+            quantized.contiguous(),
+            scales.squeeze(-1).to(torch.bfloat16).contiguous(),
+        )
 
     parts = 2 if scale_layout == "scalar_gemm1" else 1
     chunks = weights.chunk(parts, dim=1)
@@ -190,9 +211,12 @@ def _quantize_w8_weights(weights, scale_layout):
 
 
 def _build_w8_weights(num_experts, gemm_n, gemm_k, scale_layout):
-    weights = torch.empty(
-        (num_experts, gemm_n, gemm_k), device="xpu", dtype=torch.float8_e4m3fn
+    w_dtype = (
+        torch.int8
+        if scale_layout in ("int8_channel", "int8_group128")
+        else torch.float8_e4m3fn
     )
+    weights = torch.empty((num_experts, gemm_n, gemm_k), device="xpu", dtype=w_dtype)
     if scale_layout == "block":
         scales = torch.empty(
             (
@@ -209,6 +233,12 @@ def _build_w8_weights(num_experts, gemm_n, gemm_k, scale_layout):
             device="xpu",
             dtype=torch.uint8,
         )
+    elif scale_layout == "int8_channel":
+        scales = torch.empty((num_experts, gemm_n), device="xpu", dtype=torch.float32)
+    elif scale_layout == "int8_group128":
+        scales = torch.empty(
+            (num_experts, gemm_n, gemm_k // 128), device="xpu", dtype=torch.bfloat16
+        )
     else:
         parts = 2 if scale_layout == "scalar_gemm1" else 1
         scales = torch.empty((num_experts, parts), device="xpu", dtype=torch.float32)
@@ -217,6 +247,7 @@ def _build_w8_weights(num_experts, gemm_n, gemm_k, scale_layout):
         quantized, expert_scales = _quantize_w8_weights(source, scale_layout)
         weights[expert].copy_(quantized[0])
         scales[expert].copy_(expert_scales[0])
+    weights = weights.transpose(1, 2).contiguous().transpose(1, 2)
     return weights, scales
 
 

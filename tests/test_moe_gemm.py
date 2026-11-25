@@ -12,7 +12,7 @@ import utils
 from mxfp4_utils import MXFP4_BLOCK_SIZE
 from mxfp4_utils import dequantize_mxfp4_2d as _dequantize_mxfp4_2d
 from mxfp4_utils import quantize_mxfp4_2d as _quantize_mxfp4_2d
-from sgl_kernel import fused_experts
+from sgl_kernel import convert_weights_to_col_major, fused_experts, is_xe2_arch
 
 device = utils.get_device()
 ref_device = utils.get_reference_device()
@@ -2210,6 +2210,320 @@ def test_moe_grouped_mm_nt_xe20_w4a16_mxfp4_ragged_production_tiles(
     )
 
     torch.testing.assert_close(actual.cpu(), expected, rtol=1e-1, atol=1e-2)
+
+
+@pytest.mark.skipif(not is_xe2_arch(), reason="W8A16 INT8/Layout-B tests require Xe2")
+@pytest.mark.parametrize("scale_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "scale_layout",
+    ["scalar", "gate_up", "channel", "block128", "group32", "group64"],
+)
+def test_moe_grouped_mm_int8_w8a16_all_scale_modes(scale_dtype, scale_layout):
+    """Verify signed INT8 W8A16 across all unified scale layouts and tiles."""
+    torch.manual_seed(101)
+    torch.xpu.manual_seed_all(101)
+    rows_per_expert = [5, 0, 39, 17, 73]  # non-multiple-of-8 expert count (E=5)
+    num_experts = len(rows_per_expert)
+    total_m = sum(rows_per_expert)
+    gemm_n = 256
+    gemm_k = 256
+
+    act_cpu = torch.randn((total_m, gemm_k), dtype=torch.bfloat16) * 0.25
+    w_int8_cpu = torch.randint(
+        -127, 128, (num_experts, gemm_n, gemm_k), dtype=torch.int8
+    )
+
+    if scale_layout == "scalar":
+        s_cpu = (torch.rand((num_experts, 1), dtype=torch.float32) * 0.02 + 0.005).to(
+            scale_dtype
+        )
+        w_dq = w_int8_cpu.float() * s_cpu.float().unsqueeze(-1)
+    elif scale_layout == "gate_up":
+        s_cpu = (torch.rand((num_experts, 2), dtype=torch.float32) * 0.02 + 0.005).to(
+            scale_dtype
+        )
+        s_exp = s_cpu.float().repeat_interleave(gemm_n // 2, dim=1).unsqueeze(-1)
+        w_dq = w_int8_cpu.float() * s_exp
+    elif scale_layout == "channel":
+        s_cpu = (
+            torch.rand((num_experts, gemm_n), dtype=torch.float32) * 0.02 + 0.005
+        ).to(scale_dtype)
+        w_dq = w_int8_cpu.float() * s_cpu.float().unsqueeze(-1)
+    elif scale_layout == "block128":
+        s_cpu = (
+            torch.rand((num_experts, gemm_n // 128, gemm_k // 128), dtype=torch.float32)
+            * 0.02
+            + 0.005
+        ).to(scale_dtype)
+        s_exp = (
+            s_cpu.float().repeat_interleave(128, dim=1).repeat_interleave(128, dim=2)
+        )
+        w_dq = (w_int8_cpu.float() * s_exp).to(torch.bfloat16).float()
+    else:
+        group_size = 32 if scale_layout == "group32" else 64
+        s_cpu = (
+            torch.rand((num_experts, gemm_n, gemm_k // group_size), dtype=torch.float32)
+            * 0.02
+            + 0.005
+        ).to(scale_dtype)
+        s_exp = s_cpu.float().repeat_interleave(group_size, dim=2)
+        w_dq = (w_int8_cpu.float() * s_exp).to(torch.bfloat16).float()
+
+    ref_parts = []
+    start = 0
+    for e, m in enumerate(rows_per_expert):
+        if m > 0:
+            ref_parts.append(
+                act_cpu[start : start + m].float() @ w_dq[e].transpose(0, 1)
+            )
+        start += m
+    expected = torch.cat(ref_parts, dim=0).to(torch.bfloat16)
+
+    w_xpu = w_int8_cpu.to("xpu").transpose(1, 2).contiguous().transpose(1, 2)
+    out_xpu = torch.empty((total_m, gemm_n), dtype=torch.bfloat16, device="xpu")
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_xpu,
+        act_cpu.to("xpu"),
+        w_xpu,
+        s_cpu.to("xpu"),
+        None,
+        torch.tensor(rows_per_expert, dtype=torch.int32, device="xpu"),
+        num_experts,
+    )
+    actual = out_xpu.cpu().float()
+    expected_f = expected.float()
+    assert expected_f.abs().mean() > 0.05
+    error = (actual - expected_f).abs()
+    assert error.mean() <= expected_f.abs().mean() * 1e-2
+    assert error.max() <= expected_f.abs().max() * 1.5e-2
+
+
+@pytest.mark.skipif(
+    not is_xe2_arch(), reason="W8A16 UINT8/zero-point tests require Xe2"
+)
+@pytest.mark.parametrize("with_explicit_zp", [False, True])
+@pytest.mark.parametrize("activation", ["silu", "gelu", "relu2"])
+def test_fused_experts_uint8_w8a16_gptq_awq(with_explicit_zp, activation):
+    """Verify fused_experts(use_int8_w8a16=True) with symmetric uint8b128 and explicit uint8 zero-points."""
+    torch.manual_seed(202)
+    torch.xpu.manual_seed_all(202)
+    num_tokens, topk, num_experts = 19, 2, 6  # E=6 exercises non-multiple-of-8 experts
+    hidden_size, inter_size, group_size = 256, 128, 64
+    w1_rows = inter_size if activation == "relu2" else 2 * inter_size
+
+    a_cpu = torch.randn((num_tokens, hidden_size), dtype=torch.bfloat16) * 0.2
+    scores = torch.softmax(
+        torch.randn((num_tokens, num_experts), dtype=torch.float32), dim=-1
+    )
+    topk_weights, topk_ids = torch.topk(scores, topk, dim=-1)
+
+    w1_u8 = torch.randint(
+        0, 256, (num_experts, w1_rows, hidden_size), dtype=torch.uint8
+    )
+    w2_u8 = torch.randint(
+        0, 256, (num_experts, hidden_size, inter_size), dtype=torch.uint8
+    )
+    w1_s = (
+        torch.rand(
+            (num_experts, w1_rows, hidden_size // group_size), dtype=torch.float32
+        )
+        * 0.002
+        + 0.0005
+    ).to(torch.bfloat16)
+    w2_s = (
+        torch.rand(
+            (num_experts, hidden_size, inter_size // group_size), dtype=torch.float32
+        )
+        * 0.002
+        + 0.0005
+    ).to(torch.bfloat16)
+
+    if with_explicit_zp:
+        w1_zp = torch.randint(0, 256, w1_s.shape, dtype=torch.uint8)
+        w2_zp = torch.randint(0, 256, w2_s.shape, dtype=torch.uint8)
+        zp1_ref = w1_zp.float().repeat_interleave(group_size, dim=2)
+        zp2_ref = w2_zp.float().repeat_interleave(group_size, dim=2)
+    else:
+        w1_zp = None
+        w2_zp = None
+        zp1_ref = 128.0
+        zp2_ref = 128.0
+
+    w1_dq = (
+        (w1_u8.float() - zp1_ref) * w1_s.float().repeat_interleave(group_size, dim=2)
+    ).to(torch.bfloat16)
+    w2_dq = (
+        (w2_u8.float() - zp2_ref) * w2_s.float().repeat_interleave(group_size, dim=2)
+    ).to(torch.bfloat16)
+
+    ref = torch_naive_moe(
+        a_cpu.to("xpu"),
+        w1_dq.to("xpu"),
+        w2_dq.to("xpu"),
+        topk_ids.to("xpu"),
+        topk_weights.to("xpu"),
+        topk,
+        None,
+        None,
+        activations=activation,
+    )
+    w1_col, w2_col = convert_weights_to_col_major(w1_u8.to("xpu"), w2_u8.to("xpu"))
+    out = fused_experts(
+        a_cpu.to("xpu"),
+        w1_col,
+        w2_col,
+        topk_weights.to("xpu"),
+        topk_ids.to("xpu"),
+        activation=activation,
+        use_int8_w8a16=True,
+        w1_scale=w1_s.to("xpu"),
+        w2_scale=w2_s.to("xpu"),
+        w1_zp=w1_zp.to("xpu") if w1_zp is not None else None,
+        w2_zp=w2_zp.to("xpu") if w2_zp is not None else None,
+    )
+    actual = out.cpu().float()
+    expected = ref.cpu().float()
+    assert expected.abs().mean() > 0.01
+    error = (actual - expected).abs()
+    assert error.mean() <= expected.abs().mean() * 1.5e-2
+    assert error.max() <= expected.abs().max() * 2.5e-2
+
+
+@pytest.mark.skipif(
+    not is_xe2_arch(), reason="Layout-B and XPU Graph tests require Xe2"
+)
+def test_layout_b_square_matrix_non_mutation_and_xpu_graph():
+    """Verify square (N == K) Layout-B disambiguation, non-mutation of legacy weights,
+    GPT-OSS block-split BF16 fusion, and XPU Graph capture/replay."""
+    torch.manual_seed(303)
+    torch.xpu.manual_seed_all(303)
+
+    # 1. Square matrix (N == K == 128): legacy K-major vs Layout-B N-major must produce identical results
+    #    without mutating the caller's legacy tensor.
+    e_sq, n_sq, k_sq = 5, 128, 128
+    act = torch.randn((15, k_sq), dtype=torch.bfloat16, device="xpu") * 0.2
+    w_legacy = (
+        torch.randn((e_sq, n_sq, k_sq), dtype=torch.float32, device="xpu") * 2.0
+    ).to(torch.float8_e4m3fn)
+    orig_shape = tuple(w_legacy.shape)
+    orig_stride = tuple(w_legacy.stride())
+    orig_ptr = w_legacy.data_ptr()
+    scales = torch.full((e_sq, 1), 0.125, dtype=torch.float32, device="xpu")
+    rows = torch.full((e_sq,), 3, dtype=torch.int32, device="xpu")
+
+    w_col = w_legacy.transpose(1, 2).contiguous().transpose(1, 2)
+    assert w_col.shape == (e_sq, n_sq, k_sq)
+    assert w_col.stride(1) == 1 and w_legacy.stride(2) == 1
+
+    out_legacy = torch.empty((15, n_sq), dtype=torch.bfloat16, device="xpu")
+    out_col = torch.empty((15, n_sq), dtype=torch.bfloat16, device="xpu")
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_legacy, act, w_legacy, scales, None, rows, e_sq
+    )
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_col, act, w_col, scales, None, rows, e_sq
+    )
+    assert tuple(w_legacy.shape) == orig_shape
+    assert tuple(w_legacy.stride()) == orig_stride
+    assert w_legacy.data_ptr() == orig_ptr
+    torch.testing.assert_close(out_legacy, out_col, rtol=0, atol=0)
+
+    # 2. fused_experts with legacy [E, N, K] weights: non-mutating cache + XPU Graph capture & replay.
+    num_tokens, topk, hidden, inter = 8, 2, 128, 128
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="xpu") * 0.2
+    w1_fp8 = torch.randn(
+        (e_sq, 2 * inter, hidden), dtype=torch.float32, device="xpu"
+    ).to(torch.float8_e4m3fn)
+    w2_fp8 = torch.randn((e_sq, hidden, inter), dtype=torch.float32, device="xpu").to(
+        torch.float8_e4m3fn
+    )
+    s1 = torch.randint(
+        120, 128, (e_sq, 2 * inter, hidden // 32), dtype=torch.uint8, device="xpu"
+    )
+    s2 = torch.randint(
+        120, 128, (e_sq, hidden, inter // 32), dtype=torch.uint8, device="xpu"
+    )
+    scores = torch.softmax(
+        torch.randn((num_tokens, e_sq), dtype=torch.float32, device="xpu"), dim=-1
+    )
+    topk_w, topk_i = torch.topk(scores, topk, dim=-1)
+
+    w1_orig_stride = w1_fp8.stride()
+    eager_ref = fused_experts(
+        x, w1_fp8, w2_fp8, topk_w, topk_i, use_fp8_w8a8=True, w1_scale=s1, w2_scale=s2
+    ).clone()
+    assert w1_fp8.stride() == w1_orig_stride and w1_fp8.is_contiguous()
+
+    # Capture XPU Graph after warmup and replay with fresh input values.
+    static_x = x.clone()
+    static_out = torch.empty_like(static_x)
+    g = torch.xpu.XPUGraph()
+    torch.xpu.synchronize()
+    with torch.xpu.graph(g):
+        static_out.copy_(
+            fused_experts(
+                static_x,
+                w1_fp8,
+                w2_fp8,
+                topk_w,
+                topk_i,
+                use_fp8_w8a8=True,
+                w1_scale=s1,
+                w2_scale=s2,
+            )
+        )
+    new_x = torch.randn_like(static_x) * 0.2
+    static_x.copy_(new_x)
+    g.replay()
+    torch.xpu.synchronize()
+    expected_new = fused_experts(
+        new_x,
+        w1_fp8,
+        w2_fp8,
+        topk_w,
+        topk_i,
+        use_fp8_w8a8=True,
+        w1_scale=s1,
+        w2_scale=s2,
+    )
+    torch.testing.assert_close(static_out, expected_new, rtol=0, atol=0)
+
+    # 3. GPT-OSS BF16 block-split Layout-B fused kernel with interleaved bias.
+    alpha, limit = 1.702, 7.0
+    w1_bf16 = (
+        torch.randn((e_sq, 2 * inter, hidden), dtype=torch.bfloat16, device="xpu") * 0.1
+    )
+    w2_bf16 = (
+        torch.randn((e_sq, hidden, inter), dtype=torch.bfloat16, device="xpu") * 0.1
+    )
+    b1_bf16 = torch.randn((e_sq, 2 * inter), dtype=torch.float32, device="xpu") * 0.05
+    b2_bf16 = torch.randn((e_sq, hidden), dtype=torch.float32, device="xpu") * 0.05
+    out_gpt_legacy = fused_experts(
+        x,
+        w1_bf16,
+        w2_bf16,
+        topk_w,
+        topk_i,
+        b1=b1_bf16,
+        b2=b2_bf16,
+        gemm1_alpha=alpha,
+        gemm1_limit=limit,
+    )
+    w1_gpt_col, w2_gpt_col = convert_weights_to_col_major(
+        w1_bf16, w2_bf16, deinterleave_gpt_oss=True
+    )
+    out_gpt_col = fused_experts(
+        x,
+        w1_gpt_col,
+        w2_gpt_col,
+        topk_w,
+        topk_i,
+        b1=b1_bf16,
+        b2=b2_bf16,
+        gemm1_alpha=alpha,
+        gemm1_limit=limit,
+    )
+    torch.testing.assert_close(out_gpt_col, out_gpt_legacy, rtol=1e-2, atol=1e-2)
 
 
 if __name__ == "__main__":

@@ -828,7 +828,8 @@ void moe_grouped_mm_nt_xe20(
     const int64_t activation_type = 0,  // 0=silu, 1=gelu, 2=swiglu
     bool fuse_act = false,
     double gemm1_alpha = 1.702,
-    double gemm1_limit = 7.0);
+    double gemm1_limit = 7.0,
+    bool gate_up_interleaved = true);
 
 // Unified int4/mxfp4 W4A16 MoE grouped GEMM.
 // `packed_weights` is int8 or uint8 [E, N, K/2] with two 4-bit values per byte.
@@ -853,10 +854,9 @@ void moe_grouped_mm_nt_xe20_w4a16(
     bool is_int4,
     const int64_t group_size);
 
-// W8A16 grouped GEMM. Activations are BF16, weights are 8-bit (FP8 E4M3),
-// and weight_scales is 1D [E] / 2D [E, 1] / [E, 2] for float32 per-expert scalar scales,
-// 3D [E, ceil(N/128), K/128] for 128x128 float32 block scales, or
-// 3D [E, N, K/32] uint8/float8_e8m0fnu for MXFP8 (1x32 UE8M0) block scales.
+// W8A16 grouped GEMM. Activations are BF16, weights are 8-bit (FP8 E4M3, INT8, or UINT8),
+// and weight_scales supports scalar ([E] / [E, 1] / [E, 2]), per-channel ([E, N] / [E, N, 1]),
+// 128x128 block ([E, ceil(N/128), K/128]), K-group ([E, N, K/G]), and MXFP8 1x32 UE8M0 scales.
 void moe_grouped_mm_nt_xe20_w8a16(
     torch::Tensor& output,
     const torch::Tensor& activations,
@@ -864,7 +864,8 @@ void moe_grouped_mm_nt_xe20_w8a16(
     const torch::Tensor& weight_scales,
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
-    const int64_t n_experts);
+    const int64_t n_experts,
+    const std::optional<at::Tensor>& weight_zeros = std::nullopt);
 
 // Xe3 (CRI) plain bf16 grouped GEMM, tile heuristics tuned for Xe3.
 void moe_grouped_mm_nt_xe35(

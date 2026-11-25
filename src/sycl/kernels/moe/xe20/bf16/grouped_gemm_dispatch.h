@@ -51,8 +51,8 @@ inline int grouped_gemm_select_tile(int avg_m, int gemm_k, int gemm_n, bool fuse
   const bool narrow_n_fused = fuse_act && (gemm_n <= 512);
 
   if (avg_m <= 8) return 0;
-  if (avg_m <= 16 && small_weight) return 1;
-  if (avg_m <= 32 && small_weight) return 2;
+  if (avg_m <= 16) return 1;
+  if (avg_m <= 32) return 2;
   if (avg_m <= 128 && small_weight) return fuse_act ? 3 : 4;
   if (narrow_k) return fuse_act ? 3 : 4;
   if (narrow_n_fused) return 3;

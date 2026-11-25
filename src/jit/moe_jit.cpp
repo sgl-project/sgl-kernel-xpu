@@ -26,7 +26,8 @@ using KernelFn = void (*)(
     int*,         // workspace
     float,        // gemm1_alpha
     float,        // gemm1_limit
-    int);         // ld_b
+    int,          // ld_b
+    int64_t);     // expert_stride_b
 
 struct TileCfg {
   const char* tile;
@@ -110,6 +111,7 @@ bool grouped_gemm_launch(
     float gemm1_alpha,
     float gemm1_limit,
     int ld_b,
+    int64_t expert_stride_b,
     int arch,
     std::string* err) {
   const int tile_id = sgl::moe::grouped_gemm_select_tile(avg_m, gemm_k, gemm_n, fuse_act);
@@ -132,7 +134,8 @@ bool grouped_gemm_launch(
      workspace,
      gemm1_alpha,
      gemm1_limit,
-     ld_b);
+     ld_b,
+     expert_stride_b);
   return true;
 }
 
@@ -277,7 +280,25 @@ bool w4a16_grouped_gemm_launch(
 namespace {
 
 using W8A16Fn = void (*)(
-    void*, const void*, const void*, const void*, const void*, void*, int, int, const int*, int, int*, int, int, bool);
+    void*,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    void*,
+    int,
+    int,
+    const int*,
+    int,
+    int*,
+    int,
+    int64_t,
+    int,
+    int,
+    bool,
+    bool,
+    bool);
 
 struct W8A16TileCfg {
   const char* tile;
@@ -288,37 +309,27 @@ constexpr W8A16TileCfg kW8A16Tiles[] = {
     {"Shape<_16, _64, _32>", "Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>"},
     {"Shape<_32, _64, _32>", "Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>"},
     {"Shape<_64, _64, _32>", "Layout<Shape<_2, _4, _1>, Stride<_4, _1, _0>>"},
-    {"Shape<_128, _128, _16>", "Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>"},
+    {"Shape<_128, _128, _32>", "Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>"},
 };
 
-int w8a16_tile_id(int avg_m, int gemm_k, int gemm_n, int scale_mode) {
-  using moe_w8a16::ScaleMode;
-  if (moe_w8a16::is_block_scale_mode(scale_mode)) {
-    if (avg_m <= 4) return 0;
-    if (avg_m >= 1024 || (avg_m > 128 && gemm_k >= 512 && gemm_n >= 512)) return 3;
-    return 1;
-  }
+int w8a16_tile_id(int avg_m, int /*gemm_k*/, int gemm_n, int /*scale_mode*/, bool /*has_zeros*/) {
   if (avg_m <= 8) return 0;
   if (avg_m <= 32) return 1;
-  if (scale_mode == static_cast<int>(ScaleMode::ScalarGateUp) && avg_m <= 64 && gemm_k >= 2048) return 2;
-  if (scale_mode == static_cast<int>(ScaleMode::ScalarSingle) && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 128)
-    return 1;
-  if (scale_mode == static_cast<int>(ScaleMode::ScalarSingle) && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 512)
-    return 2;
+  if (avg_m <= 64 || gemm_n < 128) return 2;
   return 3;
 }
 
-uint64_t pack_w8a16_key(int tile_id, bool block_scale, int arch) {
+uint64_t pack_w8a16_key(int tile_id, bool is_int8, int arch) {
   uint64_t key = static_cast<uint64_t>(arch) & 0xFF;
   key = (key << 8) | (static_cast<uint64_t>(tile_id) & 0xFF);
-  key = (key << 1) | (block_scale ? 1u : 0u);
+  key = (key << 1) | (is_int8 ? 1u : 0u);
   return key;
 }
 
 jit::JitFnCache<W8A16Fn> g_w8a16_fns("W8A16 grouped GEMM");
 
-W8A16Fn resolve_w8a16(int tile_id, bool block_scale, int arch, std::string* err) {
-  const uint64_t key = pack_w8a16_key(tile_id, block_scale, arch);
+W8A16Fn resolve_w8a16(int tile_id, bool is_int8, int arch, std::string* err) {
+  const uint64_t key = pack_w8a16_key(tile_id, is_int8, arch);
   auto build = [&](std::string* build_err) -> void* {
     const jit::JitConfig& cfg = jit::default_config();
     if (!cfg.valid) {
@@ -334,13 +345,13 @@ W8A16Fn resolve_w8a16(int tile_id, bool block_scale, int arch, std::string* err)
     spec.template_path = cfg.src_root + "/sycl/GroupGemmW8A16Xe20LauncherInstance.cpp.in";
     spec.subs["TILE"] = kW8A16Tiles[tile_id].tile;
     spec.subs["SGLAYOUT"] = kW8A16Tiles[tile_id].sglayout;
-    spec.subs["WEIGHT_SCALE_BLOCKED"] = block_scale ? "true" : "false";
+    spec.subs["IS_INT8"] = is_int8 ? "true" : "false";
     const jit::ArchSpec arch_spec = jit::arch_spec(static_cast<jit::Arch>(arch), "-DSGL_W8A16_JIT_ENTRY");
     spec.extra_flags = arch_spec.extra_flags;
     spec.target = arch_spec.target;
     spec.entry_symbol = "sgl_moe_w8a16_entry";
-    spec.name = std::string("group_gemm_w8a16_t") + std::to_string(tile_id) + (block_scale ? "_block_" : "_scalar_") +
-                arch_spec.suffix;
+    spec.name =
+        std::string("group_gemm_w8a16_t") + std::to_string(tile_id) + (is_int8 ? "_int8_" : "_fp8_") + arch_spec.suffix;
     return jit::get_or_compile(spec, cfg, build_err);
   };
   return g_w8a16_fns.get(key, build, err);
@@ -351,10 +362,12 @@ W8A16Fn resolve_w8a16(int tile_id, bool block_scale, int arch, std::string* err)
 bool w8a16_grouped_gemm_launch(
     int avg_m,
     int scale_mode,
+    bool is_int8,
     void* queue,
     const void* activations,
     const void* weights,
     const void* weight_scales,
+    const void* weight_zeros,
     const void* bias,
     void* outputs,
     int gemm_n,
@@ -363,16 +376,21 @@ bool w8a16_grouped_gemm_launch(
     int num_experts,
     int* workspace,
     int ld_b,
+    int64_t expert_stride_b,
+    int group_size,
+    bool scale_is_bf16,
+    bool is_signed_int8,
     bool static_scheduler,
     int arch,
     std::string* err) {
-  const int tile_id = w8a16_tile_id(avg_m, gemm_k, gemm_n, scale_mode);
-  W8A16Fn fn = resolve_w8a16(tile_id, moe_w8a16::is_block_scale_mode(scale_mode), arch, err);
+  const int tile_id = w8a16_tile_id(avg_m, gemm_k, gemm_n, scale_mode, weight_zeros != nullptr);
+  W8A16Fn fn = resolve_w8a16(tile_id, is_int8, arch, err);
   if (!fn) return false;
   fn(queue,
      activations,
      weights,
      weight_scales,
+     weight_zeros,
      bias,
      outputs,
      gemm_n,
@@ -381,7 +399,11 @@ bool w8a16_grouped_gemm_launch(
      num_experts,
      workspace,
      ld_b,
+     expert_stride_b,
      scale_mode,
+     group_size,
+     scale_is_bf16,
+     is_signed_int8,
      static_scheduler);
   return true;
 }

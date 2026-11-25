@@ -41,7 +41,8 @@ __attribute__((visibility("default"))) void Xe20MoEGEMMLauncher(
     int* workspace,
     float gemm1_alpha,
     float gemm1_limit,
-    int ld_b);
+    int ld_b,
+    int64_t expert_stride_b);
 
 using Tile_8_64_32 = Shape<_8, _64, _32>;
 using Tile_16_64_32 = Shape<_16, _64, _32>;
@@ -71,7 +72,8 @@ using SG_8_4_1 = Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
       int*,                                                                             \
       float,                                                                            \
       float,                                                                            \
-      int);
+      int,                                                                              \
+      int64_t);
 
 #define DECLARE_XE20_MOE_TILE_ALL_FUSES(Tile, SGLayout)                                \
   DECLARE_XE20_MOE_EXTERN(Tile, SGLayout, ActivationType::SILU, true, true)            \
@@ -111,18 +113,19 @@ DECLARE_XE20_MOE_TILE_FUSE(Tile_256_256_32, SG_8_4_1, false)
   Xe20MoEGEMMLauncher<__VA_ARGS__>(           \
       queue,                                  \
       activations.data_ptr(),                 \
-      weights.data_ptr(),                     \
+      weights_b.data_ptr(),                   \
       nullptr,                                \
       bias_ptr,                               \
       output.data_ptr(),                      \
       gemm_n,                                 \
       gemm_k,                                 \
       total_rows_for_experts.data_ptr<int>(), \
-      n_experts,                              \
+      static_cast<int>(n_experts),            \
       atomic_buffer.data_ptr<int>(),          \
       static_cast<float>(gemm1_alpha),        \
       static_cast<float>(gemm1_limit),        \
-      ld_b)
+      ld_b,                                   \
+      expert_stride_b)
 
 #define DISPATCH_MOE_HELPER_BIAS(ActType, FuseAct, WithBias, ...) \
   do {                                                            \
@@ -168,38 +171,56 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
     const int64_t activation_type,  // 0=silu, 1=gelu, 2=swiglu_gpt_oss, 3=relu2
     bool fuse_act,
     double gemm1_alpha,
-    double gemm1_limit) {
-  int total_m = activations.sizes()[0];
-  int gemm_k = activations.sizes()[1];
-  auto weights_shape = weights.sizes().vec();
-  int gemm_n = weights.sizes()[1];
-  int avg_m = total_m / n_experts;
-
-  TORCH_CHECK(weights_shape.size() == 3, "weights must be 3D");
-  TORCH_CHECK(weights_shape[0] == n_experts, "weights must have n_experts as the first dimension");
-  TORCH_CHECK(weights_shape[1] == gemm_n, "weights must be gemm_n * gemm_k");
+    double gemm1_limit,
+    bool gate_up_interleaved) {
+  TORCH_CHECK(n_experts > 0, "n_experts must be positive");
+  TORCH_CHECK(activations.dim() == 2 && output.dim() == 2, "activations and output must be 2D");
+  TORCH_CHECK(weights.dim() == 3, "weights must be 3D");
+  TORCH_CHECK(weights.size(0) == n_experts, "weights must have n_experts as the first dimension");
   TORCH_CHECK(
-      weights_shape[0] == total_rows_for_experts.size(0),
+      n_experts == total_rows_for_experts.size(0),
       "rows_for_experts must have the same size as the first dimension of weights");
-  TORCH_CHECK(output.sizes()[0] == total_m, "output must have the same number of rows as activations");
-  // For fused activation:
-  // - Gated activations (SILU, GELU, SWIGLU): output has N/2 columns (gate * up fusion)
-  // - Non-gated RELU2: output has N columns (single GEMM with fused activation)
-  bool is_fused_non_gated_relu2 = (fuse_act && activation_type == static_cast<int64_t>(ActivationType::RELU2));
-  if (fuse_act && !is_fused_non_gated_relu2) {
-    TORCH_CHECK(output.sizes()[1] == gemm_n / 2, "output must have half the number of columns as activations");
+
+  const int total_m = static_cast<int>(activations.size(0));
+  const int gemm_k = static_cast<int>(activations.size(1));
+  TORCH_CHECK(output.size(0) == total_m, "output must have the same number of rows as activations");
+
+  const bool is_fused_non_gated_relu2 = (fuse_act && activation_type == static_cast<int64_t>(ActivationType::RELU2));
+  const int gemm_n =
+      (fuse_act && !is_fused_non_gated_relu2) ? static_cast<int>(output.size(1) * 2) : static_cast<int>(output.size(1));
+  const int avg_m = static_cast<int>(total_m / n_experts);
+
+  at::Tensor weights_b;
+  if (weights.size(1) == gemm_n && weights.size(2) == gemm_k && weights.stride(1) == 1 && weights.stride(2) >= gemm_n &&
+      weights.stride(0) >= static_cast<int64_t>(gemm_k) * weights.stride(2)) {
+    weights_b = weights;
+  } else if (
+      gemm_n != gemm_k && weights.size(1) == gemm_k && weights.size(2) == gemm_n && weights.stride(2) == 1 &&
+      weights.stride(1) >= gemm_n && weights.stride(0) >= static_cast<int64_t>(gemm_k) * weights.stride(1)) {
+    weights_b = weights.transpose(1, 2);
   } else {
-    TORCH_CHECK(output.sizes()[1] == gemm_n, "output must have the same number of columns as activations");
+    TORCH_CHECK(
+        weights.size(1) == gemm_n && weights.size(2) == gemm_k && weights.stride(2) == 1,
+        "weights shape/stride mismatch: expected [E=",
+        n_experts,
+        ", N=",
+        gemm_n,
+        ", K=",
+        gemm_k,
+        "] with unit N-stride or unit K-stride, got shape ",
+        weights.sizes(),
+        " and stride ",
+        weights.strides());
+    weights_b = weights.transpose(1, 2).contiguous().transpose(1, 2);
   }
-  // Relaxed: the kernel iterates experts scalar-wise and reads per-expert row counts
-  // at runtime, so counts not divisible by 8 are safe (e.g. Qwen1.5-MoE 60, granite-4.0-tiny 62).
-  // TORCH_CHECK(n_experts % 8 == 0, "n_experts must be a multiple of 8 for the current implementation");
+
+  TORCH_CHECK(activations.is_contiguous(), "activations must be contiguous");
   if (bias.has_value()) {
     TORCH_CHECK(
         bias->scalar_type() == at::kFloat,
         "moe_grouped_mm_nt_xe20: bias must be float32 (at::kFloat) to match kernel expectations");
-
-    // TODO this is only for binary size consideration, if needed, can remove it
+    TORCH_CHECK(bias->dim() == 2, "bias must be 2D [n_experts, N]");
+    TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape mismatch with weight");
     TORCH_CHECK(
         activation_type != static_cast<int>(ActivationType::RELU2), "RELU2 activation only supports no bias as of now");
   }
@@ -208,10 +229,6 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   TORCH_CHECK(
       activations.scalar_type() == at::ScalarType::BFloat16,
       "Only bfloat16 are supported in moe_grouped_mm_nt currently");
-  if (bias.has_value()) {
-    TORCH_CHECK(bias->dim() == 2, "bias must be 2D [n_experts, N]");
-    TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape mismatch with weight");
-  }
   TORCH_CHECK(
       activation_type >= static_cast<int>(ActivationType::MIN) &&
           activation_type <= static_cast<int>(ActivationType::MAX),
@@ -219,12 +236,39 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
       activation_type,
       ". Supported values are 0 (silu), 1 (gelu), 2 (swiglu_gpt_oss), 3 (relu2)");
 
+  if (fuse_act && gate_up_interleaved && activation_type == static_cast<int64_t>(ActivationType::SWIGLU_GPT_OSS)) {
+    // Interleaved [G0, U0, G1, U1, ...] columns have stride 2 along N, whereas
+    // Xe2 2D block VNNI loads require contiguous unit-stride columns. Preserve
+    // full compatibility for interleaved callers by running unfused GEMM1 into
+    // swiglu_gpt_oss_sigmoid_alpha.
+    at::Tensor intermediate = at::empty({total_m, gemm_n}, activations.options());
+    moe_grouped_mm_nt_xe20(
+        intermediate,
+        activations,
+        weights_b,
+        bias,
+        total_rows_for_experts,
+        n_experts,
+        activation_type,
+        /*fuse_act=*/false,
+        gemm1_alpha,
+        gemm1_limit,
+        /*gate_up_interleaved=*/true);
+    static auto op = c10::Dispatcher::singleton()
+                         .findSchemaOrThrow("sgl_kernel::swiglu_gpt_oss_sigmoid_alpha", "")
+                         .typed<at::Tensor(at::Tensor, double, double)>();
+    at::Tensor act_out = op.call(intermediate, gemm1_alpha, gemm1_limit);
+    output.copy_(act_out);
+    return;
+  }
+
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
   at::Tensor atomic_buffer = at::empty({static_cast<long>(1)}, activations.options().dtype(at::kInt));
   bool with_bias = bias.has_value();
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
-  int ld_b = static_cast<int>(weights.stride(1));
+  const int ld_b = static_cast<int>(weights_b.stride(2));
+  const int64_t expert_stride_b = weights_b.stride(0);
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // Grouped GEMM: sum over experts of (m_e, K) @ (K, N). Total M rows summed as total_m.
@@ -233,7 +277,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   const double K = static_cast<double>(gemm_k);
   const double flops = 2.0 * M * N * K;
   const double bytes = static_cast<double>(activations.numel()) * static_cast<double>(activations.element_size()) +
-                       static_cast<double>(weights.numel()) * static_cast<double>(weights.element_size()) +
+                       static_cast<double>(weights_b.numel()) * static_cast<double>(weights_b.element_size()) +
                        static_cast<double>(output.numel()) * static_cast<double>(output.element_size());
   SGL_KERNEL_PERF_SCOPE("moe_grouped_mm_nt_xe20", queue, bytes, flops);
 #endif
@@ -249,7 +293,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
             with_bias,
             &queue,
             activations.data_ptr(),
-            weights.data_ptr(),
+            weights_b.data_ptr(),
             /*scales=*/nullptr,
             bias_ptr,
             output.data_ptr(),
@@ -261,6 +305,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
             static_cast<float>(gemm1_alpha),
             static_cast<float>(gemm1_limit),
             ld_b,
+            expert_stride_b,
             jit_arch_code(),
             &jit_err),
         jit_err);

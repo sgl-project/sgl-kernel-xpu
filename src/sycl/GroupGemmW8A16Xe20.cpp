@@ -20,12 +20,13 @@
 
 using namespace cute;
 
-template <typename Tile, typename SGLayout, bool WeightScaleBlocked>
+template <typename Tile, typename SGLayout, bool IsInt8>
 __attribute__((visibility("default"))) void Xe20MoEGEMMW8A16Launcher(
     sycl::queue q,
     const void* activations,
     const void* weights,
     const void* weight_scales,
+    const void* weight_zeros,
     const void* bias,
     void* outputs,
     const int gemm_n,
@@ -34,7 +35,11 @@ __attribute__((visibility("default"))) void Xe20MoEGEMMW8A16Launcher(
     const int num_experts,
     int* workspace,
     int ld_b,
+    int64_t expert_stride_b,
     int scale_mode,
+    int group_size,
+    bool scale_is_bf16,
+    bool is_signed_int8,
     bool static_scheduler);
 
 using ScaleMode = moe_w8a16::ScaleMode;
@@ -42,86 +47,75 @@ using ScaleMode = moe_w8a16::ScaleMode;
 using Tile_16_64_32 = Shape<_16, _64, _32>;
 using Tile_32_64_32 = Shape<_32, _64, _32>;
 using Tile_64_64_32 = Shape<_64, _64, _32>;
-using Tile_128_128_16 = Shape<_128, _128, _16>;
+using Tile_128_128_32 = Shape<_128, _128, _32>;
 
 using SG_1_4_1 = Layout<Shape<_1, _4, _1>, Stride<_4, _1, _0>>;
 using SG_2_4_1 = Layout<Shape<_2, _4, _1>, Stride<_4, _1, _0>>;
-using SG_4_2_1 = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
+using SG_4_4_1 = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
 
-#define DECLARE_XE20_MOE_W8A16_EXTERN(Tile, SGLayout, WeightScaleBlocked)            \
-  extern template void Xe20MoEGEMMW8A16Launcher<Tile, SGLayout, WeightScaleBlocked>( \
-      sycl::queue,                                                                   \
-      const void*,                                                                   \
-      const void*,                                                                   \
-      const void*,                                                                   \
-      const void*,                                                                   \
-      void*,                                                                         \
-      const int,                                                                     \
-      const int,                                                                     \
-      const int*,                                                                    \
-      const int,                                                                     \
-      int*,                                                                          \
-      int,                                                                           \
-      int,                                                                           \
+#define DECLARE_XE20_MOE_W8A16_EXTERN(Tile, SGLayout, IsInt8)            \
+  extern template void Xe20MoEGEMMW8A16Launcher<Tile, SGLayout, IsInt8>( \
+      sycl::queue,                                                       \
+      const void*,                                                       \
+      const void*,                                                       \
+      const void*,                                                       \
+      const void*,                                                       \
+      const void*,                                                       \
+      void*,                                                             \
+      const int,                                                         \
+      const int,                                                         \
+      const int*,                                                        \
+      const int,                                                         \
+      int*,                                                              \
+      int,                                                               \
+      int64_t,                                                           \
+      int,                                                               \
+      int,                                                               \
+      bool,                                                              \
+      bool,                                                              \
       bool);
 
-#define DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile, SGLayout) \
-  DECLARE_XE20_MOE_W8A16_EXTERN(Tile, SGLayout, false)            \
+#define DECLARE_XE20_MOE_W8A16_ALL_WEIGHT_KINDS(Tile, SGLayout) \
+  DECLARE_XE20_MOE_W8A16_EXTERN(Tile, SGLayout, false)          \
   DECLARE_XE20_MOE_W8A16_EXTERN(Tile, SGLayout, true)
 
-DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_16_64_32, SG_1_4_1)
-DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_32_64_32, SG_1_4_1)
-DECLARE_XE20_MOE_W8A16_EXTERN(Tile_64_64_32, SG_2_4_1, false)
-DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_128_128_16, SG_4_2_1)
+DECLARE_XE20_MOE_W8A16_ALL_WEIGHT_KINDS(Tile_16_64_32, SG_1_4_1)
+DECLARE_XE20_MOE_W8A16_ALL_WEIGHT_KINDS(Tile_32_64_32, SG_1_4_1)
+DECLARE_XE20_MOE_W8A16_ALL_WEIGHT_KINDS(Tile_64_64_32, SG_2_4_1)
+DECLARE_XE20_MOE_W8A16_ALL_WEIGHT_KINDS(Tile_128_128_32, SG_4_4_1)
 
-#undef DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS
+#undef DECLARE_XE20_MOE_W8A16_ALL_WEIGHT_KINDS
 #undef DECLARE_XE20_MOE_W8A16_EXTERN
 
-#define LAUNCH_MOE_W8A16(WeightScaleBlocked, ...)            \
-  Xe20MoEGEMMW8A16Launcher<__VA_ARGS__, WeightScaleBlocked>( \
-      queue,                                                 \
-      activations.data_ptr(),                                \
-      weights.data_ptr(),                                    \
-      weight_scales.data_ptr(),                              \
-      bias_ptr,                                              \
-      output.data_ptr(),                                     \
-      gemm_n,                                                \
-      gemm_k,                                                \
-      total_rows_for_experts.data_ptr<int>(),                \
-      n_experts,                                             \
-      atomic_buffer.data_ptr<int>(),                         \
-      ld_b,                                                  \
-      scale_mode,                                            \
+#define LAUNCH_MOE_W8A16_KIND(IsInt8, Tile, SGLayout) \
+  Xe20MoEGEMMW8A16Launcher<Tile, SGLayout, IsInt8>(   \
+      queue,                                          \
+      activations.data_ptr(),                         \
+      weights_b.data_ptr(),                           \
+      weight_scales.data_ptr(),                       \
+      zero_ptr,                                       \
+      bias_ptr,                                       \
+      output.data_ptr(),                              \
+      gemm_n,                                         \
+      gemm_k,                                         \
+      total_rows_for_experts.data_ptr<int>(),         \
+      static_cast<int>(n_experts),                    \
+      atomic_buffer.data_ptr<int>(),                  \
+      ld_b,                                           \
+      expert_stride_b,                                \
+      scale_mode,                                     \
+      group_size,                                     \
+      scale_is_bf16,                                  \
+      is_signed_int8,                                 \
       static_scheduler)
 
-#define DISPATCH_MOE_W8A16_BLOCK_TILES()                                           \
-  do {                                                                             \
-    if (avg_m <= 4) {                                                              \
-      LAUNCH_MOE_W8A16(true, Tile_16_64_32, SG_1_4_1);                             \
-    } else if (avg_m >= 1024 || (avg_m > 128 && gemm_k >= 512 && gemm_n >= 512)) { \
-      LAUNCH_MOE_W8A16(true, Tile_128_128_16, SG_4_2_1);                           \
-    } else {                                                                       \
-      LAUNCH_MOE_W8A16(true, Tile_32_64_32, SG_1_4_1);                             \
-    }                                                                              \
-  } while (0)
-
-#define DISPATCH_MOE_W8A16_SCALAR_TILES()                                                                              \
-  do {                                                                                                                 \
-    if (avg_m <= 8) {                                                                                                  \
-      LAUNCH_MOE_W8A16(false, Tile_16_64_32, SG_1_4_1);                                                                \
-    } else if (avg_m <= 32) {                                                                                          \
-      LAUNCH_MOE_W8A16(false, Tile_32_64_32, SG_1_4_1);                                                                \
-    } else if (scale_mode == static_cast<int>(ScaleMode::ScalarGateUp) && avg_m <= 64 && gemm_k >= 2048) {             \
-      LAUNCH_MOE_W8A16(false, Tile_64_64_32, SG_2_4_1);                                                                \
-    } else if (                                                                                                        \
-        scale_mode == static_cast<int>(ScaleMode::ScalarSingle) && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 128) { \
-      LAUNCH_MOE_W8A16(false, Tile_32_64_32, SG_1_4_1);                                                                \
-    } else if (                                                                                                        \
-        scale_mode == static_cast<int>(ScaleMode::ScalarSingle) && gemm_n <= 2048 && gemm_k >= 1024 && avg_m <= 512) { \
-      LAUNCH_MOE_W8A16(false, Tile_64_64_32, SG_2_4_1);                                                                \
-    } else {                                                                                                           \
-      LAUNCH_MOE_W8A16(false, Tile_128_128_16, SG_4_2_1);                                                              \
-    }                                                                                                                  \
+#define LAUNCH_MOE_W8A16(Tile, SGLayout)            \
+  do {                                              \
+    if (is_int8) {                                  \
+      LAUNCH_MOE_W8A16_KIND(true, Tile, SGLayout);  \
+    } else {                                        \
+      LAUNCH_MOE_W8A16_KIND(false, Tile, SGLayout); \
+    }                                               \
   } while (0)
 
 SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
@@ -131,10 +125,18 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
     const torch::Tensor& weight_scales,
     const std::optional<at::Tensor>& bias,
     const torch::Tensor& total_rows_for_experts,
-    const int64_t n_experts) {
+    const int64_t n_experts,
+    const std::optional<at::Tensor>& weight_zeros) {
   CHECK_INPUT(2, at::ScalarType::BFloat16, output);
   CHECK_INPUT(2, at::ScalarType::BFloat16, activations);
-  CHECK_INPUT(3, at::ScalarType::Float8_e4m3fn, weights);
+  TORCH_CHECK(weights.device().is_xpu(), "weights must be an XPU tensor");
+  TORCH_CHECK(weights.dim() == 3, "W8A16 weights must be 3D");
+  const auto w_dtype = weights.scalar_type();
+  const bool is_fp8 = (w_dtype == at::ScalarType::Float8_e4m3fn);
+  const bool is_int8 = (w_dtype == at::ScalarType::Char || w_dtype == at::ScalarType::Byte);
+  const bool is_signed_int8 = (w_dtype == at::ScalarType::Char);
+  TORCH_CHECK(is_fp8 || is_int8, "W8A16 weights must be float8_e4m3fn, int8, or uint8");
+
   CHECK_INPUT(weight_scales);
   CHECK_INPUT(1, at::ScalarType::Int, total_rows_for_experts);
   TORCH_CHECK(output.device() == activations.device(), "output must be on the same device as activations");
@@ -149,52 +151,144 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
     CHECK_INPUT(2, at::kFloat, bias_tensor);
     TORCH_CHECK(bias_tensor.device() == activations.device(), "bias must be on the same device as activations");
   }
-  const bool is_mxfp8 =
-      (weight_scales.scalar_type() == at::ScalarType::Byte ||
-       weight_scales.scalar_type() == at::ScalarType::Float8_e8m0fnu);
-  if (is_mxfp8) {
-    CHECK_DIM(3, weight_scales);
-  } else {
-    TORCH_CHECK(weight_scales.scalar_type() == at::kFloat, "W8A16 scalar and 128x128 block scales must be float32");
-    TORCH_CHECK(
-        weight_scales.dim() == 1 || weight_scales.dim() == 2 || weight_scales.dim() == 3,
-        "W8A16 weight scales must be 1D [E], 2D [E, 1]/[E, 2] or 3D [E, N/128, K/128]");
-    if (weight_scales.dim() == 2) {
-      TORCH_CHECK(weight_scales.size(1) == 1 || weight_scales.size(1) == 2, "W8A16 scale count must be 1 or 2");
-    }
-  }
-  TORCH_CHECK(n_experts > 0 && n_experts % 8 == 0, "n_experts must be a positive multiple of 8");
+
+  TORCH_CHECK(n_experts > 0, "n_experts must be positive");
+  CHECK_SHAPE(total_rows_for_experts, n_experts);
+
+  const int total_m = static_cast<int>(activations.size(0));
+  const int gemm_k = static_cast<int>(activations.size(1));
+  const int gemm_n = static_cast<int>(output.size(1));
+  TORCH_CHECK(output.size(0) == total_m, "output rows must equal M_total");
   TORCH_CHECK(weights.size(0) == n_experts, "weights expert dimension mismatch");
   TORCH_CHECK(weight_scales.size(0) == n_experts, "weight scales expert dimension mismatch");
-  CHECK_SHAPE(total_rows_for_experts, n_experts);
-  TORCH_CHECK(weights.size(2) == activations.size(1), "W8A16 K dimension mismatch");
-  TORCH_CHECK(weights.size(1) % 64 == 0 && weights.size(2) % 32 == 0, "W8A16 N must be divisible by 64 and K by 32");
+  TORCH_CHECK(gemm_n % 64 == 0 && gemm_k % 32 == 0, "W8A16 N must be divisible by 64 and K by 32");
 
-  int total_m = static_cast<int>(activations.size(0));
-  int gemm_k = static_cast<int>(activations.size(1));
-  int gemm_n = static_cast<int>(weights.size(1));
-  int avg_m = total_m / static_cast<int>(n_experts);
-  int ld_b = static_cast<int>(weights.stride(1));
-  int scale_mode =
-      is_mxfp8 ? static_cast<int>(ScaleMode::BlockMXFP8)
-               : (weight_scales.dim() == 1 ? static_cast<int>(ScaleMode::ScalarSingle)
-                                           : (weight_scales.dim() == 2 ? static_cast<int>(weight_scales.size(1))
-                                                                       : static_cast<int>(ScaleMode::BlockFP32)));
-  bool weight_scale_blocked = moe_w8a16::is_block_scale_mode(scale_mode);
-  bool static_scheduler = total_m <= n_experts || (!weight_scale_blocked && gemm_k <= 128);
-  if (is_mxfp8) {
-    TORCH_CHECK(weight_scales.size(1) == gemm_n, "MXFP8 scale N dimension must equal weights N dimension");
-    TORCH_CHECK(gemm_k % 32 == 0 && weight_scales.size(2) == gemm_k / 32, "MXFP8 scale K dimension must be K/32");
-  } else if (weight_scale_blocked) {
-    TORCH_CHECK(weight_scales.size(1) == (gemm_n + 127) / 128, "W8A16 block scale N dimension must be ceil(N/128)");
+  // Resolve Layout B:
+  //   1) Preferred N-major view `[E, N, K]` with `stride(1) == 1` (zero-copy).
+  //   2) Non-square physical `[E, K, N]` with `stride(2) == 1` (zero-copy view).
+  //   3) Legacy K-major `[E, N, K]` with `stride(2) == 1` (converted on stream).
+  at::Tensor weights_b;
+  if (weights.size(1) == gemm_n && weights.size(2) == gemm_k && weights.stride(1) == 1 && weights.stride(2) >= gemm_n &&
+      weights.stride(0) >= static_cast<int64_t>(gemm_k) * weights.stride(2)) {
+    weights_b = weights;
+  } else if (
+      gemm_n != gemm_k && weights.size(1) == gemm_k && weights.size(2) == gemm_n && weights.stride(2) == 1 &&
+      weights.stride(1) >= gemm_n && weights.stride(0) >= static_cast<int64_t>(gemm_k) * weights.stride(1)) {
+    weights_b = weights.transpose(1, 2);
+  } else {
     TORCH_CHECK(
-        gemm_k % 128 == 0 && weight_scales.size(2) == gemm_k / 128, "W8A16 block scale K dimension must be K/128");
+        weights.size(1) == gemm_n && weights.size(2) == gemm_k && weights.stride(2) == 1,
+        "W8A16 weights shape/stride mismatch: expected [E=",
+        n_experts,
+        ", N=",
+        gemm_n,
+        ", K=",
+        gemm_k,
+        "] with unit N-stride or unit K-stride, got shape ",
+        weights.sizes(),
+        " and stride ",
+        weights.strides());
+    weights_b = weights.transpose(1, 2).contiguous().transpose(1, 2);
   }
-  TORCH_CHECK(output.size(0) == total_m, "output rows must equal M_total");
-  TORCH_CHECK(output.size(1) == gemm_n, "output must have the same columns as weights");
+
+  const int ld_b = static_cast<int>(weights_b.stride(2));
+  const int64_t expert_stride_b = weights_b.stride(0);
+  TORCH_CHECK((ld_b % 4) == 0, "W8A16 Layout-B pitch ld_b must be a multiple of 4 bytes, got ", ld_b);
+
+  const bool is_mxfp8 = !is_int8 && (weight_scales.scalar_type() == at::ScalarType::Byte ||
+                                     weight_scales.scalar_type() == at::ScalarType::Float8_e8m0fnu);
+  bool scale_is_bf16 = false;
+  int scale_mode = static_cast<int>(ScaleMode::ScalarSingle);
+  int group_size = gemm_k;
+
+  if (is_mxfp8) {
+    CHECK_DIM(3, weight_scales);
+    TORCH_CHECK(weight_scales.size(1) == gemm_n, "MXFP8 scale N dimension must equal N");
+    TORCH_CHECK(gemm_k % 32 == 0 && weight_scales.size(2) == gemm_k / 32, "MXFP8 scale K dimension must be K/32");
+    scale_mode = static_cast<int>(ScaleMode::BlockMXFP8);
+    group_size = 32;
+  } else {
+    TORCH_CHECK(
+        weight_scales.scalar_type() == at::kFloat || weight_scales.scalar_type() == at::kBFloat16,
+        "W8A16 non-MXFP8 weight_scales must be float32 or bfloat16");
+    scale_is_bf16 = (weight_scales.scalar_type() == at::kBFloat16);
+    if (weight_scales.dim() == 1) {
+      scale_mode = static_cast<int>(ScaleMode::ScalarSingle);
+      group_size = gemm_k;
+    } else if (weight_scales.dim() == 2) {
+      if (weight_scales.size(1) == 1) {
+        scale_mode = static_cast<int>(ScaleMode::ScalarSingle);
+      } else if (weight_scales.size(1) == 2) {
+        scale_mode = static_cast<int>(ScaleMode::ScalarGateUp);
+      } else if (weight_scales.size(1) == gemm_n) {
+        scale_mode = static_cast<int>(ScaleMode::PerChannelN);
+      } else {
+        TORCH_CHECK(
+            false, "W8A16 2D weight_scales second dim must be 1, 2, or N (", gemm_n, "), got ", weight_scales.size(1));
+      }
+      group_size = gemm_k;
+    } else if (weight_scales.dim() == 3) {
+      if (weight_scales.size(1) == gemm_n && weight_scales.size(2) == 1) {
+        scale_mode = static_cast<int>(ScaleMode::PerChannelN);
+        group_size = gemm_k;
+      } else if (weight_scales.size(1) == gemm_n && weight_scales.size(2) > 1) {
+        const int num_k_groups = static_cast<int>(weight_scales.size(2));
+        TORCH_CHECK(gemm_k % num_k_groups == 0, "W8A16 K must be divisible by weight_scales.size(2)");
+        group_size = gemm_k / num_k_groups;
+        TORCH_CHECK(
+            group_size >= 32 && (group_size & (group_size - 1)) == 0,
+            "W8A16 group_size must be a power of two >= 32, got ",
+            group_size);
+        scale_mode = static_cast<int>(ScaleMode::GroupNK);
+      } else if (
+          weight_scales.size(1) == (gemm_n + 127) / 128 && gemm_k % 128 == 0 && weight_scales.size(2) == gemm_k / 128) {
+        scale_mode = static_cast<int>(ScaleMode::BlockFP32);
+        group_size = 128;
+      } else {
+        TORCH_CHECK(
+            false,
+            "Unsupported 3D W8A16 weight_scales shape ",
+            weight_scales.sizes(),
+            " for N=",
+            gemm_n,
+            ", K=",
+            gemm_k);
+      }
+    } else {
+      TORCH_CHECK(false, "W8A16 weight_scales must be 1D, 2D, or 3D");
+    }
+  }
+
+  const void* zero_ptr = nullptr;
+  if (weight_zeros.has_value()) {
+    const auto& zp = *weight_zeros;
+    TORCH_CHECK(is_int8 && !is_signed_int8, "W8A16 weight_zeros is only supported for unsigned uint8 weights");
+    CHECK_INPUT(zp);
+    TORCH_CHECK(zp.device() == activations.device(), "weight_zeros must be on the same device as activations");
+    TORCH_CHECK(zp.scalar_type() == at::ScalarType::Byte, "W8A16 weight_zeros must be uint8");
+    TORCH_CHECK(zp.size(0) == n_experts, "weight_zeros expert dimension mismatch");
+    if (scale_mode == static_cast<int>(ScaleMode::PerChannelN)) {
+      TORCH_CHECK(
+          (zp.dim() == 2 && zp.size(1) == gemm_n) || (zp.dim() == 3 && zp.size(1) == gemm_n && zp.size(2) == 1),
+          "Per-channel weight_zeros must have shape [E, N] or [E, N, 1]");
+    } else if (scale_mode == static_cast<int>(ScaleMode::GroupNK)) {
+      TORCH_CHECK(
+          zp.dim() == 3 && zp.sizes() == weight_scales.sizes(),
+          "Groupwise weight_zeros must match weight_scales shape [E, N, K/group_size]");
+    } else {
+      TORCH_CHECK(false, "W8A16 weight_zeros requires per-channel [E, N] or per-group [E, N, K/G] scales");
+    }
+    zero_ptr = zp.data_ptr();
+  }
+
   if (bias.has_value()) {
     TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape must be [E, N]");
   }
+
+  const int avg_m = static_cast<int>(total_m / n_experts);
+  const bool weight_scale_blocked = moe_w8a16::is_block_scale_mode(scale_mode) || (zero_ptr != nullptr);
+  const bool static_scheduler = total_m <= n_experts || (!weight_scale_blocked && gemm_k <= 128);
+
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
   using StreamKey = std::pair<c10::DeviceIndex, c10::StreamId>;
@@ -207,20 +301,18 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
   if (!static_scheduler) {
     queue.memset(atomic_buffer.data_ptr(), 0, sizeof(int32_t));
   }
-  bool with_bias = bias.has_value();
-  void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
+  void* bias_ptr = bias.has_value() ? bias->data_ptr() : nullptr;
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
-  // Grouped GEMM: 2*M*N*K flops (main matmul) + dequant/scale (~2*M*N) + bias add.
   const double flops = 2.0 * static_cast<double>(total_m) * static_cast<double>(gemm_n) * static_cast<double>(gemm_k);
   const double a_bytes =
       static_cast<double>(total_m) * static_cast<double>(gemm_k) * static_cast<double>(activations.element_size());
   const double w_bytes = static_cast<double>(n_experts) * static_cast<double>(gemm_n) * static_cast<double>(gemm_k) *
-                         static_cast<double>(weights.element_size());
+                         static_cast<double>(weights_b.element_size());
   const double out_bytes =
       static_cast<double>(total_m) * static_cast<double>(gemm_n) * static_cast<double>(output.element_size());
   const double bytes = a_bytes + w_bytes + out_bytes;
-  SGL_KERNEL_PERF_SCOPE("moe_grouped_mm_nt_xe20_fp8_w8a16", queue, bytes, flops);
+  SGL_KERNEL_PERF_SCOPE("moe_grouped_mm_nt_xe20_w8a16", queue, bytes, flops);
 #endif
 
 #ifdef USE_MOE_JIT
@@ -229,10 +321,12 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
       sgl::moe_jit::w8a16_grouped_gemm_launch(
           avg_m,
           scale_mode,
+          is_int8,
           &queue,
           activations.data_ptr(),
-          weights.data_ptr(),
+          weights_b.data_ptr(),
           weight_scales.data_ptr(),
+          zero_ptr,
           bias_ptr,
           output.data_ptr(),
           gemm_n,
@@ -241,21 +335,28 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
           static_cast<int>(n_experts),
           atomic_buffer.data_ptr<int>(),
           ld_b,
+          expert_stride_b,
+          group_size,
+          scale_is_bf16,
+          is_signed_int8,
           static_scheduler,
           jit_arch_code(),
           &jit_err),
       jit_err);
 #else
-  if (weight_scale_blocked) {
-    DISPATCH_MOE_W8A16_BLOCK_TILES();
+  if (avg_m <= 8) {
+    LAUNCH_MOE_W8A16(Tile_16_64_32, SG_1_4_1);
+  } else if (avg_m <= 32) {
+    LAUNCH_MOE_W8A16(Tile_32_64_32, SG_1_4_1);
+  } else if (avg_m <= 64 || gemm_n < 128) {
+    LAUNCH_MOE_W8A16(Tile_64_64_32, SG_2_4_1);
   } else {
-    DISPATCH_MOE_W8A16_SCALAR_TILES();
+    LAUNCH_MOE_W8A16(Tile_128_128_32, SG_4_4_1);
   }
 #endif
 }
 
-#undef DISPATCH_MOE_W8A16_BLOCK_TILES
-#undef DISPATCH_MOE_W8A16_SCALAR_TILES
 #undef LAUNCH_MOE_W8A16
+#undef LAUNCH_MOE_W8A16_KIND
 
 #undef SYCL_INTEL_TARGET

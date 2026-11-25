@@ -478,13 +478,31 @@ def _flash_attn_with_kvcache_page_size_1(
 
     num_slots = page_table.shape[1]
     if page_table.shape[0] == 1:
-        # One request: the row is a static prefix plus padding. Gathering the
-        # whole row keeps the index count fixed, so an XPU graph can capture
-        # it. Boolean masking cannot (Level Zero error 44). cu_seqlens_k
-        # limits the varlen kernel to the occupied prefix. Eager decode
-        # already slices the row to the real length, so this matches that path.
-        flat_slots = page_table.reshape(-1).to(torch.int64)
-        max_seqlen_k = num_slots
+        # One request: the row is a valid prefix plus -1 padding. Gathering a
+        # fixed-width row keeps the index count static, so an XPU graph can
+        # capture it. Boolean masking cannot (Level Zero error 44).
+        # cu_seqlens_k limits the varlen kernel to the occupied prefix.
+        #
+        # The slot indices are clamped into range first: an unclamped gather
+        # reads the -1 padding as an out-of-bounds index. Clamped entries
+        # land in the tail past cache_seqlens, which the kernel never
+        # attends to, so the result is unchanged.
+        #
+        # Outside graph capture the row is sliced to the live length first,
+        # so the gather costs the real sequence length instead of the full
+        # table width. During capture the width stays at num_slots, the
+        # static shape the graph was captured with.
+        capturing = getattr(torch.xpu, "is_current_stream_capturing", None)
+        if capturing is not None and capturing():
+            width = num_slots
+        else:
+            width = max(int(cache_seqlens.max().item()), 1)
+        flat_slots = (
+            page_table.reshape(-1)[:width]
+            .to(torch.int64)
+            .clamp(min=0, max=num_blocks - 1)
+        )
+        max_seqlen_k = width
     else:
         seqlens = cache_seqlens.long()
         # page_table packs the valid (occupied) slots first per row, so masking

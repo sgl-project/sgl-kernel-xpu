@@ -101,9 +101,9 @@ def test_reserve_env(monkeypatch):
 
 def test_deadline(monkeypatch):
     monkeypatch.delenv(failure.DEADLINE_ENV, raising=False)
-    assert failure.deadline_s() == 5.0
-    assert failure.deadline_s(60.0) == 5.0  # not tied to the watchdog
-    assert failure.deadline_s(3.0) == 3.0  # but never past SGLang's limit
+    assert failure.deadline_s() == 2.0
+    assert failure.deadline_s(60.0) == 2.0  # not tied to the watchdog
+    assert failure.deadline_s(1.5) == 1.5  # but never past SGLang's limit
     monkeypatch.setenv(failure.DEADLINE_ENV, "20")
     assert failure.deadline_s(60.0) == 20.0
     monkeypatch.setenv(failure.DEADLINE_ENV, "0")

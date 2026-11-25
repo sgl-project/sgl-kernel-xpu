@@ -102,7 +102,7 @@ constexpr int PEER_HEALTH_PTR = EPOCH + 32;
 // two words: the address of this layer's mailbox region (for the health record)
 constexpr int MBOX_PTR = EPOCH + 34;
 constexpr int CNT_WORDS = EPOCH + 40;
-constexpr uint64_t WAIT_CYCLES_DEFAULT = 14000000000ull;  // 5 s
+constexpr uint64_t WAIT_CYCLES_DEFAULT = 5600000000ull;  // 2 s
 
 // ----------------------------------------------------------------------------
 // The layer's 16-bit dtype DT (half or bf16): hidden states, norm / router /

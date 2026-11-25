@@ -1,5 +1,5 @@
 """Fail-stop of the mono decode kernels: the in-kernel waits for the peer card
-give up after a deadline (``SGLANG_XPU_MONO_DEADLINE_S``, default 5 s), the failed
+give up after a deadline (``SGLANG_XPU_MONO_DEADLINE_S``, default 2 s), the failed
 step's outputs are NaN, and the wait that gives up writes a host copy of the
 device's health words. A thread polls that copy and stops the server with an
 error that names the likely cause, so a stalled peer never hangs it."""
@@ -17,7 +17,9 @@ from sgl_kernel import mono_decode
 logger = logging.getLogger(__name__)
 
 DEADLINE_ENV = "SGLANG_XPU_MONO_DEADLINE_S"
-DEFAULT_DEADLINE_S = 5.0
+# below the xe driver's 5 s job timeout: a stalled step fails the waits (NaN
+# outputs, a named error) before the driver resets the engine
+DEFAULT_DEADLINE_S = 2.0
 POLL_S = 0.05
 # test hook, "RANK:SECONDS": that many seconds after the build, rank RANK
 # shifts the first layer's mailbox tags, so both ranks' next waits there fail
@@ -25,7 +27,7 @@ FAULT_ENV = "SGLANG_XPU_MONO_FAULT_INJECT"
 
 
 def deadline_s(limit: Optional[float] = None) -> float:
-    """The wait deadline: ``SGLANG_XPU_MONO_DEADLINE_S`` (default 5 s), at most
+    """The wait deadline: ``SGLANG_XPU_MONO_DEADLINE_S`` (default 2 s), at most
     ``limit`` (SGLang's: half the watchdog timeout)."""
     value = os.environ.get(DEADLINE_ENV)
     seconds = float(value) if value else DEFAULT_DEADLINE_S

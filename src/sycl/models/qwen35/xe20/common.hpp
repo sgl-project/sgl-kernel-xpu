@@ -2,8 +2,10 @@
 //
 // Mono decode (one resident kernel per decoder layer) for Qwen3.5 / Qwen3.6
 // MoE (35B-A3B shapes) served by SGLang at TP2 on two Intel Arc Pro B70 (Xe2,
-// 32 Xe cores): shapes, the layer dtype, the arguments in SGLang's layouts, the
-// P2P mailbox and the Xe2 primitives shared by every layer kernel.
+// 32 Xe cores): the counters, the arguments in SGLang's layouts and the
+// model-shaped helpers shared by every layer kernel. The shapes are in
+// shape.hpp; the shape-free pieces (mailbox, hand-offs, GEMV and DPAS
+// primitives) are the Xe2 stage library's (include/sgl_kernel/stage/xe20/).
 //
 // Weights (SGLang block-FP8 checkpoint, used in place):
 // - fp8 e4m3 linears [N][K] with 128x128 block scales [N / 128][K / 128] fp32:
@@ -18,45 +20,15 @@
 // - GatedDeltaNet: conv state [slots][4096][3 (+ draft tokens)] (channel
 //   major, taps innermost), recurrent state [slots][16][128 v][128 k] fp32.
 #pragma once
-#include <cmath>
-#include <cstdint>
-#include <sycl/ext/intel/experimental/cache_control_properties.hpp>
-#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
-#include <sycl/ext/oneapi/bfloat16.hpp>
-#include <sycl/ext/oneapi/experimental/clock.hpp>
-#include <sycl/ext/oneapi/experimental/prefetch.hpp>
-#include <sycl/sycl.hpp>
-#include <type_traits>
+#include "sgl_kernel/stage/xe20/common.hpp"
+#include "sgl_kernel/stage/xe20/gemv.hpp"
+#include "sgl_kernel/stage/xe20/p2p_mailbox.hpp"
+#include "sgl_kernel/stage/xe20/xmx.hpp"
+#include "shape.hpp"
 
 namespace sgl_mono {
 
-using half = sycl::half;
-using h2 = sycl::vec<half, 2>;
-using bf16 = sycl::ext::oneapi::bfloat16;
-namespace syclex = sycl::ext::oneapi::experimental;
-namespace intelex = sycl::ext::intel::experimental;
-
-constexpr int NWG = 32, WGS = 512, NSG = 32;
-constexpr int HID = 2048, NE = 256, TOPK = 8,
-              INTER = 256;        // per rank (TP2): expert / shared inter 512 / 2
-constexpr int QB = 128;           // fp8 block size (N and K)
-constexpr int KB_HID = HID / QB;  // K blocks of a hidden-size row (16)
-constexpr float EPS = 1e-6f;
-// GDN (per rank): 8 k heads, 16 v heads, 128 dims
-constexpr int NKH = 8, NVH = 16, DK = 128, DV = 128;
-constexpr int KD = NKH * DK, VD = NVH * DV, CONVD = 2 * KD + VD, QKVZ = CONVD + VD;
-// full attention (per rank): 8 q heads, 1 kv head, head dim 256, partial RoPE
-// 64 dims
-constexpr int NQ = 8, HD = 256, QKV_ROWS = NQ * 2 * HD + 2 * HD;  // 4608
-constexpr int GROWS = NQ * HD + 2 * HD;                           // gate + k + v rows
-constexpr float SM_SCALE = 0.0625f * 1.4426950408889634f, THETA = 1.0e7f;
-constexpr int GKV_MID = 2, GKV_ROWS = 2,
-              GKV_CHUNKS = (GROWS - GKV_MID * NWG * NSG) / GKV_ROWS;  // 256
-constexpr int SPW = INTER / NWG;                                      // shared inter rows per WG (8)
-constexpr int SHR = 2 * INTER / NSG;                                  // shared gate|up rows per SG in the partial (16)
-// MTP fc (16-bit, the same full [2048][4096] on both ranks; each rank computes
-// half of the output rows)
-constexpr int MTP_FC_IN = 2 * HID, MTP_FC_OUT = HID / 2;
+using namespace sgl_kernel::stage::xe20;  // NOLINT: the shape-free stage pieces
 
 enum { C_A = 0, C_B, C_C, C_O, C_GU, C_TKT, NCNT };  // GDN: A = qkvz, B = core ; ATTN: A = q, B = att, C = merge
 constexpr int EPOCH = NCNT * 16;
@@ -68,79 +40,16 @@ constexpr int MBT = EPOCH + 4, MBT2 = EPOCH + 16;
 // the MTP prologue's tag counters (its own scratch): one per row count 1, 2, 3,
 // 4, 6, 8, each with its own mailbox region (mtp.hpp)
 constexpr int MTPT = EPOCH + 18;
-// two words: the address of the device's health words (mono_health), written
-// at registration and read only by a wait that is taking long
-constexpr int HEALTH_PTR = EPOCH + 28;
-// health words: [0] FAILED (sticky: a wait gave up), [1] waits that gave up,
-// [2] FAILED of the peer (written through P2P by a rank that gave up), and of
-// the first wait that gave up: [3] the tag it waited for, [4] / [5] the word it
-// last read (low / high half), [6] the word's offset in the mailbox region (in
-// words from the region start), [7] the low half of the address of the
-// layer's counters (which layer); [8] / [9] the address of the host copy of
-// words 0 .. 7 (host memory, written once by the wait that marks the device
-// failed, for a host thread to poll), or 0
-enum {
-  H_FAILED = 0,
-  H_TIMEOUTS,
-  H_PEER_FAILED,
-  H_TAG,
-  H_SEEN_LO,
-  H_SEEN_HI,
-  H_SLOT,
-  H_LAYER,
-  H_HOST_LO,
-  H_HOST_HI,
-  H_WORDS = 16
-};
-// two words after the health pointer: the wait deadline in cycles of the
-// sub-group clock (~2.8 GHz), set per device (mono_set_deadline)
-constexpr int DEADLINE = EPOCH + 30;
-// two words: reserved for the address of the peer's health words (P2P mapping)
-// that a rank giving up its wait would flag. The host does not set it yet (0:
-// no flag is written), so the peer's own wait gives up at its deadline.
-constexpr int PEER_HEALTH_PTR = EPOCH + 32;
-// two words: the address of this layer's mailbox region (for the health record)
-constexpr int MBOX_PTR = EPOCH + 34;
-constexpr int CNT_WORDS = EPOCH + 40;
-constexpr uint64_t WAIT_CYCLES_DEFAULT = 5600000000ull;  // 2 s
-
-// ----------------------------------------------------------------------------
-// The layer's 16-bit dtype DT (half or bf16): hidden states, norm / router /
-// conv / ba / MTP fc weights, KV cache, conv state. e16 has no arithmetic, so
-// every access names DT. The fp16 scratch and SLM vectors hold values rounded
-// to DT where SGLang rounds to its dtype (a bf16 value in the fp16 range is
-// exact in fp16): the fp8 GEMVs keep their fp16 products in both dtypes.
-struct e16 {
-  uint16_t u;
-};
-template <typename DT>
-inline float f32(uint16_t u) {
-  return (float)sycl::bit_cast<DT>(u);
-}
-template <typename DT>
-inline float ld16(const e16* p, size_t i) {
-  return f32<DT>(p[i].u);
-}
-template <typename DT>
-inline uint16_t bits(float v) {
-  return sycl::bit_cast<uint16_t>((DT)v);
-}
-template <typename DT>
-inline void st16(e16* p, size_t i, float v) {
-  p[i].u = bits<DT>(v);
-}
-template <typename DT>
-inline float rnd(float v) {
-  return (float)(DT)v;
-}
-// v rounded to DT, held in fp16
-template <typename DT>
-inline half toh(float v) {
-  if constexpr (std::is_same_v<DT, half>)
-    return (half)v;
-  else
-    return (half)(float)(DT)v;
-}
+// the mailbox control block (stage p2p_mailbox.hpp): the address of the
+// device's health words (mono_health, written at registration and read only by
+// a wait that is taking long), the wait deadline (mono_set_deadline), the
+// peer's health words (reserved: the host does not set them yet, so the
+// peer's own wait gives up at its deadline) and this layer's mailbox region
+constexpr int CTL = EPOCH + 28;
+constexpr int HEALTH_PTR = CTL + CTL_HEALTH_PTR, DEADLINE = CTL + CTL_DEADLINE;
+constexpr int PEER_HEALTH_PTR = CTL + CTL_PEER_HEALTH_PTR, MBOX_PTR = CTL + CTL_MBOX_PTR;
+constexpr int CNT_WORDS = CTL + CTL_WORDS;
+static_assert(CNT_WORDS == EPOCH + 40, "counter layout");
 
 // ----------------------------------------------------------------------------
 // arguments (e16: the layer's dtype DT; scales: fp32 128x128 block scales)
@@ -261,378 +170,14 @@ inline Scratch scratch_carve(void* base, uint64_t* mbox, uint64_t* peer) {
 }
 constexpr size_t MBOX_WORDS = 2 * HID;  // per layer, rows-1 region
 
-// ----------------------------------------------------------------------------
-// helpers
-using mb_ref = sycl::atomic_ref<
-    uint64_t,
-    sycl::memory_order::relaxed,
-    sycl::memory_scope::system,
-    sycl::access::address_space::global_space>;
-// A peer write may land as two 4-byte halves (e.g. GPUs on different CPU root
-// ports): each half carries the 16-bit tag (word = tag|hi16, tag|lo16), so a
-// word that mixes two writes never matches.
-inline uint64_t mb_word(uint32_t v, uint32_t tag) {
-  const uint64_t t = tag & 0xffffu;
-  return (t << 48) | ((uint64_t)(v >> 16) << 32) | (t << 16) | (v & 0xffffu);
-}
-inline bool mb_match(uint64_t w, uint32_t tag) {
-  const uint32_t t = tag & 0xffffu;
-  return (uint32_t)(w >> 48) == t && ((uint32_t)(w >> 16) & 0xffffu) == t;
-}
-inline uint32_t mb_val(uint64_t w) {
-  return ((uint32_t)(w >> 32) << 16) | ((uint32_t)w & 0xffffu);
-}
-// initial value of every mailbox word (mono_mailbox_never): its two halves
-// carry different tags, so it matches no tag
-constexpr uint64_t MB_NEVER = 0x00000000ffff0000ull;
-static_assert(((MB_NEVER >> 48) & 0xffffu) != ((MB_NEVER >> 16) & 0xffffu), "MB_NEVER must match no tag");
-// Send of a word to the peer: one uncached 64-bit store (a posted PCIe write
-// that reaches the peer's memory without a flush of this card's caches; a
-// cached store may stay in this card's cache and miss the peer's wait).
-// SIMD16 vISA: the kernels run 16-wide sub-groups.
-inline void mb_put(uint64_t* peer, uint64_t w) {
-#if defined(__SYCL_DEVICE_ONLY__)
-  const uint64_t a = reinterpret_cast<uint64_t>(peer);
-  asm volatile(
-      "{\n"
-      ".decl MB_A v_type=G type=uq num_elts=16 alias=<%0,0>\n"
-      ".decl MB_D v_type=G type=uq num_elts=16 alias=<%1,0>\n"
-      "lsc_store.ugm.uc.uc.uc (M1, 16) flat[MB_A]:a64 MB_D:d64\n"
-      "}\n"
-      :
-      : "rw"(a), "rw"(w)
-      : "memory");
-#else
-  (void)peer;
-  (void)w;
-#endif
-}
-using h_ref = sycl::
-    atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>;
-using hs_ref = sycl::
-    atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::system, sycl::access::address_space::global_space>;
-// The slow path of a mailbox wait (the first poll missed): polls until the
-// word matches, or gives up when this device already failed (health FAILED,
-// sticky: every later wait exits after a few hundred polls), when the peer
-// reported a failure, or after the deadline. The wait that marks the device
-// failed records why, tells the peer and publishes the record to the host
-// copy. False: gave up.
-inline bool mb_wait_slow(const uint64_t* mine, uint32_t tag, uint64_t& w, const uint32_t* cnt) {
-  uint64_t t0 = syclex::clock<syclex::clock_scope::sub_group>();
-  for (uint32_t n = 1;; ++n) {
-    w = mb_ref(*const_cast<uint64_t*>(mine)).load();
-    if (mb_match(w, tag)) return true;
-    if ((n & 255u) == 0) {
-      int* h = reinterpret_cast<int*>(*reinterpret_cast<const volatile uint64_t*>(cnt + HEALTH_PTR));
-      if (h == nullptr) continue;  // not registered
-      const uint64_t limit = *reinterpret_cast<const volatile uint64_t*>(cnt + DEADLINE);
-      const bool peer_failed = hs_ref(h[H_PEER_FAILED]).load() != 0;
-      const bool failed = h_ref(h[H_FAILED]).load() != 0 || peer_failed;
-      // the sub-group clock is per hardware thread slot: a preempted and resumed
-      // thread may read an earlier value; restart the deadline then
-      const uint64_t now = syclex::clock<syclex::clock_scope::sub_group>();
-      if ((int64_t)(now - t0) < 0) t0 = now;
-      if (failed || now - t0 > (limit ? limit : WAIT_CYCLES_DEFAULT)) {
-        h_ref(h[H_TIMEOUTS]).fetch_add(1);
-        if (h_ref(h[H_FAILED]).exchange(1) == 0) {  // this wait marks the device failed
-          if (!peer_failed) {                       // it timed out: record it and tell the peer
-            h_ref(h[H_TAG]).store((int)(tag & 0xffffu));
-            h_ref(h[H_SEEN_LO]).store((int)(uint32_t)w);
-            h_ref(h[H_SEEN_HI]).store((int)(uint32_t)(w >> 32));
-            const uint64_t* region =
-                reinterpret_cast<const uint64_t*>(*reinterpret_cast<const volatile uint64_t*>(cnt + MBOX_PTR));
-            h_ref(h[H_SLOT]).store(region ? (int)(mine - region) : -1);
-            h_ref(h[H_LAYER]).store((int)(uint32_t) reinterpret_cast<uintptr_t>(cnt));
-            // the peer's health words (P2P), so its waits give up at once
-            int* ph = reinterpret_cast<int*>(*reinterpret_cast<const volatile uint64_t*>(cnt + PEER_HEALTH_PTR));
-            if (ph != nullptr) hs_ref(ph[H_PEER_FAILED]).store(1);
-          }
-          int* host = reinterpret_cast<int*>(
-              (uint64_t)(uint32_t)h_ref(h[H_HOST_LO]).load() | ((uint64_t)(uint32_t)h_ref(h[H_HOST_HI]).load() << 32));
-          if (host != nullptr) {
-            for (int k = H_TIMEOUTS; k <= H_LAYER; ++k)
-              hs_ref(host[k]).store(h_ref(h[k]).load());
-            hs_ref(host[H_PEER_FAILED]).store(peer_failed ? 1 : 0);
-            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
-            hs_ref(host[H_FAILED]).store(1);
-          }
-        }
-        return false;
-      }
-    }
-  }
-}
-// waits for this call's word (tag) in own mailbox word `mine`; on a give-up the
-// word reads as all ones, a NaN in each 16- or 32-bit value, so the outputs of
-// a failed step are NaN (and the device's health records the failure)
+// the mailbox waits of a layer (its counters S.cnt hold the control block at CTL)
 inline uint64_t mb_wait(const uint64_t* mine, uint32_t tag, const uint32_t* cnt) {
-  uint64_t w = mb_ref(*const_cast<uint64_t*>(mine)).load();
-  if (!mb_match(w, tag) && !mb_wait_slow(mine, tag, w, cnt)) w = ~0ull;
-  return w;
+  return mailbox_wait<CTL>(mine, tag, cnt);
 }
-// all-reduce of two values: one mailbox word of two bf16 + tag. Both ranks add
-// the same bf16-rounded partials (a + b == b + a), so their sums are bitwise
-// equal. A failed wait gives NaN (0xffff halves).
 inline void mb_ar2(uint64_t* peer, uint64_t* mine, float& v0, float& v1, uint32_t tag, const uint32_t* cnt) {
-  const bf16 a0 = (bf16)v0, a1 = (bf16)v1;
-  const uint32_t v = (uint32_t)sycl::bit_cast<uint16_t>(a0) | ((uint32_t)sycl::bit_cast<uint16_t>(a1) << 16);
-  mb_put(peer, mb_word(v, tag));
-  const uint32_t p = mb_val(mb_wait(mine, tag, cnt));
-  v0 = (float)a0 + (float)sycl::bit_cast<bf16>((uint16_t)(p & 0xffffu));
-  v1 = (float)a1 + (float)sycl::bit_cast<bf16>((uint16_t)(p >> 16));
+  mailbox_ar2<CTL>(peer, mine, v0, v1, tag, cnt);
 }
 
-inline uint32_t fp8x2_lo(uint32_t w) {  // bytes 0,2 -> two fp16 = e4m3 / 256
-  uint32_t t = w & 0x00ff00ffu;
-  return ((t & 0x00800080u) << 8) | ((t & 0x007f007fu) << 7);
-}
-inline uint32_t fp8x2_hi(uint32_t w) {  // bytes 1,3
-  uint32_t t = (w >> 8) & 0x00ff00ffu;
-  return ((t & 0x00800080u) << 8) | ((t & 0x007f007fu) << 7);
-}
-inline h2 as_h2(uint32_t u) {
-  return sycl::bit_cast<h2>(u);
-}
-
-// 16 fp8 weights . 16 activations stored permuted (x0,x2,x1,x3 per 4) in SLM.
-inline float dot16_fp8(sycl::uint4 w, const uint32_t* xp) {
-  sycl::uint4 xa = *reinterpret_cast<const sycl::uint4*>(xp);
-  sycl::uint4 xb = *reinterpret_cast<const sycl::uint4*>(xp + 4);
-  h2 acc = as_h2(fp8x2_lo(w.x())) * as_h2(xa.x());
-  acc += as_h2(fp8x2_hi(w.x())) * as_h2(xa.y());
-  acc += as_h2(fp8x2_lo(w.y())) * as_h2(xa.z());
-  acc += as_h2(fp8x2_hi(w.y())) * as_h2(xa.w());
-  acc += as_h2(fp8x2_lo(w.z())) * as_h2(xb.x());
-  acc += as_h2(fp8x2_hi(w.z())) * as_h2(xb.y());
-  acc += as_h2(fp8x2_lo(w.w())) * as_h2(xb.z());
-  acc += as_h2(fp8x2_hi(w.w())) * as_h2(xb.w());
-  return (float)acc[0] + (float)acc[1];
-}
-// 16 fp8 weights . 16 activations in natural order (registers)
-inline float dot16_fp8_nat(sycl::uint4 w, const sycl::vec<half, 16>& x) {
-  h2 acc = as_h2(fp8x2_lo(w.x())) * h2(x[0], x[2]);
-  acc += as_h2(fp8x2_hi(w.x())) * h2(x[1], x[3]);
-  acc += as_h2(fp8x2_lo(w.y())) * h2(x[4], x[6]);
-  acc += as_h2(fp8x2_hi(w.y())) * h2(x[5], x[7]);
-  acc += as_h2(fp8x2_lo(w.z())) * h2(x[8], x[10]);
-  acc += as_h2(fp8x2_hi(w.z())) * h2(x[9], x[11]);
-  acc += as_h2(fp8x2_lo(w.w())) * h2(x[12], x[14]);
-  acc += as_h2(fp8x2_hi(w.w())) * h2(x[13], x[15]);
-  return (float)acc[0] + (float)acc[1];
-}
-// 8 16-bit (DT) weights . 8 activations in natural order (fp16 in SLM), fp32
-template <typename DT>
-inline float dot8_w16(sycl::uint4 w, const half* x) {
-  const sycl::vec<uint16_t, 8> wh = sycl::bit_cast<sycl::vec<uint16_t, 8>>(w);
-  const sycl::vec<half, 8> xv = *reinterpret_cast<const sycl::vec<half, 8>*>(x);
-  float a = 0.f;
-#pragma unroll
-  for (int i = 0; i < 8; ++i)
-    a += f32<DT>(wh[i]) * (float)xv[i];
-  return a;
-}
-template <int KCH>
-inline void load_row(sycl::uint4 (&w)[KCH], const uint8_t* row, int lane) {
-#pragma unroll
-  for (int j = 0; j < KCH; ++j)
-    w[j] = *reinterpret_cast<const sycl::uint4*>(row + j * 256 + lane * 16);
-}
-// The block scales of this lane's chunks of a K = KCH * 256 fp8 row: chunk j
-// covers K bytes j * 256 + lane * 16 .. + 16, i.e. K block 2 j + lane / 8.
-// srow: the row's [K / 128] scales.
-template <int KCH>
-inline void load_scales(float (&sc)[KCH], const float* srow, int lane) {
-#pragma unroll
-  for (int j = 0; j < KCH; ++j)
-    sc[j] = srow[2 * j + (lane >> 3)];
-}
-// sum over a K = KCH * 256 fp8 row (registers) . x (permuted SLM), the lanes'
-// chunks scaled by their K block, reduced over the sub-group: * 256 = output
-template <int KCH>
-inline float
-dot_row_regs(sycl::sub_group sg, int lane, const sycl::uint4 (&w)[KCH], const uint32_t* xp, const float (&sc)[KCH]) {
-  float sacc = 0.f;
-#pragma unroll
-  for (int j = 0; j < KCH; ++j)
-    sacc += dot16_fp8(w[j], xp + (j * 256 + lane * 16) / 2) * sc[j];
-  return sycl::reduce_over_group(sg, sacc, sycl::plus<float>());
-}
-// x[k] -> permuted slot (x0,x2,x1,x3 per 4): swap bits 0 and 1 of k.
-inline void store_perm(half* xp, int k, half v) {
-  xp[(k & ~3) | ((k & 1) << 1) | ((k >> 1) & 1)] = v;
-}
-
-inline uint32_t uc_load32(const uint32_t* p) {  // L1-uncached plain load
-  syclex::annotated_ptr<
-      const uint32_t,
-      decltype(syclex::properties{
-          intelex::read_hint<intelex::cache_control<intelex::cache_mode::uncached, syclex::cache_level::L1>>})>
-      a(p);
-  return *a;
-}
-// state store with L1 streaming + L3 write-back (IGC LSC builtin)
-#ifdef __SYCL_DEVICE_ONLY__
-typedef unsigned int lsc_u4 __attribute__((ext_vector_type(4)));
-extern "C" SYCL_EXTERNAL void
-__builtin_IB_lsc_store_global_uint4(__attribute__((opencl_global)) lsc_u4* base, int off, lsc_u4 val, int cache);
-#endif
-inline void st_store8(float* p, const sycl::vec<float, 8>& v) {
-#ifdef __SYCL_DEVICE_ONLY__
-  auto* g = (__attribute__((opencl_global)) lsc_u4*)(__attribute__((opencl_global)) void*)(p);
-  lsc_u4 a = {
-      sycl::bit_cast<unsigned>(v[0]),
-      sycl::bit_cast<unsigned>(v[1]),
-      sycl::bit_cast<unsigned>(v[2]),
-      sycl::bit_cast<unsigned>(v[3])};
-  lsc_u4 b = {
-      sycl::bit_cast<unsigned>(v[4]),
-      sycl::bit_cast<unsigned>(v[5]),
-      sycl::bit_cast<unsigned>(v[6]),
-      sycl::bit_cast<unsigned>(v[7])};
-  __builtin_IB_lsc_store_global_uint4(g, 0, a, 6);  // LSC_STCC_L1S_L3WB
-  __builtin_IB_lsc_store_global_uint4(g, 1, b, 6);
-#else
-  (void)p;
-  (void)v;
-#endif
-}
-
-using cnt_ref = sycl::atomic_ref<
-    uint32_t,
-    sycl::memory_order::relaxed,
-    sycl::memory_scope::device,
-    sycl::access::address_space::global_space>;
-// NOTE: the release fence also waits for the thread's outstanding LOADS ->
-// issue preloads after signal().
-inline void signal(sycl::nd_item<1> it, uint32_t* c) {
-  sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
-  sycl::group_barrier(it.get_group());
-  if (it.get_local_linear_id() == 0) cnt_ref(*c).fetch_add(1u, sycl::memory_order::release);
-}
-// The consumer polls with a relaxed load; the producer's release is the fence
-// in signal() and the release RMW. After the loop the polling work-item takes
-// one device-scope acquire fence, and the work-group barrier then orders the
-// data for the rest of the work-group (the fence synchronizes with the
-// producer's release, the barrier with the other threads; happens-before is
-// transitive). One fence a WG lowers to one L1 invalidate; a fence in every
-// thread would invalidate once per thread and delay the hand-off more.
-// Measured against the same wait without the fence on two B70
-// (bf16, 8 rotating layer copies, A B A B twice): GDN layers 0 us, attention
-// layers of 1 row +0.9 us (1K context) / +1.3 us (32K context), i.e. +0.8 %
-// each, 8 rows and the verify kernels within 1 us: about 0.2 % of a decode step.
-// The counters and targets wrap at 2^32 (32 producers a call: after 2^27
-// calls of a layer), so compare the signed difference.
-inline void wait_for(sycl::nd_item<1> it, uint32_t* c, uint32_t target) {
-  if (it.get_local_linear_id() == 0) {
-    while ((int32_t)(cnt_ref(*c).load(sycl::memory_order::relaxed) - target) < 0) {
-    }
-    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
-  }
-  sycl::group_barrier(it.get_group());
-}
-// in-WG barrier with SLM-only memory semantics (group_barrier also fences
-// global memory = waits for loads)
-inline void wg_bar(sycl::group<1> g) {
-#if defined(__SYCL_DEVICE_ONLY__)
-  __spirv_ControlBarrier(
-      __spv::Scope::Workgroup,
-      __spv::Scope::Workgroup,
-      __spv::MemorySemanticsMask::AcquireRelease | __spv::MemorySemanticsMask::WorkgroupMemory);
-#else
-  sycl::group_barrier(g);
-#endif
-}
-
-// ---- Xe2 DPAS + 2D block loads (inline vISA / IGC builtins, as the sycl-tla
-// arch primitives): joint_matrix element access (get_wi_data) does not build
-// with IGC 2.38.
-#if defined(__clang__)
-typedef float v8f __attribute__((ext_vector_type(8)));
-typedef unsigned int v8u __attribute__((ext_vector_type(8)));
-typedef unsigned int v4u __attribute__((ext_vector_type(4)));
-typedef int v2i __attribute__((ext_vector_type(2)));
-#else
-// the host compiler pass (g++) parses the kernels too: a stand-in with the
-// operations they use
-template <typename T, int N>
-struct hvec {
-  T v[N];
-  hvec() = default;
-  explicit hvec(T x) {
-    for (int i = 0; i < N; ++i)
-      v[i] = x;
-  }
-  T& operator[](int i) {
-    return v[i];
-  }
-  const T& operator[](int i) const {
-    return v[i];
-  }
-  hvec& operator+=(const hvec& o) {
-    for (int i = 0; i < N; ++i)
-      v[i] += o.v[i];
-    return *this;
-  }
-  hvec operator*(T s) const {
-    hvec r;
-    for (int i = 0; i < N; ++i)
-      r.v[i] = v[i] * s;
-    return r;
-  }
-};
-using v8f = hvec<float, 8>;
-using v8u = hvec<unsigned int, 8>;
-using v4u = hvec<unsigned int, 4>;
-using v2i = hvec<int, 2>;
-#endif
-#ifdef __SYCL_DEVICE_ONLY__
-extern "C" SYCL_EXTERNAL v8u __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(
-    intptr_t base, int width_m1, int height_m1, int pitch_m1, v2i xy);
-extern "C" SYCL_EXTERNAL v8u __builtin_IB_subgroup_block_read_flat_transform_u16_k16(
-    intptr_t base, int width_m1, int height_m1, int pitch_m1, v2i xy);
-#endif
-// d[8 rows x 16 cols] (lane = column, element i = row i) += a[8 x 16 half] .
-// b[16 x 16 half]
-//   a: dpas A layout, lane l element j = (A[2j + l/8][2(l%8)], A[2j +
-//   l/8][2(l%8) + 1]) b: VNNI, lane n element p = (B[2p][n], B[2p + 1][n])
-inline void dpas_hf(v8f& d, const v4u& a, const v8u& b) {
-#ifdef __SYCL_DEVICE_ONLY__
-  asm("{\n"
-      ".decl DST     v_type=G type=f num_elts=128 alias=<%0,0>\n"
-      ".decl SRC1_UD v_type=G type=UD num_elts=128 alias=<%2,0>\n"
-      ".decl SRC2_UD v_type=G type=UD num_elts=64 alias=<%1,0>\n"
-      "dpas.hf.hf.8.8 (M1, 16) DST.0 DST.0 SRC1_UD.0 SRC2_UD(0,0)\n"
-      "}\n"
-      : "+rw"(d)
-      : "rw"(a), "rw"(b));
-#else
-  (void)d;
-  (void)a;
-  (void)b;
-#endif
-}
-// the same for DT operands (attention: q, P, K and V in the KV cache dtype)
-template <typename DT>
-inline void dpas16(v8f& d, const v4u& a, const v8u& b) {
-  if constexpr (std::is_same_v<DT, half>) {
-    dpas_hf(d, a, b);
-  } else {
-#ifdef __SYCL_DEVICE_ONLY__
-    asm("{\n"
-        ".decl DST     v_type=G type=f num_elts=128 alias=<%0,0>\n"
-        ".decl SRC1_UD v_type=G type=UD num_elts=128 alias=<%2,0>\n"
-        ".decl SRC2_UD v_type=G type=UD num_elts=64 alias=<%1,0>\n"
-        "dpas.bf.bf.8.8 (M1, 16) DST.0 DST.0 SRC1_UD.0 SRC2_UD(0,0)\n"
-        "}\n"
-        : "+rw"(d)
-        : "rw"(a), "rw"(b));
-#else
-    (void)d;
-    (void)a;
-    (void)b;
-#endif
-  }
-}
 // K tile: 16 token rows x 16 dims at dims dw*2.. (dw in dwords) of the K
 // buffer (token pitch HD halves) -> VNNI B of K^T (lane = token)
 inline v8u load_k_tile(const void* row0, int dw) {
@@ -656,13 +201,6 @@ inline v8u load_v_tile(const void* row0, int col) {
   return v8u{};
 #endif
 }
-inline uint32_t pack_h2(half a, half b) {
-  return (uint32_t)sycl::bit_cast<uint16_t>(a) | ((uint32_t)sycl::bit_cast<uint16_t>(b) << 16);
-}
-inline uint32_t pack16(uint16_t a, uint16_t b) {
-  return (uint32_t)a | ((uint32_t)b << 16);
-}
-
 // token t of a request -> its slot (page table of page indices, ps tokens a
 // page); a 16-token tile never crosses a page (ps % 16 == 0)
 inline int64_t kv_slot(const int* btab, int ps, int t) {

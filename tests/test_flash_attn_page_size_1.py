@@ -9,9 +9,8 @@ path against an fp32 reference over the valid prefix only.
 """
 
 import pytest
-import torch
-
 import sgl_kernel  # noqa: F401 - registers torch.ops.sgl_kernel.*
+import torch
 from sgl_kernel.flash_attn import flash_attn_with_kvcache
 
 DEVICE = "xpu"
@@ -51,9 +50,7 @@ def reference(q, k_cache, v_cache, slots, causal):
         seqlen_q, seqlen_k = qf.shape[0], k.shape[0]
         rows = torch.arange(seqlen_q).unsqueeze(1)
         cols = torch.arange(seqlen_k).unsqueeze(0)
-        scores = scores.masked_fill(
-            cols > (seqlen_k - seqlen_q) + rows, float("-inf")
-        )
+        scores = scores.masked_fill(cols > (seqlen_k - seqlen_q) + rows, float("-inf"))
     out = torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v)
     return out.unsqueeze(0)
 
@@ -72,7 +69,11 @@ def run_and_check(seqlen_q, seqlen_k, dtype, causal, seed=0):
         causal=causal,
     )
     torch.xpu.synchronize()
-    tol = dict(atol=2e-2, rtol=2e-2) if dtype == torch.float16 else dict(atol=5e-2, rtol=5e-2)
+    tol = (
+        dict(atol=2e-2, rtol=2e-2)
+        if dtype == torch.float16
+        else dict(atol=5e-2, rtol=5e-2)
+    )
     assert torch.allclose(out.float().cpu(), ref.to(dtype).float(), **tol)
 
 
@@ -95,9 +96,7 @@ def test_page_size_1_capture_width_clamps_padding(monkeypatch, sentinel):
     # the padding reaches index_select. Without clamping, -1 (or any junk
     # sentinel) is an out-of-bounds read; with clamping the result must
     # still match the reference over the valid prefix.
-    monkeypatch.setattr(
-        torch.xpu, "is_current_stream_capturing", lambda: True
-    )
+    monkeypatch.setattr(torch.xpu, "is_current_stream_capturing", lambda: True)
     slots, page_table, k_cache, v_cache = build_case(37, sentinel=sentinel)
     gen = torch.Generator().manual_seed(3)
     q = torch.randn(1, 1, HEADS_Q, HEAD_DIM, generator=gen)
@@ -142,9 +141,7 @@ def test_page_size_1_multi_request_masked_path():
     torch.xpu.synchronize()
     for row, length in enumerate(lengths):
         row_slots = page_table[row, :length].long()
-        ref = reference(
-            q[row : row + 1], k_cache, v_cache, row_slots, causal=True
-        )
+        ref = reference(q[row : row + 1], k_cache, v_cache, row_slots, causal=True)
         assert torch.allclose(
             out[row : row + 1].float().cpu(),
             ref.to(torch.float16).float(),

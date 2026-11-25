@@ -2,7 +2,7 @@
 //
 // Batched decode (NB = 2, 4, 8 rows; one token per request; SGLang pads the
 // batch with rows of KV slot 0, sequence length 1 and state slot 0): the same
-// one-kernel-per-layer structure as mono_layers.hpp, every GEMV as DPAS with
+// one-kernel-per-layer structure as layers.hpp, every GEMV as DPAS with
 // the activations as the A matrix (NB rows, zero padded to 8) and the weights
 // as B. All fp8 weights are [N][K] (rows = outputs, routed experts included):
 // lane = output row, 16 B per 16-K chunk, fp8 -> fp16 with fp8x2_lo / hi; the K
@@ -14,7 +14,7 @@
 // (expert, row eighth) are dealt to the work-groups, the rows' routing weights
 // are folded into the hidden activations, down is split by output rows.
 #pragma once
-#include "mono_layers.hpp"
+#include "layers.hpp"
 
 namespace sgl_mono {
 
@@ -1599,8 +1599,8 @@ void launch_gdn_b(sycl::queue& q, const Ptrs& P, const Scratch& S, const Scratch
 
 // decode launchers of one layer kind and dtype, 1, 2, 3, 4, 6 or 8 rows: each
 // instance is compiled in its own translation unit and library
-// (mono_{gdn,attn}_{fp16,bf16}, built with -fvisibility=hidden) and called
-// from MonoDecodeXe20: exported
+// (qwen35_{gdn,attn}_launch_{fp16,bf16}, built with -fvisibility=hidden) and
+// called from qwen35_decode: exported
 #pragma GCC visibility push(default)
 template <typename DT>
 void launch_gdn(sycl::queue& q, int nb, const Ptrs& P, const Scratch& S, const ScratchB& SB) {

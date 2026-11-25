@@ -14,11 +14,11 @@ limitations under the License.
 ==============================================================================*/
 
 // Host side of the mono decode layers (Qwen3.5 / Qwen3.6 MoE, TP2, Xe2): the
-// device check, the per-layer registry (SGLang
-// weights registered once, caches bound separately and again whenever the
-// pools move, one scratch per layer) and the per-step launch on the current
-// torch XPU queue. The kernels are in kernels/mono_decode/xe20/, one
-// translation unit (and library) per kernel kind and dtype.
+// device check, the per-layer registry (SGLang weights registered once, caches
+// bound separately and again whenever the pools move) and the per-step launch
+// on the current torch XPU queue. The launchers are the qwen35_*_launch_*
+// sources next to this file, one translation unit (and library) per kernel
+// kind and dtype.
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUFunctions.h>
 #include <c10/xpu/XPUStream.h>
@@ -34,9 +34,9 @@ limitations under the License.
 #include <unordered_map>
 #include <vector>
 
-#include "Utils.h"
-#include "kernels/mono_decode/xe20/mono_layers_s.hpp"
-#include "kernels/mono_decode/xe20/mono_mtp.hpp"
+#include "../../../Utils.h"
+#include "layers_s.hpp"
+#include "mtp.hpp"
 #include "sgl_kernel_ops.h"  // the ops, exported
 
 // the kernels are compiled in their own translation units (one per layer kind

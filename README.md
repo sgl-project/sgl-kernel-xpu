@@ -31,11 +31,12 @@ variables (default is `ON` for all):
 | `USE_QSA` | `ON` | QSA sparse attention and indexer preparation and MQA scoring |
 | `USE_MLA_SPARSE_FUSED` | `OFF` | Fused (single-pass) sparse MLA decode kernel (optimization track) |
 
-There is also an opt-in switch (default `OFF`):
+There are also opt-in switches (default `OFF`):
 
 | Variable | Default | Set to `ON`/`1` to enable |
 | --- | --- | --- |
 | `USE_SYCL_JIT` | `OFF` | Runtime-JIT kernels (FMHA/MLA/MoE/GDN compiled on demand instead of AOT) |
+| `USE_MONO_DECODE` | `OFF` | Xe2 mono decode kernels for Qwen3.5 / Qwen3.6 MoE at TP2, used by SGLang's `--enable-xpu-monokernel` (e.g. `USE_MONO_DECODE=ON pip install -v .`) |
 
 Notes:
 - `OFF` and `0` are both accepted.

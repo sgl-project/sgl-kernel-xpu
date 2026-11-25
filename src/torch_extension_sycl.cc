@@ -813,10 +813,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gated_delta_rule_verify", torch::kXPU, &gated_delta_rule_verify);
 #endif  // USE_GDN
 
-  /*
-   * Mono decode (Qwen3.5 / Qwen3.6 MoE decoder layers, TP2, Xe2)
-   */
-#ifdef USE_MONO_DECODE
+#if SYCL_INTEL_TARGET == 20 && defined(USE_MONO_DECODE)
+  /* Qwen3.5 / Qwen3.6 MoE decode (sgl_kernel.mono_decode, TP2) */
   m.def("mono_decode_supported(int device) -> bool");
   m.impl("mono_decode_supported", c10::DispatchKey::BackendSelect, &mono_decode_supported);
   m.def("mono_max_context() -> int");
@@ -851,7 +849,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "mono_decode_layer_verify(int layer, int tokens, Tensor hidden, Tensor residual, Tensor! hid_out, "
       "Tensor! res_out, Tensor positions, Tensor m0, Tensor? m1, Tensor? m2) -> bool");
   m.impl("mono_decode_layer_verify", torch::kXPU, &mono_decode_layer_verify);
-#endif  // USE_MONO_DECODE
+#endif  // Xe20 only Qwen3.5 decode (USE_MONO_DECODE)
 
   /*
    * Mamba causal conv1d (XPU)

@@ -1764,7 +1764,7 @@ std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_table(
 /*
  * Mono decode (Xe2, USE_MONO_DECODE): one resident kernel per Qwen3.5 / Qwen3.6
  * MoE decoder layer at TP2, the TP all-reduces done inside the kernel through a
- * P2P mailbox in the peer card's memory (src/sycl/MonoDecodeXe20.cpp).
+ * P2P mailbox in the peer card's memory (src/sycl/models/qwen35/xe20/).
  */
 bool mono_decode_supported(int64_t device);
 int64_t mono_max_context();

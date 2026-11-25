@@ -27,7 +27,9 @@ option(USE_QSA "Build Xe2 BF16 QSA sparse attention" ON)
 # OFF also pins the runtime dispatch to the 2-stage path (see below) so the fused
 # launchers are never referenced.
 option(USE_MLA_SPARSE_FUSED "Build the fused (single-pass) sparse MLA decode kernel (optimization track)" OFF)
-option(USE_MONO_DECODE "Build the Xe2 mono decode layer kernels (Qwen3.5 / Qwen3.6 MoE, TP2)" ON)
+# The mono decode kernels serve one model family on one architecture; building
+# them is opt-in.
+option(USE_MONO_DECODE "Build the Xe2 mono decode layer kernels (Qwen3.5 / Qwen3.6 MoE, TP2)" OFF)
 # Master runtime-JIT switch (opt-in, default OFF). When ON, kernels that support
 # runtime codegen (currently FMHA decode/prefill) are compiled on demand via
 # src/jit instead of being instantiated ahead of time. Enable with USE_SYCL_JIT=ON
@@ -153,8 +155,7 @@ if(NOT USE_QSA)
     list(FILTER device_cpp EXCLUDE REGEX "/QSAPrepare\\.cpp$")
 endif()
 if(NOT USE_MONO_DECODE OR NOT DPCPP_SYCL_TARGET MATCHES "bmg")
-    list(FILTER device_cpp EXCLUDE REGEX "/MonoDecodeXe20\\.cpp$")
-    list(FILTER device_cpp EXCLUDE REGEX "/kernels/mono_decode/")
+    list(FILTER device_cpp EXCLUDE REGEX "/models/qwen35/")
 endif()
 if(NOT USE_MOE)
     list(FILTER device_cpp EXCLUDE REGEX "/(GroupGemm(Xe20|W4A16Xe20|W8A16Xe20)|MoE(Align|PrepareInputs|Sum|_fused_gate|_sum_reduce))\\.cpp$")

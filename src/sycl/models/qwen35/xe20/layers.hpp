@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Single-row decode layer kernels (one token of one request), see
-// mono_common.hpp for the shapes and layouts. Two layer kernels share one tail:
+// common.hpp for the shapes and layouts. Two layer kernels share one tail:
 //   GDN  front (linear_attention): input norm, in_proj q|k|v|z (fp8) + b|a
 //        (16-bit), causal conv1d, gated delta rule, gated RMSNorm -> o (2048,
 //        SLM)
@@ -20,7 +20,7 @@
 // be recorded into a graph. Every launch on a scratch must be matched by one
 // launch on the peer card.
 #pragma once
-#include "mono_common.hpp"
+#include "common.hpp"
 
 namespace sgl_mono {
 

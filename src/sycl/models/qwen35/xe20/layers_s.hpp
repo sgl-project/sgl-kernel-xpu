@@ -18,7 +18,7 @@
 // Attention: request b's context is seq_lens[b] - T cached tokens (page table
 // row b); the T new k / v are written to out_cache_loc and merged causally.
 #pragma once
-#include "mono_layers_b.hpp"
+#include "layers_b.hpp"
 
 namespace sgl_mono {
 

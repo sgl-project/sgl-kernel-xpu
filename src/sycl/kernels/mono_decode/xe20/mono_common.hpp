@@ -286,11 +286,26 @@ inline uint32_t mb_val(uint64_t w) {
 // carry different tags, so it matches no tag
 constexpr uint64_t MB_NEVER = 0x00000000ffff0000ull;
 static_assert(((MB_NEVER >> 48) & 0xffffu) != ((MB_NEVER >> 16) & 0xffffu), "MB_NEVER must match no tag");
-// A read-modify-write, not a store: it completes at the peer card's memory, so
-// the word cannot linger in this card's cache (a store to the peer's memory may
-// stay there until evicted and miss the peer's wait).
+// Send of a word to the peer: one uncached 64-bit store (a posted PCIe write
+// that reaches the peer's memory without a flush of this card's caches; a
+// cached store may stay in this card's cache and miss the peer's wait).
+// SIMD16 vISA: the kernels run 16-wide sub-groups.
 inline void mb_put(uint64_t* peer, uint64_t w) {
-  (void)mb_ref(*peer).exchange(w);
+#if defined(__SYCL_DEVICE_ONLY__)
+  const uint64_t a = reinterpret_cast<uint64_t>(peer);
+  asm volatile(
+      "{\n"
+      ".decl MB_A v_type=G type=uq num_elts=16 alias=<%0,0>\n"
+      ".decl MB_D v_type=G type=uq num_elts=16 alias=<%1,0>\n"
+      "lsc_store.ugm.uc.uc.uc (M1, 16) flat[MB_A]:a64 MB_D:d64\n"
+      "}\n"
+      :
+      : "rw"(a), "rw"(w)
+      : "memory");
+#else
+  (void)peer;
+  (void)w;
+#endif
 }
 using h_ref = sycl::
     atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>;

@@ -8,6 +8,7 @@ writes the state after each token to SGLang's verify scratch, as the standard
 target-verify path does."""
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -18,6 +19,27 @@ from ..failure import FailureWatch, deadline_s, schedule_fault
 from ..peer import require_ptrace, tp_agree
 
 logger = logging.getLogger(__name__)
+
+
+WORK_GROUPS_ENV = "SGLANG_XPU_MONO_WORK_GROUPS"
+
+
+def apply_work_groups(device: torch.device) -> int:
+    """The work-groups of the kernels' launches: the device's (32, or the Xe
+    cores of a smaller Xe2 GPU such as the Arc Pro B60's 20), or
+    ``SGLANG_XPU_MONO_WORK_GROUPS`` (20 .. 32; e.g. 20 on an Arc Pro B70 to run
+    the kernels of a 20-core GPU). Set it the same on every rank."""
+    value = os.environ.get(WORK_GROUPS_ENV, "").strip()
+    if value:
+        q35.force_work_groups(int(value))
+    n = q35.work_groups(device)
+    if n < 32:
+        logger.info(
+            "XPU monokernel: %d work-groups a kernel (the kernels of a GPU with "
+            "fewer than 32 Xe cores: functional, not tuned)",
+            n,
+        )
+    return n
 
 
 def _require(ok, message: str):
@@ -117,6 +139,7 @@ class MonoQwen35:
         self.budget = memory.apply(dev)  # before SGLang sizes its pools
         self.deadline = deadline_s(context.deadline_s)
         require_ptrace(group)
+        apply_work_groups(dev)
         self.ws = q35.Qwen35Workspace(
             group.device_group.group_name, len(self.layers), dev, self.deadline
         )
@@ -267,6 +290,7 @@ class MonoQwen35MTP:
         dev = next(model.parameters()).device
         self.deadline = deadline_s(context.deadline_s)
         require_ptrace(group)
+        apply_work_groups(dev)
         self.ws = q35.Qwen35Workspace(
             group.device_group.group_name, 2, dev, self.deadline
         )

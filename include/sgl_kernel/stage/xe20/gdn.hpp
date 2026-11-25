@@ -54,7 +54,7 @@ inline void load_conv_b(e16* csl, ConvOf conv_of, const int (&chs)[NR], int h, i
 // GDN layer
 template <class Tr, typename DT, bool SPLIT = false>
 inline void gdn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Scratch& S, const Split& X = Split{}) {
-  const int wg = it.get_group(0);
+  const int wg = (SPLIT && X.vwg >= 0) ? X.vwg : (int)it.get_group(0);
   const int lid = it.get_local_linear_id();
   sycl::sub_group sg = it.get_sub_group();
   const int s = sg.get_group_linear_id();
@@ -281,7 +281,7 @@ inline void gdn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Sc
 template <class Tr, int NB, typename DT, bool SPLIT = false>
 inline void gdn_layer_b(
     sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Scratch& S, const ScratchB& SB, const Split& X = Split{}) {
-  const int wg = it.get_group(0);
+  const int wg = (SPLIT && X.vwg >= 0) ? X.vwg : (int)it.get_group(0);
   const int lid = it.get_local_linear_id();
   sycl::sub_group sg = it.get_sub_group();
   const int s = sg.get_group_linear_id();
@@ -549,7 +549,7 @@ inline void gdn_layer_s(
     sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Scratch& S, const ScratchB& SB, const Split& X = Split{}) {
   constexpr int NRQ = NB / T;
   static_assert(NRQ * T == NB && T >= 2, "spec verify: NB = requests x tokens");
-  const int wg = it.get_group(0);
+  const int wg = (SPLIT && X.vwg >= 0) ? X.vwg : (int)it.get_group(0);
   const int lid = it.get_local_linear_id();
   sycl::sub_group sg = it.get_sub_group();
   const int s = sg.get_group_linear_id();

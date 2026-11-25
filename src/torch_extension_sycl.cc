@@ -819,6 +819,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("qwen35_supported", c10::DispatchKey::BackendSelect, &qwen35_supported);
   m.def("qwen35_max_context() -> int");
   m.impl("qwen35_max_context", c10::DispatchKey::BackendSelect, &qwen35_max_context);
+  m.def("qwen35_work_groups(int device) -> int");
+  m.impl("qwen35_work_groups", c10::DispatchKey::BackendSelect, &qwen35_work_groups);
+  m.def("qwen35_force_work_groups(int n) -> ()");
+  m.impl("qwen35_force_work_groups", c10::DispatchKey::BackendSelect, &qwen35_force_work_groups);
   m.def("qwen35_sizes() -> int[]");
   m.impl("qwen35_sizes", c10::DispatchKey::BackendSelect, &qwen35_sizes);
   m.def("qwen35_mailbox_never() -> int");

@@ -33,7 +33,7 @@ inline void tail(
     const sycl::uint4 (&prt_s)[Tr::SHR / 4],
     const Split& X = Split{}) {
   const uint32_t mtag = uc_load32(S.cnt + MBT) + 1u;  // rows-1 mailbox region
-  const int wg = it.get_group(0);
+  const int wg = (SPLIT && X.vwg >= 0) ? X.vwg : (int)it.get_group(0);
   const int lid = it.get_local_linear_id();
   sycl::sub_group sg = it.get_sub_group();
   const int s = sg.get_group_linear_id();
@@ -361,7 +361,7 @@ inline void tail_b(
     const Split& X = Split{}) {
   const uint32_t mtag = uc_load32(S.cnt + mb_tag<NB>()) + 1u;  // this configuration's mailbox region and tag
   constexpr size_t MB0 = mb_region<Tr, NB>(), MB1 = mb_region<Tr, NB>() + (size_t)NB * Tr::HID / 2;
-  const int wg = it.get_group(0);
+  const int wg = (SPLIT && X.vwg >= 0) ? X.vwg : (int)it.get_group(0);
   const int lid = it.get_local_linear_id();
   sycl::sub_group sg = it.get_sub_group();
   const int s = sg.get_group_linear_id();

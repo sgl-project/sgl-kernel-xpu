@@ -1,5 +1,5 @@
 """The XPU monokernel spec of Qwen3.5 / Qwen3.6 MoE 35B-A3B (block-FP8, TP2 on
-two Xe2 GPUs with 32 Xe cores): decode steps of 1, 2, 3, 4, 6 or 8 rows, and
+two Xe2 GPUs with at least 20 Xe cores): decode steps of 1, 2, 3, 4, 6 or 8 rows, and
 MTP target-verify steps of those widths (EAGLE / NEXTN, top-1 chains of 2, 3,
 4, 6 or 8 tokens a request), run one mono kernel per decoder layer, and the
 MTP drafter's draft decode steps run a prologue kernel and an attention layer
@@ -200,7 +200,7 @@ def model_disable_reasons(model: torch.nn.Module, hf_config: Any, copies: dict) 
         ]
     device = next(model.parameters()).device
     if not qwen35_decode.is_supported(device):
-        return [f"{device} is not an Xe2 GPU with at least 32 Xe cores"]
+        return [f"{device} is not an Xe2 GPU with at least 20 Xe cores"]
     from .runtime import layer_modules
 
     reasons = []
@@ -226,7 +226,7 @@ def build(model, hf_config, context):
 
 SPEC = MonoSpec(
     name="qwen3_5_moe_35b_a3b_fp8",
-    devices={"xe2": DeviceLimits(widths=WIDTHS, tp_sizes=(2,), resident_blocks=32)},
+    devices={"xe2": DeviceLimits(widths=WIDTHS, tp_sizes=(2,), resident_blocks=20)},
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16", "float16"}),
@@ -259,7 +259,7 @@ def mtp_model_disable_reasons(
         ]
     device = next(model.parameters()).device
     if not qwen35_decode.is_supported(device):
-        return [f"{device} is not an Xe2 GPU with at least 32 Xe cores"]
+        return [f"{device} is not an Xe2 GPU with at least 20 Xe cores"]
     from .runtime import is_attention, layer_modules
 
     try:
@@ -293,7 +293,7 @@ def build_mtp(model, hf_config, context):
 # request, EAGLE / NEXTN top-1 chains) run the prologue and attention kernels.
 MTP_SPEC = MonoSpec(
     name="qwen3_5_moe_35b_a3b_fp8_mtp",
-    devices={"xe2": DeviceLimits(widths=WIDTHS, tp_sizes=(2,), resident_blocks=32)},
+    devices={"xe2": DeviceLimits(widths=WIDTHS, tp_sizes=(2,), resident_blocks=20)},
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     requires=SPEC.requires,
     numerics=SPEC.numerics,

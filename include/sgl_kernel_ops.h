@@ -1768,6 +1768,8 @@ std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_table(
  */
 bool qwen35_supported(int64_t device);
 int64_t qwen35_max_context();
+int64_t qwen35_work_groups(int64_t device);
+void qwen35_force_work_groups(int64_t n);
 std::vector<int64_t> qwen35_sizes();
 int64_t qwen35_mailbox_never();
 std::vector<at::Tensor> qwen35_prepare_layer(bool attn, const std::vector<at::Tensor>& tensors);

@@ -499,7 +499,7 @@ def test_metadata_must_be_unit_stride_xpu_vectors(which):
 @requires_mono
 def test_the_layers_device_serves_calls_while_another_is_current():
     if torch.xpu.device_count() < 2 or not mono_available(1):
-        pytest.skip("needs two Xe2 GPUs with 32 Xe cores")
+        pytest.skip("needs two Xe2 GPUs with at least 20 Xe cores")
     gen = torch.Generator().manual_seed(11)
     dev1 = torch.device("xpu:1")
     with torch.xpu.device(0):  # xpu:0 is current, the layer lives on xpu:1
@@ -899,6 +899,37 @@ def test_mtp_prologue_tags_are_per_row_count():
     assert tags() == [65533 + 4] * 6
 
 
+@requires_mono
+def test_mtp_prologue_on_20_work_groups():
+    """The MTP prologue of a 20-core GPU (Arc Pro B60: the 32 work-groups'
+    parts on 20 work-groups) gives bitwise the 32-work-group output, for every
+    row count and both dtypes (needs a GPU with 32 Xe cores for the reference)."""
+    q35 = _q35()
+    if q35.work_groups(torch.device(DEVICE)) < 32:
+        pytest.skip("needs a GPU with 32 Xe cores for the reference")
+    for dtype in (F16, BF16):
+        gen = torch.Generator().manual_seed(31)
+        fc = (torch.randn(2048, 4096, generator=gen) * 0.02).to(dtype).to(DEVICE)
+        ne = (torch.randn(2048, generator=gen) * 0.1).to(dtype).to(DEVICE)
+        nh = (torch.randn(2048, generator=gen) * 0.1).to(dtype).to(DEVICE)
+        pro = LocalLayers(DEVICE, [("mtp", [fc, ne, nh])], rank=1)
+        for nb in MTP_WIDTHS:
+            e = torch.randn(nb, 2048, generator=gen).to(dtype).to(DEVICE)
+            h = (torch.randn(nb, 2048, generator=gen) * 3).to(dtype).to(DEVICE)
+            outs = []
+            for wgs in (0, 20):
+                q35.force_work_groups(wgs)
+                try:
+                    out = torch.empty_like(e)
+                    assert pro.mtp(0, e, h, out)
+                    torch.xpu.synchronize()
+                finally:
+                    q35.force_work_groups(0)
+                outs.append(out.cpu())
+            assert outs[0].float().abs().max() > 0
+            assert torch.equal(outs[0], outs[1]), f"{dtype} {nb} rows"
+
+
 STACK = ("gdn", "attn", "gdn")
 
 
@@ -990,14 +1021,23 @@ SPLIT_CASES = [
 
 
 @requires_mono
+@pytest.mark.parametrize("wgs", [32, 20])
 @pytest.mark.parametrize("nb,tokens,dtype", SPLIT_CASES)
-def test_split_modes_bitwise(nb, tokens, dtype):
+def test_split_modes_bitwise(nb, tokens, dtype, wgs):
     """Modes 1 (one kernel a segment, in-kernel all-reduces) and 2 (the
     all-reduces by the caller on ar, here the loopback sum ar + ar) give bitwise
     the outputs, caches and per-call counters of mode 0 for a GatedDeltaNet,
     attention, GatedDeltaNet stack, over two consecutive steps (the second one
-    runs on the counters and states the first left)."""
+    runs on the counters and states the first left).
+
+    wgs 20: the kernels of a GPU with 20 Xe cores (Arc Pro B60), which run the
+    32 work-groups' parts on 20 work-groups: on a GPU with 32 Xe cores, their
+    modes 0, 1 and 2 against the 32-work-group mode 0; on a 20-core GPU (no
+    32-work-group launch), modes 1 and 2 against its mode 0."""
     q35 = _q35()
+    native = q35.work_groups(torch.device(DEVICE))
+    if wgs > native:
+        pytest.skip(f"the device runs {native} work-groups")
     nreq = nb // tokens
     gen = torch.Generator().manual_seed(700 + nb * 10 + tokens)
     ps = 64
@@ -1080,8 +1120,12 @@ def test_split_modes_bitwise(nb, tokens, dtype):
     for x in ref[0]:
         assert torch.isfinite(x.float()).all()
         assert x.float().abs().max() > 0  # all-zero outputs are not a result
-    for mode in (1, 2):
-        got = run(mode)
+    q35.force_work_groups(0 if wgs == native else wgs)
+    try:
+        runs = [(mode, run(mode)) for mode in ((1, 2) if wgs == native else (0, 1, 2))]
+    finally:
+        q35.force_work_groups(0)
+    for mode, got in runs:
         for j, (x, y) in enumerate(zip(ref[0], got[0])):
             assert torch.equal(
                 x, y

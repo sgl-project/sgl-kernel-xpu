@@ -199,6 +199,9 @@ enum SplitSeg : int {
 struct Split {
   int seg = SEG_ALL;
   float* ar = nullptr;  // mode 2: [rows][HID] fp32, the values to all-reduce / all-reduced
+  // >= 0: the work-group this call runs as (a launch with fewer work-groups
+  // than NWG runs the NWG work-groups' parts in turn); -1: the launch's own
+  int vwg = -1;
 };
 // The segment guards are written out as (!SPLIT || X.seg == k), and mode 2's
 // as (SPLIT && X.ar): with SPLIT false the compiler folds them while it emits

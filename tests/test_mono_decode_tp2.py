@@ -248,6 +248,31 @@ def _worker(rank, path, conn):
         mtp_case(f"mtp{nb}", nb, torch.bfloat16)
     mtp_case("mtp2_fp16", 2, torch.float16)
 
+    # the kernels of a GPU with 20 Xe cores (Arc Pro B60): the 32 work-groups'
+    # parts on 20 work-groups, modes 0 / 1 / 2 and the MTP prologue, compared
+    # with the 32-work-group results above (on a GPU with 32 Xe cores)
+    native = q35.work_groups(torch.device(dev))
+    out["native_wgs"] = native
+    if native >= 32:
+        q35.force_work_groups(20)
+        try:
+            for case, attn, nb, tokens, dtype in SPLIT_TP2:
+                for mode in (0, 1, 2):
+                    layer_case(
+                        f"{case}_w20_m{mode}",
+                        attn,
+                        nb,
+                        tokens=tokens,
+                        dtype=dtype,
+                        reps=2,
+                        mode=mode,
+                    )
+            for nb in (1, 3, 8):
+                mtp_case(f"mtp{nb}_w20", nb, torch.bfloat16)
+            mtp_case("mtp2_fp16_w20", 2, torch.float16)
+        finally:
+            q35.force_work_groups(0)
+
     # fail-stop: no wait gave up so far; then rank 1's tags skip ahead, so
     # neither rank ever sees the words it waits for: both give up within the
     # deadline, record it, and a later call exits at once (sticky)
@@ -391,6 +416,33 @@ def test_fail_stop(pair):
             word = int(health[6]) & 0xFFFFFFFF
             assert (word - own) & 0xFFFFFFFF < nbytes, hex(word)
             assert int(health[7]) & 0xFFFFFFFF == cnt & 0xFFFFFFFF
+
+
+@requires_two_cards
+@pytest.mark.parametrize("case", [c[0] for c in SPLIT_TP2])
+def test_20_work_groups_tp2(pair, case):
+    """The kernels of a GPU with 20 Xe cores (Arc Pro B60), run on 20
+    work-groups of a 32-core GPU: modes 0, 1 and 2 give bitwise the
+    32-work-group mode 0 outputs on both ranks."""
+    if pair[0]["native_wgs"] < 32:
+        pytest.skip("needs GPUs with 32 Xe cores for the reference")
+    for r in pair:
+        ho, ro = r[f"{case}_m0"]
+        for mode in (0, 1, 2):
+            h2, r2 = r[f"{case}_w20_m{mode}"]
+            assert torch.equal(ho, h2), f"20 work-groups, mode {mode}: hid_out"
+            assert torch.equal(ro, r2), f"20 work-groups, mode {mode}: res_out"
+
+
+@requires_two_cards
+@pytest.mark.parametrize("case", ["mtp1", "mtp3", "mtp8", "mtp2_fp16"])
+def test_mtp_prologue_20_work_groups_tp2(pair, case):
+    """The MTP prologue of a 20-core GPU at TP2: bitwise the 32-work-group
+    output on both ranks."""
+    if pair[0]["native_wgs"] < 32:
+        pytest.skip("needs GPUs with 32 Xe cores for the reference")
+    for r in pair:
+        assert torch.equal(r[case][0], r[f"{case}_w20"][0])
 
 
 @requires_two_cards

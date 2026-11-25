@@ -181,7 +181,7 @@ inline void zero_v_tail(const Ptrs& P, int64_t tile, int r0, int dh, int lane) {
 
 template <class Tr, typename DT, bool SPLIT = false>
 inline void attn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Scratch& S, const Split& X = Split{}) {
-  const int wg = it.get_group(0);
+  const int wg = (SPLIT && X.vwg >= 0) ? X.vwg : (int)it.get_group(0);
   const int lid = it.get_local_linear_id();
   sycl::sub_group sg = it.get_sub_group();
   const int s = sg.get_group_linear_id();
@@ -523,8 +523,8 @@ inline void attn_chunks_b(
     const int (&coff)[NB + 1],
     bool dyn,
     int ach,
-    RqOf rq) {
-  const int wg = it.get_group(0);
+    RqOf rq,
+    int wg) {
   sycl::sub_group sg = it.get_sub_group();
   const int s = sg.get_group_linear_id();
   const int lane = sg.get_local_linear_id();
@@ -710,7 +710,7 @@ inline bool attn_schedule(const int (&lcs)[NB], int (&coff)[NB + 1], int& ach) {
 template <class Tr, int NB, typename DT, bool SPLIT = false>
 inline void attn_layer_b(
     sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Scratch& S, const ScratchB& SB, const Split& X = Split{}) {
-  const int wg = it.get_group(0);
+  const int wg = (SPLIT && X.vwg >= 0) ? X.vwg : (int)it.get_group(0);
   const int lid = it.get_local_linear_id();
   sycl::sub_group sg = it.get_sub_group();
   const int s = sg.get_group_linear_id();
@@ -795,7 +795,7 @@ inline void attn_layer_b(
     wg_bar(grp);
   }
   if ((!SPLIT || X.seg == SEG_F2)) {
-    attn_chunks_b<Tr, NB, DT>(it, slm, P, S, SB, lcs, coff, dyn, ach, [](int b) { return b; });
+    attn_chunks_b<Tr, NB, DT>(it, slm, P, S, SB, lcs, coff, dyn, ach, [](int b) { return b; }, wg);
     // ---- gate / k / v rows (80 per WG: 5 tiles x 4 K slices, SGs 0..19)
     {
       sycl::uint4 wg4[32];
@@ -987,7 +987,7 @@ template <class Tr, int NB, int T, typename DT, bool SPLIT = false>
 inline void attn_layer_s(
     sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Scratch& S, const ScratchB& SB, const Split& X = Split{}) {
   static_assert(NB % T == 0 && T >= 2, "spec verify: NB = requests x tokens");
-  const int wg = it.get_group(0);
+  const int wg = (SPLIT && X.vwg >= 0) ? X.vwg : (int)it.get_group(0);
   const int lid = it.get_local_linear_id();
   sycl::sub_group sg = it.get_sub_group();
   const int s = sg.get_group_linear_id();
@@ -1069,7 +1069,7 @@ inline void attn_layer_s(
     wg_bar(grp);
   }
   if ((!SPLIT || X.seg == SEG_F2)) {
-    attn_chunks_b<Tr, NB, DT>(it, slm, P, S, SB, lcs, coff, dyn, ach, [](int b) { return b / T; });
+    attn_chunks_b<Tr, NB, DT>(it, slm, P, S, SB, lcs, coff, dyn, ach, [](int b) { return b / T; }, wg);
     // ---- gate / k / v rows (80 per WG: 5 tiles x 4 K slices, SGs 0..19)
     {
       sycl::uint4 wg4[32];

@@ -48,6 +48,8 @@ limitations under the License.
 #include <vector>
 
 #include "../../../Utils.h"
+#include "b60/launch.hpp"
+#include "b60/mtp.hpp"
 #include "launch.hpp"
 #include "mtp.hpp"
 #include "sgl_kernel_ops.h"  // the ops, exported
@@ -68,7 +70,16 @@ namespace sgl_mono {
   extern template bool launch_gdn_verify_split<DT>(                                                                  \
       sycl::queue&, int, int, const Ptrs&, const Scratch&, const ScratchB&, const Split&);                           \
   extern template bool launch_attn_verify_split<DT>(                                                                 \
-      sycl::queue&, int, int, const Ptrs&, const Scratch&, const ScratchB&, const Split&);
+      sycl::queue&, int, int, const Ptrs&, const Scratch&, const ScratchB&, const Split&);                           \
+  extern template bool b60_launch_gdn<DT>(                                                                           \
+      sycl::queue&, int, int, const Ptrs&, const Scratch&, const ScratchB&, const Split&, const Segs&);              \
+  extern template bool b60_launch_attn<DT>(                                                                          \
+      sycl::queue&, int, int, const Ptrs&, const Scratch&, const ScratchB&, const Split&, const Segs&);              \
+  extern template bool b60_launch_gdn_verify<DT>(                                                                    \
+      sycl::queue&, int, int, int, const Ptrs&, const Scratch&, const ScratchB&, const Split&, const Segs&);         \
+  extern template bool b60_launch_attn_verify<DT>(                                                                   \
+      sycl::queue&, int, int, int, const Ptrs&, const Scratch&, const ScratchB&, const Split&, const Segs&);         \
+  extern template bool b60_launch_mtp<DT>(sycl::queue&, int, int, const Ptrs&, const Scratch&, int);
 MONO_EXTERN_LAUNCHERS(half)
 MONO_EXTERN_LAUNCHERS(bf16)
 #undef MONO_EXTERN_LAUNCHERS
@@ -84,29 +95,46 @@ using sgl_mono::ScratchB;
 using sgl_mono::Split;
 
 // -----------------------------------------------------------------------------
-// device check: Xe2 (Battlemage) with at least 32 Xe cores. The layer kernels
-// keep 32 work-groups resident, one per Xe core, that wait on each other: a
-// part with fewer Xe cores (BMG-G21: 20; Arc Pro B65) cannot run them.
-constexpr int kResidentWorkGroups = sgl_mono::NWG;
+// device check: Xe2 (Battlemage) with at least 20 Xe cores. A launch keeps one
+// work-group a Xe core resident, and the work-groups wait on each other: with
+// 32 or more Xe cores (Arc Pro B70) the layer kernels run their NWG = 32
+// work-groups; with 20 to 31 (Arc Pro B60: 20) the b60/ kernels run the 32
+// work-groups' parts on as many work-groups as there are Xe cores.
+constexpr int kMinWorkGroups = 20;
 
-bool supported_device(at::DeviceIndex d) {
-  if (!is_bmg(d)) return false;
+int xe_cores_of(at::DeviceIndex d) {
+  if (!is_bmg(d)) return 0;
   const auto& dev = c10::xpu::get_raw_device(d);
-  const int xe_cores = dev.get_info<sycl::ext::intel::info::device::gpu_slices>() *
-                       dev.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
-  return xe_cores >= kResidentWorkGroups;
+  return dev.get_info<sycl::ext::intel::info::device::gpu_slices>() *
+         dev.get_info<sycl::ext::intel::info::device::gpu_subslices_per_slice>();
+}
+
+int xe_cores(int64_t device) {                      // cached; 0: not an Xe2 GPU
+  static std::array<std::atomic<int>, 64> known{};  // 0 unknown, else cores + 1
+  const at::DeviceIndex d = device < 0 ? c10::xpu::current_device() : (at::DeviceIndex)device;
+  if (d < 0 || d >= (at::DeviceIndex)known.size()) return xe_cores_of(d);
+  int v = known[d].load(std::memory_order_relaxed);
+  if (v == 0) {
+    v = xe_cores_of(d) + 1;
+    known[d].store(v, std::memory_order_relaxed);
+  }
+  return v - 1;
 }
 
 bool xe2_device(int64_t device) {
-  static std::array<std::atomic<int8_t>, 64> known{};  // 0 unknown, 1 / -1
-  const at::DeviceIndex d = device < 0 ? c10::xpu::current_device() : (at::DeviceIndex)device;
-  if (d < 0 || d >= (at::DeviceIndex)known.size()) return supported_device(d);
-  int8_t v = known[d].load(std::memory_order_relaxed);
-  if (v == 0) {
-    v = supported_device(d) ? 1 : -1;
-    known[d].store(v, std::memory_order_relaxed);
-  }
-  return v == 1;
+  return xe_cores(device) >= kMinWorkGroups;
+}
+
+// test hook (qwen35_force_work_groups): launch on this many work-groups
+// (kMinWorkGroups .. NWG) instead of the device's, e.g. 20 on a B70 to run the
+// b60/ kernels; 0: the device's
+std::atomic<int> g_force_work_groups{0};
+
+// work-groups of a launch on device d: NWG (the layer kernels) or fewer (b60/)
+int work_groups(int64_t device) {
+  const int f = g_force_work_groups.load(std::memory_order_relaxed);
+  if (f > 0) return f;
+  return std::min(xe_cores(device), (int)sgl_mono::NWG);
 }
 
 void check_device(const at::Tensor& t, const char* op) {
@@ -115,7 +143,7 @@ void check_device(const at::Tensor& t, const char* op) {
       xe2_device(t.get_device()),
       "qwen35: ",
       op,
-      ": unsupported device (the decode kernels need an Xe2 (Battlemage) GPU with at least 32 Xe cores; "
+      ": unsupported device (the decode kernels need an Xe2 (Battlemage) GPU with at least 20 Xe cores; "
       "check qwen35_supported() first).");
 }
 
@@ -472,6 +500,18 @@ int tag_word(int nb) {
     default:
       return MBT2 + 1;  // 6
   }
+}
+
+// the per-call counters of one layer kernel (its counters row lc), as the
+// one-kernel layer advances them after its last stage: the epoch and the
+// mailbox tag of the row count nb
+void advance_counters(sycl::queue& q, uint32_t* lc, int nb) {
+  using namespace sgl_mono;
+  const int tw = tag_word(nb);
+  q.single_task<class Qwen35SplitAdvanceK>([=] {
+    lc[EPOCH] += 1u;
+    lc[tw] += 1u;
+  });
 }
 
 }  // namespace
@@ -956,6 +996,64 @@ bool qwen35_decode_step(
       P.state_idx = M.state_idx;
     }
   };
+  const int pw = work_groups(dev);
+  if (pw < NWG) {
+    // fewer Xe cores than NWG (b60/): every mode runs the segments of the split
+    // plan on pw work-groups, one kernel a layer (mode 0) or a segment (modes
+    // 1 / 2; mode 2 runs plan items [i0, i1))
+    const std::vector<PlanItem> plan = split_plan(table, (int)l0, (int)l1, mode == 2);
+    size_t b = 0, e = plan.size();
+    Split X;
+    if (mode == 2) {
+      TORCH_CHECK(
+          ar.has_value() && ar->scalar_type() == at::kFloat && ar->is_contiguous() && ar->numel() >= nb * HID,
+          "qwen35: mode 2 needs ar, a contiguous fp32 [>= rows, ",
+          HID,
+          "] tensor");
+      TORCH_CHECK(0 <= i0 && i0 <= i1, "qwen35: bad plan range [", i0, ", ", i1, ")");
+      X.ar = ar->data_ptr<float>();
+      b = std::min((size_t)i0, plan.size());
+      e = std::min((size_t)i1, plan.size());
+    }
+    bool launched = false;
+    Segs G;
+    auto flush = [&](int l) -> bool {  // launches G's segments of layer l
+      if (G.n == 0) return true;
+      const LayerDesc& D = table[l];
+      Ptrs P;
+      Carved c;
+      layer_args(l, P, c);
+      bool ok;
+      if (tokens == 1)
+        ok = D.kind == K_ATTN ? (bf ? b60_launch_attn<bf16>(q, pw, (int)nb, P, c.S, c.SB, X, G)
+                                    : b60_launch_attn<sycl::half>(q, pw, (int)nb, P, c.S, c.SB, X, G))
+                              : (bf ? b60_launch_gdn<bf16>(q, pw, (int)nb, P, c.S, c.SB, X, G)
+                                    : b60_launch_gdn<sycl::half>(q, pw, (int)nb, P, c.S, c.SB, X, G));
+      else
+        ok = D.kind == K_ATTN
+                 ? (bf ? b60_launch_attn_verify<bf16>(q, pw, (int)nb, (int)tokens, P, c.S, c.SB, X, G)
+                       : b60_launch_attn_verify<sycl::half>(q, pw, (int)nb, (int)tokens, P, c.S, c.SB, X, G))
+                 : (bf ? b60_launch_gdn_verify<bf16>(q, pw, (int)nb, (int)tokens, P, c.S, c.SB, X, G)
+                       : b60_launch_gdn_verify<sycl::half>(q, pw, (int)nb, (int)tokens, P, c.S, c.SB, X, G));
+      G.n = 0;
+      // every kind has the same shapes: only the first launch can refuse
+      TORCH_CHECK(ok || !launched, "qwen35: a shape refused after the first launch");
+      launched |= ok;
+      return ok;
+    };
+    for (size_t i = b; i < e; ++i) {
+      const PlanItem& it = plan[i];
+      if (it.seg == ITEM_AR) continue;
+      if (it.seg == ITEM_ADVANCE) {
+        if (!flush(it.l)) return false;
+        advance_counters(q, cnt + it.l * CNT_WORDS, (int)nb);
+        continue;
+      }
+      G.seg[G.n++] = it.seg;
+      if (mode != 0 && !flush(it.l)) return false;
+    }
+    return true;
+  }
   if (mode == 0) {
     for (int64_t l = l0; l < l1; ++l) {
       const LayerDesc& D = table[l];
@@ -1007,12 +1105,7 @@ bool qwen35_decode_step(
     const PlanItem& it = plan[i];
     if (it.seg == ITEM_AR) continue;
     if (it.seg == ITEM_ADVANCE) {  // the per-call counters, as the one-kernel layer advances them
-      uint32_t* lc = cnt + it.l * CNT_WORDS;
-      const int tw = tag_word((int)nb);
-      q.single_task<class Qwen35SplitAdvanceK>([=] {
-        lc[EPOCH] += 1u;
-        lc[tw] += 1u;
-      });
+      advance_counters(q, cnt + it.l * CNT_WORDS, (int)nb);
       continue;
     }
     const LayerDesc& D = table[it.l];
@@ -1098,7 +1191,33 @@ bool qwen35_mtp_prologue(
       carve(workspace.data_ptr(), reinterpret_cast<uint32_t*>(counters.data_ptr<int32_t>()), D.mbox, D.peer);
   const c10::DeviceGuard guard(embed.device());
   sycl::queue& q = c10::xpu::getCurrentXPUStream(dev).queue();
+  const int pw = work_groups(dev);
+  if (pw < NWG)
+    return D.bf ? b60_launch_mtp<bf16>(q, pw, (int)nb, P, c.S, D.rank)
+                : b60_launch_mtp<sycl::half>(q, pw, (int)nb, P, c.S, D.rank);
   return D.bf ? launch_mtp<bf16>(q, (int)nb, P, c.S, D.rank) : launch_mtp<sycl::half>(q, (int)nb, P, c.S, D.rank);
+}
+
+// The work-groups a launch on `device` has: 32 (the layer kernels; >= 32 Xe
+// cores) or the Xe cores of a smaller part (20 on an Arc Pro B60; the b60/
+// kernels run the 32 work-groups' parts in turn).
+int64_t qwen35_work_groups(int64_t device) {
+  return work_groups(device);
+}
+
+// Test hook: launch every kernel on n work-groups (20 .. 32) whatever the
+// device has, e.g. 20 on an Arc Pro B70 to run the kernels of a 20-core part;
+// 0: the device's. Between steps (the kernels of one step must agree).
+void qwen35_force_work_groups(int64_t n) {
+  TORCH_CHECK(
+      n == 0 || (n >= kMinWorkGroups && n <= sgl_mono::NWG),
+      "qwen35_force_work_groups: n must be 0 or ",
+      kMinWorkGroups,
+      " .. ",
+      sgl_mono::NWG,
+      ", got ",
+      n);
+  g_force_work_groups.store((int)n, std::memory_order_relaxed);
 }
 
 // Test hook (fault injection): shifts one kernel's mailbox tags on this rank

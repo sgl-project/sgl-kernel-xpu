@@ -23,11 +23,28 @@ def is_available() -> bool:
 
 def is_supported(device: torch.device) -> bool:
     """Whether the kernels run on ``device``: an Xe2 (Battlemage) GPU with at
-    least 32 Xe cores (the 32 work-groups of a layer kernel stay resident)."""
+    least 20 Xe cores. A launch keeps one work-group a Xe core resident: 32 on
+    a GPU with 32 or more Xe cores (Arc Pro B70), else one a Xe core (Arc Pro
+    B60: 20), each running the parts of several of the 32 (functional, not
+    tuned)."""
     if not is_available() or device.type != "xpu":
         return False
     index = device.index if device.index is not None else torch.xpu.current_device()
     return bool(_ops.qwen35_supported(index))
+
+
+def work_groups(device: torch.device) -> int:
+    """The work-groups of a launch on ``device`` (32, or the Xe cores of a
+    smaller Xe2 GPU; see force_work_groups)."""
+    index = device.index if device.index is not None else torch.xpu.current_device()
+    return int(_ops.qwen35_work_groups(index))
+
+
+def force_work_groups(n: int) -> None:
+    """Test hook: launch every kernel on ``n`` work-groups (20 .. 32), e.g. 20
+    on an Arc Pro B70 to run the kernels of a 20-core GPU; 0: the device's.
+    Process-wide; set it the same on both ranks, between steps."""
+    _ops.qwen35_force_work_groups(int(n))
 
 
 def max_context() -> int:

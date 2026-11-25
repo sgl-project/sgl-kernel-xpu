@@ -23,9 +23,9 @@ def mono_available(device: int = 0) -> bool:
 
 requires_mono = pytest.mark.skipif(
     not mono_available(),
-    reason="needs the qwen35 decode kernels and an Xe2 GPU with 32 Xe cores",
+    reason="needs the qwen35 decode kernels and an Xe2 GPU with at least 20 Xe cores",
 )
 requires_two_cards = pytest.mark.skipif(
     not (mono_available(0) and mono_available(1)),
-    reason="needs two Xe2 GPUs with 32 Xe cores",
+    reason="needs two Xe2 GPUs with at least 20 Xe cores",
 )

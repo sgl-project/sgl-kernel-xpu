@@ -164,8 +164,8 @@ inline void gdn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Sc
       acc += xnew * cwt[3];
       qk[lid] = rnd<DT>(acc / (1.f + sycl::exp(-acc)));
       // conv state <- (s1, s2, x): q/k channels by the (even h, c = 0) WG of the
-      // k head, v channels by the owner
-      if (lid >= 256 || ((h & 1) == 0 && c == 0)) {
+      // k head (split: in the T1 segment, see there), v channels by the owner
+      if (lid >= 256 || (!SPLIT && (h & 1) == 0 && c == 0)) {
         e16* cp = conv + (size_t)cch * cst_ch;
         cp[0] = cst[1];
         cp[1] = cst[2];
@@ -253,6 +253,18 @@ inline void gdn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Sc
   // -------------------------
   if (!SPLIT || X.seg == SEG_T1 || X.seg == SEG_T1A || X.seg == SEG_T1B) {
     wait_for(it, S.cnt + C_B * 16, Tr::NWG * call);
+    if constexpr (SPLIT) {
+      // the q/k conv windows, read at F2's start by the k head's 4 WGs: one
+      // kernel orders the reads before the write by C_A; split, the write waits
+      // for C_B (every WG's F2 done)
+      if ((X.seg == SEG_T1 || X.seg == SEG_T1A) && lid < 256 && (h & 1) == 0 && c == 0) {
+        e16* cp = conv + (size_t)cch * cst_ch;
+        const e16 t1 = cp[1], t2 = cp[2];
+        cp[0] = t1;
+        cp[1] = t2;
+        st16<DT>(cp, 2, (float)S.qkv[cch]);
+      }
+    }
     const sycl::vec<half, 4> o4 = *reinterpret_cast<const sycl::vec<half, 4>*>(S.core + lid * 4);
     const sycl::vec<half, 4> z4 = *reinterpret_cast<const sycl::vec<half, 4>*>(S.zbuf + lid * 4);
     float ss = 0.f;
@@ -428,7 +440,7 @@ inline void gdn_layer_b(
         acc += f32<DT>(c2.u) * cwt[2];
         acc += xnew * cwt[3];
         qk[b * 384 + lid] = rnd<DT>(acc / (1.f + sycl::exp(-acc)));
-        if (lid >= 256 || ((h & 1) == 0 && c == 0)) {
+        if (lid >= 256 || (!SPLIT && (h & 1) == 0 && c == 0)) {  // (split q/k: T1)
           e16* cv = conv_of(b) + (size_t)cch * chs[b];
           cv[0] = c1;
           cv[1] = c2;
@@ -513,6 +525,18 @@ inline void gdn_layer_b(
   // --- S3: gated RMSNorm (all heads, all rows) -> perm A tiles ; tail --------
   if (!SPLIT || X.seg == SEG_T1 || X.seg == SEG_T1A || X.seg == SEG_T1B) {
     wait_for(it, S.cnt + C_B * 16, Tr::NWG * call);
+    if constexpr (SPLIT) {  // the q/k conv windows (see gdn_layer)
+      if ((X.seg == SEG_T1 || X.seg == SEG_T1A) && lid < 256 && (h & 1) == 0 && c == 0) {
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+          e16* cv = conv_of(b) + (size_t)cch * chs[b];
+          const e16 t1 = cv[1], t2 = cv[2];
+          cv[0] = t1;
+          cv[1] = t2;
+          st16<DT>(cv, 2, (float)SB.qkv[b * Tr::CONVD + cch]);
+        }
+      }
+    }
     sycl::vec<half, 4> o4[NB], z4[NB];
 #pragma unroll
     for (int b = 0; b < NB; ++b) {
@@ -695,7 +719,9 @@ inline void gdn_layer_s(
           acc += win[t + 3] * cwt[3];
           qk[(b * T + t) * 384 + lid] = rnd<DT>(acc / (1.f + sycl::exp(-acc)));
         }
-        if (lid >= 256 || ((h & 1) == 0 && c == 0)) {  // the windows: taps 1, 2, then the T inputs
+        // the windows: taps 1, 2, then the T inputs (to inter_conv, not the conv
+        // state read above: no order needed between the k head's 4 WGs)
+        if (lid >= 256 || ((h & 1) == 0 && c == 0)) {
           e16* ln = P.inter_conv + (size_t)islot(b) * P.inter_conv_stride + (size_t)cch * P.inter_conv_cstride;
 #pragma unroll
           for (int j = 0; j < T + 2; ++j)

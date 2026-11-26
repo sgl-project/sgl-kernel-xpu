@@ -434,6 +434,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 #if SYCL_INTEL_TARGET == 20
   m.def("fp8_w8a16_mm_xe20(Tensor! output, Tensor input, Tensor weight, Tensor weight_scale, Tensor? bias) -> ()");
   m.impl("fp8_w8a16_mm_xe20", torch::kXPU, &fp8_w8a16_mm_xe20);
+  m.def(
+      "int8_scaled_mm(Tensor mat_a, Tensor mat_b, Tensor scales_a, Tensor scales_b, ScalarType out_dtype, Tensor? "
+      "bias=None) -> Tensor");
+  m.impl("int8_scaled_mm", torch::kXPU, &int8_scaled_mm);
 #endif  // SYCL_INTEL_TARGET == 20
 
   m.def("merge_state_v2(Tensor v_a, Tensor s_a, Tensor v_b, Tensor s_b, Tensor! v_merged, Tensor! s_merged) -> ()");

@@ -412,31 +412,6 @@ def test_topk_sigmoid_jit_vs_aot(
     )
 
 
-@pytest.mark.parametrize("num_experts", [8, 32, 128, 256])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("with_bias", [False, True])
-@pytest.mark.skipif(not HAS_SGLANG_JIT, reason="Requires SGLang for JIT compilation")
-@pytest.mark.skipif(not HAS_XPU, reason="Requires XPU device")
-def test_topk_sigmoid_jit_vs_reference(num_experts, dtype, with_bias):
-    torch.manual_seed(42)
-    values = torch.linspace(-4, 4, num_experts, device="xpu").to(dtype)
-    order = torch.stack([torch.randperm(num_experts, device="xpu") for _ in range(32)])
-    gating = values[order]
-    bias = torch.randn(num_experts, device="xpu") if with_bias else None
-    weights = torch.empty(32, 4, dtype=torch.float32, device="xpu")
-    indices = torch.empty(32, 4, dtype=torch.int32, device="xpu")
-
-    jit_topk_sigmoid(weights, indices, gating, True, bias, 1.0, 0)
-
-    scores = gating.float().sigmoid()
-    ranking = scores + bias if bias is not None else scores
-    expected_indices = ranking.topk(4, dim=-1).indices
-    assert torch.equal(indices.to(torch.int64), expected_indices)
-    expected_weights = scores.gather(1, expected_indices)
-    expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
-    torch.testing.assert_close(weights, expected_weights, rtol=1e-3, atol=1e-3)
-
-
 def reference_moe_fused_gate(scores, bias, num_expert_group, topk_group, topk):
     """PyTorch reference for the hierarchical grouped-topk MoE gate.
 

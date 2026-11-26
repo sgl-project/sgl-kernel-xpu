@@ -4,6 +4,7 @@ deadline, the fail-stop watch that turns a failed in-kernel wait into a server
 stop, and the spec's configuration checks."""
 
 import threading
+import time
 import types
 
 import pytest
@@ -350,3 +351,49 @@ def test_require_ptrace_refuses_without_ptrace(monkeypatch):
         peer.require_ptrace(group)  # every rank can: no error
     finally:
         dist.destroy_process_group()
+
+
+def test_failure_watch_reports_when_describing_fails():
+    # the watch is the only fail-stop of a replayed graph: an error while
+    # describing the failure must not kill it silently
+    words = torch.zeros(16, dtype=torch.int32)
+    words[0] = 1
+    stopped = []
+    w = failure.FailureWatch(
+        words,
+        0,
+        2.0,
+        lambda a: 1 / 0,
+        on_failure=lambda: stopped.append(1),
+        poll_s=0.01,
+    )
+    for _ in range(200):
+        if stopped:
+            break
+        time.sleep(0.01)
+    w.close()
+    assert stopped and "describing it failed" in w.message
+
+
+def test_counter_wait_failure_is_described():
+    words = [1, 1, 0, 64, 32, 0, 1, 0x1234, 0, 0, 1, 0, 0, 0, 0, 0]
+    m = failure.describe(words, 1, 2.0, lambda a: "layer 3")
+    assert (
+        "other work-groups of this card in layer 3" in m and "counter B: 32 of 64" in m
+    )
+    words[10] = 0  # a mailbox wait
+    assert "a wait for the peer card in layer 3" in failure.describe(
+        words, 1, 2.0, lambda a: "layer 3"
+    )
+
+
+def test_bad_environment_values_name_the_variable(monkeypatch):
+    monkeypatch.setenv(failure.DEADLINE_ENV, "2s")
+    with pytest.raises(ValueError, match=failure.DEADLINE_ENV):
+        failure.deadline_s()
+    monkeypatch.setenv(memory.RESERVE_ENV, "one")
+    with pytest.raises(ValueError, match=memory.RESERVE_ENV):
+        memory.reserve_gib()
+    monkeypatch.setenv(failure.FAULT_ENV, "0-60")
+    with pytest.raises(ValueError, match=failure.FAULT_ENV):
+        failure.schedule_fault(0, 0, None)

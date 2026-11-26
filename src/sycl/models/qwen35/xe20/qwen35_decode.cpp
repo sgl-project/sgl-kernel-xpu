@@ -806,9 +806,16 @@ void qwen35_bind_attn_caches(at::Tensor& desc, const at::Tensor& k, const at::Te
 }
 
 // Counters and health words of a device: zeroes them and links every
-// counters row to the health words, the health words to their host copy
+// counters row to the health words, to the peer's health words (peer_health:
+// the peer rank's copy mapped on this device, e.g. symmetric memory; none: the
+// peer is not told of a failure), the health words to their host copy
 // (pinned), and sets the wait deadline. Enqueued on the current stream.
-void qwen35_init_counters(at::Tensor& counters, at::Tensor& health, at::Tensor& health_host, double deadline_s) {
+void qwen35_init_counters(
+    at::Tensor& counters,
+    at::Tensor& health,
+    at::Tensor& health_host,
+    double deadline_s,
+    const std::optional<at::Tensor>& peer_health) {
   using namespace sgl_mono;
   check_device(counters, "qwen35_init_counters");
   const int dev = counters.get_device();
@@ -826,6 +833,17 @@ void qwen35_init_counters(at::Tensor& counters, at::Tensor& health, at::Tensor& 
       H_WORDS,
       "] host tensor");
   TORCH_CHECK(deadline_s > 0.0 && deadline_s <= 600.0, "qwen35: deadline_s must be in (0, 600], got ", deadline_s);
+  uint64_t php = 0;
+  if (peer_health.has_value()) {
+    const at::Tensor& ph = *peer_health;
+    TORCH_CHECK(
+        ph.is_xpu() && ph.scalar_type() == at::kInt && ph.is_contiguous() && ph.numel() == H_WORDS,
+        "qwen35: peer_health must be an int32 [",
+        H_WORDS,
+        "] XPU tensor (the peer's health words mapped on this device)");
+    php = reinterpret_cast<uint64_t>(ph.data_ptr());
+    TORCH_CHECK(php % 8 == 0 && reinterpret_cast<uint64_t>(health.data_ptr()) != php, "qwen35: bad peer_health");
+  }
   const int64_t n = counters.size(0);
   at::Tensor c = at::zeros({n, CNT_WORDS}, at::TensorOptions().dtype(at::kInt));
   const uint64_t hp = reinterpret_cast<uint64_t>(health.data_ptr());
@@ -834,6 +852,7 @@ void qwen35_init_counters(at::Tensor& counters, at::Tensor& health, at::Tensor& 
     int32_t* cw = c.data_ptr<int32_t>() + i * CNT_WORDS;
     std::memcpy(cw + HEALTH_PTR, &hp, 8);
     std::memcpy(cw + DEADLINE, &dl, 8);
+    std::memcpy(cw + PEER_HEALTH_PTR, &php, 8);
   }
   at::Tensor h = at::zeros({H_WORDS}, at::TensorOptions().dtype(at::kInt));
   const uint64_t hh = reinterpret_cast<uint64_t>(health_host.data_ptr());
@@ -1233,6 +1252,12 @@ void qwen35_fault_inject(at::Tensor& counters, int64_t delta) {
   const c10::DeviceGuard guard(counters.device());
   sycl::queue& q = c10::xpu::getCurrentXPUStream(counters.get_device()).queue();
   q.single_task<class Qwen35FaultInjectK>([=] {
+    if (arrivals) {  // the stage arrival counters fall behind the epoch: the waits
+                     // for them never complete (the tickets and the epoch stay)
+      for (int c : {C_A, C_B, C_C, C_O, C_GU})
+        cnt[c * 16] -= d;
+      return;
+    }
     for (int i = 0; i < 4; ++i)
       cnt[MBT + i] += d;  // rows 1, 2, 4, 8
     for (int i = 0; i < 2; ++i)

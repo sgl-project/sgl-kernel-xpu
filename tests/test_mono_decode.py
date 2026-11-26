@@ -8,6 +8,8 @@ checks and a multi-layer launch. The kernels run through the caller-owned
 interface (torch.ops.sgl_kernel.qwen35_*): a CPU layer table, a loopback mailbox,
 workspace and counters row a kernel (mono_decode_fixtures.LocalLayers)."""
 
+import time
+
 import pytest
 import torch
 from mono_decode_utils import (
@@ -1136,3 +1138,61 @@ def test_split_modes_bitwise(nb, tokens, dtype, wgs):
                     x, y
                 ), f"mode {mode}: layer {i} ({STACK[i]}) cache {j}"
         assert torch.equal(ref[2], got[2]), f"mode {mode}: counters"
+
+
+@requires_mono
+@pytest.mark.parametrize("wgs", [32, 20])
+@pytest.mark.parametrize("attn", [False, True])
+def test_work_group_wait_gives_up(attn, wgs):
+    """A wait for the other work-groups of the card (their arrivals on a stage
+    counter) has the mailbox waits' deadline: when the arrivals never come
+    (here the kernel's arrival counters are set back, as when not all
+    work-groups are resident) it gives up instead of hanging, records which counter, and a
+    later call exits at once."""
+    from sgl_kernel.monokernel import failure
+
+    q35 = _q35()
+    native = q35.work_groups(torch.device(DEVICE))
+    if wgs > native:
+        pytest.skip(f"the device runs {native} work-groups")
+    gen = torch.Generator().manual_seed(91 + attn)
+    nb = 1
+    if attn:
+        pt, seq, slot, pos, nslots = _attn_case(gen, [100], 64)
+        t = attn_tensors(gen, DEVICE, BF16)
+        caches = list(kv_caches(gen, DEVICE, nslots, BF16))
+        meta = (pos.to(DEVICE), pt.to(DEVICE), seq.to(DEVICE), slot.to(DEVICE))
+    else:
+        t = gdn_tensors(gen, DEVICE, BF16)
+        caches = list(gdn_caches(gen, DEVICE, 2, BF16))
+        z = torch.zeros(nb, dtype=torch.int64, device=DEVICE)
+        meta = (z, torch.ones(nb, dtype=torch.int32, device=DEVICE))
+    layer = LocalLayers(DEVICE, [("attn" if attn else "gdn", t)], deadline_s=0.5)
+    layer.bind(0, caches, 64)
+    h, r = rows(nb, gen, DEVICE, BF16)
+    health = layer.state.health
+    q35.force_work_groups(0 if wgs == native else wgs)
+    try:
+        _run(layer, h, r, *meta)
+        torch.xpu.synchronize()
+        assert int(health[0].cpu()) == 0
+        torch.ops.sgl_kernel.qwen35_fault_inject(layer.counters(0), 1 << 20, True)
+        times = []
+        for _ in range(2):
+            t0 = time.monotonic()
+            _run(layer, h, r, *meta)
+            torch.xpu.synchronize()
+            times.append(time.monotonic() - t0)
+    finally:
+        q35.force_work_groups(0)
+    w = health.cpu()
+    assert int(w[0]) == 1 and int(w[1]) >= 1, w
+    assert int(w[10]) == 1 and int(w[6]) == 0, w  # a counter wait, C_A (first stage)
+    cnt = layer.counters(0).data_ptr() & 0xFFFFFFFF
+    assert int(w[7]) & 0xFFFFFFFF == cnt
+    host = layer.state.health_host
+    assert int(host[0]) == 1 and int(host[10]) == 1
+    assert times[0] < 15, f"the first call gave up after {times[0]:.1f} s"
+    assert times[1] < 5, f"a call after the failure took {times[1]:.1f} s"
+    message = failure.describe(w.tolist(), 0, 0.5, lambda a: "layer 0")
+    assert "other work-groups" in message and "counter A" in message, message

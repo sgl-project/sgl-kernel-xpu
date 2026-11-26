@@ -53,7 +53,7 @@ inline void mtp_prologue_b60(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, c
     signal(it, S.cnt + C_A * 16);
   }
 
-  wait_for(it, S.cnt + C_A * 16, NWG * call);
+  wait_for(it, S.cnt, C_A, NWG * call);
   if (w == 0 && lid == 0) {  // every work-group has read the epoch and the tag
     cnt_ref(S.cnt[EPOCH]).store(call);
     cnt_ref(S.cnt[MTPT + mtp_idx<NB>()]).store(mtag);

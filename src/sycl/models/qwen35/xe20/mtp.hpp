@@ -89,7 +89,7 @@ inline void mtp_prologue(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const
 
   // ---- norms of every row -> z = [norm_e(e); norm_h(h)] (DT values in fp16)
   // in SLM
-  wait_for(it, S.cnt + C_A * 16, NWG * call);
+  wait_for(it, S.cnt, C_A, NWG * call);
   if (wg == 0 && lid == 0) {  // every WG has read the epoch and the mailbox tag
     cnt_ref(S.cnt[EPOCH]).store(call);
     cnt_ref(S.cnt[MTPT + mtp_idx<NB>()]).store(mtag);

@@ -28,9 +28,9 @@ constexpr int MBT = EPOCH + 4, MBT2 = EPOCH + 16;
 constexpr int MTPT = EPOCH + 18;
 // the mailbox control block (stage p2p_mailbox.hpp): the address of the
 // device's health words (mono_health, written at registration and read only by
-// a wait that is taking long), the wait deadline (mono_set_deadline), the
-// peer's health words (reserved: the host does not set them yet, so the
-// peer's own wait gives up at its deadline) and this layer's mailbox region
+// a wait that is taking long), the wait deadline, the peer's health words (a
+// wait that gives up flags the peer's FAILED there, so the peer's waits give
+// up at once) and this layer's mailbox region
 constexpr int CTL = EPOCH + 28;
 constexpr int HEALTH_PTR = CTL + CTL_HEALTH_PTR, DEADLINE = CTL + CTL_DEADLINE;
 constexpr int PEER_HEALTH_PTR = CTL + CTL_PEER_HEALTH_PTR, MBOX_PTR = CTL + CTL_MBOX_PTR;
@@ -163,6 +163,40 @@ inline uint64_t mb_wait(const uint64_t* mine, uint32_t tag, const uint32_t* cnt)
 }
 inline void mb_ar2(uint64_t* peer, uint64_t* mine, float& v0, float& v1, uint32_t tag, const uint32_t* cnt) {
   mailbox_ar2<CTL>(peer, mine, v0, v1, tag, cnt);
+}
+
+constexpr uint32_t SPIN_POLLS = 1u << 14;
+// Wait for `target` arrivals (signal) on counter ci (C_A ...) of the layer's
+// counters cnt. The consumer polls with a relaxed load; the producer's release
+// is the fence in signal() and the release RMW. After the loop the polling
+// work-item takes one device-scope acquire fence, and the work-group barrier
+// then orders the data for the rest of the work-group (the fence synchronizes
+// with the producer's release, the barrier with the other threads;
+// happens-before is transitive). One fence a WG lowers to one L1 invalidate; a
+// fence in every thread would invalidate once per thread and delay the
+// hand-off more. Measured against the same wait without the fence on two B70
+// (bf16, 8 rotating layer copies, A B A B twice): GDN layers 0 us, attention
+// layers of 1 row +0.9 us (1K context) / +1.3 us (32K context), i.e. +0.8 %
+// each, 8 rows and the verify kernels within 1 us: about 0.2 % of a decode step.
+// The counters and targets wrap at 2^32 (32 producers a call: after 2^27
+// calls of a layer), so compare the signed difference. A wait still polling
+// after SPIN_POLLS polls goes on with the mailbox waits' deadline
+// (counter_wait_slow): when not all
+// work-groups are resident it gives up (the step's outputs are NaN through the
+// failed device's mailbox waits) instead of hanging.
+inline void wait_for(sycl::nd_item<1> it, uint32_t* cnt, int ci, uint32_t target) {
+  if (it.get_local_linear_id() == 0) {
+    // the plain poll loop first: a hand-off takes far fewer polls. The
+    // deadline costs up to 3.6 us a layer on two B70 (attention 2 rows 1K;
+    // 1 row: 0.5 to 1.5 us, GatedDeltaNet 0.8 us), against the wait without it
+    for (uint32_t n = 0; (int32_t)(cnt_ref(cnt[ci * 16]).load(sycl::memory_order::relaxed) - target) < 0;)
+      if (__builtin_expect(++n == SPIN_POLLS, 0)) {
+        counter_wait_slow<CTL>(cnt, ci, target);
+        break;
+      }
+    sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
+  }
+  sycl::group_barrier(it.get_group());
 }
 
 // ----------------------------------------------------------------------------

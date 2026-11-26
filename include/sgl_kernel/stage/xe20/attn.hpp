@@ -255,7 +255,7 @@ inline void attn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const S
   // ---------------- S2: q norm + RoPE, attention split along the context -----
   // (split: the merge segment needs the normalized q too)
   if (!SPLIT || X.seg == SEG_F2 || X.seg == SEG_F3) {
-    wait_for(it, S.cnt + C_A * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_A, Tr::NWG * call);
     if (s < Tr::NQ) head_norm_rope<Tr, DT>(sg, lane, S.qkv_raw + s * 512, P.q_norm_w, rope, qs + s * Tr::HD, nullptr);
     wg_bar(grp);
   }
@@ -405,7 +405,7 @@ inline void attn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const S
   // ---------------- S3: merge partials + new token, gate ; WG = (head, 64
   // dims) -----------------
   if ((!SPLIT || X.seg == SEG_F3)) {
-    wait_for(it, S.cnt + C_B * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_B, Tr::NWG * call);
     {
       const int hh = (wg * 64) / Tr::HD, d0 = (wg * 64) % Tr::HD;
       float* mrg = reinterpret_cast<float*>(slm + Tr::A_AO);  // [32][64]
@@ -467,7 +467,7 @@ inline void attn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const S
   // ---------------- S4: o (all heads) -> SLM ; tail
   // -------------------------------------------
   if (!SPLIT || X.seg == SEG_T1 || X.seg == SEG_T1A || X.seg == SEG_T1B) {
-    wait_for(it, S.cnt + C_C * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_C, Tr::NWG * call);
     for (int k = lid; k < Tr::NQ * Tr::HD; k += Tr::WGS)
       store_perm(xp, k, S.attn_out[k]);
     wg_bar(grp);
@@ -780,7 +780,7 @@ inline void attn_layer_b(
   // -> partials (global)
   // (split: the merge segment needs the normalized q too)
   if (!SPLIT || X.seg == SEG_F2 || X.seg == SEG_F3) {
-    wait_for(it, S.cnt + C_A * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_A, Tr::NWG * call);
     for (int p = s; p < NB * Tr::NQ; p += Tr::NSG) {  // (row, head) per SG
       const int b = p / Tr::NQ, hh = p % Tr::NQ;
       q_norm_rope_b<Tr, DT>(
@@ -831,7 +831,7 @@ inline void attn_layer_b(
   // ---- S3: per row: new k (norm + RoPE) / v, K / V write (WG 0), merge the
   // row's chunk partials + the new token, gate
   if ((!SPLIT || X.seg == SEG_F3)) {
-    wait_for(it, S.cnt + C_B * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_B, Tr::NWG * call);
     {
       const int hh = wg >> 2, d0 = (wg & 3) * 64;
       if (s < NB) {
@@ -962,7 +962,7 @@ inline void attn_layer_b(
 
   // ---- S4: o (all heads, all rows) -> perm A tiles ; tail
   if (!SPLIT || X.seg == SEG_T1 || X.seg == SEG_T1A || X.seg == SEG_T1B) {
-    wait_for(it, S.cnt + C_C * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_C, Tr::NWG * call);
     if (wg == 0 && lid < NB) cnt_ref(S.cnt[ATK + lid]).store(0u);  // every pair is done with the tickets
 #pragma unroll
     for (int b = 0; b < NB; ++b) {
@@ -1054,7 +1054,7 @@ inline void attn_layer_s(
   // -> partials (global)
   // (split: the merge segment needs the normalized q too)
   if (!SPLIT || X.seg == SEG_F2 || X.seg == SEG_F3) {
-    wait_for(it, S.cnt + C_A * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_A, Tr::NWG * call);
     for (int p = s; p < NB * Tr::NQ; p += Tr::NSG) {  // (row, head) per SG
       const int b = p / Tr::NQ, hh = p % Tr::NQ;
       q_norm_rope_b<Tr, DT>(
@@ -1105,7 +1105,7 @@ inline void attn_layer_s(
   // ---- S3: per row: new k (norm + RoPE) / v, K / V write (WG 0), merge the
   // row's chunk partials + the request's new tokens, gate
   if ((!SPLIT || X.seg == SEG_F3)) {
-    wait_for(it, S.cnt + C_B * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_B, Tr::NWG * call);
     {
       const int hh = wg >> 2, d0 = (wg & 3) * 64;
       if (s < NB) {
@@ -1250,7 +1250,7 @@ inline void attn_layer_s(
 
   // ---- S4: o (all heads, all rows) -> perm A tiles ; tail
   if (!SPLIT || X.seg == SEG_T1 || X.seg == SEG_T1A || X.seg == SEG_T1B) {
-    wait_for(it, S.cnt + C_C * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_C, Tr::NWG * call);
     if (wg == 0 && lid < NB) cnt_ref(S.cnt[ATK + lid]).store(0u);  // every pair is done with the tickets
 #pragma unroll
     for (int b = 0; b < NB; ++b) {

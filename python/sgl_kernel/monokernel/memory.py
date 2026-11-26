@@ -22,6 +22,8 @@ from typing import Any, Optional
 
 import torch
 
+from .failure import env_number
+
 logger = logging.getLogger(__name__)
 
 RESERVE_ENV = "SGLANG_XPU_MONO_VRAM_RESERVE_GIB"
@@ -49,10 +51,9 @@ CAP_MARGIN_GIB = 0.25
 
 
 def reserve_gib() -> float:
-    value = os.environ.get(RESERVE_ENV)
-    gib = float(value) if value else DEFAULT_RESERVE_GIB
+    gib = env_number(RESERVE_ENV, float, DEFAULT_RESERVE_GIB)
     if gib < 0:
-        raise ValueError(f"{RESERVE_ENV}={value}: the reserve must not be negative")
+        raise ValueError(f"{RESERVE_ENV}={gib:g}: the reserve must not be negative")
     return gib
 
 

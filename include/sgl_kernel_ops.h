@@ -1784,7 +1784,12 @@ void qwen35_bind_gdn_caches(
     const std::optional<at::Tensor>& inter_ssm,
     const std::optional<at::Tensor>& inter_conv);
 void qwen35_bind_attn_caches(at::Tensor& desc, const at::Tensor& k, const at::Tensor& v, int64_t page_size);
-void qwen35_init_counters(at::Tensor& counters, at::Tensor& health, at::Tensor& health_host, double deadline_s);
+void qwen35_init_counters(
+    at::Tensor& counters,
+    at::Tensor& health,
+    at::Tensor& health_host,
+    double deadline_s,
+    const std::optional<at::Tensor>& peer_health);
 bool qwen35_decode_step(
     int64_t mode,
     int64_t i0,
@@ -1813,6 +1818,6 @@ bool qwen35_mtp_prologue(
     at::Tensor& workspace,
     at::Tensor& counters);
 std::vector<int64_t> qwen35_split_ar_slots(const at::Tensor& layers, int64_t l0, int64_t l1);
-void qwen35_fault_inject(at::Tensor& counters, int64_t delta);
+void qwen35_fault_inject(at::Tensor& counters, int64_t delta, bool arrivals);
 
 #pragma GCC visibility pop

@@ -131,7 +131,7 @@ inline void tail(
 
   // ---------------- S5': reduce the partials (fixed order): rs, x2, logits,
   // shared slice, gate -----
-  wait_for(it, S.cnt + c_o * 16, Tr::NWG * call);
+  wait_for(it, S.cnt, c_o, Tr::NWG * call);
   float* lgs = reinterpret_cast<float*>(L.ao + 512);  // 256 logits
   {
     float ss = 0.f;
@@ -269,7 +269,7 @@ inline void tail(
 
   // ---------------- S7: down for this WG's 64 rows ; all-reduce #2
   // -----------------------------
-  wait_for(it, S.cnt + C_GU * 16, Tr::NWG * call);
+  wait_for(it, S.cnt, C_GU, Tr::NWG * call);
   if (!SPLIT && wg == 0 && lid == 0) {  // every WG has read the epoch and the tag (split: split_advance)
     cnt_ref(S.cnt[EPOCH]).store(call);
     cnt_ref(S.cnt[MBT]).store(mtag);
@@ -479,7 +479,7 @@ inline void tail_b(
   if (SPLIT && (!SPLIT || X.seg == SEG_T1 || X.seg == SEG_T1A || X.seg == SEG_T1B)) return;
 
   // --- S5': reduce the partials (fixed order) per row ------------------------
-  wait_for(it, S.cnt + c_o * 16, Tr::NWG * call);
+  wait_for(it, S.cnt, c_o, Tr::NWG * call);
   if (lid < NB) {
     float ss = 0.f, ga = 0.f;
 #pragma unroll
@@ -718,7 +718,7 @@ inline void tail_b(
         ld_rows<4>(wb7[t][ct], brow(j, ct));
     }
   }
-  wait_for(it, S.cnt + C_GU * 16, Tr::NWG * call);
+  wait_for(it, S.cnt, C_GU, Tr::NWG * call);
 #pragma unroll
   for (int t = S7PRE; t < 4; ++t) {
     const int j = s + Tr::NSG * t;

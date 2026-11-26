@@ -90,8 +90,11 @@ class Qwen35Workspace:
         self.n = n_mailboxes
         self.mailbox_words = s["mailbox_words"]
         words = n_mailboxes * self.mailbox_words
+        hw = s["health_words"]
+        # the mailboxes, then the health words (the peer's waits flag a failure
+        # in them)
         self._buf = _SymmetricMemory.empty_strided_p2p(
-            (words * 8,), [1], torch.uint8, device, group_name
+            (words * 8 + hw * 4,), [1], torch.uint8, device, group_name
         )
         self._handle = _SymmetricMemory.rendezvous(self._buf, group_name)
         if self._handle.world_size != 2:
@@ -105,7 +108,10 @@ class Qwen35Workspace:
         self.counters = torch.zeros(
             (n_mailboxes, s["counter_words"]), dtype=torch.int32, device=device
         )
-        self.health = torch.zeros(s["health_words"], dtype=torch.int32, device=device)
+        self.health = self._handle.get_buffer(self.rank, (hw,), torch.int32, words * 2)
+        self.peer_health = self._handle.get_buffer(
+            1 - self.rank, (hw,), torch.int32, words * 2
+        )
         self.health_host = torch.zeros(
             s["health_words"], dtype=torch.int32
         ).pin_memory()
@@ -115,7 +121,11 @@ class Qwen35Workspace:
         self.deadline_s = float(deadline_s)
         self._own.fill_(qwen35_mailbox_never())
         _ops.qwen35_init_counters(
-            self.counters, self.health, self.health_host, self.deadline_s
+            self.counters,
+            self.health,
+            self.health_host,
+            self.deadline_s,
+            self.peer_health,
         )
         # the peer may write into the mailboxes only after they were filled
         torch.xpu.synchronize(self.device)
@@ -262,9 +272,14 @@ def qwen35_mtp_prologue(
     )
 
 
-def qwen35_fault_inject(ws: Qwen35Workspace, row: int, delta: int = 7) -> None:
-    """Test hook: shifts kernel ``row``'s mailbox tags on this rank."""
-    _ops.qwen35_fault_inject(ws.counters[row], delta)
+def qwen35_fault_inject(
+    ws: Qwen35Workspace, row: int, delta: int = 7, arrivals: bool = False
+) -> None:
+    """Test hook: shifts kernel ``row``'s mailbox tags on this rank (the peer's
+    waits and then this rank's give up), or with ``arrivals`` sets its stage
+    arrival counters back (its waits for this card's other work-groups give
+    up)."""
+    _ops.qwen35_fault_inject(ws.counters[row], delta, arrivals)
 
 
 def stack_descs(descs: List[torch.Tensor]) -> torch.Tensor:

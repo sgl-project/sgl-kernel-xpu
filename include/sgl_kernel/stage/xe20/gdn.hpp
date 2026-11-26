@@ -155,7 +155,7 @@ inline void gdn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Sc
 
   // ---------------- S2: conv1d + SiLU, L2 norm, gated delta rule -------------
   if ((!SPLIT || X.seg == SEG_F2)) {
-    wait_for(it, S.cnt + C_A * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_A, Tr::NWG * call);
     if (lid < 320) {
       const float xnew = (float)S.qkv[cch];
       float acc = ld16<DT>(cst, 0) * cwt[0];
@@ -252,7 +252,7 @@ inline void gdn_layer(sycl::nd_item<1> it, uint8_t* slm, const Ptrs& P, const Sc
   // ---------------- S3: gated RMSNorm (all heads) -> o in SLM ; tail
   // -------------------------
   if (!SPLIT || X.seg == SEG_T1 || X.seg == SEG_T1A || X.seg == SEG_T1B) {
-    wait_for(it, S.cnt + C_B * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_B, Tr::NWG * call);
     if constexpr (SPLIT) {
       // the q/k conv windows, read at F2's start by the k head's 4 WGs: one
       // kernel orders the reads before the write by C_A; split, the write waits
@@ -429,7 +429,7 @@ inline void gdn_layer_b(
 
   // --- S2: conv1d + SiLU, L2 norm, gated delta rule, all rows ----------------
   if ((!SPLIT || X.seg == SEG_F2)) {
-    wait_for(it, S.cnt + C_A * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_A, Tr::NWG * call);
     if (lid < 320) {
 #pragma unroll
       for (int b = 0; b < NB; ++b) {
@@ -524,7 +524,7 @@ inline void gdn_layer_b(
 
   // --- S3: gated RMSNorm (all heads, all rows) -> perm A tiles ; tail --------
   if (!SPLIT || X.seg == SEG_T1 || X.seg == SEG_T1A || X.seg == SEG_T1B) {
-    wait_for(it, S.cnt + C_B * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_B, Tr::NWG * call);
     if constexpr (SPLIT) {  // the q/k conv windows (see gdn_layer)
       if ((X.seg == SEG_T1 || X.seg == SEG_T1A) && lid < 256 && (h & 1) == 0 && c == 0) {
 #pragma unroll
@@ -700,7 +700,7 @@ inline void gdn_layer_s(
   // --- S2: conv1d over each request's window (all tokens at once), gated delta
   // rule in token order ---
   if ((!SPLIT || X.seg == SEG_F2)) {
-    wait_for(it, S.cnt + C_A * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_A, Tr::NWG * call);
     if (lid < 320) {
 #pragma unroll
       for (int b = 0; b < NRQ; ++b) {
@@ -809,7 +809,7 @@ inline void gdn_layer_s(
 
   // --- S3: gated RMSNorm (all heads, all rows) -> perm A tiles ; tail --------
   if (!SPLIT || X.seg == SEG_T1 || X.seg == SEG_T1A || X.seg == SEG_T1B) {
-    wait_for(it, S.cnt + C_B * 16, Tr::NWG * call);
+    wait_for(it, S.cnt, C_B, Tr::NWG * call);
     sycl::vec<half, 4> o4[NB], z4[NB];
 #pragma unroll
     for (int b = 0; b < NB; ++b) {

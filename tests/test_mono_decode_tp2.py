@@ -6,7 +6,8 @@ rank; each case is its own one-row layer table on mailbox and counters row i):
   shards gives bitwise the same outputs (the all-reduces add the two partial
   sums; a rank reading its own partial instead of the peer's would not be
   symmetric);
-* fail-stop: a stalled peer fails both ranks within the deadline.
+* fail-stop: a stalled peer fails both ranks within the deadline; the rank
+  that gives up first tells the peer.
 """
 
 import io
@@ -308,6 +309,16 @@ def _worker(rank, path, conn):
         own.numel() * own.element_size(),
         ws.counters[i].data_ptr(),
     )
+    # the peer is told: rank 0 gives up at 0.5 s and flags rank 1's health
+    # words (symmetric memory), so rank 1 gives up long before its own
+    # deadline (4 s: below the driver's 5 s job timeout)
+    ws.set_deadline(0.5 if rank == 0 else 4.0)
+    if rank == 1:
+        q35.qwen35_fault_inject(ws, i, 7)
+    t0 = time.monotonic()
+    assert step(i, k, hs, rs, ho, ro, zero.long(), state_idx=zero)
+    torch.xpu.synchronize()
+    out["peer_told"] = (health.cpu().clone(), time.monotonic() - t0)
     buf = io.BytesIO()  # bytes: the process may exit before the tensors are
     torch.save(out, buf)  # read back from shared memory
     conn.send(buf.getvalue())
@@ -416,6 +427,17 @@ def test_fail_stop(pair):
             word = int(health[6]) & 0xFFFFFFFF
             assert (word - own) & 0xFFFFFFFF < nbytes, hex(word)
             assert int(health[7]) & 0xFFFFFFFF == cnt & 0xFFFFFFFF
+
+
+@requires_two_cards
+def test_peer_is_told_of_a_failure(pair):
+    """The rank whose wait gives up first flags the peer's health words (in
+    symmetric memory): the peer's waits give up at once, not at their own
+    deadline."""
+    (h0, t0), (h1, t1) = pair[0]["peer_told"], pair[1]["peer_told"]
+    assert int(h0[0]) == 1 and int(h0[2]) == 0, h0  # rank 0 timed out itself
+    assert int(h1[0]) == 1 and int(h1[2]) == 1, h1  # rank 1 was told
+    assert t1 < 2.5, f"rank 1 gave up after {t1:.1f} s (its own deadline is 4 s)"
 
 
 @requires_two_cards

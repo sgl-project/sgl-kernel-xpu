@@ -838,7 +838,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("qwen35_bind_gdn_caches", torch::kXPU, &qwen35_bind_gdn_caches);
   m.def("qwen35_bind_attn_caches(Tensor(a!) desc, Tensor k, Tensor v, int page_size) -> ()");
   m.impl("qwen35_bind_attn_caches", torch::kXPU, &qwen35_bind_attn_caches);
-  m.def("qwen35_init_counters(Tensor(a!) counters, Tensor(b!) health, Tensor(c!) health_host, float deadline_s) -> ()");
+  m.def(
+      "qwen35_init_counters(Tensor(a!) counters, Tensor(b!) health, Tensor(c!) health_host, float deadline_s, "
+      "Tensor? peer_health=None) -> ()");
   m.impl("qwen35_init_counters", torch::kXPU, &qwen35_init_counters);
   m.def(
       "qwen35_decode_step(int mode, int i0, int i1, Tensor(e!)? ar, Tensor layers, int l0, int l1, Tensor hidden, "
@@ -852,7 +854,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("qwen35_mtp_prologue", torch::kXPU, &qwen35_mtp_prologue);
   m.def("qwen35_split_ar_slots(Tensor layers, int l0, int l1) -> int[]");
   m.impl("qwen35_split_ar_slots", torch::kCPU, &qwen35_split_ar_slots);
-  m.def("qwen35_fault_inject(Tensor(a!) counters, int delta) -> ()");
+  m.def("qwen35_fault_inject(Tensor(a!) counters, int delta, bool arrivals=False) -> ()");
   m.impl("qwen35_fault_inject", torch::kXPU, &qwen35_fault_inject);
 #endif  // Xe20 only Qwen3.5 decode (USE_MONO_DECODE)
 

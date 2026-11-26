@@ -1,26 +1,6 @@
-/* Copyright 2026 SGLang Team. All Rights Reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-==============================================================================*/
-
-// W8A8 INT8 scaled GEMM for Xe2 (BMG):
-//   out[M, N] = out_dtype( float32(mat_a[M, K] @ mat_b[K, N]) * scales_a[M] * scales_b[N] (+ bias[N]) )
-// Matches the SGLang CUDA sgl_kernel.int8_scaled_mm contract.
-
 #undef SYCL_INTEL_TARGET
 #define SYCL_INTEL_TARGET 20
 
-// Torch headers before CuTe: cute/util/print.hpp redefines printf.
 #include <ATen/ATen.h>
 #include <c10/core/DeviceGuard.h>
 #include <c10/xpu/XPUStream.h>
@@ -59,8 +39,7 @@ SGL_KERNEL_EXPORT torch::Tensor int8_scaled_mm(
   TORCH_CHECK(mat_b.scalar_type() == torch::kInt8, "int8_scaled_mm: mat_b must be Int8");
   TORCH_CHECK(mat_a.size(1) == mat_b.size(0), "int8_scaled_mm: mat_a and mat_b inner dimensions must match");
   TORCH_CHECK(
-      out_dtype == torch::kHalf || out_dtype == torch::kBFloat16,
-      "int8_scaled_mm: out_dtype must be Half or BFloat16");
+      out_dtype == torch::kHalf || out_dtype == torch::kBFloat16, "int8_scaled_mm: out_dtype must be Half or BFloat16");
 
   const int64_t M = mat_a.size(0);
   const int64_t K = mat_a.size(1);

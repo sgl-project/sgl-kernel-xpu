@@ -1,9 +1,7 @@
 /***************************************************************************************************
- * Copyright (C) 2026 SGLang Team. All rights reserved.
- * SPDX-License-Identifier: Apache-2.0
+ * Copyright (C) 2026 Intel Corporation, All rights reserved.
+ * SPDX-License-Identifier: BSD-3-Clause
  **************************************************************************************************/
-
-#pragma once
 
 // Dedicated W8A8 INT8 scaled GEMM for Xe2 (BMG), SYCL-TLA only
 // (CuTe tensors + Xe block-2D copy atoms + native XE_DPAS_TT<8, int32_t, int8_t>):
@@ -38,6 +36,8 @@
 // and 16-bit block-2D store (uint16_t), branching uniformly on is_bf16 only in the epilogue.
 // This halves compile time, peak compile RSS, and binary size with zero mainloop overhead.
 
+#pragma once
+
 #include <bit>
 #include <cstdint>
 #include <cute/tensor.hpp>
@@ -68,21 +68,15 @@ struct Params {
   uint16_t* out;         // [M, N] of bf16/fp16 bits, stride (ldd, 1)
   int M, N, K;
   int lda, ldb, ldd;
-  int ks_per;            // decode: k-tiles per sub-group slice
-  int dpf;               // decode: L1 prefetch distance (k-tiles)
-  bool is_bf16;          // true -> bfloat16, false -> float16
+  int ks_per;    // decode: k-tiles per sub-group slice
+  int dpf;       // decode: L1 prefetch distance (k-tiles)
+  bool is_bf16;  // true -> bfloat16, false -> float16
 };
 
 inline auto make_operands(const Params& p) {
-  Tensor A = make_tensor(
-      make_gmem_ptr(p.a),
-      make_layout(make_shape(p.M, p.K), make_stride(p.lda, _1{})));
-  Tensor B = make_tensor(
-      make_gmem_ptr(p.b),
-      make_layout(make_shape(p.N, p.K), make_stride(p.ldb, _1{})));
-  Tensor C = make_tensor(
-      make_gmem_ptr(p.out),
-      make_layout(make_shape(p.M, p.N), make_stride(p.ldd, _1{})));
+  Tensor A = make_tensor(make_gmem_ptr(p.a), make_layout(make_shape(p.M, p.K), make_stride(p.lda, _1{})));
+  Tensor B = make_tensor(make_gmem_ptr(p.b), make_layout(make_shape(p.N, p.K), make_stride(p.ldb, _1{})));
+  Tensor C = make_tensor(make_gmem_ptr(p.out), make_layout(make_shape(p.M, p.N), make_stride(p.ldd, _1{})));
   return cute::make_tuple(A, B, C);
 }
 
@@ -376,8 +370,8 @@ inline float wave_efficiency(int nwg, int wave_slots) {
   return static_cast<float>(nwg) / static_cast<float>(waves * wave_slots);
 }
 
-static void run(
-    sycl::queue& q,
+static void
+run(sycl::queue& q,
     void* out,
     const int8_t* a,
     const int8_t* b,
@@ -393,21 +387,7 @@ static void run(
     bool is_bf16) {
   if (M <= 0 || N <= 0) return;
   Params p{
-      a,
-      b,
-      scale_a,
-      scale_b,
-      bias,
-      static_cast<uint16_t*>(out),
-      M,
-      N,
-      K,
-      lda,
-      ldb,
-      ldd,
-      0,
-      kDecodePrefetch,
-      is_bf16};
+      a, b, scale_a, scale_b, bias, static_cast<uint16_t*>(out), M, N, K, lda, ldb, ldd, 0, kDecodePrefetch, is_bf16};
 
   const bool use_dec = M <= 32 || (M <= 64 && N <= 1024);
   if (use_dec) {

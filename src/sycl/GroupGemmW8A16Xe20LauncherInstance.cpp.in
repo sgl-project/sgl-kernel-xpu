@@ -33,6 +33,12 @@ void Xe20MoEGEMMW8A16Launcher(
     int* workspace,
     int ld_b_param,
     int64_t expert_stride_b_param,
+    int64_t expert_stride_s_param,
+    int scale_n_stride_param,
+    int scale_k_stride_param,
+    int64_t expert_stride_z_param,
+    int zero_n_stride_param,
+    int zero_k_stride_param,
     int scale_mode,
     int group_size,
     bool scale_is_bf16,
@@ -84,6 +90,12 @@ void Xe20MoEGEMMW8A16Launcher(
       mma,
       static_cast<int32_t>(ld_b_param),
       expert_stride_b_param,
+      expert_stride_s_param,
+      static_cast<int32_t>(scale_n_stride_param),
+      static_cast<int32_t>(scale_k_stride_param),
+      expert_stride_z_param,
+      static_cast<int32_t>(zero_n_stride_param),
+      static_cast<int32_t>(zero_k_stride_param),
       scale_mode,
       group_size,
       scale_is_bf16,
@@ -104,7 +116,9 @@ void Xe20MoEGEMMW8A16Launcher(
 template __attribute__((visibility("default"))) void Xe20MoEGEMMW8A16Launcher<
   @TILE@, @SGLAYOUT@, @IS_INT8@>(
     sycl::queue, const void*, const void*, const void*, const void*, const void*, void*,
-    const int, const int, const int*, const int, int*, int, int64_t, int, int, bool, bool, bool);
+    const int, const int, const int*, const int, int*, int, int64_t,
+    int64_t, int, int, int64_t, int, int,
+    int, int, bool, bool, bool);
 
 #ifdef SGL_W8A16_JIT_ENTRY
 extern "C" __attribute__((visibility("default"))) void sgl_moe_w8a16_entry(
@@ -122,6 +136,12 @@ extern "C" __attribute__((visibility("default"))) void sgl_moe_w8a16_entry(
     int* workspace,
     int ld_b,
     int64_t expert_stride_b,
+    int64_t expert_stride_s,
+    int scale_n_stride,
+    int scale_k_stride,
+    int64_t expert_stride_z,
+    int zero_n_stride,
+    int zero_k_stride,
     int scale_mode,
     int group_size,
     bool scale_is_bf16,
@@ -142,6 +162,12 @@ extern "C" __attribute__((visibility("default"))) void sgl_moe_w8a16_entry(
       workspace,
       ld_b,
       expert_stride_b,
+      expert_stride_s,
+      scale_n_stride,
+      scale_k_stride,
+      expert_stride_z,
+      zero_n_stride,
+      zero_k_stride,
       scale_mode,
       group_size,
       scale_is_bf16,

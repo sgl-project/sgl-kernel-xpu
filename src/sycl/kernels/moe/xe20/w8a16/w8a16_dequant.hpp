@@ -163,43 +163,26 @@ CUTE_DEVICE void int8_sym_reorder_folded(
 #if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET) && SYCL_INTEL_TARGET == 20
   const uint32_t scale_c = 0x7E000000u;
   const uint32_t shift_c = 0xBF000000u;
+  const uint16_t xor_mask = is_signed_int8 ? 0x0080u : 0x0000u;
   if constexpr (Kind == ReorderKind::UU) {
-    if (is_signed_int8) {
-      asm("{\n"
-          ".decl IN_UB v_type=G type=UB num_elts=64 alias=<%1,0>\n"
-          ".decl OUT_UW v_type=G type=UW num_elts=64 alias=<%0,0>\n"
-          "xor (M1_NM, 32) OUT_UW(0,0)<1> IN_UB(0,0)<1;1,0> 0x80:uw\n"
-          "xor (M1_NM, 32) OUT_UW(1,0)<1> IN_UB(0,32)<1;1,0> 0x80:uw\n" MOE_INT8_BF16_SYM_FOLDED_TAIL "}\n"
-          : "=rw"(dst0)
-          : "rw"(src0), "rw.u"(scale_c), "rw.u"(shift_c), "rw"(muls));
-    } else {
-      asm("{\n"
-          ".decl IN_UB v_type=G type=UB num_elts=64 alias=<%1,0>\n"
-          ".decl OUT_UW v_type=G type=UW num_elts=64 alias=<%0,0>\n"
-          "mov (M1_NM, 32) OUT_UW(0,0)<1> IN_UB(0,0)<1;1,0>\n"
-          "mov (M1_NM, 32) OUT_UW(1,0)<1> IN_UB(0,32)<1;1,0>\n" MOE_INT8_BF16_SYM_FOLDED_TAIL "}\n"
-          : "=rw"(dst0)
-          : "rw"(src0), "rw.u"(scale_c), "rw.u"(shift_c), "rw"(muls));
-    }
+    asm("{\n"
+        ".decl IN_UB v_type=G type=UB num_elts=64 alias=<%1,0>\n"
+        ".decl OUT_UW v_type=G type=UW num_elts=64 alias=<%0,0>\n"
+        ".decl XOR_UW v_type=G type=UW num_elts=1 alias=<%5,0>\n"
+        "xor (M1_NM, 32) OUT_UW(0,0)<1> IN_UB(0,0)<1;1,0> XOR_UW(0,0)<0;1,0>\n"
+        "xor (M1_NM, 32) OUT_UW(1,0)<1> IN_UB(0,32)<1;1,0> XOR_UW(0,0)<0;1,0>\n" MOE_INT8_BF16_SYM_FOLDED_TAIL "}\n"
+        : "=rw"(dst0)
+        : "rw"(src0), "rw.u"(scale_c), "rw.u"(shift_c), "rw"(muls), "rw.u"(xor_mask));
   } else {
     static_assert(Kind == ReorderKind::VV, "unsupported INT8 -> BF16 reorder kind for folded dequant");
-    if (is_signed_int8) {
-      asm("{\n"
-          ".decl IN_UB v_type=G type=UB num_elts=64 alias=<%1,0>\n"
-          ".decl OUT_UW v_type=G type=UW num_elts=64 alias=<%0,0>\n"
-          "xor (M1_NM, 32) OUT_UW(0,0)<1> IN_UB(0,0)<4;2,1> 0x80:uw\n"
-          "xor (M1_NM, 32) OUT_UW(1,0)<1> IN_UB(0,2)<4;2,1> 0x80:uw\n" MOE_INT8_BF16_SYM_FOLDED_TAIL "}\n"
-          : "=rw"(dst0)
-          : "rw"(src0), "rw.u"(scale_c), "rw.u"(shift_c), "rw"(muls));
-    } else {
-      asm("{\n"
-          ".decl IN_UB v_type=G type=UB num_elts=64 alias=<%1,0>\n"
-          ".decl OUT_UW v_type=G type=UW num_elts=64 alias=<%0,0>\n"
-          "mov (M1_NM, 32) OUT_UW(0,0)<1> IN_UB(0,0)<4;2,1>\n"
-          "mov (M1_NM, 32) OUT_UW(1,0)<1> IN_UB(0,2)<4;2,1>\n" MOE_INT8_BF16_SYM_FOLDED_TAIL "}\n"
-          : "=rw"(dst0)
-          : "rw"(src0), "rw.u"(scale_c), "rw.u"(shift_c), "rw"(muls));
-    }
+    asm("{\n"
+        ".decl IN_UB v_type=G type=UB num_elts=64 alias=<%1,0>\n"
+        ".decl OUT_UW v_type=G type=UW num_elts=64 alias=<%0,0>\n"
+        ".decl XOR_UW v_type=G type=UW num_elts=1 alias=<%5,0>\n"
+        "xor (M1_NM, 32) OUT_UW(0,0)<1> IN_UB(0,0)<4;2,1> XOR_UW(0,0)<0;1,0>\n"
+        "xor (M1_NM, 32) OUT_UW(1,0)<1> IN_UB(0,2)<4;2,1> XOR_UW(0,0)<0;1,0>\n" MOE_INT8_BF16_SYM_FOLDED_TAIL "}\n"
+        : "=rw"(dst0)
+        : "rw"(src0), "rw.u"(scale_c), "rw.u"(shift_c), "rw"(muls), "rw.u"(xor_mask));
   }
 #elif defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
 #error "W8A16 folded reorder is only supported on SYCL_INTEL_TARGET 20 (BMG/Xe20)"

@@ -103,7 +103,10 @@ struct W8A16Mainloop<
       BPackedTensor& Bp,
       const uint8_t* w_scale_bytes,
       const uint8_t* w_zero_gmem,
-      int w_scale_row_stride,
+      int w_scale_n_stride,
+      int w_scale_k_stride,
+      int w_zero_n_stride,
+      int w_zero_k_stride,
       DTensor& D,
       Coord blk_coord,
       TiledMMA mma,
@@ -234,8 +237,12 @@ struct W8A16Mainloop<
       const bool is_n_blocked_128 = (scale_mode == static_cast<int>(ScaleMode::BlockFP32));
       const bool is_mxfp8 = !IsInt8 && (scale_mode == static_cast<int>(ScaleMode::BlockMXFP8));
       const int scale_elem_bytes = is_mxfp8 ? 1 : (scale_is_bf16 ? 2 : 4);
+      const int64_t scale_k_step_bytes = static_cast<int64_t>(w_scale_k_stride) * scale_elem_bytes;
       const int reload_mask =
           (scale_mode == static_cast<int>(ScaleMode::PerChannelN)) ? 0x7FFFFFFF : (group_size / BLK_K - 1);
+
+      auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+      const bool has_zp = IsInt8 && (w_zero_gmem != nullptr);
 
       const uint8_t* scale_ptr[thr_N * channel_num];
       const uint8_t* zero_ptr[IsInt8 ? (thr_N * channel_num) : 1];
@@ -255,17 +262,15 @@ struct W8A16Mainloop<
           const int clamped_col = cute::min(col, gemm_n - 1);
           const int scale_row = is_n_blocked_128 ? (clamped_col >> 7) : clamped_col;
           scale_ptr[n * channel_num + c] =
-              w_scale_bytes + static_cast<int64_t>(scale_row) * w_scale_row_stride * scale_elem_bytes;
+              w_scale_bytes + static_cast<int64_t>(scale_row) * w_scale_n_stride * scale_elem_bytes;
           if constexpr (IsInt8) {
-            zero_ptr[n * channel_num + c] =
-                (w_zero_gmem == nullptr) ? nullptr
-                                         : (w_zero_gmem + static_cast<int64_t>(clamped_col) * w_scale_row_stride);
+            zero_ptr[n * channel_num + c] = (w_zero_gmem == nullptr)
+                                                ? nullptr
+                                                : (w_zero_gmem + static_cast<int64_t>(clamped_col) * w_zero_n_stride);
           }
         }
       }
 
-      auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
-      const bool has_zp = IsInt8 && (w_zero_gmem != nullptr);
       const uint8_t* init_scale_ptr[thr_N * channel_num];
       CUTLASS_PRAGMA_UNROLL
       for (int s = 0; s < thr_N * channel_num; ++s) {
@@ -273,60 +278,142 @@ struct W8A16Mainloop<
       }
 
       uint32_t out_of_fast_range = 0u;
-      for (int k_tile = 0, k_tile_prefetch = Stages; k_tile < k_tile_count; ++k_tile, ++k_tile_prefetch) {
-        barrier_arrive(barrier_scope);
-        copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA_packed);
-        copy(tiled_copy_b, tBgBp(_, _, _, k_tile), tBrB_packed);
+      if constexpr (!IsInt8) {
+        if (is_mxfp8 && BLK_K == 32) {
+          // Single-basic-block MXFP8 K-loop: 1 scale per K-tile (BLK_K == 32),
+          // zero intra-loop branches so IGC pipelines loads, reorder, and DPAS.
+          for (int k_tile = 0, k_tile_prefetch = Stages; k_tile < k_tile_count; ++k_tile, ++k_tile_prefetch) {
+            barrier_arrive(barrier_scope);
+            copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA_packed);
+            copy(tiled_copy_b, tBgBp(_, _, _, k_tile), tBrB_packed);
 
-        if ((k_tile & reload_mask) == 0) {
-          CUTLASS_PRAGMA_UNROLL
-          for (int n = 0; n < thr_N; ++n) {
             CUTLASS_PRAGMA_UNROLL
-            for (int c = 0; c < channel_num; ++c) {
-              const int slot = n * channel_num + c;
-              const uint8_t* sp = scale_ptr[slot];
-              scale_ptr[slot] = sp + scale_elem_bytes;
-              if constexpr (IsInt8) {
-                mul_pairs[n][c] = read_fp_scale(sp, 0, scale_is_bf16) * 256.0f;
-                if (has_zp) {
-                  const uint8_t* zp = zero_ptr[slot];
-                  zero_ptr[slot] = zp + 1;
-                  zp_pairs[n][c] = -static_cast<float>(zp[0]) * (1.0f / 256.0f);
-                }
-              } else if (is_mxfp8) {
+            for (int n = 0; n < thr_N; ++n) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int c = 0; c < channel_num; ++c) {
+                const int slot = n * channel_num + c;
+                const uint8_t* sp = scale_ptr[slot];
+                scale_ptr[slot] = sp + scale_k_step_bytes;
                 const uint32_t e8m0 = static_cast<uint32_t>(sp[0]);
                 out_of_fast_range |= static_cast<uint32_t>(e8m0 != 0xFFu && (e8m0 - 74u) > 124u);
                 const uint32_t bits = (e8m0 == 0xFFu) ? 0x7FC00000u : ((e8m0 + 56u) << 23);
                 mul_pairs[n][c] = sycl::bit_cast<float>(bits);
-              } else {
-                const float s = read_fp_scale(sp, 0, scale_is_bf16);
-                const uint32_t s_bits = sycl::bit_cast<uint32_t>(s);
-                const uint32_t exp_b = (s_bits >> 23) & 0xFFu;
-                out_of_fast_range |=
-                    static_cast<uint32_t>((s_bits & 0x7FFFFFFFu) != 0u && exp_b != 0xFFu && (exp_b - 74u) > 124u);
-                mul_pairs[n][c] = s * 0x1p56f;
+              }
+            }
+
+            if (k_tile_prefetch < k_tile_count) {
+              prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+              prefetch(prefetch_b, pBgBp(_, _, _, k_tile_prefetch));
+            }
+
+            reorder(tArA_packed, tSrA);
+            e4m3_reorder_dequant(tBrB_packed, tSrB, mul_of);
+            cute::gemm(mma, tSrA, tSrB, tCrC);
+            barrier_wait(barrier_scope);
+          }
+        } else {
+          for (int k_tile = 0, k_tile_prefetch = Stages; k_tile < k_tile_count; ++k_tile, ++k_tile_prefetch) {
+            barrier_arrive(barrier_scope);
+            copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA_packed);
+            copy(tiled_copy_b, tBgBp(_, _, _, k_tile), tBrB_packed);
+
+            if ((k_tile & reload_mask) == 0) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int n = 0; n < thr_N; ++n) {
+                CUTLASS_PRAGMA_UNROLL
+                for (int c = 0; c < channel_num; ++c) {
+                  const int slot = n * channel_num + c;
+                  const uint8_t* sp = scale_ptr[slot];
+                  scale_ptr[slot] = sp + scale_k_step_bytes;
+                  if (is_mxfp8) {
+                    const uint32_t e8m0 = static_cast<uint32_t>(sp[0]);
+                    out_of_fast_range |= static_cast<uint32_t>(e8m0 != 0xFFu && (e8m0 - 74u) > 124u);
+                    const uint32_t bits = (e8m0 == 0xFFu) ? 0x7FC00000u : ((e8m0 + 56u) << 23);
+                    mul_pairs[n][c] = sycl::bit_cast<float>(bits);
+                  } else {
+                    const float s = read_fp_scale(sp, 0, scale_is_bf16);
+                    const uint32_t s_bits = sycl::bit_cast<uint32_t>(s);
+                    const uint32_t exp_b = (s_bits >> 23) & 0xFFu;
+                    out_of_fast_range |=
+                        static_cast<uint32_t>((s_bits & 0x7FFFFFFFu) != 0u && exp_b != 0xFFu && (exp_b - 74u) > 124u);
+                    mul_pairs[n][c] = s * 0x1p56f;
+                  }
+                }
+              }
+            }
+
+            if (k_tile_prefetch < k_tile_count) {
+              prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+              prefetch(prefetch_b, pBgBp(_, _, _, k_tile_prefetch));
+            }
+
+            reorder(tArA_packed, tSrA);
+            e4m3_reorder_dequant(tBrB_packed, tSrB, mul_of);
+            cute::gemm(mma, tSrA, tSrB, tCrC);
+            barrier_wait(barrier_scope);
+          }
+        }
+      } else if (!has_zp) {
+        for (int k_tile = 0, k_tile_prefetch = Stages; k_tile < k_tile_count; ++k_tile, ++k_tile_prefetch) {
+          barrier_arrive(barrier_scope);
+          copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA_packed);
+          copy(tiled_copy_b, tBgBp(_, _, _, k_tile), tBrB_packed);
+
+          if ((k_tile & reload_mask) == 0) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < thr_N; ++n) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int c = 0; c < channel_num; ++c) {
+                const int slot = n * channel_num + c;
+                const uint8_t* sp = scale_ptr[slot];
+                scale_ptr[slot] = sp + scale_k_step_bytes;
+                mul_pairs[n][c] = read_fp_scale(sp, 0, scale_is_bf16) * 256.0f;
               }
             }
           }
-        }
 
-        if (k_tile_prefetch < k_tile_count) {
-          prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
-          prefetch(prefetch_b, pBgBp(_, _, _, k_tile_prefetch));
-        }
-
-        reorder(tArA_packed, tSrA);
-        if constexpr (IsInt8) {
-          if (has_zp) {
-            uint8_zp_reorder_dequant(tBrB_packed, tSrB, zp_of, mul_of);
-          } else {
-            int8_sym_reorder_dequant(tBrB_packed, tSrB, mul_of, is_signed_int8);
+          if (k_tile_prefetch < k_tile_count) {
+            prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+            prefetch(prefetch_b, pBgBp(_, _, _, k_tile_prefetch));
           }
-        } else {
-          e4m3_reorder_dequant(tBrB_packed, tSrB, mul_of);
+
+          reorder(tArA_packed, tSrA);
+          int8_sym_reorder_dequant(tBrB_packed, tSrB, mul_of, is_signed_int8);
+          cute::gemm(mma, tSrA, tSrB, tCrC);
+          barrier_wait(barrier_scope);
         }
-        cute::gemm(mma, tSrA, tSrB, tCrC);
-        barrier_wait(barrier_scope);
+      } else {
+        for (int k_tile = 0, k_tile_prefetch = Stages; k_tile < k_tile_count; ++k_tile, ++k_tile_prefetch) {
+          barrier_arrive(barrier_scope);
+          copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA_packed);
+          copy(tiled_copy_b, tBgBp(_, _, _, k_tile), tBrB_packed);
+
+          if ((k_tile & reload_mask) == 0) {
+            CUTLASS_PRAGMA_UNROLL
+            for (int n = 0; n < thr_N; ++n) {
+              CUTLASS_PRAGMA_UNROLL
+              for (int c = 0; c < channel_num; ++c) {
+                const int slot = n * channel_num + c;
+                const uint8_t* sp = scale_ptr[slot];
+                scale_ptr[slot] = sp + scale_k_step_bytes;
+                mul_pairs[n][c] = read_fp_scale(sp, 0, scale_is_bf16) * 256.0f;
+                const uint8_t* zp = zero_ptr[slot];
+                zero_ptr[slot] = zp + w_zero_k_stride;
+                zp_pairs[n][c] = -static_cast<float>(zp[0]) * (1.0f / 256.0f);
+              }
+            }
+          }
+
+          if (k_tile_prefetch < k_tile_count) {
+            prefetch(prefetch_a, pAgA(_, _, _, k_tile_prefetch));
+            prefetch(prefetch_b, pBgBp(_, _, _, k_tile_prefetch));
+          }
+
+          reorder(tArA_packed, tSrA);
+          uint8_zp_reorder_dequant(tBrB_packed, tSrB, zp_of, mul_of);
+          cute::gemm(mma, tSrA, tSrB, tCrC);
+          barrier_wait(barrier_scope);
+        }
       }
 
       if constexpr (!IsInt8) {
@@ -360,7 +447,7 @@ struct W8A16Mainloop<
                 for (int c = 0; c < channel_num; ++c) {
                   const int slot = n * channel_num + c;
                   const uint8_t* sp = scale_ptr[slot];
-                  scale_ptr[slot] = sp + scale_elem_bytes;
+                  scale_ptr[slot] = sp + scale_k_step_bytes;
                   int req = kShiftUnset;
                   if (is_mxfp8) {
                     const uint32_t e8m0 = static_cast<uint32_t>(sp[0]);

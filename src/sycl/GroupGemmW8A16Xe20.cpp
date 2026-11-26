@@ -36,6 +36,12 @@ __attribute__((visibility("default"))) void Xe20MoEGEMMW8A16Launcher(
     int* workspace,
     int ld_b,
     int64_t expert_stride_b,
+    int64_t expert_stride_s,
+    int scale_n_stride,
+    int scale_k_stride,
+    int64_t expert_stride_z,
+    int zero_n_stride,
+    int zero_k_stride,
     int scale_mode,
     int group_size,
     bool scale_is_bf16,
@@ -69,6 +75,12 @@ using SG_4_4_1 = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
       int*,                                                              \
       int,                                                               \
       int64_t,                                                           \
+      int64_t,                                                           \
+      int,                                                               \
+      int,                                                               \
+      int64_t,                                                           \
+      int,                                                               \
+      int,                                                               \
       int,                                                               \
       int,                                                               \
       bool,                                                              \
@@ -103,6 +115,12 @@ DECLARE_XE20_MOE_W8A16_ALL_WEIGHT_KINDS(Tile_128_128_32, SG_4_4_1)
       atomic_buffer.data_ptr<int>(),                  \
       ld_b,                                           \
       expert_stride_b,                                \
+      expert_stride_s,                                \
+      scale_n_stride,                                 \
+      scale_k_stride,                                 \
+      expert_stride_z,                                \
+      zero_n_stride,                                  \
+      zero_k_stride,                                  \
       scale_mode,                                     \
       group_size,                                     \
       scale_is_bf16,                                  \
@@ -137,7 +155,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
   const bool is_signed_int8 = (w_dtype == at::ScalarType::Char);
   TORCH_CHECK(is_fp8 || is_int8, "W8A16 weights must be float8_e4m3fn, int8, or uint8");
 
-  CHECK_INPUT(weight_scales);
+  CHECK_DEVICE(weight_scales);
   CHECK_INPUT(1, at::ScalarType::Int, total_rows_for_experts);
   TORCH_CHECK(output.device() == activations.device(), "output must be on the same device as activations");
   TORCH_CHECK(weights.device() == activations.device(), "weights must be on the same device as activations");
@@ -259,11 +277,47 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
     }
   }
 
+  auto resolve_scale_like_strides =
+      [](const torch::Tensor& t, const char* name, int64_t& expert_stride, int& n_stride, int& k_stride) {
+        if (t.dim() <= 2) {
+          TORCH_CHECK(t.is_contiguous(), "W8A16 1D/2D ", name, " must be contiguous");
+          expert_stride = t.stride(0);
+          n_stride = 1;
+          k_stride = 1;
+          return;
+        }
+        if (t.is_contiguous()) {
+          expert_stride = t.stride(0);
+          n_stride = static_cast<int>(t.stride(1));
+          k_stride = static_cast<int>(t.stride(2));
+          return;
+        }
+        TORCH_CHECK(
+            t.stride(1) == 1 && t.stride(2) >= t.size(1) && t.stride(0) >= t.size(2) * t.stride(2),
+            "W8A16 3D ",
+            name,
+            " must be K-major contiguous or N-major (stride(1) == 1), got shape ",
+            t.sizes(),
+            " and stride ",
+            t.strides());
+        expert_stride = t.stride(0);
+        n_stride = 1;
+        k_stride = static_cast<int>(t.stride(2));
+      };
+
+  int64_t expert_stride_s = 1;
+  int scale_n_stride = 1;
+  int scale_k_stride = 1;
+  resolve_scale_like_strides(weight_scales, "weight_scales", expert_stride_s, scale_n_stride, scale_k_stride);
+
   const void* zero_ptr = nullptr;
+  int64_t expert_stride_z = 0;
+  int zero_n_stride = 1;
+  int zero_k_stride = 1;
   if (weight_zeros.has_value()) {
     const auto& zp = *weight_zeros;
     TORCH_CHECK(is_int8 && !is_signed_int8, "W8A16 weight_zeros is only supported for unsigned uint8 weights");
-    CHECK_INPUT(zp);
+    CHECK_DEVICE(zp);
     TORCH_CHECK(zp.device() == activations.device(), "weight_zeros must be on the same device as activations");
     TORCH_CHECK(zp.scalar_type() == at::ScalarType::Byte, "W8A16 weight_zeros must be uint8");
     TORCH_CHECK(zp.size(0) == n_experts, "weight_zeros expert dimension mismatch");
@@ -278,6 +332,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
     } else {
       TORCH_CHECK(false, "W8A16 weight_zeros requires per-channel [E, N] or per-group [E, N, K/G] scales");
     }
+    resolve_scale_like_strides(zp, "weight_zeros", expert_stride_z, zero_n_stride, zero_k_stride);
     zero_ptr = zp.data_ptr();
   }
 
@@ -287,7 +342,12 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
 
   const int avg_m = static_cast<int>(total_m / n_experts);
   const bool weight_scale_blocked = moe_w8a16::is_block_scale_mode(scale_mode) || (zero_ptr != nullptr);
-  const bool static_scheduler = total_m <= n_experts || (!weight_scale_blocked && gemm_k <= 128);
+  const int64_t total_weight_bytes = static_cast<int64_t>(n_experts) * gemm_n * gemm_k;
+  // Static round-robin scheduling avoids atomic setup on tiny matrices, whereas
+  // dynamic work-stealing keeps workgroups packed onto 1-2 experts at a time to
+  // avoid DTLB thrashing when total expert weights exceed L2/DTLB reach.
+  const bool static_scheduler =
+      (!weight_scale_blocked && gemm_k <= 128) || (total_m <= n_experts && total_weight_bytes <= (4LL << 20));
 
   auto stream = at::xpu::getCurrentXPUStream();
   auto queue = stream.queue();
@@ -336,6 +396,12 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
           atomic_buffer.data_ptr<int>(),
           ld_b,
           expert_stride_b,
+          expert_stride_s,
+          scale_n_stride,
+          scale_k_stride,
+          expert_stride_z,
+          zero_n_stride,
+          zero_k_stride,
           group_size,
           scale_is_bf16,
           is_signed_int8,

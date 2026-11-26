@@ -1022,6 +1022,10 @@ def fused_experts(
                     f"with scalar scales (w1_scale.shape={w1_scale.shape})"
                 )
         assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
+        if not w1_scale.is_contiguous():
+            w1_scale = w1_scale.contiguous()
+        if not w2_scale.is_contiguous():
+            w2_scale = w2_scale.contiguous()
     elif use_int8_w8a16:
         assert w1.dtype in (
             torch.int8,

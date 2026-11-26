@@ -73,6 +73,12 @@ class W8A16Kernel {
     TiledMMA mma;
     int32_t ld_b;
     int64_t expert_stride_b;
+    int64_t expert_stride_s;
+    int32_t scale_n_stride;
+    int32_t scale_k_stride;
+    int64_t expert_stride_z;
+    int32_t zero_n_stride;
+    int32_t zero_k_stride;
     int32_t scale_mode;
     int32_t group_size;
     bool scale_is_bf16 = false;
@@ -116,26 +122,6 @@ class W8A16Kernel {
     const int32_t mode = params.scale_mode;
     const bool is_mxfp8 = !IsInt8 && (mode == static_cast<int32_t>(ScaleMode::BlockMXFP8));
     const int scale_elem_bytes = is_mxfp8 ? 1 : (params.scale_is_bf16 ? 2 : 4);
-    int scale_row_stride = 1;
-    int64_t expert_scale_elems = 1;
-    if (mode == static_cast<int32_t>(ScaleMode::ScalarSingle)) {
-      scale_row_stride = 1;
-      expert_scale_elems = 1;
-    } else if (mode == static_cast<int32_t>(ScaleMode::ScalarGateUp)) {
-      scale_row_stride = 2;
-      expert_scale_elems = 2;
-    } else if (mode == static_cast<int32_t>(ScaleMode::PerChannelN)) {
-      scale_row_stride = 1;
-      expert_scale_elems = N;
-    } else if (mode == static_cast<int32_t>(ScaleMode::BlockFP32)) {
-      scale_row_stride = K / FP8_GROUP_SIZE_K;
-      expert_scale_elems = static_cast<int64_t>((N + 127) / 128) * scale_row_stride;
-    } else {
-      // BlockMXFP8 (group_size=32) or GroupNK (arbitrary power-of-two group_size)
-      scale_row_stride = K / params.group_size;
-      expert_scale_elems = static_cast<int64_t>(N) * scale_row_stride;
-    }
-    const int64_t expert_zero_elems = static_cast<int64_t>(N) * scale_row_stride;
 
     int pre_rows = 0;
     int pre_tiles = 0;
@@ -153,14 +139,15 @@ class W8A16Kernel {
       int expert_id = i;
       int ld_b = params.ld_b;
       int64_t B_offset = static_cast<int64_t>(expert_id) * params.expert_stride_b;
-      int64_t S_byte_offset = static_cast<int64_t>(expert_id) * expert_scale_elems * scale_elem_bytes;
+      int64_t S_byte_offset = static_cast<int64_t>(expert_id) * params.expert_stride_s * scale_elem_bytes;
 
       uint8_t* ptr_A_curr_batch = const_cast<uint8_t*>(params.Activations) + pre_rows * K * sizeof(ElementA);
       uint8_t* ptr_B_curr_batch = const_cast<uint8_t*>(params.PackedWeights) + B_offset;
       const uint8_t* ptr_S_curr_batch = static_cast<const uint8_t*>(params.WeightScales) + S_byte_offset;
       const uint8_t* ptr_Z_curr_batch =
-          params.WeightZeros == nullptr ? nullptr
-                                        : (params.WeightZeros + static_cast<int64_t>(expert_id) * expert_zero_elems);
+          params.WeightZeros == nullptr
+              ? nullptr
+              : (params.WeightZeros + static_cast<int64_t>(expert_id) * params.expert_stride_z);
       const float* ptr_Bias_curr_batch =
           params.Bias == nullptr ? nullptr : params.Bias + static_cast<int64_t>(expert_id) * N;
 
@@ -179,7 +166,10 @@ class W8A16Kernel {
             B_tensor,
             ptr_S_curr_batch,
             ptr_Z_curr_batch,
-            scale_row_stride,
+            params.scale_n_stride,
+            params.scale_k_stride,
+            params.zero_n_stride,
+            params.zero_k_stride,
             D_tensor,
             tile_coord,
             mma,

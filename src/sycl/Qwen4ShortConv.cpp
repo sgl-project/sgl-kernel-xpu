@@ -8,6 +8,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -33,17 +34,12 @@ inline float silu(float x) {
   return x / (1.f + sycl::exp(-x));
 }
 
-template <typename T, int N>
-struct alignas(sizeof(T) * N) Pack {
-  T v[N];
-};
-
 // conv_input[t] = [state[slot_t], x[t]] and state[slot_t] advances by one column, for one block of channels.
 // The old state is staged in SLM before the barrier, so the in-place update never races with its own reads.
 // Global state and conv_input blocks are contiguous, so they move in packs of VEC elements.
 template <typename T, int VEC>
 struct ShortConvStateKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
-  using P = Pack<T, VEC>;
+  using P = aligned_vec<T, VEC>;
   T* state;
   const int64_t* state_indices;
   const T* x;
@@ -72,7 +68,7 @@ struct ShortConvStateKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       const P pack = slot_state[i];
 #pragma unroll
       for (int k = 0; k < VEC; ++k) {
-        old_state[i * VEC + k] = pack.v[k];
+        old_state[i * VEC + k] = pack[k];
       }
     }
     for (int i = local_id; i < block_channels; i += STATE_WG_SIZE) {
@@ -87,7 +83,7 @@ struct ShortConvStateKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       int col = i * VEC - channel * out_len;
 #pragma unroll
       for (int k = 0; k < VEC; ++k) {
-        pack.v[k] = col < state_len ? old_state[channel * state_len + col] : new_x[channel];
+        pack[k] = col < state_len ? old_state[channel * state_len + col] : new_x[channel];
         if (++col == out_len) {
           col = 0;
           ++channel;
@@ -104,7 +100,7 @@ struct ShortConvStateKernel : public __SYCL_KER_CONFIG_CONVENTION__ {
       int col = i * VEC - channel * state_len;
 #pragma unroll
       for (int k = 0; k < VEC; ++k) {
-        pack.v[k] = col + 1 < state_len ? old_state[i * VEC + k + 1] : new_x[channel];
+        pack[k] = col + 1 < state_len ? old_state[i * VEC + k + 1] : new_x[channel];
         if (++col == state_len) {
           col = 0;
           ++channel;

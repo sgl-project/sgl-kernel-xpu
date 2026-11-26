@@ -8,6 +8,7 @@
 #include <sycl/sycl.hpp>
 
 #include "Utils.h"
+#include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
 inline float to_float(float u) {
@@ -33,22 +34,6 @@ inline void from_float(sycl::half& d, float s) {
 inline void from_float(sycl::ext::oneapi::bfloat16& d, float s) {
   d = static_cast<sycl::ext::oneapi::bfloat16>(s);
 }
-
-// sycl::vec/half/bfloat16 have non-public members, so memcpy over them is UB.
-// This aggregate carries the same 128-bit pack and is copied by assignment.
-// Callers guarantee 16B alignment: head_size % (16 / sizeof(scalar_t)) == 0.
-template <typename scalar_t, typename pack_128b_t>
-struct alignas(sizeof(pack_128b_t)) scalar_pack_t {
-  static constexpr uint32_t num_elems = sizeof(pack_128b_t) / sizeof(scalar_t);
-  scalar_t elems[num_elems];
-
-  scalar_t& operator[](uint32_t i) {
-    return elems[i];
-  }
-  const scalar_t& operator[](uint32_t i) const {
-    return elems[i];
-  }
-};
 
 template <typename scalar_t, typename pack_128b_t>
 struct MergePrefixSuffix {
@@ -120,7 +105,7 @@ struct MergePrefixSuffix {
     const float out_se = sycl::fmax(p_se + s_se, std::numeric_limits<float>::min());
     const float p_scale = p_se / out_se;
     const float s_scale = s_se / out_se;
-    using vec_t = scalar_pack_t<scalar_t, pack_128b_t>;
+    using vec_t = aligned_vec<scalar_t, sizeof(pack_128b_t) / sizeof(scalar_t)>;
 
     if (pack_offset < head_size) {
       const vec_t p_vec = *reinterpret_cast<const vec_t*>(prefix_head_ptr + pack_offset);
@@ -252,7 +237,7 @@ struct MergeState {
     const float a_scale = a_se / d;
     const float b_scale = b_se / d;
 
-    using vec_t = scalar_pack_t<scalar_t, pack_128b_t>;
+    using vec_t = aligned_vec<scalar_t, sizeof(pack_128b_t) / sizeof(scalar_t)>;
 
     if (pack_offset < head_size) {
       const vec_t a_vec = *reinterpret_cast<const vec_t*>(v_a + head_offset + pack_offset);

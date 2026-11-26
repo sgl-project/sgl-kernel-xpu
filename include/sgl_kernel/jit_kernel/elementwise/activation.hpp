@@ -14,7 +14,7 @@
  * Self-contained JIT port of the AOT kernels in src/sycl/TripleOps.cpp. Kept
  * numerically identical (same functor math, fp32 accumulation):
  *   - one work-group per token row, grid-stride over vector units in the row
- *   - vectorized load/store via aligned_vector<T, N>
+ *   - vectorized load/store via aligned_vec<T, N>
  *   - vec width + work-group size chosen with the AOT get_config() heuristic
  *   - no .wait() in the launcher (PyTorch owns stream synchronization)
  *
@@ -28,12 +28,10 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
-#include "../memory.hpp"
+#include "sgl_kernel/aligned_vec.h"
 
 namespace sgl {
 namespace sycl_kernel {
-
-using sgl::sycl::aligned_vector;
 
 // Selects which activation is applied to the gate half. Values must match
 // _ACT_KIND_MAP in the Python wrapper.
@@ -72,7 +70,7 @@ inline T act_and_mul_elem(T gate, T up) {
 template <typename T, ActivationKind kAct, int N>
 class ActAndMulKernel {
  public:
-  using Vec = aligned_vector<T, N>;
+  using Vec = aligned_vec<T, N>;
 
   ActAndMulKernel(const T* input, T* output, int64_t dim) : input_(input), output_(output), dim_(dim) {}
 

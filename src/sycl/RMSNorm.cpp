@@ -16,6 +16,7 @@
 #include "Norm.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
@@ -450,8 +451,8 @@ template <
     typename Cfg = NormConfig>
 struct RMSNormNoRstdKernelFunctor {
   using accscalar_t = acc_type<scalar_t>;
-  using vec_t = aligned_vector_loop<scalar_t, vec_size>;
-  using weight_vec_t = aligned_vector_loop<weight_t, vec_size>;
+  using vec_t = aligned_vec<scalar_t, vec_size>;
+  using weight_vec_t = aligned_vec<weight_t, vec_size>;
 
   [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item_id) const {
     const index_t row = item_id.get_group(0);
@@ -1029,7 +1030,7 @@ gemma_fused_add_rmsnorm(torch::Tensor& input, torch::Tensor& residual, torch::Te
 template <typename scalar_t, int vec_size, int ITERS>
 struct GroupedGemmaRMSNormFunctor {
   using accscalar_t = acc_type<scalar_t>;
-  using vec_t = aligned_vector_loop<scalar_t, vec_size>;
+  using vec_t = aligned_vec<scalar_t, vec_size>;
 
   [[sycl::reqd_sub_group_size(NUM_REDUCE_STAGES)]] void operator()(sycl::nd_item<1> item) const {
     const uint32_t wg = item.get_group(0);

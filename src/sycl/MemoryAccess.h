@@ -32,7 +32,6 @@ static inline int preferred_vector_width(at::DeviceIndex dev_id, int elem_sz) {
   return ret;
 }
 
-// aligned vector generates vectorized load/store on XPU
 template <int N_BYTES>
 struct aligned_element {};
 template <>
@@ -64,34 +63,19 @@ struct aligned_element<16> {
   using element_type = uint128_t;
 };
 
+// Vector-width selection uses sycl::vec alignment, which can differ from an aligned array.
 template <typename scalar_t, int vec_size>
-struct aligned_vector {
-  using element_type = typename aligned_element<sizeof(scalar_t)>::element_type;
-  using type = sycl::vec<element_type, vec_size>;
-};
-
-template <typename scalar_t, int vec_size>
-struct alignas(sizeof(scalar_t) * vec_size) aligned_vector_loop {
-  scalar_t val[vec_size];
-
-  scalar_t& operator[](int index) {
-    return val[index];
-  }
-
-  scalar_t const& operator[](int index) const {
-    return val[index];
-  }
-};
+using aligned_vector_t = sycl::vec<typename aligned_element<sizeof(scalar_t)>::element_type, vec_size>;
 
 template <typename scalar_t>
 inline int can_vectorize_up_to(at::DeviceIndex dev_id, char* pointer) {
   int elem_size = sizeof(scalar_t);
   int preferred_width = preferred_vector_width(dev_id, elem_size);
   uint64_t address = reinterpret_cast<uint64_t>(pointer);
-  constexpr int vec2_alignment = std::alignment_of<typename aligned_vector<scalar_t, 2>::type>::value;
-  constexpr int vec4_alignment = std::alignment_of<typename aligned_vector<scalar_t, 4>::type>::value;
-  constexpr int vec8_alignment = std::alignment_of<typename aligned_vector<scalar_t, 8>::type>::value;
-  constexpr int vec16_alignment = std::alignment_of<typename aligned_vector<scalar_t, 16>::type>::value;
+  constexpr int vec2_alignment = alignof(aligned_vector_t<scalar_t, 2>);
+  constexpr int vec4_alignment = alignof(aligned_vector_t<scalar_t, 4>);
+  constexpr int vec8_alignment = alignof(aligned_vector_t<scalar_t, 8>);
+  constexpr int vec16_alignment = alignof(aligned_vector_t<scalar_t, 16>);
   if (address % vec16_alignment == 0) {
     return std::min<int>(preferred_width, 16);
   } else if (address % vec8_alignment == 0) {

@@ -11,6 +11,7 @@
 #include "MemoryAccess.h"
 #include "SGLKernelPerf.h"
 #include "Utils.h"
+#include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -83,13 +84,13 @@ struct SwigluScalarKernel {
 // The pair-block is the only formulation where both load and store are
 // full-width contiguous.
 //
-// aligned_vector_loop (MemoryAccess.h:73) rather than sycl::vec<scalar_t, 16>
+// aligned_vec rather than sycl::vec<scalar_t, 16>
 // because it is the in-tree idiom for exactly this (SiluAndMulClamp.cpp:99)
 // and is a bare alignas POD array with no element-type traits to satisfy.
 template <typename scalar_t, int VP>
 struct SwigluInterleavedVecKernel {
-  using in_vec_t = aligned_vector_loop<scalar_t, 2 * VP>;
-  using out_vec_t = aligned_vector_loop<scalar_t, VP>;
+  using in_vec_t = aligned_vec<scalar_t, 2 * VP>;
+  using out_vec_t = aligned_vec<scalar_t, VP>;
 
   const scalar_t* x;
   scalar_t* y;

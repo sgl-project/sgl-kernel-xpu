@@ -8,6 +8,7 @@
 #include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -23,7 +24,7 @@ constexpr int64_t MAX_HIDDEN = std::numeric_limits<int32_t>::max() / 2;
 // bf16/fp16 sigmoid for every input value, so the result is bit-exact with eager.
 template <typename T, int V>
 struct SigmoidMulKernel {
-  using Vec = aligned_vector_loop<T, V>;
+  using Vec = aligned_vec<T, V>;
   const T* input;
   const T* gate;
   T* output;

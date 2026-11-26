@@ -21,6 +21,7 @@
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "cutlass/float8.h"
+#include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
 // TODO: Remove this when sycl float8 is supported
@@ -309,7 +310,7 @@ struct FusedQKNormRopeKernel {
     static_assert(
         !interleave || numElemsPerThread % 2 == 0, "numElemsPerThread must be even for the interleaved pairing");
     constexpr int numChunks = numElemsPerThread / VecSize;
-    using VecT = aligned_vector_loop<scalar_t, VecSize>;
+    using VecT = aligned_vec<scalar_t, VecSize>;
 
     auto sg = item.get_sub_group();
     const int laneId = static_cast<int>(item.get_local_id(0) % NUM_REDUCE_STAGES);
@@ -713,7 +714,7 @@ struct FusedQKNormRopeCacheKernel {
         weight_ptr = k_weight_ptr;
       }
 
-      using VecT = aligned_vector_loop<scalar_t, kVecSize>;
+      using VecT = aligned_vec<scalar_t, kVecSize>;
       float elems[kElemsPerThread];
       float sum_of_squares = 0.0f;
 #pragma unroll
@@ -1147,7 +1148,7 @@ struct FusedQNormRopeWarpKernel {
       scalar_t* row_out = rowPtr(
           out_ptr, static_cast<int64_t>(token_id), static_cast<int64_t>(head_id), out_token_stride, out_head_stride);
 
-      using VecT = aligned_vector_loop<scalar_t, kVecSize>;
+      using VecT = aligned_vec<scalar_t, kVecSize>;
       float elems[kElemsPerThread];
       float sum_of_squares = 0.0f;
 #pragma unroll
@@ -1248,7 +1249,7 @@ void launchFusedQNormRopeWarpImpl(
 // exceed resident work-groups). head_dim/rope_dim are runtime values.
 template <typename scalar_t, typename IdType, int64_t kVecSize>
 struct FusedQNormRopeCTAKernel {
-  using VecT = aligned_vector_loop<scalar_t, kVecSize>;
+  using VecT = aligned_vec<scalar_t, kVecSize>;
 
   const scalar_t* q_ptr;
   scalar_t* out_ptr;
@@ -1585,7 +1586,7 @@ constexpr int64_t kElementsPerScaleChunk = 64;
 
 template <typename scalar_t, typename IdType, int64_t kVecSize>
 struct FusedKNormRopeFlashMLAKernel {
-  using VecT = aligned_vector_loop<scalar_t, kVecSize>;
+  using VecT = aligned_vec<scalar_t, kVecSize>;
 
   const scalar_t* kv_ptr;
   const scalar_t* kv_weight_ptr;

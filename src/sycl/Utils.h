@@ -419,16 +419,3 @@ inline T safe_recip(T x) {
   const T inv = sycl::native::recip(safe_d);
   return sycl::select(T(0), inv, nz);
 }
-
-template <typename scalar_t, int vec_size>
-struct alignas(sizeof(scalar_t) * vec_size) aligned_vec {
-  scalar_t val[vec_size];
-
-  scalar_t& operator[](int index) {
-    return val[index];
-  }
-
-  scalar_t const& operator[](int index) const {
-    return val[index];
-  }
-};

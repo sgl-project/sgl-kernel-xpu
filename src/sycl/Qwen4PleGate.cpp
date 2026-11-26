@@ -7,6 +7,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -21,11 +22,7 @@ constexpr int VECS_PER_THREAD = 2;
 constexpr float GATE_FLOOR = 1.0e-6f;
 constexpr int64_t MAX_GRID_DIM = std::numeric_limits<int32_t>::max();  // SYCL id queries are 32-bit
 
-template <typename T>
-struct alignas(sizeof(T) * VEC) Vec8 {
-  T v[VEC];
-};
-using bf16x8 = Vec8<bf16>;
+using bf16x8 = aligned_vec<bf16, VEC>;
 
 inline float round_bf16(float f) {
   return static_cast<float>(static_cast<bf16>(f));
@@ -65,7 +62,7 @@ struct GateValueKernel {
       bf16x8 out;
 #pragma unroll
       for (int i = 0; i < VEC; ++i) {
-        out.v[i] = static_cast<bf16>(activated * static_cast<float>(vv.v[i]));
+        out[i] = static_cast<bf16>(activated * static_cast<float>(vv[i]));
       }
       y[idx] = out;
     }
@@ -97,7 +94,7 @@ struct GateReduceKernel {
       const bf16x8 qv = q[idx];
 #pragma unroll
       for (int i = 0; i < VEC; ++i) {
-        dot += round_bf16(static_cast<float>(kv.v[i]) * static_cast<float>(qv.v[i]));
+        dot += round_bf16(static_cast<float>(kv[i]) * static_cast<float>(qv[i]));
       }
     }
     dot = sycl::reduce_over_group(item.get_group(), dot, sycl::plus<float>());
@@ -110,7 +107,7 @@ struct GateReduceKernel {
       bf16x8 out;
 #pragma unroll
       for (int i = 0; i < VEC; ++i) {
-        out.v[i] = static_cast<bf16>(activated * static_cast<float>(vv.v[i]));
+        out[i] = static_cast<bf16>(activated * static_cast<float>(vv[i]));
       }
       y[idx] = out;
     }

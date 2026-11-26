@@ -25,19 +25,16 @@
 #include <cstring>
 #include <sycl/sycl.hpp>
 
-#include "../memory.hpp"
+#include "sgl_kernel/aligned_vec.h"
 
 namespace sgl {
 namespace sycl_kernel {
-
-// Import aligned_vector from memory utilities
-using sgl::sycl::aligned_vector;
 
 // ============================================================================
 // Vector Type Aliases
 // ============================================================================
 
-using float4 = aligned_vector<float, 4>;
+using float4 = aligned_vec<float, 4>;
 
 // ============================================================================
 // Timestep Embedding Kernel

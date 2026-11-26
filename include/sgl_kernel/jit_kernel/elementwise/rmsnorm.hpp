@@ -18,13 +18,10 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
-#include "../memory.hpp"
+#include "sgl_kernel/aligned_vec.h"
 
 namespace sgl {
 namespace sycl_kernel {
-
-// Import aligned_vector from memory utilities
-using sgl::sycl::aligned_vector;
 
 // Sub-group size matching sgl-kernel-xpu's NUM_REDUCE_STAGES
 static constexpr int kSubGroupSize = 16;
@@ -48,7 +45,7 @@ constexpr int get_vec_size() {
 template <typename T, int64_t kHiddenSize, int kVecSize = get_vec_size<T, kHiddenSize>()>
 class RMSNormKernel {
  public:
-  using Vec = aligned_vector<T, kVecSize>;
+  using Vec = aligned_vec<T, kVecSize>;
   static constexpr int64_t kVectorizedSize = kHiddenSize / kVecSize;
 
   RMSNormKernel(

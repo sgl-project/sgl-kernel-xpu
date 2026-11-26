@@ -8,6 +8,7 @@
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
@@ -139,17 +140,6 @@ struct FusedTopkSigmoid {
   const int top_k;
 };
 
-/// Aligned array type
-template <
-    typename T,
-    /// Number of elements in the array
-    int N,
-    /// Alignment requirement in bytes
-    int Alignment = sizeof(T) * N>
-class alignas(Alignment) AlignedArray {
-  T data[N];
-};
-
 static constexpr int sub_group_size = 32;
 static constexpr int WARP_SIZE = sub_group_size;
 static constexpr float NEG_INIFINITY = -std::numeric_limits<float>::infinity();
@@ -239,7 +229,7 @@ struct TopkGatingSigmoid {
     // this can support all powers of 2 up to 16.
     // NOTE(woosuk): The original implementation uses CUTLASS aligned array here.
     // We defined our own aligned array and use it here to avoid the dependency on CUTLASS.
-    using AccessType = AlignedArray<T, ELTS_PER_LDG>;
+    using AccessType = aligned_vec<T, ELTS_PER_LDG>;
 
     // Finally, we pull in the data from global mem
     T row_chunk_temp[VPT];

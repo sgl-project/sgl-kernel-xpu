@@ -13,6 +13,7 @@ budget below estimates that memory from the graph configuration, refuses a
 torch allocation past the budget fails (an out-of-memory error stops the
 server) instead of pushing the card into eviction."""
 
+import dataclasses
 import logging
 import math
 import os
@@ -103,6 +104,10 @@ class Budget:
         )
         return math.floor(free / self.total_gib * 100) / 100
 
+    def with_reserve(self, reserve: float) -> float:
+        """max_fraction with another reserve."""
+        return dataclasses.replace(self, reserve_gib=reserve).max_fraction
+
     @property
     def torch_cap_fraction(self) -> float:
         """Torch's allocator limit (a fraction of the card): the physical limit
@@ -157,6 +162,9 @@ def refusal(b: Budget, graphs: Graphs, max_running: Optional[int]) -> str:
         f"({RESERVE_ENV}): a full card makes the driver evict buffers and stall them. Use "
         f"--mem-fraction-static {b.max_fraction:.2f} or less"
         + (f", or capture fewer graphs ({', '.join(fewer)})" if fewer else "")
+        + ". If SGLang needs a larger fraction for the model (e.g. a 24 GB card with MTP), "
+        f"a smaller reserve ({RESERVE_ENV}=0.5) raises the limit to {b.with_reserve(0.5):.2f}, "
+        "with less margin against evictions"
     )
 
 

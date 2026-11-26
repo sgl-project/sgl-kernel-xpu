@@ -174,21 +174,16 @@ constexpr uint32_t SPIN_POLLS = 1u << 14;
 // with the producer's release, the barrier with the other threads;
 // happens-before is transitive). One fence a WG lowers to one L1 invalidate; a
 // fence in every thread would invalidate once per thread and delay the
-// hand-off more. Measured against the same wait without the fence on two B70
-// (bf16, 8 rotating layer copies, A B A B twice): GDN layers 0 us, attention
-// layers of 1 row +0.9 us (1K context) / +1.3 us (32K context), i.e. +0.8 %
-// each, 8 rows and the verify kernels within 1 us: about 0.2 % of a decode step.
-// The counters and targets wrap at 2^32 (32 producers a call: after 2^27
-// calls of a layer), so compare the signed difference. A wait still polling
-// after SPIN_POLLS polls goes on with the mailbox waits' deadline
-// (counter_wait_slow): when not all
-// work-groups are resident it gives up (the step's outputs are NaN through the
-// failed device's mailbox waits) instead of hanging.
+// hand-off more. The counters and targets wrap at 2^32 (32 producers a call:
+// after 2^27 calls of a layer), so compare the signed difference. A wait still
+// polling after SPIN_POLLS polls goes on with the mailbox waits' deadline
+// (counter_wait_slow): when not all work-groups are resident it gives up (the
+// step's outputs are NaN through the failed device's mailbox waits) instead of
+// hanging.
 inline void wait_for(sycl::nd_item<1> it, uint32_t* cnt, int ci, uint32_t target) {
   if (it.get_local_linear_id() == 0) {
-    // the plain poll loop first: a hand-off takes far fewer polls. The
-    // deadline costs up to 3.6 us a layer on two B70 (attention 2 rows 1K;
-    // 1 row: 0.5 to 1.5 us, GatedDeltaNet 0.8 us), against the wait without it
+    // the plain poll loop first: a hand-off takes far fewer polls, and the
+    // deadline code outside it costs less there
     for (uint32_t n = 0; (int32_t)(cnt_ref(cnt[ci * 16]).load(sycl::memory_order::relaxed) - target) < 0;)
       if (__builtin_expect(++n == SPIN_POLLS, 0)) {
         counter_wait_slow<CTL>(cnt, ci, target);

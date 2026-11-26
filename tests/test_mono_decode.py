@@ -1226,3 +1226,87 @@ def test_work_group_wait_gives_up(attn, wgs):
     assert times[1] < 5, f"a call after the failure took {times[1]:.1f} s"
     message = failure.describe(w.tolist(), 0, 0.5, lambda a: "layer 0")
     assert "other work-groups" in message and "counter A" in message, message
+
+
+MAX_CONTEXT_CASES = [  # (rows, tokens a request, cached tokens a request, dtype)
+    (1, 1, [524287], BF16),
+    (2, 1, [524287, 262144], F16),
+    (4, 1, [524287, 300001, 131072, 63], BF16),
+    (8, 1, [524287, 400000, 262145, 131109, 40961, 5000, 64, 0], BF16),
+    (6, 3, [524285, 262143], F16),
+    (8, 8, [524280], BF16),
+]
+
+
+@requires_mono
+@pytest.mark.parametrize("wgs", [32, 20])
+@pytest.mark.parametrize("nb,tokens,lc,dtype", MAX_CONTEXT_CASES)
+def test_attn_at_the_max_context(nb, tokens, lc, dtype, wgs):
+    """Attention at the longest supported context (max_context, 512K cached
+    tokens with the new ones), decode and verify rows, against the torch
+    reference; wgs 20: the kernels of a 20-core GPU (Arc Pro B60). Small
+    residual rows, so res_out - (h + r) is the attention's contribution."""
+    q35 = _q35()
+    assert max(lc) + tokens <= q35.max_context()
+    native = q35.work_groups(torch.device(DEVICE))
+    if wgs > native:
+        pytest.skip(f"the device runs {native} work-groups")
+    nreq = nb // tokens
+    gen = torch.Generator().manual_seed(800 + nb * 10 + tokens)
+    ps = 64
+    npr = (max(lc) + tokens + ps - 1) // ps + 1
+    pt = (torch.randperm(nreq * npr, generator=gen).to(torch.int32) + 1).view(nreq, npr)
+    slot = torch.tensor(
+        [
+            int(pt[b, (lc[b] + i) // ps]) * ps + (lc[b] + i) % ps
+            for b in range(nreq)
+            for i in range(tokens)
+        ]
+    )
+    pos = torch.tensor([lc[b] + i for b in range(nreq) for i in range(tokens)])
+    seq = torch.tensor([c + tokens for c in lc], dtype=torch.int32)
+    t = attn_tensors(gen, DEVICE, dtype)
+    kc, vc = kv_caches(gen, DEVICE, (nreq * npr + 1) * ps, dtype)
+    h, r = rows(nb, gen, DEVICE, dtype)
+    h, r = h * 0.01, r * 0.01
+    kc_ref, vc_ref = kc.cpu(), vc.cpu()
+    layer = _register(True, t, [kc, vc], ps)
+    ho, ro = torch.empty_like(h), torch.empty_like(r)
+    args = (pos.to(DEVICE), pt.to(DEVICE), seq.to(DEVICE), slot.to(DEVICE))
+    q35.force_work_groups(0 if wgs == native else wgs)
+    try:
+        if tokens == 1:
+            ho, ro = _run(layer, h, r, *args)
+        else:
+            assert _verify(layer, tokens, h, r, ho, ro, *args)
+        torch.xpu.synchronize()
+    finally:
+        q35.force_work_groups(0)
+    tc = cpu(t)
+    ar = loopback_ar if nb == 1 else loopback_ar_fp16
+    hr = h.cpu().float() + r.cpu().float()
+    for b in range(nreq):
+        for i in range(tokens):
+            row = b * tokens + i
+            _, er, _ = ref_attn(
+                tc,
+                kc_ref,
+                vc_ref,
+                h[row : row + 1].cpu(),
+                r[row : row + 1].cpu(),
+                pt[b : b + 1],
+                torch.tensor([lc[b] + i + 1]),
+                slot[row : row + 1],
+                pos[row : row + 1],
+                ps,
+                dtype,
+                ar,
+            )
+            _check(
+                ro[row].cpu().float() - hr[row],
+                er[0] - hr[row],
+                0.999,
+                f"mixer of row {row} ({lc[b] + i} cached tokens)",
+            )
+    _check(kc[slot].cpu(), kc_ref[slot], 0.9999, "new k rows")
+    _check(vc[slot].cpu(), vc_ref[slot], 0.9999, "new v rows")

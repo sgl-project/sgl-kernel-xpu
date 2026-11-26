@@ -81,6 +81,7 @@ class W8A16Kernel {
     int32_t zero_k_stride;
     int32_t scale_mode;
     int32_t group_size;
+    int32_t n_block_shift = 0;
     bool scale_is_bf16 = false;
     bool is_signed_int8 = true;
     bool static_scheduler = false;
@@ -178,6 +179,7 @@ class W8A16Kernel {
             N,
             params.scale_mode,
             params.group_size,
+            params.n_block_shift,
             params.scale_is_bf16,
             params.is_signed_int8);
 

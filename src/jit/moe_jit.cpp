@@ -302,6 +302,7 @@ using W8A16Fn = void (*)(
     int,
     int,
     int,
+    int,
     bool,
     bool,
     bool);
@@ -390,6 +391,7 @@ bool w8a16_grouped_gemm_launch(
     int zero_n_stride,
     int zero_k_stride,
     int group_size,
+    int n_block_shift,
     bool scale_is_bf16,
     bool is_signed_int8,
     bool static_scheduler,
@@ -420,6 +422,7 @@ bool w8a16_grouped_gemm_launch(
      zero_k_stride,
      scale_mode,
      group_size,
+     n_block_shift,
      scale_is_bf16,
      is_signed_int8,
      static_scheduler);

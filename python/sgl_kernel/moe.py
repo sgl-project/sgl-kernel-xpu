@@ -610,6 +610,27 @@ def _ensure_xe2_col_major_weight(w: torch.Tensor) -> torch.Tensor:
         return converted
 
 
+def _normalize_block_shape(
+    block_shape: Optional[list[int]], param_name: str = "block_shape"
+) -> Optional[tuple[int, int]]:
+    if block_shape is None:
+        return None
+    norm = list(block_shape)
+    if len(norm) == 1:
+        norm = [1, norm[0]]
+    assert (
+        len(norm) == 2
+    ), f"{param_name} must have 1 or 2 dimensions, got {block_shape}"
+    bn, bk = int(norm[0]), int(norm[1])
+    assert (
+        bn >= 1 and (bn & (bn - 1)) == 0
+    ), f"{param_name} block_n must be a power of two >= 1, got {block_shape}"
+    assert (
+        bk >= 32 and (bk & (bk - 1)) == 0
+    ), f"{param_name} block_k must be a power of two >= 32, got {block_shape}"
+    return bn, bk
+
+
 def _validate_w8a16_weight_scale(
     scale: torch.Tensor,
     weights: torch.Tensor,
@@ -617,13 +638,20 @@ def _validate_w8a16_weight_scale(
     allow_scalar: bool,
     is_int8: bool = False,
     zp: Optional[torch.Tensor] = None,
-) -> None:
+    block_shape: Optional[tuple[int, int]] = None,
+    raw_block_shape: Optional[list[int]] = None,
+) -> str:
     """Validate an FP8 or INT8/UINT8 expert scale tensor against logical `[E, N, K]` weights."""
     n_dim = weights.shape[1]
     k_dim = weights.shape[2]
     is_mxfp8 = (not is_int8) and scale.dtype in (torch.uint8, torch.float8_e8m0fnu)
     if is_mxfp8:
         assert zp is None, f"{name} MXFP8 does not support zero-points"
+        if block_shape is not None:
+            assert block_shape == (
+                1,
+                32,
+            ), f"MXFP8 scales require block_shape=[1, 32] or [32], got {raw_block_shape}"
         assert scale.ndim == 3, f"{name} MXFP8 scales must be 3D [E, N, K/32]"
         assert scale.shape[0] == weights.shape[0], (
             f"{name} expert dimension {scale.shape[0]} must match weights "
@@ -640,9 +668,11 @@ def _validate_w8a16_weight_scale(
             f"{name} MXFP8 scale K dimension {scale.shape[2]} must equal K/32 "
             f"({k_dim // 32})"
         )
-        return
+        return "mxfp8"
 
-    allowed_dtypes = (torch.float32, torch.bfloat16) if is_int8 else (torch.float32,)
+    allowed_dtypes = (torch.float32, torch.bfloat16)
+    if not is_int8:
+        allowed_dtypes = (torch.float32, torch.bfloat16)
     assert (
         scale.dtype in allowed_dtypes
     ), f"{name} must have dtype in {allowed_dtypes}, got {scale.dtype}"
@@ -657,7 +687,11 @@ def _validate_w8a16_weight_scale(
     if scale.ndim == 1:
         assert allow_scalar, f"{name} scalar scales are not supported for this path"
         assert zp is None, f"{name} scalar scales do not support zero-points"
-        return
+        assert block_shape is None, (
+            f"block_shape is only valid for 3D block scales, got {raw_block_shape} "
+            f"with scalar scales ({name}.shape={scale.shape})"
+        )
+        return "scalar"
 
     if scale.ndim == 2:
         expected_columns = 2 if name == "w1_scale" else 1
@@ -665,55 +699,92 @@ def _validate_w8a16_weight_scale(
             assert (
                 is_int8 or allow_scalar
             ), f"{name} per-channel scales are not supported for this path"
+            assert block_shape is None, (
+                f"block_shape is only valid for 3D block scales, got {raw_block_shape} "
+                f"with 2D per-channel scales ({name}.shape={scale.shape})"
+            )
             if zp is not None:
-                assert zp.dtype == torch.uint8 and tuple(zp.shape) in (
-                    (weights.shape[0], n_dim),
-                    (weights.shape[0], n_dim, 1),
+                assert (
+                    is_int8
+                    and zp.dtype == torch.uint8
+                    and tuple(zp.shape)
+                    in (
+                        (weights.shape[0], n_dim),
+                        (weights.shape[0], n_dim, 1),
+                    )
                 ), f"zero-point for {name} must be uint8 [E, N] or [E, N, 1]"
-            return
+            return "channel"
         assert allow_scalar, f"{name} scalar scales are not supported for this path"
         assert zp is None, f"{name} scalar scales do not support zero-points"
+        assert block_shape is None, (
+            f"block_shape is only valid for 3D block scales, got {raw_block_shape} "
+            f"with scalar scales ({name}.shape={scale.shape})"
+        )
         assert scale.shape[1] in (1, expected_columns), (
             f"{name} scalar scale shape must be [E, 1] or "
             f"[E, {expected_columns}], got {tuple(scale.shape)}"
         )
-        return
+        return "scalar"
 
-    if scale.shape[1] == n_dim and scale.shape[2] == 1:
-        if zp is not None:
-            assert zp.dtype == torch.uint8 and tuple(zp.shape) in (
-                (weights.shape[0], n_dim),
-                (weights.shape[0], n_dim, 1),
-            ), f"zero-point for {name} must be uint8 [E, N] or [E, N, 1]"
-        return
-
-    if is_int8 and scale.shape[1] == n_dim and scale.shape[2] > 1:
+    s_n, s_k = scale.shape[1], scale.shape[2]
+    if block_shape is not None:
+        bn, bk = block_shape
         assert (
-            k_dim % scale.shape[2] == 0
-        ), f"{name} K={k_dim} must be divisible by scale groups {scale.shape[2]}"
-        group_size = k_dim // scale.shape[2]
+            k_dim % bk == 0
+        ), f"{name} block scales require K divisible by {bk}, got K={k_dim}"
+        expected_shape = (
+            weights.shape[0],
+            (n_dim + bn - 1) // bn,
+            k_dim // bk,
+        )
+        assert tuple(scale.shape) == expected_shape, (
+            f"{name} block scales for block_shape={[bn, bk]} must have shape "
+            f"{expected_shape}, got {tuple(scale.shape)}"
+        )
+        if zp is not None:
+            assert (
+                is_int8 and zp.dtype == torch.uint8 and zp.shape == scale.shape
+            ), f"zero-point for {name} must be uint8 with shape {tuple(scale.shape)}"
+        return "block"
+
+    if s_n == n_dim and s_k == 1:
+        assert (
+            is_int8 or allow_scalar
+        ), f"{name} per-channel scales are not supported for this path"
+        if zp is not None:
+            assert (
+                is_int8
+                and zp.dtype == torch.uint8
+                and tuple(zp.shape)
+                in (
+                    (weights.shape[0], n_dim),
+                    (weights.shape[0], n_dim, 1),
+                )
+            ), f"zero-point for {name} must be uint8 [E, N] or [E, N, 1]"
+        return "channel"
+
+    assert (
+        1 <= s_n <= n_dim
+    ), f"{name} 3D scale N dimension {s_n} must be in [1, {n_dim}]"
+    assert (
+        s_k >= 1 and k_dim % s_k == 0
+    ), f"{name} K={k_dim} must be divisible by scale groups {s_k}"
+    if s_k > 1:
+        group_size = k_dim // s_k
         assert (
             group_size >= 32 and (group_size & (group_size - 1)) == 0
         ), f"{name} group_size must be a power of two >= 32, got {group_size}"
-        if zp is not None:
-            assert (
-                zp.dtype == torch.uint8 and zp.shape == scale.shape
-            ), f"zero-point for {name} must be uint8 with shape {tuple(scale.shape)}"
-        return
-
-    assert zp is None, f"{name} 128x128 block scales do not support zero-points"
-    expected_shape = (
-        weights.shape[0],
-        (n_dim + 127) // 128,
-        (k_dim + 127) // 128,
-    )
-    assert tuple(scale.shape) == expected_shape, (
-        f"{name} block scales must have shape [E, ceil(N/128), ceil(K/128)] "
-        f"={expected_shape}, got {tuple(scale.shape)}"
-    )
-    assert (
-        k_dim % 128 == 0
-    ), f"{name} block scales require K divisible by 128, got K={k_dim}"
+    if 2 <= s_n < n_dim:
+        matched = any(((n_dim + (1 << sh) - 1) >> sh) == s_n for sh in range(1, 21))
+        assert matched, (
+            f"{name} 3D block scales shape {tuple(scale.shape)} is incompatible "
+            f"with N={n_dim} (expected ceil(N / block_n) for a power-of-two block_n)"
+        )
+    if zp is not None:
+        assert (
+            is_int8 and zp.dtype == torch.uint8 and zp.shape == scale.shape
+        ), f"zero-point for {name} must be uint8 with shape {tuple(scale.shape)}"
+    return "block"
 
 
 def _validate_fp8_weight_scale(
@@ -752,6 +823,7 @@ def fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    w2_block_shape: Optional[list[int]] = None,
     no_combine: bool = False,
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
@@ -863,24 +935,29 @@ def fused_experts(
     assert a2_scale is None, (
         "prequantized FP8 activation input is not supported: " "a2_scale must be None"
     )
-    if block_shape is not None:
-        assert use_w8a16, "block_shape is only supported for FP8/INT8 W8A16 MoE paths"
-        if use_fp8_weight:
-            assert list(block_shape) in (
-                [128, 128],
-                [1, 32],
-                [32],
-            ), "FP8 MoE currently supports block_shape=[128, 128], [1, 32], or [32] (MXFP8)"
+    norm_w1_block_shape = None
+    norm_w2_block_shape = None
+    if block_shape is not None or w2_block_shape is not None:
+        assert (
+            use_w8a16
+        ), "block_shape/w2_block_shape are only supported for FP8/INT8 W8A16 MoE paths"
+        norm_w1_block_shape = _normalize_block_shape(block_shape, "block_shape")
+        norm_w2_block_shape = (
+            _normalize_block_shape(w2_block_shape, "w2_block_shape")
+            if w2_block_shape is not None
+            else norm_w1_block_shape
+        )
+    _SUPPORTED_ACTIVATIONS = ("silu", "gelu", "gelu_tanh", "gelu_erf", "relu2")
     if use_w8a16:
-        assert activation in ("silu", "gelu", "relu2"), (
-            "W8A16 MoE supports silu, gelu, relu2, GPT-OSS SwiGLU, and "
-            "DeepSeek-V4 clamped SwiGLU only"
+        assert activation in _SUPPORTED_ACTIVATIONS, (
+            f"W8A16 MoE supports {_SUPPORTED_ACTIVATIONS}, GPT-OSS SwiGLU, and "
+            f"clamped SwiGLU only, got {activation!r}"
         )
         if use_fp8_weight:
             assert (
                 w1_g_idx_perm is None and w2_g_idx_perm is None
             ), "w1_g_idx_perm/w2_g_idx_perm are only supported by INT4/INT8 paths"
-        if activation == "gelu" or activation == "relu2":
+        if activation != "silu":
             assert (
                 gemm1_alpha is None and gemm1_limit is None and swiglu_limit is None
             ), f"{activation} cannot be combined with a SwiGLU alpha or clamp"
@@ -891,18 +968,16 @@ def fused_experts(
             )
         elif swiglu_limit is not None:
             assert (
-                swiglu_limit == 10 and gemm1_limit is None and gemm1_alpha is None
-            ), "W8A16 DeepSeek-V4 SwiGLU currently requires swiglu_limit=10"
+                swiglu_limit > 0 and gemm1_limit is None and gemm1_alpha is None
+            ), "W8A16 clamped SwiGLU requires swiglu_limit > 0"
         else:
             assert (
                 gemm1_limit is None
             ), "gemm1_limit requires gemm1_alpha for GPT-OSS SwiGLU"
     else:
-        assert activation in (
-            "silu",
-            "gelu",
-            "relu2",
-        ), f"Only silu, gelu and relu2 are supported but got {activation}"
+        assert (
+            activation in _SUPPORTED_ACTIVATIONS
+        ), f"Only {_SUPPORTED_ACTIVATIONS} are supported but got {activation}"
 
     # Unified 4-bit W4A16 MoE (mxfp4 or int4). Weights are packed int8/uint8
     # [E, N, K/2]; scales are [E, N, K/group_size] N-outer. For mxfp4 the
@@ -987,40 +1062,41 @@ def fused_experts(
         assert (
             w1_scale is not None and w2_scale is not None
         ), "w1_scale/w2_scale must be provided for FP8 weight-only MoE"
-        _validate_w8a16_weight_scale(w1_scale, w1, "w1_scale", allow_scalar=True)
-        _validate_w8a16_weight_scale(w2_scale, w2, "w2_scale", allow_scalar=True)
+        assert w1_scale.dtype in (
+            torch.float32,
+            torch.uint8,
+            torch.float8_e8m0fnu,
+        ) and w2_scale.dtype in (
+            torch.float32,
+            torch.uint8,
+            torch.float8_e8m0fnu,
+        ), "FP8 MoE scales must be float32, uint8, or float8_e8m0fnu"
+        w1_kind = _validate_w8a16_weight_scale(
+            w1_scale,
+            w1,
+            "w1_scale",
+            allow_scalar=True,
+            block_shape=norm_w1_block_shape,
+            raw_block_shape=block_shape,
+        )
+        w2_kind = _validate_w8a16_weight_scale(
+            w2_scale,
+            w2,
+            "w2_scale",
+            allow_scalar=True,
+            block_shape=norm_w2_block_shape,
+            raw_block_shape=(
+                w2_block_shape if w2_block_shape is not None else block_shape
+            ),
+        )
+        assert w1_kind == w2_kind, (
+            "w1_scale and w2_scale must use the same scalar, channel, MXFP8, or block layout, "
+            f"got {w1_kind} vs {w2_kind}"
+        )
         if w1_scale.ndim == 1:
             w1_scale = w1_scale.unsqueeze(1)
         if w2_scale.ndim == 1:
             w2_scale = w2_scale.unsqueeze(1)
-        w1_scale_is_mxfp8 = w1_scale.ndim == 3 and w1_scale.dtype in (
-            torch.uint8,
-            torch.float8_e8m0fnu,
-        )
-        w2_scale_is_mxfp8 = w2_scale.ndim == 3 and w2_scale.dtype in (
-            torch.uint8,
-            torch.float8_e8m0fnu,
-        )
-        assert (
-            w1_scale.ndim == w2_scale.ndim and w1_scale_is_mxfp8 == w2_scale_is_mxfp8
-        ), "w1_scale and w2_scale must use the same scalar, MXFP8, or 128x128 block layout"
-        if block_shape is not None:
-            norm_block_shape = list(block_shape)
-            if w1_scale_is_mxfp8:
-                assert norm_block_shape in (
-                    [1, 32],
-                    [32],
-                ), f"MXFP8 scales require block_shape=[1, 32] or [32], got {block_shape}"
-            elif w1_scale.ndim == 3:
-                assert norm_block_shape == [
-                    128,
-                    128,
-                ], f"Standard FP8 block scales require block_shape=[128, 128], got {block_shape}"
-            else:
-                assert False, (
-                    f"block_shape is only valid for 3D block scales, got {block_shape} "
-                    f"with scalar scales (w1_scale.shape={w1_scale.shape})"
-                )
         assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
         if not w1_scale.is_contiguous():
             w1_scale = w1_scale.contiguous()
@@ -1041,11 +1117,31 @@ def fused_experts(
             assert (
                 w1.dtype == torch.uint8
             ), "w1_zp/w2_zp require unsigned uint8 weights in INT8 W8A16 MoE"
-        _validate_w8a16_weight_scale(
-            w1_scale, w1, "w1_scale", allow_scalar=True, is_int8=True, zp=w1_zp
+        w1_kind = _validate_w8a16_weight_scale(
+            w1_scale,
+            w1,
+            "w1_scale",
+            allow_scalar=True,
+            is_int8=True,
+            zp=w1_zp,
+            block_shape=norm_w1_block_shape,
+            raw_block_shape=block_shape,
         )
-        _validate_w8a16_weight_scale(
-            w2_scale, w2, "w2_scale", allow_scalar=True, is_int8=True, zp=w2_zp
+        w2_kind = _validate_w8a16_weight_scale(
+            w2_scale,
+            w2,
+            "w2_scale",
+            allow_scalar=True,
+            is_int8=True,
+            zp=w2_zp,
+            block_shape=norm_w2_block_shape,
+            raw_block_shape=(
+                w2_block_shape if w2_block_shape is not None else block_shape
+            ),
+        )
+        assert w1_kind == w2_kind, (
+            "w1_scale and w2_scale must use the same scalar, channel, or block layout, "
+            f"got {w1_kind} vs {w2_kind}"
         )
         if not w1_scale.is_contiguous():
             w1_scale = w1_scale.contiguous()
@@ -1200,14 +1296,16 @@ def fused_experts(
     )
 
     if use_w8a16:
-        if activation == "gelu":
+        if activation in ("gelu", "gelu_tanh"):
             activation_type = 1
+        elif activation == "gelu_erf":
+            activation_type = 5
         elif activation == "relu2":
             activation_type = 3
         elif activation != "silu":
             raise ValueError(
                 f"W8A16 Xe2 path does not support activation={activation!r}; "
-                "supported activations are 'silu', 'gelu', and 'relu2'"
+                "supported activations are 'silu', 'gelu', 'gelu_tanh', 'gelu_erf', and 'relu2'"
             )
         elif gemm1_alpha is not None:
             if gemm1_limit is None:
@@ -1256,10 +1354,14 @@ def fused_experts(
                 )
             elif activation_type == 4:
                 torch.ops.sgl_kernel.silu_and_mul_clamp(
-                    intermediate_cache2, intermediate_cache1, swiglu_limit
+                    intermediate_cache2, intermediate_cache1, float(swiglu_limit)
                 )
             elif activation_type == 1:
                 torch.ops.sgl_kernel.gelu_tanh_and_mul(
+                    intermediate_cache2, intermediate_cache1
+                )
+            elif activation_type == 5:
+                torch.ops.sgl_kernel.gelu_and_mul(
                     intermediate_cache2, intermediate_cache1
                 )
             elif activation_type == 3:
@@ -1294,8 +1396,9 @@ def fused_experts(
         )
         return out_hidden_states
 
-    # 0=silu, 1=gelu, 2=swiglu (silu with alpha/limit clamping for gpt-oss),
-    # 3=relu2, 4=swiglu_deepseek_v4 (clamp gate/up then plain silu * up).
+    # 0=silu, 1=gelu_tanh, 2=swiglu (silu with alpha/limit clamping for gpt-oss),
+    # 3=relu2, 4=swiglu_deepseek_v4 (clamp gate/up then plain silu * up),
+    # 5=gelu_erf (exact erf GELU).
     if activation == "silu":
         activation_type = 0
         if gemm1_alpha is not None:
@@ -1305,19 +1408,17 @@ def fused_experts(
             activation_type = 2
             activation = "swiglu_gpt_oss"
         elif swiglu_limit is not None:
-            assert swiglu_limit == 10
-            # DeepSeek-V4 swiglu clamp. The 4-bit grouped GEMM no longer fuses
-            # activation, so the clamp is applied in the unfused activation path
-            # below (see activation_type == 4 handling).
-            assert (
-                use_4bit_w4a16
-            ), "swiglu_limit requires use_mxfp4_w4a16=True or use_int4_w4a16=True"
+            assert swiglu_limit > 0, "swiglu_limit must be > 0"
+            if use_mxfp4_xe3:
+                assert swiglu_limit == 10
             activation_type = 4
             activation = "swiglu_deepseek_v4"
             # Carry the clamp threshold in gemm1_limit (the only limit slot).
             gemm1_limit = float(swiglu_limit)
-    elif activation == "gelu":
+    elif activation in ("gelu", "gelu_tanh"):
         activation_type = 1
+    elif activation == "gelu_erf":
+        activation_type = 5
     elif activation == "relu2":
         activation_type = 3
     else:
@@ -1356,8 +1457,10 @@ def fused_experts(
     # and apply the gated activation with its dedicated elementwise kernel.
     # When GPT-OSS weights have been block-split into [gate, up] halves, always
     # use the fused kernel so interleaved bias and block-split weights stay aligned.
-    use_unfused_act = use_4bit_w4a16 or (
-        not w1_gate_up_block_split and avg_m <= 128 and big_weight
+    use_unfused_act = (
+        use_4bit_w4a16
+        or activation_type in (4, 5)
+        or (not w1_gate_up_block_split and avg_m <= 128 and big_weight)
     )
     # Plain bf16 grouped GEMM: dispatch to the Xe3 (CRI) op when running on
     # Xe3, otherwise the Xe2 (BMG) op. use_fp8_weight and
@@ -1405,6 +1508,7 @@ def fused_experts(
                 w1_group_size,
             )
         else:
+            unfused_gemm_act_type = 0 if activation_type in (4, 5) else activation_type
             moe_grouped_mm_nt(
                 intermediate_cache1,
                 input_A_shuffle,
@@ -1412,7 +1516,7 @@ def fused_experts(
                 b1,
                 expert_offsets,
                 E,
-                activation_type,
+                unfused_gemm_act_type,
                 fuse_act=False,
                 gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
                 gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
@@ -1434,10 +1538,14 @@ def fused_experts(
                 )
             elif activation_type == 4:
                 torch.ops.sgl_kernel.silu_and_mul_clamp(
-                    intermediate_cache2, intermediate_cache1, swiglu_limit
+                    intermediate_cache2, intermediate_cache1, float(swiglu_limit)
                 )
             elif activation_type == 1:
                 torch.ops.sgl_kernel.gelu_tanh_and_mul(
+                    intermediate_cache2, intermediate_cache1
+                )
+            elif activation_type == 5:
+                torch.ops.sgl_kernel.gelu_and_mul(
                     intermediate_cache2, intermediate_cache1
                 )
             elif activation_type == 3:
@@ -1485,7 +1593,7 @@ def fused_experts(
                 b2,
                 expert_offsets,
                 E,
-                activation_type,
+                0 if activation_type in (4, 5) else activation_type,
                 fuse_act=False,
                 gemm1_alpha=float(gemm1_alpha) if gemm1_alpha is not None else 1.702,
                 gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,

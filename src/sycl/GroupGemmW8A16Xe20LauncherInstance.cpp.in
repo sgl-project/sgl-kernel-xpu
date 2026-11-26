@@ -41,6 +41,7 @@ void Xe20MoEGEMMW8A16Launcher(
     int zero_k_stride_param,
     int scale_mode,
     int group_size,
+    int n_block_shift,
     bool scale_is_bf16,
     bool is_signed_int8,
     bool static_scheduler) {
@@ -98,6 +99,7 @@ void Xe20MoEGEMMW8A16Launcher(
       static_cast<int32_t>(zero_k_stride_param),
       scale_mode,
       group_size,
+      n_block_shift,
       scale_is_bf16,
       is_signed_int8,
       static_scheduler};
@@ -118,7 +120,7 @@ template __attribute__((visibility("default"))) void Xe20MoEGEMMW8A16Launcher<
     sycl::queue, const void*, const void*, const void*, const void*, const void*, void*,
     const int, const int, const int*, const int, int*, int, int64_t,
     int64_t, int, int, int64_t, int, int,
-    int, int, bool, bool, bool);
+    int, int, int, bool, bool, bool);
 
 #ifdef SGL_W8A16_JIT_ENTRY
 extern "C" __attribute__((visibility("default"))) void sgl_moe_w8a16_entry(
@@ -144,6 +146,7 @@ extern "C" __attribute__((visibility("default"))) void sgl_moe_w8a16_entry(
     int zero_k_stride,
     int scale_mode,
     int group_size,
+    int n_block_shift,
     bool scale_is_bf16,
     bool is_signed_int8,
     bool static_scheduler) {
@@ -170,6 +173,7 @@ extern "C" __attribute__((visibility("default"))) void sgl_moe_w8a16_entry(
       zero_k_stride,
       scale_mode,
       group_size,
+      n_block_shift,
       scale_is_bf16,
       is_signed_int8,
       static_scheduler);

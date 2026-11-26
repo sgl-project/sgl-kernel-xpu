@@ -92,6 +92,7 @@ bool w8a16_grouped_gemm_launch(
     int zero_n_stride,
     int zero_k_stride,
     int group_size,
+    int n_block_shift,
     bool scale_is_bf16,
     bool is_signed_int8,
     bool static_scheduler,

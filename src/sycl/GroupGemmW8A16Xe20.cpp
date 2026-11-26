@@ -44,6 +44,7 @@ __attribute__((visibility("default"))) void Xe20MoEGEMMW8A16Launcher(
     int zero_k_stride,
     int scale_mode,
     int group_size,
+    int n_block_shift,
     bool scale_is_bf16,
     bool is_signed_int8,
     bool static_scheduler);
@@ -79,6 +80,7 @@ using SG_4_4_1 = Layout<Shape<_4, _4, _1>, Stride<_4, _1, _0>>;
       int,                                                               \
       int,                                                               \
       int64_t,                                                           \
+      int,                                                               \
       int,                                                               \
       int,                                                               \
       int,                                                               \
@@ -123,6 +125,7 @@ DECLARE_XE20_MOE_W8A16_ALL_WEIGHT_KINDS(Tile_128_128_32, SG_4_4_1)
       zero_k_stride,                                  \
       scale_mode,                                     \
       group_size,                                     \
+      n_block_shift,                                  \
       scale_is_bf16,                                  \
       is_signed_int8,                                 \
       static_scheduler)
@@ -179,7 +182,9 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
   TORCH_CHECK(output.size(0) == total_m, "output rows must equal M_total");
   TORCH_CHECK(weights.size(0) == n_experts, "weights expert dimension mismatch");
   TORCH_CHECK(weight_scales.size(0) == n_experts, "weight scales expert dimension mismatch");
-  TORCH_CHECK(gemm_n % 64 == 0 && gemm_k % 32 == 0, "W8A16 N must be divisible by 64 and K by 32");
+  TORCH_CHECK(
+      gemm_n >= 64 && gemm_n % 16 == 0 && gemm_k % 32 == 0,
+      "W8A16 requires N >= 64 divisible by 16 and K divisible by 32");
 
   // Resolve Layout B:
   //   1) Preferred N-major view `[E, N, K]` with `stride(1) == 1` (zero-copy).
@@ -218,6 +223,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
   bool scale_is_bf16 = false;
   int scale_mode = static_cast<int>(ScaleMode::ScalarSingle);
   int group_size = gemm_k;
+  int n_block_shift = 0;
 
   if (is_mxfp8) {
     CHECK_DIM(3, weight_scales);
@@ -246,31 +252,55 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
       }
       group_size = gemm_k;
     } else if (weight_scales.dim() == 3) {
-      if (weight_scales.size(1) == gemm_n && weight_scales.size(2) == 1) {
+      const int64_t s_n = weight_scales.size(1);
+      const int64_t s_k = weight_scales.size(2);
+      TORCH_CHECK(
+          s_n >= 1 && s_n <= gemm_n, "W8A16 3D weight_scales size(1) must be in [1, N (", gemm_n, ")], got ", s_n);
+      TORCH_CHECK(
+          s_k >= 1 && gemm_k % s_k == 0,
+          "W8A16 K (",
+          gemm_k,
+          ") must be divisible by weight_scales.size(2) (",
+          s_k,
+          ")");
+      if (s_n == gemm_n && s_k == 1) {
         scale_mode = static_cast<int>(ScaleMode::PerChannelN);
         group_size = gemm_k;
-      } else if (weight_scales.size(1) == gemm_n && weight_scales.size(2) > 1) {
-        const int num_k_groups = static_cast<int>(weight_scales.size(2));
-        TORCH_CHECK(gemm_k % num_k_groups == 0, "W8A16 K must be divisible by weight_scales.size(2)");
-        group_size = gemm_k / num_k_groups;
-        TORCH_CHECK(
-            group_size >= 32 && (group_size & (group_size - 1)) == 0,
-            "W8A16 group_size must be a power of two >= 32, got ",
-            group_size);
-        scale_mode = static_cast<int>(ScaleMode::GroupNK);
-      } else if (
-          weight_scales.size(1) == (gemm_n + 127) / 128 && gemm_k % 128 == 0 && weight_scales.size(2) == gemm_k / 128) {
-        scale_mode = static_cast<int>(ScaleMode::BlockFP32);
-        group_size = 128;
       } else {
-        TORCH_CHECK(
-            false,
-            "Unsupported 3D W8A16 weight_scales shape ",
-            weight_scales.sizes(),
-            " for N=",
-            gemm_n,
-            ", K=",
-            gemm_k);
+        group_size = static_cast<int>(gemm_k / s_k);
+        if (s_k > 1) {
+          TORCH_CHECK(
+              group_size >= 32 && (group_size & (group_size - 1)) == 0,
+              "W8A16 group_size must be a power of two >= 32, got ",
+              group_size);
+        }
+        if (s_n == gemm_n) {
+          scale_mode = static_cast<int>(ScaleMode::GroupNK);
+          n_block_shift = 0;
+        } else if (s_n == 1) {
+          scale_mode = static_cast<int>(ScaleMode::BlockFP32);
+          n_block_shift = 30;
+        } else {
+          int matched_shift = -1;
+          for (int sh = 1; sh <= 20; ++sh) {
+            const int64_t blk_n = int64_t{1} << sh;
+            if (((gemm_n + blk_n - 1) >> sh) == s_n) {
+              matched_shift = sh;
+              break;
+            }
+          }
+          TORCH_CHECK(
+              matched_shift > 0,
+              "Unsupported 3D W8A16 weight_scales shape ",
+              weight_scales.sizes(),
+              " for N=",
+              gemm_n,
+              ", K=",
+              gemm_k,
+              " (expected size(1) == ceil(N / block_n) for a power-of-two block_n)");
+          scale_mode = static_cast<int>(ScaleMode::BlockFP32);
+          n_block_shift = matched_shift;
+        }
       }
     } else {
       TORCH_CHECK(false, "W8A16 weight_scales must be 1D, 2D, or 3D");
@@ -325,12 +355,14 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
       TORCH_CHECK(
           (zp.dim() == 2 && zp.size(1) == gemm_n) || (zp.dim() == 3 && zp.size(1) == gemm_n && zp.size(2) == 1),
           "Per-channel weight_zeros must have shape [E, N] or [E, N, 1]");
-    } else if (scale_mode == static_cast<int>(ScaleMode::GroupNK)) {
+    } else if (
+        scale_mode == static_cast<int>(ScaleMode::GroupNK) || scale_mode == static_cast<int>(ScaleMode::BlockFP32)) {
       TORCH_CHECK(
           zp.dim() == 3 && zp.sizes() == weight_scales.sizes(),
-          "Groupwise weight_zeros must match weight_scales shape [E, N, K/group_size]");
+          "Block/groupwise weight_zeros must match weight_scales shape ",
+          weight_scales.sizes());
     } else {
-      TORCH_CHECK(false, "W8A16 weight_zeros requires per-channel [E, N] or per-group [E, N, K/G] scales");
+      TORCH_CHECK(false, "W8A16 weight_zeros requires per-channel [E, N] or 3D block/group scales");
     }
     resolve_scale_like_strides(zp, "weight_zeros", expert_stride_z, zero_n_stride, zero_k_stride);
     zero_ptr = zp.data_ptr();
@@ -403,6 +435,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
           zero_n_stride,
           zero_k_stride,
           group_size,
+          n_block_shift,
           scale_is_bf16,
           is_signed_int8,
           static_scheduler,

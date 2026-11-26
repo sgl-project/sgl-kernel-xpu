@@ -115,6 +115,7 @@ struct W8A16Mainloop<
       int gemm_n,
       int scale_mode,
       int group_size,
+      int n_block_shift,
       bool scale_is_bf16,
       bool is_signed_int8) {
     auto wg_m = get<0>(blk_coord);
@@ -234,12 +235,13 @@ struct W8A16Mainloop<
       };
 
       const int x_idx = sg_local_id / channel_num;
-      const bool is_n_blocked_128 = (scale_mode == static_cast<int>(ScaleMode::BlockFP32));
       const bool is_mxfp8 = !IsInt8 && (scale_mode == static_cast<int>(ScaleMode::BlockMXFP8));
       const int scale_elem_bytes = is_mxfp8 ? 1 : (scale_is_bf16 ? 2 : 4);
       const int64_t scale_k_step_bytes = static_cast<int64_t>(w_scale_k_stride) * scale_elem_bytes;
       const int reload_mask =
-          (scale_mode == static_cast<int>(ScaleMode::PerChannelN)) ? 0x7FFFFFFF : (group_size / BLK_K - 1);
+          (scale_mode == static_cast<int>(ScaleMode::PerChannelN) || group_size >= k_tile_count * BLK_K)
+              ? 0x7FFFFFFF
+              : (group_size / BLK_K - 1);
 
       auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
       const bool has_zp = IsInt8 && (w_zero_gmem != nullptr);
@@ -260,13 +262,12 @@ struct W8A16Mainloop<
         for (int c = 0; c < channel_num; ++c) {
           const int col = n_tile_start + n_sg_start + n * SUBGROUP_SIZE + x_idx + c * (SUBGROUP_SIZE / channel_num);
           const int clamped_col = cute::min(col, gemm_n - 1);
-          const int scale_row = is_n_blocked_128 ? (clamped_col >> 7) : clamped_col;
+          const int scale_row = clamped_col >> n_block_shift;
           scale_ptr[n * channel_num + c] =
               w_scale_bytes + static_cast<int64_t>(scale_row) * w_scale_n_stride * scale_elem_bytes;
           if constexpr (IsInt8) {
-            zero_ptr[n * channel_num + c] = (w_zero_gmem == nullptr)
-                                                ? nullptr
-                                                : (w_zero_gmem + static_cast<int64_t>(clamped_col) * w_zero_n_stride);
+            zero_ptr[n * channel_num + c] =
+                (w_zero_gmem == nullptr) ? nullptr : (w_zero_gmem + static_cast<int64_t>(scale_row) * w_zero_n_stride);
           }
         }
       }

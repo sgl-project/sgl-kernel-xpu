@@ -1131,18 +1131,26 @@ def test_fp8_moe_rejects_external_activation_scales():
         fused_experts(**inputs, use_fp8_w8a8=True, a1_scale=torch.ones(1, 1))
 
 
-def test_fp8_moe_accepts_only_128_by_128_block_metadata():
+def test_fp8_moe_validates_block_shape_metadata():
     inputs = _make_fp8_api_validation_inputs()
-    with pytest.raises(AssertionError, match=r"block_shape=\[128, 128\]"):
+    # Scale shape (8, 2, 1) corresponds to [128, 128] for w1 (8, 256, 128), not [64, 128]
+    with pytest.raises(
+        AssertionError, match=r"block_shape=\[64, 128\] must have shape"
+    ):
         fused_experts(**inputs, use_fp8_w8a8=True, block_shape=[64, 128])
+    # Non-power-of-two block_n and block_k < 32 must be rejected
+    with pytest.raises(AssertionError, match="block_n must be a power of two"):
+        fused_experts(**inputs, use_fp8_w8a8=True, block_shape=[48, 128])
+    with pytest.raises(AssertionError, match="block_k must be a power of two >= 32"):
+        fused_experts(**inputs, use_fp8_w8a8=True, block_shape=[128, 16])
 
 
 def test_fp8_moe_rejects_contradictory_block_shape_metadata():
     inputs = _make_fp8_api_validation_inputs()
-    # 1. Standard FP8 block scale (FP32 3D) with MXFP8 block_shape [1, 32]
+    # 1. Standard FP8 128x128 block scale (8, 2, 1) with mismatched block_shape [1, 32]
     with pytest.raises(
         AssertionError,
-        match=r"Standard FP8 block scales require block_shape=\[128, 128\]",
+        match=r"block_shape=\[1, 32\] must have shape",
     ):
         fused_experts(**inputs, use_fp8_w8a8=True, block_shape=[1, 32])
 
@@ -1167,10 +1175,13 @@ def test_fp8_moe_rejects_contradictory_block_shape_metadata():
         fused_experts(**inputs_scalar, use_fp8_w8a8=True, block_shape=[128, 128])
 
 
-def test_fp8_moe_rejects_non_block_w8a8_scales():
+def test_fp8_moe_rejects_mismatched_channel_and_block_scales():
     inputs = _make_fp8_api_validation_inputs()
-    inputs["w1_scale"] = torch.ones((8, 256, 1), dtype=torch.float32)
-    with pytest.raises(AssertionError, match="w1_scale block scales"):
+    inputs["w1_scale"] = torch.ones((8, 256, 1), dtype=torch.float32)  # channel
+    with pytest.raises(
+        AssertionError,
+        match="w1_scale and w2_scale must use the same scalar, channel, MXFP8, or block layout",
+    ):
         fused_experts(**inputs, use_fp8_w8a8=True)
 
 
@@ -1182,7 +1193,7 @@ def test_fp8_moe_rejects_incompatible_scale_layouts():
     )  # Standard Block FP8
     with pytest.raises(
         AssertionError,
-        match="w1_scale and w2_scale must use the same scalar, MXFP8, or 128x128 block layout",
+        match="w1_scale and w2_scale must use the same scalar, channel, MXFP8, or block layout",
     ):
         fused_experts(**inputs, use_fp8_w8a8=True)
 
@@ -2524,6 +2535,317 @@ def test_layout_b_square_matrix_non_mutation_and_xpu_graph():
         gemm1_limit=limit,
     )
     torch.testing.assert_close(out_gpt_col, out_gpt_legacy, rtol=1e-2, atol=1e-2)
+
+
+def _dequant_general_block_fp32(
+    w_q: torch.Tensor,
+    scale: torch.Tensor,
+    block_n: int,
+    block_k: int,
+    zp: torch.Tensor = None,
+) -> torch.Tensor:
+    e_dim, n_dim, k_dim = w_q.shape
+    w_f = w_q.float()
+    if zp is not None:
+        zp_exp = (
+            zp.float()
+            .repeat_interleave(block_n, dim=1)[:, :n_dim, :]
+            .repeat_interleave(block_k, dim=2)[:, :, :k_dim]
+        )
+        w_f = w_f - zp_exp
+    s_exp = (
+        scale.float()
+        .repeat_interleave(block_n, dim=1)[:, :n_dim, :]
+        .repeat_interleave(block_k, dim=2)[:, :, :k_dim]
+    )
+    return (w_f * s_exp).to(torch.bfloat16)
+
+
+def _reference_moe_general(
+    x: torch.Tensor,
+    w1_bf16: torch.Tensor,
+    w2_bf16: torch.Tensor,
+    topk_w: torch.Tensor,
+    topk_i: torch.Tensor,
+    activation: str = "silu",
+    swiglu_limit: float = None,
+) -> torch.Tensor:
+    out = torch.zeros_like(x, dtype=torch.float32)
+    inter = w2_bf16.shape[2]
+    for tok in range(x.shape[0]):
+        a_tok = x[tok : tok + 1].float()
+        for slot in range(topk_i.shape[1]):
+            exp_id = int(topk_i[tok, slot].item())
+            weight = float(topk_w[tok, slot].item())
+            gu = a_tok @ w1_bf16[exp_id].float().t()
+            gate, up = gu[:, :inter], gu[:, inter:]
+            if activation == "silu" and swiglu_limit is not None:
+                gate_c = gate.clamp(max=swiglu_limit).to(torch.bfloat16).float()
+                up_c = (
+                    up.clamp(min=-swiglu_limit, max=swiglu_limit)
+                    .to(torch.bfloat16)
+                    .float()
+                )
+                act = (F.silu(gate_c) * up_c).to(torch.bfloat16).float()
+            elif activation == "silu":
+                act = (F.silu(gate) * up).to(torch.bfloat16).float()
+            elif activation in ("gelu", "gelu_tanh"):
+                act = (F.gelu(gate, approximate="tanh") * up).to(torch.bfloat16).float()
+            elif activation == "gelu_erf":
+                act = (F.gelu(gate, approximate="none") * up).to(torch.bfloat16).float()
+            else:
+                raise ValueError(activation)
+            down = act @ w2_bf16[exp_id].float().t()
+            out[tok : tok + 1] += down * weight
+    return out.to(torch.bfloat16)
+
+
+@pytest.mark.skipif(not is_xe2_arch(), reason="W8A16 general scale tests require Xe2")
+@pytest.mark.parametrize(
+    "hidden,inter,w1_block,w2_block",
+    [
+        # CompressedTensors 32x32 non-128-aligned shape
+        (288, 160, [32, 32], [32, 32]),
+        # Qwen3-235B TP=8 style split: shard=192 -> w1 [64, 128], w2 [128, 64]
+        (256, 192, [64, 128], [128, 64]),
+        # Qwen3-30B TP=8 style split: shard=96 -> w1 [32, 128], w2 [128, 32]
+        (256, 96, [32, 128], [128, 32]),
+        # FP32 1x64 K-group scales
+        (256, 128, [1, 64], [1, 64]),
+    ],
+)
+def test_fused_experts_general_block_and_channel_scales(
+    hidden, inter, w1_block, w2_block
+):
+    torch.manual_seed(517)
+    torch.xpu.manual_seed_all(517)
+    num_experts, num_tokens, topk = 6, 19, 2
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="xpu") * 0.3
+    scores = torch.softmax(
+        torch.randn((num_tokens, num_experts), dtype=torch.float32, device="xpu"),
+        dim=-1,
+    )
+    topk_w, topk_i = torch.topk(scores, topk, dim=-1)
+
+    w1_fp8 = (torch.randn((num_experts, 2 * inter, hidden), device="xpu") * 2.0).to(
+        torch.float8_e4m3fn
+    )
+    w2_fp8 = (torch.randn((num_experts, hidden, inter), device="xpu") * 2.0).to(
+        torch.float8_e4m3fn
+    )
+    s1 = (
+        torch.rand(
+            (
+                num_experts,
+                (2 * inter + w1_block[0] - 1) // w1_block[0],
+                hidden // w1_block[1],
+            ),
+            dtype=torch.float32,
+            device="xpu",
+        )
+        * 0.08
+        + 0.02
+    )
+    s2 = (
+        torch.rand(
+            (
+                num_experts,
+                (hidden + w2_block[0] - 1) // w2_block[0],
+                inter // w2_block[1],
+            ),
+            dtype=torch.float32,
+            device="xpu",
+        )
+        * 0.08
+        + 0.02
+    )
+
+    out = fused_experts(
+        x,
+        w1_fp8,
+        w2_fp8,
+        topk_w,
+        topk_i,
+        use_fp8_w8a8=True,
+        w1_scale=s1,
+        w2_scale=s2,
+        block_shape=w1_block,
+        w2_block_shape=w2_block,
+    )
+    ref = _reference_moe_general(
+        x,
+        _dequant_general_block_fp32(w1_fp8, s1, w1_block[0], w1_block[1]),
+        _dequant_general_block_fp32(w2_fp8, s2, w2_block[0], w2_block[1]),
+        topk_w,
+        topk_i,
+    )
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+    # Also verify Per-Channel FP8 ([E, N] 2D and [E, N, 1] 3D) on the same shapes.
+    sc1_2d = (
+        torch.rand((num_experts, 2 * inter), dtype=torch.float32, device="xpu") * 0.08
+        + 0.02
+    )
+    sc2_2d = (
+        torch.rand((num_experts, hidden), dtype=torch.float32, device="xpu") * 0.08
+        + 0.02
+    )
+    ref_ch = _reference_moe_general(
+        x,
+        (w1_fp8.float() * sc1_2d.unsqueeze(-1)).to(torch.bfloat16),
+        (w2_fp8.float() * sc2_2d.unsqueeze(-1)).to(torch.bfloat16),
+        topk_w,
+        topk_i,
+    )
+    for sc1, sc2 in ((sc1_2d, sc2_2d), (sc1_2d.unsqueeze(-1), sc2_2d.unsqueeze(-1))):
+        out_ch = fused_experts(
+            x,
+            w1_fp8,
+            w2_fp8,
+            topk_w,
+            topk_i,
+            use_fp8_w8a8=True,
+            w1_scale=sc1,
+            w2_scale=sc2,
+        )
+        torch.testing.assert_close(out_ch, ref_ch, rtol=2e-2, atol=2e-2)
+
+    # Also verify 2D-blocked UINT8 + explicit zero-point.
+    w1_u8 = torch.randint(
+        0, 255, (num_experts, 2 * inter, hidden), dtype=torch.uint8, device="xpu"
+    )
+    w2_u8 = torch.randint(
+        0, 255, (num_experts, hidden, inter), dtype=torch.uint8, device="xpu"
+    )
+    zp1 = torch.randint(96, 160, s1.shape, dtype=torch.uint8, device="xpu")
+    zp2 = torch.randint(96, 160, s2.shape, dtype=torch.uint8, device="xpu")
+    u8_s1 = s1 * 0.02
+    u8_s2 = s2 * 0.02
+    out_u8 = fused_experts(
+        x,
+        w1_u8,
+        w2_u8,
+        topk_w,
+        topk_i,
+        use_int8_w8a16=True,
+        w1_scale=u8_s1,
+        w2_scale=u8_s2,
+        w1_zp=zp1,
+        w2_zp=zp2,
+        block_shape=w1_block,
+        w2_block_shape=w2_block,
+    )
+    ref_u8 = _reference_moe_general(
+        x,
+        _dequant_general_block_fp32(w1_u8, u8_s1, w1_block[0], w1_block[1], zp1),
+        _dequant_general_block_fp32(w2_u8, u8_s2, w2_block[0], w2_block[1], zp2),
+        topk_w,
+        topk_i,
+    )
+    torch.testing.assert_close(out_u8, ref_u8, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not is_xe2_arch(), reason="W8A16 activation tests require Xe2")
+def test_fused_experts_gelu_erf_and_arbitrary_swiglu_limit():
+    torch.manual_seed(619)
+    torch.xpu.manual_seed_all(619)
+    num_experts, num_tokens, topk, hidden, inter = 4, 24, 2, 128, 128
+    # Scale inputs so gate pre-activations land around [-1.5, 1.5] where erf vs tanh differ
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="xpu") * 0.45
+    scores = torch.softmax(
+        torch.randn((num_tokens, num_experts), dtype=torch.float32, device="xpu"),
+        dim=-1,
+    )
+    topk_w, topk_i = torch.topk(scores, topk, dim=-1)
+
+    w1_fp8 = (torch.randn((num_experts, 2 * inter, hidden), device="xpu") * 1.5).to(
+        torch.float8_e4m3fn
+    )
+    w2_fp8 = (torch.randn((num_experts, hidden, inter), device="xpu") * 1.5).to(
+        torch.float8_e4m3fn
+    )
+    s1 = torch.full((num_experts, 1), 0.125, dtype=torch.float32, device="xpu")
+    s2 = torch.full((num_experts, 1), 0.125, dtype=torch.float32, device="xpu")
+    w1_bf16 = (w1_fp8.float() * 0.125).to(torch.bfloat16)
+    w2_bf16 = (w2_fp8.float() * 0.125).to(torch.bfloat16)
+
+    # 1. Exact erf GELU ("gelu_erf") vs tanh GELU ("gelu_tanh" & legacy "gelu") on W8A16 & BF16
+    ref_erf = _reference_moe_general(
+        x, w1_bf16, w2_bf16, topk_w, topk_i, activation="gelu_erf"
+    )
+    ref_tanh = _reference_moe_general(
+        x, w1_bf16, w2_bf16, topk_w, topk_i, activation="gelu_tanh"
+    )
+    assert (ref_erf.float() - ref_tanh.float()).abs().max().item() > 3e-3
+    out_fp8_erf = fused_experts(
+        x,
+        w1_fp8,
+        w2_fp8,
+        topk_w,
+        topk_i,
+        activation="gelu_erf",
+        use_fp8_w8a8=True,
+        w1_scale=s1,
+        w2_scale=s2,
+    )
+    out_fp8_tanh = fused_experts(
+        x,
+        w1_fp8,
+        w2_fp8,
+        topk_w,
+        topk_i,
+        activation="gelu_tanh",
+        use_fp8_w8a8=True,
+        w1_scale=s1,
+        w2_scale=s2,
+    )
+    out_fp8_legacy_gelu = fused_experts(
+        x,
+        w1_fp8,
+        w2_fp8,
+        topk_w,
+        topk_i,
+        activation="gelu",
+        use_fp8_w8a8=True,
+        w1_scale=s1,
+        w2_scale=s2,
+    )
+    out_bf16_erf = fused_experts(
+        x, w1_bf16, w2_bf16, topk_w, topk_i, activation="gelu_erf"
+    )
+    torch.testing.assert_close(out_fp8_erf, ref_erf, rtol=1.5e-2, atol=1.5e-2)
+    torch.testing.assert_close(out_bf16_erf, ref_erf, rtol=1.5e-2, atol=1.5e-2)
+    torch.testing.assert_close(out_fp8_tanh, ref_tanh, rtol=1.5e-2, atol=1.5e-2)
+    torch.testing.assert_close(out_fp8_legacy_gelu, out_fp8_tanh, rtol=0, atol=0)
+
+    # 2. Arbitrary positive swiglu_limit values (not just 10.0) on W8A16 & BF16
+    for limit in (1.5, 5.0, 10.0, 14.5):
+        ref_clamp = _reference_moe_general(
+            x, w1_bf16, w2_bf16, topk_w, topk_i, activation="silu", swiglu_limit=limit
+        )
+        out_fp8_clamp = fused_experts(
+            x,
+            w1_fp8,
+            w2_fp8,
+            topk_w,
+            topk_i,
+            activation="silu",
+            use_fp8_w8a8=True,
+            w1_scale=s1,
+            w2_scale=s2,
+            swiglu_limit=limit,
+        )
+        out_bf16_clamp = fused_experts(
+            x,
+            w1_bf16,
+            w2_bf16,
+            topk_w,
+            topk_i,
+            activation="silu",
+            swiglu_limit=limit,
+        )
+        torch.testing.assert_close(out_fp8_clamp, ref_clamp, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(out_bf16_clamp, ref_clamp, rtol=2e-2, atol=2e-2)
 
 
 if __name__ == "__main__":

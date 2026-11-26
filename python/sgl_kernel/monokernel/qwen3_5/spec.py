@@ -166,11 +166,13 @@ def config_disable_reasons(cfg: Any, hf_config: Any) -> list:
             )
     dtype = _model_dtype(cfg, hf_config)
     conv_dtype = _conv_dtype()
-    if dtype == "float16" and conv_dtype != "float16":
+    if dtype == "float16":
+        # the kernels have fp16 versions (tests), but a server cannot serve:
+        # SGLang's block-FP8 MoE (prefill) takes bfloat16 activations only
         reasons.append(
-            "an fp16 model needs SGLANG_MAMBA_CONV_DTYPE=float16 (one dtype for activations and conv state)"
+            "dtype float16: SGLang's block-FP8 MoE (prefill) runs bfloat16 only; use --dtype bfloat16"
         )
-    if dtype == "bfloat16" and conv_dtype not in ("bfloat16", None):
+    elif conv_dtype not in ("bfloat16", None):
         reasons.append(
             f"SGLANG_MAMBA_CONV_DTYPE {conv_dtype!r} is not the model dtype bfloat16"
         )
@@ -229,12 +231,12 @@ SPEC = MonoSpec(
     devices={"xe2": DeviceLimits(widths=WIDTHS, tp_sizes=(2,), resident_blocks=20)},
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     requires=Requirements(
-        dtypes=frozenset({"bfloat16", "float16"}),
+        dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"intel_xpu"}),
         server_args={
             "page_size": frozenset({64, 128}),
             "disable_radix_cache": frozenset({True}),
-            "kv_cache_dtype": frozenset({"auto", "bfloat16", "float16"}),
+            "kv_cache_dtype": frozenset({"auto", "bfloat16"}),
         },
     ),
     numerics=Numerics(

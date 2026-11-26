@@ -221,10 +221,10 @@ def test_spec_reasons(monkeypatch):
     reasons = " | ".join(spec.config_disable_reasons(cfg, hf))
     assert "hidden_size" in reasons and "block-FP8" in reasons
     assert "topk above 1" in reasons and "speculative_num_draft_tokens 5" in reasons
-    monkeypatch.setattr(spec, "_conv_dtype", lambda: "bfloat16")
+    monkeypatch.setattr(spec, "_conv_dtype", lambda: "float16")
     assert any(
         "SGLANG_MAMBA_CONV_DTYPE" in r
-        for r in spec.config_disable_reasons(_cfg(dtype="float16"), _hf())
+        for r in spec.config_disable_reasons(_cfg(dtype="bfloat16"), _hf())
     )
 
 
@@ -289,16 +289,19 @@ def test_spec_kv_dtype_must_match_the_model(monkeypatch, dtype, kv, ok):
     assert (not any("kv_cache_dtype" in r for r in reasons)) is ok, reasons
 
 
-def test_spec_auto_dtype_follows_the_checkpoint(monkeypatch):
-    # dtype auto on an fp16 checkpoint needs the fp16 conv state like dtype fp16
+def test_spec_refuses_fp16(monkeypatch):
+    # SGLang's block-FP8 MoE (prefill) runs bf16 only: an fp16 server cannot
+    # serve, for --dtype float16 and for auto on an fp16 checkpoint
     spec = _spec()
-    monkeypatch.setattr(spec, "_conv_dtype", lambda: "bfloat16")
-    hf = _hf()
-    hf.torch_dtype = "float16"
-    reasons = spec.config_disable_reasons(_cfg(dtype="auto"), hf)
-    assert any("SGLANG_MAMBA_CONV_DTYPE=float16" in r for r in reasons), reasons
     monkeypatch.setattr(spec, "_conv_dtype", lambda: "float16")
-    assert spec.config_disable_reasons(_cfg(dtype="auto"), hf) == []
+    hf = _hf()
+    for cfg, h in ((_cfg(dtype="float16"), _hf()), (_cfg(dtype="auto"), hf)):
+        hf.torch_dtype = "float16"
+        reasons = spec.config_disable_reasons(cfg, h)
+        assert any("bfloat16 only" in r for r in reasons), reasons
+    assert "float16" not in spec.SPEC.requires.dtypes
+    monkeypatch.setattr(spec, "_conv_dtype", lambda: None)
+    assert spec.config_disable_reasons(_cfg(dtype="auto"), _hf()) == []
 
 
 def test_spec_layer_count_has_an_upper_bound(monkeypatch):

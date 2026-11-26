@@ -1141,6 +1141,36 @@ def test_split_modes_bitwise(nb, tokens, dtype, wgs):
 
 
 @requires_mono
+def test_work_groups_never_exceed_the_device(monkeypatch):
+    """The work-group override (qwen35_force_work_groups,
+    SGLANG_XPU_MONO_WORK_GROUPS) never launches more work-groups than the
+    device has Xe cores (they could not all be resident)."""
+    from sgl_kernel.monokernel.qwen3_5 import runtime
+
+    q35 = _q35()
+    d = torch.device(DEVICE)
+    native = q35.work_groups(d)
+    try:
+        q35.force_work_groups(32)
+        assert q35.work_groups(d) == native
+        q35.force_work_groups(20)
+        assert q35.work_groups(d) == 20
+        for bad in (19, 33):
+            with pytest.raises(RuntimeError):
+                q35.force_work_groups(bad)
+        for bad in ("19", str(native + 1), "x"):
+            monkeypatch.setenv(runtime.WORK_GROUPS_ENV, bad)
+            with pytest.raises(ValueError, match=runtime.WORK_GROUPS_ENV):
+                runtime.apply_work_groups(d)
+        monkeypatch.setenv(runtime.WORK_GROUPS_ENV, "20")
+        assert runtime.apply_work_groups(d) == 20
+        monkeypatch.delenv(runtime.WORK_GROUPS_ENV)
+        assert runtime.apply_work_groups(d) == native
+    finally:
+        q35.force_work_groups(0)
+
+
+@requires_mono
 @pytest.mark.parametrize("wgs", [32, 20])
 @pytest.mark.parametrize("attn", [False, True])
 def test_work_group_wait_gives_up(attn, wgs):

@@ -41,9 +41,10 @@ def work_groups(device: torch.device) -> int:
 
 
 def force_work_groups(n: int) -> None:
-    """Test hook: launch every kernel on ``n`` work-groups (20 .. 32), e.g. 20
-    on an Arc Pro B70 to run the kernels of a 20-core GPU; 0: the device's.
-    Process-wide; set it the same on both ranks, between steps."""
+    """Test hook: launch every kernel on at most ``n`` work-groups (20 .. 32,
+    never more than the device's Xe cores), e.g. 20 on an Arc Pro B70 to run
+    the kernels of a 20-core GPU; 0: the device's. Process-wide; set it the
+    same on both ranks, between steps."""
     _ops.qwen35_force_work_groups(int(n))
 
 

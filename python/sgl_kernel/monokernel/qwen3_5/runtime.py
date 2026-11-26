@@ -28,10 +28,22 @@ def apply_work_groups(device: torch.device) -> int:
     """The work-groups of the kernels' launches: the device's (32, or the Xe
     cores of a smaller Xe2 GPU such as the Arc Pro B60's 20), or
     ``SGLANG_XPU_MONO_WORK_GROUPS`` (20 .. 32; e.g. 20 on an Arc Pro B70 to run
-    the kernels of a 20-core GPU). Set it the same on every rank."""
+    the kernels of a 20-core GPU; at most the device's). Set it the same on
+    every rank."""
+    q35.force_work_groups(0)
+    native = q35.work_groups(device)
     value = os.environ.get(WORK_GROUPS_ENV, "").strip()
     if value:
-        q35.force_work_groups(int(value))
+        try:
+            n = int(value)
+        except ValueError:
+            n = -1
+        if not 20 <= n <= native:
+            raise ValueError(
+                f"{WORK_GROUPS_ENV}={value!r}: must be an integer in 20 .. {native} "
+                f"(this device has {native} work-groups a launch)"
+            )
+        q35.force_work_groups(n)
     n = q35.work_groups(device)
     if n < 32:
         logger.info(

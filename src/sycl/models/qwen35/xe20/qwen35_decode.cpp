@@ -125,16 +125,18 @@ bool xe2_device(int64_t device) {
   return xe_cores(device) >= kMinWorkGroups;
 }
 
-// test hook (qwen35_force_work_groups): launch on this many work-groups
-// (kMinWorkGroups .. NWG) instead of the device's, e.g. 20 on a B70 to run the
-// b60/ kernels; 0: the device's
+// test hook (qwen35_force_work_groups): launch on at most this many
+// work-groups (kMinWorkGroups .. NWG), e.g. 20 on a B70 to run the b60/
+// kernels; 0: the device's
 std::atomic<int> g_force_work_groups{0};
 
-// work-groups of a launch on device d: NWG (the layer kernels) or fewer (b60/)
+// work-groups of a launch on device d: NWG (the layer kernels) or fewer (b60/),
+// never more than the device's Xe cores (one resident work-group a core: a
+// launch of more would wait on work-groups that cannot run)
 int work_groups(int64_t device) {
+  const int n = std::min(xe_cores(device), (int)sgl_mono::NWG);
   const int f = g_force_work_groups.load(std::memory_order_relaxed);
-  if (f > 0) return f;
-  return std::min(xe_cores(device), (int)sgl_mono::NWG);
+  return f > 0 ? std::min(f, n) : n;
 }
 
 void check_device(const at::Tensor& t, const char* op) {
@@ -1224,9 +1226,10 @@ int64_t qwen35_work_groups(int64_t device) {
   return work_groups(device);
 }
 
-// Test hook: launch every kernel on n work-groups (20 .. 32) whatever the
-// device has, e.g. 20 on an Arc Pro B70 to run the kernels of a 20-core part;
-// 0: the device's. Between steps (the kernels of one step must agree).
+// Test hook: launch every kernel on at most n work-groups (20 .. 32; never
+// more than the device's Xe cores), e.g. 20 on an Arc Pro B70 to run the
+// kernels of a 20-core part; 0: the device's. Process-wide, between steps (the
+// kernels of one step must agree).
 void qwen35_force_work_groups(int64_t n) {
   TORCH_CHECK(
       n == 0 || (n >= kMinWorkGroups && n <= sgl_mono::NWG),
@@ -1242,8 +1245,11 @@ void qwen35_force_work_groups(int64_t n) {
 // Test hook (fault injection): shifts one kernel's mailbox tags on this rank
 // by `delta` (its int32 [CNT_WORDS] counters row; queued on the current
 // stream), so the peer never sees the words it waits for: both ranks give up
-// their waits and record the failure.
-void qwen35_fault_inject(at::Tensor& counters, int64_t delta) {
+// their waits and record the failure. arrivals: sets its stage arrival
+// counters back by `delta` instead, so its next call waits for work-group
+// arrivals on this card that never come (as when not all work-groups are
+// resident): the counter waits give up.
+void qwen35_fault_inject(at::Tensor& counters, int64_t delta, bool arrivals) {
   using namespace sgl_mono;
   check_device(counters, "qwen35_fault_inject");
   check_counters(counters, counters.get_device(), "qwen35_fault_inject", false);

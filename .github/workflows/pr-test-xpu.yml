@@ -96,8 +96,8 @@ jobs:
               # nightly image and the wheel that ships to tests contains
               # the pre-PR kernel code.
               rm -rf build && \
-              uv pip install -v --no-build-isolation --reinstall-package sglang-kernel-xpu . && \
-              python -c "import sgl_kernel; print(sgl_kernel.__file__)" \
+              USE_MONO_DECODE=ON uv pip install -v --no-build-isolation --reinstall-package sglang-kernel-xpu . && \
+              python -c "import sgl_kernel; from sgl_kernel import minicpm5_decode; assert minicpm5_decode.is_available(); print(sgl_kernel.__file__)" \
             '
 
       - name: Install Dependency

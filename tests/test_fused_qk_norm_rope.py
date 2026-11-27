@@ -1407,28 +1407,38 @@ def _eager_rope(x, cos_sin_cache, rope_dim, is_neox):
 # head_dim 64 and 128 are where torch-xpu's RMSNorm summation order is reproduced; NeoX
 # rope_dims include MiniMax-H3's 96 of 128 (a non-power-of-2 rotary lane count). Q and K
 # are GQA views of one packed qkv buffer; scales cover unit and large activations.
+# Measured: a different fp32 summation order changes a few elements per 10M; 32768 rows
+# expose one in every case. The last row is MiniMax-H3's DiT attention per rank (TP4 of
+# 56 heads, 5 s at 768p) with positions 0..N-1 as the model passes them.
 @pytest.mark.parametrize(
-    "head_dim,is_neox,rope_dim",
+    "num_tokens,num_qo_heads,num_kv_heads,head_dim,is_neox,rope_dim,shuffle_positions",
     [
-        (64, True, 32),
-        (64, True, 64),
-        (128, True, 96),
-        (128, True, 128),
-        (64, False, 40),
-        (64, False, 64),
-        (128, False, 96),
-        (128, False, 128),
+        (32768, 14, 2, 64, True, 32, True),
+        (32768, 14, 2, 64, True, 64, True),
+        (32768, 14, 2, 128, True, 96, True),
+        (32768, 14, 2, 128, True, 128, True),
+        (32768, 14, 2, 64, False, 40, True),
+        (32768, 14, 2, 64, False, 64, True),
+        (32768, 14, 2, 128, False, 96, True),
+        (32768, 14, 2, 128, False, 128, True),
+        (18880, 14, 14, 128, True, 96, False),  # MiniMax-H3
     ],
 )
 @pytest.mark.parametrize("scale", [1.0, 30.0])
 @pytest.mark.parametrize("cache_dtype", [torch.float32, torch.bfloat16])
 @torch.no_grad()
 def test_fused_inplace_qknorm_rope_round_norm_before_rope_matches_eager(
-    head_dim, is_neox, rope_dim, scale, cache_dtype
+    num_tokens,
+    num_qo_heads,
+    num_kv_heads,
+    head_dim,
+    is_neox,
+    rope_dim,
+    shuffle_positions,
+    scale,
+    cache_dtype,
 ):
-    # Measured: a different fp32 summation order changes a few elements per 10M;
-    # this many rows exposes one in every case.
-    num_tokens, num_qo_heads, num_kv_heads, dtype = 32768, 14, 2, torch.bfloat16
+    dtype = torch.bfloat16
     heads = num_qo_heads + 2 * num_kv_heads
     g = torch.Generator(device=device).manual_seed(head_dim * rope_dim)
     qkv = (
@@ -1444,7 +1454,10 @@ def test_fused_inplace_qknorm_rope_round_norm_before_rope_matches_eager(
         * 0.01
     )
     cache = torch.cat((angles.cos(), angles.sin()), dim=-1).to(dtype)
-    positions = torch.randperm(num_tokens, device=device, generator=g)
+    if shuffle_positions:
+        positions = torch.randperm(num_tokens, device=device, generator=g)
+    else:
+        positions = torch.arange(num_tokens, device=device)
 
     def split(buf):
         rows = buf.view(num_tokens, heads, head_dim)

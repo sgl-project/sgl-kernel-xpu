@@ -3341,6 +3341,90 @@ def test_flash_attn_varlen_output_noncontiguous(d, causal, dtype):
     ).abs().max().item() + fwd_atol, "non-contiguous q/k/v must match golden result"
 
 
+def _row_strided_like(t, nheads):
+    """``t`` as the first ``nheads`` heads of a wider buffer: same values, last
+    two dims contiguous, but the token stride is 2 * nheads * d (e.g. V sliced out
+    of a fused projection output while K was made contiguous)."""
+    wide = torch.empty(
+        *t.shape[:-2], 2 * nheads, t.shape[-1], device=t.device, dtype=t.dtype
+    )
+    strided = wide[..., :nheads, :]
+    strided.copy_(t)
+    assert strided.stride(-1) == 1 and strided.stride(-3) == 2 * t.stride(-3)
+    return strided
+
+
+@pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
+@pytest.mark.parametrize("strided", ["v", "k"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_varlen_v_strides_differ_from_k(causal, strided):
+    """K's and V's token strides differ: the kernel must read each with its own
+    strides, for every sequence (Xe35 used K's for V and packed per-sequence
+    offsets)."""
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+    torch.random.manual_seed(int(causal))
+    batch_size, seqlen, nheads, d, dtype = 2, 256, 8, 128, torch.bfloat16
+    total = batch_size * seqlen
+    q, k, v = (
+        torch.randn(total, nheads, d, device=device, dtype=dtype) for _ in range(3)
+    )
+    cu_seqlens = torch.arange(
+        0, (batch_size + 1) * seqlen, step=seqlen, dtype=torch.int32, device=device
+    )
+    kwargs = dict(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        causal=causal,
+        softmax_scale=d**-0.5,
+    )
+    k_in = _row_strided_like(k, nheads) if strided == "k" else k
+    v_in = _row_strided_like(v, nheads) if strided == "v" else v
+    out = flash_attn_varlen_func(q, k_in, v_in, **kwargs)
+    torch.testing.assert_close(out, flash_attn_varlen_func(q, k, v, **kwargs))
+
+
+@pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
+@pytest.mark.parametrize("seqlen_q", [1, 128])
+def test_flash_attn_with_kvcache_v_strides_differ_from_k(seqlen_q):
+    """Paged KV whose V cache is row-strided while the K cache is contiguous."""
+    from sgl_kernel.flash_attn import flash_attn_with_kvcache
+
+    torch.random.manual_seed(seqlen_q)
+    batch_size, nheads, d, page_size, dtype = 2, 8, 128, 64, torch.bfloat16
+    pages_per_seq = 4
+    num_pages = batch_size * pages_per_seq
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_cache, v_cache = (
+        torch.randn(num_pages, page_size, nheads, d, device=device, dtype=dtype)
+        for _ in range(2)
+    )
+    page_table = (
+        torch.randperm(num_pages, device=device)
+        .to(torch.int32)
+        .view(batch_size, pages_per_seq)
+    )
+    cache_seqlens = torch.tensor(
+        [page_size * pages_per_seq, page_size * pages_per_seq - 37],
+        dtype=torch.int32,
+        device=device,
+    )
+    kwargs = dict(
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        causal=True,
+        softmax_scale=d**-0.5,
+    )
+    out = flash_attn_with_kvcache(
+        q, k_cache, _row_strided_like(v_cache, nheads), **kwargs
+    )
+    torch.testing.assert_close(
+        out, flash_attn_with_kvcache(q, k_cache, v_cache, **kwargs)
+    )
+
+
 @pytest.mark.skipif(device.type != "xpu", reason="XPU not available")
 @pytest.mark.parametrize("causal,local", [(False, False), (False, True), (True, False)])
 @pytest.mark.parametrize("use_sinks", [False, True])

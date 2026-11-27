@@ -9,6 +9,8 @@ This test validates the fused SiLU+Mul+MXFP4 quantization kernel against:
 import pytest
 import torch
 
+torch.manual_seed(42)
+
 try:
     import sgl_kernel
 

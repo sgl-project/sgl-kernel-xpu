@@ -21,13 +21,10 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
-#include "../memory.hpp"
+#include "sgl_kernel/aligned_vec.h"
 
 namespace sgl {
 namespace sycl_kernel {
-
-// Import aligned_vector from memory utilities
-using sgl::sycl::aligned_vector;
 
 // ============================================================================
 // Helper Types for RoPE
@@ -38,16 +35,16 @@ struct packed2_t {
   float x, y;
 };
 
-// Cast from aligned_vector<T, 2> to packed2_t for processing
+// Cast from aligned_vec<T, 2> to packed2_t for processing
 template <typename T>
-inline packed2_t cast_to_fp32x2(const aligned_vector<T, 2>& v) {
+inline packed2_t cast_to_fp32x2(const aligned_vec<T, 2>& v) {
   return packed2_t{static_cast<float>(v[0]), static_cast<float>(v[1])};
 }
 
-// Cast from packed2_t back to aligned_vector<T, 2>
+// Cast from packed2_t back to aligned_vec<T, 2>
 template <typename T>
-inline aligned_vector<T, 2> cast_from_fp32x2(const packed2_t& v) {
-  aligned_vector<T, 2> result;
+inline aligned_vec<T, 2> cast_from_fp32x2(const packed2_t& v) {
+  aligned_vec<T, 2> result;
   result[0] = static_cast<T>(v.x);
   result[1] = static_cast<T>(v.y);
   return result;
@@ -89,7 +86,7 @@ struct FusedRopeStoreParams {
 template <bool kIsNeox, int64_t kRopeDim, typename DType, typename IdType, uint32_t kWorkThreads>
 class FusedRopeKernel {
  public:
-  using DType2 = aligned_vector<DType, 2>;
+  using DType2 = aligned_vec<DType, 2>;
 
   static constexpr int64_t kLanesPerVecGroup = kWorkThreads * (1 + kIsNeox);
   static constexpr int64_t kTotalVecs = kRopeDim / 2;
@@ -134,8 +131,8 @@ class FusedRopeKernel {
         DType* input_y = input + (kRopeDim / 2);
         DType2* input_vec_x_ptr = reinterpret_cast<DType2*>(input_x);
         DType2* input_vec_y_ptr = reinterpret_cast<DType2*>(input_y);
-        const aligned_vector<float, 2>* cos_ptr_vec = reinterpret_cast<const aligned_vector<float, 2>*>(cos_ptr);
-        const aligned_vector<float, 2>* sin_ptr_vec = reinterpret_cast<const aligned_vector<float, 2>*>(sin_ptr);
+        const aligned_vec<float, 2>* cos_ptr_vec = reinterpret_cast<const aligned_vec<float, 2>*>(cos_ptr);
+        const aligned_vec<float, 2>* sin_ptr_vec = reinterpret_cast<const aligned_vec<float, 2>*>(sin_ptr);
 
 #pragma unroll
         for (int64_t i = 0; i < kVecSize; ++i) {
@@ -143,8 +140,8 @@ class FusedRopeKernel {
           if (vec_idx >= kRopeDim / 4) break;
           DType2 input_vec_x = input_vec_x_ptr[vec_idx];
           DType2 input_vec_y = input_vec_y_ptr[vec_idx];
-          aligned_vector<float, 2> cos_pair = cos_ptr_vec[vec_idx];
-          aligned_vector<float, 2> sin_pair = sin_ptr_vec[vec_idx];
+          aligned_vec<float, 2> cos_pair = cos_ptr_vec[vec_idx];
+          aligned_vec<float, 2> sin_pair = sin_ptr_vec[vec_idx];
 
 #pragma unroll
           for (int j = 0; j < 2; ++j) {
@@ -199,7 +196,7 @@ class FusedRopeKernel {
 template <bool kIsNeox, int64_t kRopeDim, typename DType, typename IdType, uint32_t kWorkThreads>
 class FusedRopeStoreKernel {
  public:
-  using DType2 = aligned_vector<DType, 2>;
+  using DType2 = aligned_vec<DType, 2>;
 
   // Use ceiling division so every element is covered for non-power-of-2 rope dims
   // (e.g. rope_dim=80 or 96).  Out-of-bound lane indices are guarded below.
@@ -248,8 +245,8 @@ class FusedRopeStoreKernel {
         DType* input_y = input + (kRopeDim / 2);
         DType2* input_vec_x_ptr = reinterpret_cast<DType2*>(input_x);
         DType2* input_vec_y_ptr = reinterpret_cast<DType2*>(input_y);
-        const aligned_vector<float, 2>* cos_ptr_vec = reinterpret_cast<const aligned_vector<float, 2>*>(cos_ptr);
-        const aligned_vector<float, 2>* sin_ptr_vec = reinterpret_cast<const aligned_vector<float, 2>*>(sin_ptr);
+        const aligned_vec<float, 2>* cos_ptr_vec = reinterpret_cast<const aligned_vec<float, 2>*>(cos_ptr);
+        const aligned_vec<float, 2>* sin_ptr_vec = reinterpret_cast<const aligned_vec<float, 2>*>(sin_ptr);
 
 #pragma unroll
         for (int64_t i = 0; i < kVecSize; ++i) {
@@ -258,8 +255,8 @@ class FusedRopeStoreKernel {
           if (vec_idx >= kRopeDim / 4) break;
           DType2 input_vec_x = input_vec_x_ptr[vec_idx];
           DType2 input_vec_y = input_vec_y_ptr[vec_idx];
-          aligned_vector<float, 2> cos_pair = cos_ptr_vec[vec_idx];
-          aligned_vector<float, 2> sin_pair = sin_ptr_vec[vec_idx];
+          aligned_vec<float, 2> cos_pair = cos_ptr_vec[vec_idx];
+          aligned_vec<float, 2> sin_pair = sin_ptr_vec[vec_idx];
 
 #pragma unroll
           for (int j = 0; j < 2; ++j) {

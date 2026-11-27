@@ -10,17 +10,19 @@
 #include <cstdint>
 #include <initializer_list>
 #include <iostream>
+#include <numeric>
 #include <sycl/sycl.hpp>
 #include <type_traits>
 #include <vector>
 
-#include "MemoryAccess.h"
 #include "Norm.h"
 #include "QuantUtils.h"
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "VecUtils.h"
 #include "cutlass/float8.h"
+#include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
 // TODO: Remove this when sycl float8 is supported
@@ -175,60 +177,6 @@ inline void dispatchFusedQKNormRopeVecSize(int64_t vec_size, Fn&& fn) {
   }
 }
 
-// Picks the largest power-of-two width (<= max_vec_size) for which:
-//   1. `elems_per_thread` (the per-lane algorithmic element count) is evenly
-//      divisible by vec_size -- required so the kernel's static_assert
-//      (kElemsPerThread % VecSize == 0) always holds;
-//   2. every pointer in `ptrs` is aligned to `elem_size * vec_size` bytes;
-//   3. every stride in `elem_strides` (elements; row strides for
-//      non-contiguous q/k) is itself a multiple of vec_size.
-// Falls back to 1 (always valid) if no larger width satisfies all three.
-// `elem_strides` defaults to empty for fully contiguous callers. Only the
-// physical load/store chunk width shrinks; `elems_per_thread` itself is
-// unaffected.
-inline int64_t pickAlignedVecSize(
-    int64_t max_vec_size,
-    int64_t elem_size,
-    std::initializer_list<const void*> ptrs,
-    int64_t elems_per_thread,
-    std::initializer_list<int64_t> elem_strides = {}) {
-  for (int64_t vec_size = max_vec_size; vec_size > 1; vec_size >>= 1) {
-    if (elems_per_thread % vec_size != 0) continue;
-
-    const int64_t align_bytes = elem_size * vec_size;
-    bool ok = true;
-    for (const void* p : ptrs) {
-      if (reinterpret_cast<uintptr_t>(p) % align_bytes != 0) {
-        ok = false;
-        break;
-      }
-    }
-    if (ok) {
-      for (int64_t stride : elem_strides) {
-        if (stride % vec_size != 0) {
-          ok = false;
-          break;
-        }
-      }
-    }
-    if (ok) return vec_size;
-  }
-  return 1;
-}
-
-// Picks the device's preferred vector width, clamped by `pickAlignedVecSize`
-// for the row's element count/alignment/strides. Shared preamble for every
-// norm+rope launcher below.
-inline int64_t pickVecSizeForRow(
-    int64_t elem_size,
-    std::initializer_list<const void*> ptrs,
-    int64_t elems_per_thread,
-    std::initializer_list<int64_t> elem_strides = {}) {
-  const int64_t preferredVecSize = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), elem_size);
-  const int64_t maxVecSize = std::min<int64_t>(elems_per_thread, preferredVecSize);
-  return pickAlignedVecSize(maxVecSize, elem_size, ptrs, elems_per_thread, elem_strides);
-}
-
 // Caps work-group size for warp-per-(token,head) kernels: work-groups wider
 // than 512 sub-groups-of-16 add barrier/sync overhead without improving
 // occupancy, so the cap only applies at that width.
@@ -309,7 +257,7 @@ struct FusedQKNormRopeKernel {
     static_assert(
         !interleave || numElemsPerThread % 2 == 0, "numElemsPerThread must be even for the interleaved pairing");
     constexpr int numChunks = numElemsPerThread / VecSize;
-    using VecT = aligned_vector_loop<scalar_t, VecSize>;
+    using VecT = aligned_vec<scalar_t, VecSize>;
 
     auto sg = item.get_sub_group();
     const int laneId = static_cast<int>(item.get_local_id(0) % NUM_REDUCE_STAGES);
@@ -490,6 +438,7 @@ void launchFusedQKNormRopeImpl(
     float high,
     float attention_factor,
     int rotary_dim,
+    int vec_size,
     sycl::queue& q) {
   const int totalQKHeads = num_heads_q + num_heads_k;
   const int64_t totalWarps = static_cast<int64_t>(num_tokens) * totalQKHeads;
@@ -500,7 +449,6 @@ void launchFusedQKNormRopeImpl(
   const float log2_base = std::log2(base);
 
   constexpr int64_t numElemsPerThread = head_dim / NUM_REDUCE_STAGES;
-  const int64_t vec_size = pickVecSizeForRow(sizeof(scalar_t), {qkv, q_weight, k_weight}, numElemsPerThread);
 
   dispatchFusedQKNormRopeVecSize<numElemsPerThread>(vec_size, [&](auto vec_size_tag) {
     constexpr int kVecSize = static_cast<int>(decltype(vec_size_tag)::value);
@@ -591,6 +539,9 @@ SGL_KERNEL_EXPORT void fused_qk_norm_rope(
     using scalar_t = typename decltype(scalar_tag)::type;
     dispatchFusedQKNormRopeHeadDim(head_dim, "fusedQKNormRope", [&](auto head_dim_tag) {
       constexpr int64_t kHeadDimConst = decltype(head_dim_tag)::value;
+      constexpr int64_t kElemsPerThread = kHeadDimConst / NUM_REDUCE_STAGES;
+      constexpr int max_vec = std::gcd(max_vec_size<scalar_t>(), static_cast<int>(kElemsPerThread));
+      const int vec_size = get_vec_size(max_vec, {qkv, q_weight, k_weight});
       if (interleave) {
         launchFusedQKNormRopeImpl<kHeadDimConst, true, scalar_t>(
             qkv.data_ptr(),
@@ -608,6 +559,7 @@ SGL_KERNEL_EXPORT void fused_qk_norm_rope(
             static_cast<float>(high),
             static_cast<float>(attention_factor),
             static_cast<int>(rotary_dim),
+            vec_size,
             queue);
       } else {
         launchFusedQKNormRopeImpl<kHeadDimConst, false, scalar_t>(
@@ -626,6 +578,7 @@ SGL_KERNEL_EXPORT void fused_qk_norm_rope(
             static_cast<float>(high),
             static_cast<float>(attention_factor),
             static_cast<int>(rotary_dim),
+            vec_size,
             queue);
       }
     });
@@ -713,7 +666,7 @@ struct FusedQKNormRopeCacheKernel {
         weight_ptr = k_weight_ptr;
       }
 
-      using VecT = aligned_vector_loop<scalar_t, kVecSize>;
+      using VecT = aligned_vec<scalar_t, kVecSize>;
       float elems[kElemsPerThread];
       float sum_of_squares = 0.0f;
 #pragma unroll
@@ -1009,6 +962,7 @@ void launchFusedQKNormRopeCacheImpl(
     int64_t num_kv_heads,
     int64_t rope_dim,
     float eps,
+    int vec_size,
     sycl::queue& queue) {
   const int64_t totalWork = num_tokens * (num_qo_heads + num_kv_heads);
   const auto launch_cfg = computePersistentLaunchConfig(totalWork, NUM_REDUCE_STAGES);
@@ -1050,15 +1004,6 @@ void launchFusedQKNormRopeCacheImpl(
         queue);
     return;
   }
-  // q/k rows may be non-contiguous beyond the last dimension (e.g. sliced
-  // out of a larger packed buffer), so the chosen vector width must also
-  // divide the token/head strides, not just satisfy base-pointer alignment.
-  const int64_t vec_size = pickVecSizeForRow(
-      sizeof(scalar_t),
-      {q_ptr, k_ptr, q_weight_ptr, k_weight_ptr},
-      kElemsPerThread,
-      {q_token_stride, k_token_stride, q_head_stride, k_head_stride});
-
   dispatchFusedQKNormRopeVecSize<kElemsPerThread>(vec_size, [&](auto vec_size_tag) {
     constexpr int64_t kVecSize = decltype(vec_size_tag)::value;
     launchFusedQKNormRopeCacheVecImpl<kHeadDim, kIsNeox, scalar_t, cache_t, IdType, kVecSize>(
@@ -1147,7 +1092,7 @@ struct FusedQNormRopeWarpKernel {
       scalar_t* row_out = rowPtr(
           out_ptr, static_cast<int64_t>(token_id), static_cast<int64_t>(head_id), out_token_stride, out_head_stride);
 
-      using VecT = aligned_vector_loop<scalar_t, kVecSize>;
+      using VecT = aligned_vec<scalar_t, kVecSize>;
       float elems[kElemsPerThread];
       float sum_of_squares = 0.0f;
 #pragma unroll
@@ -1209,16 +1154,12 @@ void launchFusedQNormRopeWarpImpl(
     int64_t num_tokens,
     int64_t num_heads,
     float eps,
+    int vec_size,
     sycl::queue& queue) {
   const int64_t totalWork = num_tokens * num_heads;
   const auto launch_cfg = computePersistentLaunchConfig(totalWork, NUM_REDUCE_STAGES);
 
   constexpr int64_t kElemsPerThread = kHeadDim / NUM_REDUCE_STAGES;
-  const int64_t vec_size = pickVecSizeForRow(
-      sizeof(scalar_t),
-      {q_ptr, out_ptr},
-      kElemsPerThread,
-      {q_token_stride, q_head_stride, out_token_stride, out_head_stride});
 
   dispatchFusedQKNormRopeVecSize<kElemsPerThread>(vec_size, [&](auto vec_size_tag) {
     constexpr int64_t kVecSize = decltype(vec_size_tag)::value;
@@ -1248,7 +1189,7 @@ void launchFusedQNormRopeWarpImpl(
 // exceed resident work-groups). head_dim/rope_dim are runtime values.
 template <typename scalar_t, typename IdType, int64_t kVecSize>
 struct FusedQNormRopeCTAKernel {
-  using VecT = aligned_vector_loop<scalar_t, kVecSize>;
+  using VecT = aligned_vec<scalar_t, kVecSize>;
 
   const scalar_t* q_ptr;
   scalar_t* out_ptr;
@@ -1408,6 +1349,7 @@ void launchFusedQNormRopeCTA(
     int64_t num_tokens,
     int64_t num_heads,
     float eps,
+    int vec_size,
     sycl::queue& queue) {
   // `stage` in FusedQNormRopeCTAKernel is head_dim floats of SLM per
   // work-group; unlike the warp path (register-only), this scales directly
@@ -1426,11 +1368,6 @@ void launchFusedQNormRopeCTA(
       " bytes of SLM staging, but the device only provides ",
       available_slm_bytes,
       " bytes of local memory per work-group");
-
-  // vec_size must evenly divide head_dim (the CTA loop strides by
-  // workgroup_size * vec_size, with no OOB remainder handling).
-  const int64_t vec_size = pickVecSizeForRow(
-      sizeof(scalar_t), {q_ptr, out_ptr}, head_dim, {q_token_stride, q_head_stride, out_token_stride, out_head_stride});
 
   // head_dim is a runtime value here (unlike the warp path), so there's no
   // real compile-time elems-per-thread to pass. 16 is just the largest
@@ -1520,6 +1457,8 @@ SGL_KERNEL_EXPORT void fused_q_norm_rope(
         constexpr int64_t kElemsPerThread = kHeadDimConst / NUM_REDUCE_STAGES;
         if (dispatched || head_dim != kHeadDimConst || rope_dim % kElemsPerThread != 0) return;
         dispatched = true;
+        constexpr int max_vec = std::gcd(max_vec_size<scalar_t>(), static_cast<int>(kElemsPerThread));
+        const int vec_size = get_vec_size(max_vec, {q_input, q_output});
         launchFusedQNormRopeWarpImpl<kHeadDimConst, scalar_t, IdType>(
             q_ptr,
             out_ptr,
@@ -1533,6 +1472,7 @@ SGL_KERNEL_EXPORT void fused_q_norm_rope(
             num_tokens,
             num_heads,
             static_cast<float>(eps),
+            vec_size,
             queue);
       };
       try_warp_head_dim(std::integral_constant<int64_t, 64>{});
@@ -1541,6 +1481,7 @@ SGL_KERNEL_EXPORT void fused_q_norm_rope(
       try_warp_head_dim(std::integral_constant<int64_t, 256>{});
 
       if (!dispatched) {
+        const int vec_size = get_vec_size<scalar_t>({q_input, q_output});
         launchFusedQNormRopeCTA<scalar_t, IdType>(
             q_ptr,
             out_ptr,
@@ -1555,6 +1496,7 @@ SGL_KERNEL_EXPORT void fused_q_norm_rope(
             num_tokens,
             num_heads,
             static_cast<float>(eps),
+            vec_size,
             queue);
       }
     });
@@ -1585,7 +1527,7 @@ constexpr int64_t kElementsPerScaleChunk = 64;
 
 template <typename scalar_t, typename IdType, int64_t kVecSize>
 struct FusedKNormRopeFlashMLAKernel {
-  using VecT = aligned_vector_loop<scalar_t, kVecSize>;
+  using VecT = aligned_vec<scalar_t, kVecSize>;
 
   const scalar_t* kv_ptr;
   const scalar_t* kv_weight_ptr;
@@ -1822,6 +1764,7 @@ void launchFusedKNormRopeFlashMLA(
     int64_t rope_dim,
     int64_t num_tokens,
     float eps,
+    int vec_size,
     sycl::queue& queue) {
   const auto dev_id = dpcppGetDeviceIdOfCurrentQueue();
   const int64_t required_slm_bytes = 2 * head_dim * static_cast<int64_t>(sizeof(float));
@@ -1835,8 +1778,6 @@ void launchFusedKNormRopeFlashMLA(
       " bytes of SLM staging, but the device only provides ",
       available_slm_bytes,
       " bytes of local memory per work-group");
-
-  const int64_t vec_size = pickVecSizeForRow(sizeof(scalar_t), {kv_ptr, kv_weight_ptr}, head_dim, {kv_stride_batch});
 
   dispatchFusedQKNormRopeVecSize<16>(vec_size, [&](auto vec_size_tag) {
     constexpr int64_t kVecSize = decltype(vec_size_tag)::value;
@@ -1945,6 +1886,7 @@ SGL_KERNEL_EXPORT void fused_k_norm_rope_flashmla(
       const int32_t* out_loc_ptr = static_cast<const int32_t*>(out_loc.data_ptr());
       uint8_t* kvcache_ptr = static_cast<uint8_t*>(kvcache.data_ptr());
 
+      const int vec_size = get_vec_size<scalar_t>({kv, kv_weight});
       launchFusedKNormRopeFlashMLA<scalar_t, IdType>(
           kv_ptr,
           kv_weight_ptr,
@@ -1960,6 +1902,7 @@ SGL_KERNEL_EXPORT void fused_k_norm_rope_flashmla(
           rope_dim,
           num_tokens,
           static_cast<float>(eps),
+          vec_size,
           queue);
     });
   });
@@ -2085,6 +2028,9 @@ SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
         using IdType = typename decltype(id_tag)::type;
         dispatchFusedQKNormRopeHeadDim(head_dim, "fused_inplace_qknorm_rope", [&](auto head_dim_tag) {
           constexpr int64_t kHeadDimConst = decltype(head_dim_tag)::value;
+          constexpr int64_t kElemsPerThread = kHeadDimConst / NUM_REDUCE_STAGES;
+          constexpr int max_vec = std::gcd(max_vec_size<scalar_t>(), static_cast<int>(kElemsPerThread));
+          const int vec_size = get_vec_size(max_vec, {q_view, k_view, q_weight, k_weight});
           if (is_neox) {
             launchFusedQKNormRopeCacheImpl<kHeadDimConst, true, scalar_t, cache_t, IdType>(
                 static_cast<scalar_t*>(q_view.data_ptr()),
@@ -2102,6 +2048,7 @@ SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
                 num_kv_heads,
                 rope_dim,
                 static_cast<float>(eps),
+                vec_size,
                 queue);
           } else {
             launchFusedQKNormRopeCacheImpl<kHeadDimConst, false, scalar_t, cache_t, IdType>(
@@ -2120,6 +2067,7 @@ SGL_KERNEL_EXPORT void fused_inplace_qknorm_rope(
                 num_kv_heads,
                 rope_dim,
                 static_cast<float>(eps),
+                vec_size,
                 queue);
           }
         });

@@ -10,9 +10,9 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
-#include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
@@ -66,14 +66,14 @@ struct op_and_mul_functor {
     func_t fn;
     int64_t bound = dim / N;
     for (int64_t i = offset; i < bound; i += step) {
-      auto unary_val = reinterpret_cast<aligned_vector_loop<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i];
-      auto mul_val = reinterpret_cast<aligned_vector_loop<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i + bound];
+      auto unary_val = reinterpret_cast<aligned_vec<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i];
+      auto mul_val = reinterpret_cast<aligned_vec<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i + bound];
 #pragma unroll
       for (int i = 0; i < N; ++i) {
         [[maybe_unused]] auto a = unary_val[i], b = mul_val[i];
         unary_val[i] = fn(unary_val[i], mul_val[i]);
       }
-      reinterpret_cast<aligned_vector_loop<scalar_t, N>*>(output_ptr)[token_id * bound + i] = unary_val;
+      reinterpret_cast<aligned_vec<scalar_t, N>*>(output_ptr)[token_id * bound + i] = unary_val;
     }
   }
 

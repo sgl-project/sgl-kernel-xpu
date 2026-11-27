@@ -8,10 +8,10 @@
 #include <optional>
 #include <sycl/sycl.hpp>
 
-#include "MemoryAccess.h"
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "VecUtils.h"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -313,11 +313,7 @@ void launch_top_p_renorm_kernel(
   const int local_size = kTopPRenormWgSize;
   const int global_size = batch_size * local_size;
 
-  int vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(float));
-  vec_size = get_min_vec_size(vec_size, const_cast<float*>(probs_ptr), renorm_probs_ptr);
-
-  // align vec_size with vocab_size
-  vec_size = std::gcd(vec_size, vocab_size);
+  const int vec_size = get_vec_size<float>({probs, renorm_probs});
 
   SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
     sycl_kernel_submit(

@@ -22,13 +22,10 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
-#include "../memory.hpp"
+#include "sgl_kernel/aligned_vec.h"
 
 namespace sgl {
 namespace sycl_kernel {
-
-// Import aligned_vector from memory utilities
-using sgl::sycl::aligned_vector;
 
 static constexpr int kQKNormSubGroupSize = 16;
 
@@ -48,7 +45,7 @@ constexpr int qknorm_get_vec_size() {
 template <typename T, int64_t kHeadDim, int kVecSize = qknorm_get_vec_size<T, kHeadDim>()>
 class QKNormKernel {
  public:
-  using Vec = aligned_vector<T, kVecSize>;
+  using Vec = aligned_vec<T, kVecSize>;
   static constexpr int64_t kVectorizedSize = kHeadDim / kVecSize;
 
   QKNormKernel(

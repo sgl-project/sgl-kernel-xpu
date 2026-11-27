@@ -362,50 +362,6 @@ static inline int64_t dpcppLocalMemSize(DeviceId dev_id = dpcppGetDeviceIdOfCurr
   return dev_prop->local_mem_size;
 }
 
-template <typename T>
-uint32_t dpcppPrefVectorWidth(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
-  auto* dev_prop = at::xpu::getDeviceProperties(dev_id);
-  if constexpr (std::is_same_v<T, char>) {
-    return dev_prop->preferred_vector_width_char;
-  } else if constexpr (std::is_same_v<T, short>) {
-    return dev_prop->preferred_vector_width_short;
-  } else if constexpr (std::is_same_v<T, int>) {
-    return dev_prop->preferred_vector_width_int;
-  } else if constexpr (std::is_same_v<T, int64_t>) {
-    return dev_prop->preferred_vector_width_long;
-  } else if constexpr (std::is_same_v<T, float>) {
-    return dev_prop->preferred_vector_width_float;
-  } else if constexpr (std::is_same_v<T, double>) {
-    return dev_prop->preferred_vector_width_double;
-  } else if constexpr (std::is_same_v<T, sycl::half>) {
-    return dev_prop->preferred_vector_width_half;
-  } else {
-    throw std::invalid_argument("Invalid data type to fetch preferred vector width!");
-  }
-}
-
-template <typename T>
-uint32_t dpcppNativeVectorWidth(DeviceId dev_id = dpcppGetDeviceIdOfCurrentQueue()) {
-  auto* dev_prop = at::xpu::getDeviceProperties(dev_id);
-  if constexpr (std::is_same_v<T, char>) {
-    return dev_prop->native_vector_width_char;
-  } else if constexpr (std::is_same_v<T, short>) {
-    return dev_prop->native_vector_width_short;
-  } else if constexpr (std::is_same_v<T, int>) {
-    return dev_prop->native_vector_width_int;
-  } else if constexpr (std::is_same_v<T, int64_t>) {
-    return dev_prop->native_vector_width_long;
-  } else if constexpr (std::is_same_v<T, float>) {
-    return dev_prop->native_vector_width_float;
-  } else if constexpr (std::is_same_v<T, double>) {
-    return dev_prop->native_vector_width_double;
-  } else if constexpr (std::is_same_v<T, sycl::half>) {
-    return dev_prop->native_vector_width_half;
-  } else {
-    throw std::invalid_argument("Invalid data type to fetch native vector width!");
-  }
-}
-
 template <typename T, typename std::enable_if<std::is_integral<T>::value, int>::type = 0>
 inline T div_up(T x, T y) {
   return (x + y - 1) / y;
@@ -419,16 +375,3 @@ inline T safe_recip(T x) {
   const T inv = sycl::native::recip(safe_d);
   return sycl::select(T(0), inv, nz);
 }
-
-template <typename scalar_t, int vec_size>
-struct alignas(sizeof(scalar_t) * vec_size) aligned_vec {
-  scalar_t val[vec_size];
-
-  scalar_t& operator[](int index) {
-    return val[index];
-  }
-
-  scalar_t const& operator[](int index) const {
-    return val[index];
-  }
-};

@@ -176,6 +176,8 @@ add_subdirectory(${SGL_OPS_XPU_ROOT}/src)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl_kernel/jit_kernel
         DESTINATION sgl_kernel/include/sgl_kernel
         FILES_MATCHING PATTERN "*.hpp")
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl_kernel/aligned_vec.h
+        DESTINATION sgl_kernel/include/sgl_kernel)
 
 if(SGL_BUILD_MEMORY_MONITOR)
   install(CODE

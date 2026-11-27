@@ -6,7 +6,6 @@
 #include <optional>
 #include <sycl/sycl.hpp>
 
-#include "MemoryAccess.h"
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"

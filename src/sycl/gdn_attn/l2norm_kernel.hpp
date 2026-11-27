@@ -7,6 +7,7 @@
 #include "../SYCLHelpers.h"
 #include "../Utils.h"
 #include "gdn_attn_utils.h"
+#include "sgl_kernel/aligned_vec.h"
 
 namespace gdn {
 

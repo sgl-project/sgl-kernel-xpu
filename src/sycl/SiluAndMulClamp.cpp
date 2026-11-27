@@ -20,7 +20,7 @@
 // Performance design mirrors TripleOps.cpp:
 //   - One work-group per token row  →  no per-element integer division
 //   - Device-adaptive work-group size via dpcppMaxWorkGroupSize()
-//   - Vectorised loads/stores via aligned_vector_loop<scalar_t, N> (N up to 16)
+//   - Vectorised loads/stores via aligned_vec<scalar_t, N> (N up to 16)
 
 #include <ATen/ATen.h>
 #include <ATen/OpMathType.h>
@@ -29,10 +29,10 @@
 
 #include <sycl/sycl.hpp>
 
-#include "MemoryAccess.h"
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
 static constexpr float LOG2E = 1.442695040888963f;  // log2(e) for exp2 conversion
@@ -80,18 +80,17 @@ struct SiluAndMulClampFunctor {
 
     for (int64_t i = offset; i < bound; i += step) {
       // Gate half: input[token_id, :H]  vectorised at position i
-      auto gate_vec = reinterpret_cast<const aligned_vector_loop<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i];
+      auto gate_vec = reinterpret_cast<const aligned_vec<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i];
       // Up half:  input[token_id, H:]  vectorised at position i
-      auto up_vec =
-          reinterpret_cast<const aligned_vector_loop<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i + bound];
+      auto up_vec = reinterpret_cast<const aligned_vec<scalar_t, N>*>(input_ptr)[token_id * bound * 2 + i + bound];
 
-      aligned_vector_loop<scalar_t, N> out_vec;
+      aligned_vec<scalar_t, N> out_vec;
 #pragma unroll
       for (int k = 0; k < N; ++k) {
         out_vec[k] = silu_and_mul_clamp_elem<scalar_t>(gate_vec[k], up_vec[k], limit);
       }
 
-      reinterpret_cast<aligned_vector_loop<scalar_t, N>*>(output_ptr)[token_id * bound + i] = out_vec;
+      reinterpret_cast<aligned_vec<scalar_t, N>*>(output_ptr)[token_id * bound + i] = out_vec;
     }
   }
 };

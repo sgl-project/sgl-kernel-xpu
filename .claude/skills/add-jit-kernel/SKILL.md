@@ -66,7 +66,7 @@ mapping from the matching AOT source**:
 
 - `src/sycl/RMSNorm.cpp`, `src/sycl/Rope.cpp`, `src/sycl/FusedQKNormRope.cpp`,
   `src/sycl/Norm.h` — element-wise / normalization references.
-- `src/sycl/SYCLHelpers.h`, `src/sycl/MemoryAccess.h`, `src/sycl/Utils.h` —
+- `src/sycl/SYCLHelpers.h`, `src/sycl/Utils.h` —
   device query, vectorized access, and reduction helpers used by AOT kernels
   (mirror their strategy, but keep the JIT header self-contained).
 - `src/torch_extension_sycl.cc` — the op schema + `torch::kXPU` binding for each

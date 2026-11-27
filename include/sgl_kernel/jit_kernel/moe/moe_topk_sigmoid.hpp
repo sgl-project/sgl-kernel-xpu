@@ -31,6 +31,8 @@
 #include <limits>
 #include <sycl/sycl.hpp>
 
+#include "sgl_kernel/aligned_vec.h"
+
 namespace sgl {
 namespace sycl_kernel {
 namespace topk_sigmoid {
@@ -49,12 +51,6 @@ template <int Dim, typename KernelT>
 inline void submit_nd(::sycl::queue& q, ::sycl::range<Dim> global, ::sycl::range<Dim> local, const KernelT& ker) {
   q.submit([&](::sycl::handler& cgh) { cgh.parallel_for(::sycl::nd_range<Dim>(global, local), ker); });
 }
-
-// Aligned array for vectorized loads (avoids a CUTLASS dependency).
-template <typename T, int N, int Alignment = static_cast<int>(sizeof(T) * N)>
-class alignas(Alignment) AlignedArray {
-  T data[N];
-};
 
 // ---------------------------------------------------------------------------
 // General fallback: one sub-group per token, fp32 ranking. Handles any
@@ -268,7 +264,7 @@ struct TopkGatingSigmoid {
     const int first_elt_read_by_thread = thread_group_idx * ELTS_PER_LDG;
     const T* thread_read_ptr = thread_row_ptr + first_elt_read_by_thread;
 
-    using AccessType = AlignedArray<T, ELTS_PER_LDG>;
+    using AccessType = aligned_vec<T, ELTS_PER_LDG>;
 
     T row_chunk_temp[VPT];
     AccessType* row_chunk_vec_ptr = reinterpret_cast<AccessType*>(&row_chunk_temp);

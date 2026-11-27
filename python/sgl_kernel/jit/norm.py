@@ -168,7 +168,7 @@ class _XPUQKNormWrapper:
         self._module = module
         self._head_dim = head_dim
         # Mirrors qknorm_get_vec_size() in qknorm.hpp; the kernel reinterpret-casts
-        # head pointers to aligned_vector<T, N>, declared alignas(N * sizeof(T)).
+        # head pointers to aligned_vec<T, N>, declared alignas(N * sizeof(T)).
         self._vec_size = 8 if head_dim % 8 == 0 else 4 if head_dim % 4 == 0 else 2
         self._func_name = f"qknorm_forward_{dtype_str}_{head_dim}"
         self._argtypes = [

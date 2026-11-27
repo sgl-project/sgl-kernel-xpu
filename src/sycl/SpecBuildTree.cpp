@@ -50,10 +50,10 @@ Outputs:
 
 #include <sycl/sycl.hpp>
 
-#include "MemoryAccess.h"
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "VecUtils.h"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -503,10 +503,9 @@ SGL_KERNEL_EXPORT void build_tree_kernel_efficient(
   const int64_t max_row_blocks = std::max<int64_t>((draft_token_num + 31) / 32, 1);
   const int64_t row_blocks = bs < num_subslices ? std::min<int64_t>(max_row_blocks, (num_subslices + bs - 1) / bs) : 1;
 
-  int pack_words = std::min<int>(
-      can_vectorize_up_to<int32_t>(
-          dpcppGetDeviceIdOfCurrentQueue(), reinterpret_cast<char*>(tree_mask.data_ptr<bool>())),
-      kMaxMaskPackWords);
+  const int pack_bytes =
+      get_vec_size(std::min(max_vec_size<bool>(), kMaxMaskPackWords * 4), {tree_mask.flatten()}, true);
+  int pack_words = std::max(1, pack_bytes / 4);
   while (pack_words > 1 && draft_token_num < 4 * pack_words) {
     pack_words >>= 1;
   }

@@ -35,10 +35,10 @@
 #include <algorithm>
 #include <sycl/sycl.hpp>
 
-#include "MemoryAccess.h"
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "VecUtils.h"
 #include "sgl_kernel_export.h"
 
 // TODO: Remove this when sycl float8 is supported
@@ -207,8 +207,13 @@ sgl_per_tensor_quant_fp8(at::Tensor input, at::Tensor output_q, at::Tensor outpu
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(), "sgl_per_tensor_quant_fp8", [&] {
     using sycl_scalar_t = sycl_type_t<scalar_t>;
 
-    int vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(sycl_scalar_t));
-    SGL_DISPATCH_VEC_SIZE(vec_size, [&] { LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, VEC_SIZE); });
+    // TODO: Previously this only queried static preferred_vector_width without pointer alignment
+    // checks and ran an unnecessary runtime SGL_DISPATCH_VEC_SIZE. Keep static max_vec_size for
+    // sycl::vec::load/store; switch to get_vec_size if vectorized pointer casts are used later.
+    // int vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(sycl_scalar_t));
+    // SGL_DISPATCH_VEC_SIZE(vec_size, [&] { LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, VEC_SIZE); });
+    constexpr int vec_size = max_vec_size<sycl_scalar_t>();
+    LAUNCH_KERNEL(sycl_scalar_t, cutlass::float_e4m3_t, vec_size);
   });
 
 #undef LAUNCH_KERNEL

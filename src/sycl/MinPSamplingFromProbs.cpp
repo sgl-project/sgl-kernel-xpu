@@ -8,10 +8,10 @@
 #include <optional>
 #include <sycl/sycl.hpp>
 
-#include "MemoryAccess.h"
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "VecUtils.h"
 #include "comm/Random.h"
 #include "comm/Sampling.h"
 #include "sgl_kernel_export.h"
@@ -155,8 +155,7 @@ void launch_min_p_sampling(
   const int local_size = kMinPWgSize;
   const int global_size = batch_size * local_size;
 
-  const uint32_t preferred_vec_size = preferred_vector_width(dpcppGetDeviceIdOfCurrentQueue(), sizeof(float));
-  const uint32_t vec_size = std::gcd(preferred_vec_size, vocab_size);
+  const uint32_t vec_size = static_cast<uint32_t>(get_vec_size<float>({probs}));
 
   SGL_DISPATCH_VEC_SIZE(vec_size, [&] {
     SGL_DISPATCH_BOOL(deterministic, DETERMINISTIC, [&] {

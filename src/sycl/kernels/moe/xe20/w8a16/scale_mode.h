@@ -32,4 +32,11 @@ inline bool is_block_scale_mode(ScaleMode mode) {
   return is_block_scale_mode(static_cast<int32_t>(mode));
 }
 
+inline int w8a16_select_tile(int avg_m, int gemm_n) {
+  if (avg_m <= 8) return 0;
+  if (avg_m <= 32) return 1;
+  if (avg_m <= 64 || gemm_n < 128) return 2;
+  return 3;
+}
+
 }  // namespace moe_w8a16

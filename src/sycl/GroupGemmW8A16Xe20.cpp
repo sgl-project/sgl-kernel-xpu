@@ -216,7 +216,13 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
 
   const int ld_b = static_cast<int>(weights_b.stride(2));
   const int64_t expert_stride_b = weights_b.stride(0);
-  TORCH_CHECK((ld_b % 4) == 0, "W8A16 Layout-B pitch ld_b must be a multiple of 4 bytes, got ", ld_b);
+  TORCH_CHECK(
+      (ld_b % 16) == 0 && (expert_stride_b % 64) == 0,
+      "W8A16 Layout-B requires 16-byte pitch alignment (ld_b % 16 == 0) and "
+      "64-byte expert base alignment (expert_stride_b % 64 == 0), got ld_b=",
+      ld_b,
+      ", expert_stride_b=",
+      expert_stride_b);
 
   const bool is_mxfp8 = !is_int8 && (weight_scales.scalar_type() == at::ScalarType::Byte ||
                                      weight_scales.scalar_type() == at::ScalarType::Float8_e8m0fnu);
@@ -443,14 +449,20 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
           &jit_err),
       jit_err);
 #else
-  if (avg_m <= 8) {
-    LAUNCH_MOE_W8A16(Tile_16_64_32, SG_1_4_1);
-  } else if (avg_m <= 32) {
-    LAUNCH_MOE_W8A16(Tile_32_64_32, SG_1_4_1);
-  } else if (avg_m <= 64 || gemm_n < 128) {
-    LAUNCH_MOE_W8A16(Tile_64_64_32, SG_2_4_1);
-  } else {
-    LAUNCH_MOE_W8A16(Tile_128_128_32, SG_4_4_1);
+  const int tile_id = moe_w8a16::w8a16_select_tile(avg_m, gemm_n);
+  switch (tile_id) {
+    case 0:
+      LAUNCH_MOE_W8A16(Tile_16_64_32, SG_1_4_1);
+      break;
+    case 1:
+      LAUNCH_MOE_W8A16(Tile_32_64_32, SG_1_4_1);
+      break;
+    case 2:
+      LAUNCH_MOE_W8A16(Tile_64_64_32, SG_2_4_1);
+      break;
+    default:
+      LAUNCH_MOE_W8A16(Tile_128_128_32, SG_4_4_1);
+      break;
   }
 #endif
 }

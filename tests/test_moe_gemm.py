@@ -2404,13 +2404,13 @@ def test_fused_experts_uint8_w8a16_gptq_awq(with_explicit_zp, activation):
     not is_xe2_arch(), reason="Layout-B and XPU Graph tests require Xe2"
 )
 def test_layout_b_square_matrix_non_mutation_and_xpu_graph():
-    """Verify square (N == K) Layout-B disambiguation, non-mutation of legacy weights,
+    """Verify square (N == K) Layout-B disambiguation, in-place upgrade without memory leak,
     GPT-OSS block-split BF16 fusion, and XPU Graph capture/replay."""
     torch.manual_seed(303)
     torch.xpu.manual_seed_all(303)
 
     # 1. Square matrix (N == K == 128): legacy K-major vs Layout-B N-major must produce identical results
-    #    without mutating the caller's legacy tensor.
+    #    when passed directly to C++ op.
     e_sq, n_sq, k_sq = 5, 128, 128
     act = torch.randn((15, k_sq), dtype=torch.bfloat16, device="xpu") * 0.2
     w_legacy = (
@@ -2439,7 +2439,7 @@ def test_layout_b_square_matrix_non_mutation_and_xpu_graph():
     assert w_legacy.data_ptr() == orig_ptr
     torch.testing.assert_close(out_legacy, out_col, rtol=0, atol=0)
 
-    # 2. fused_experts with legacy [E, N, K] weights: non-mutating cache + XPU Graph capture & replay.
+    # 2. fused_experts with legacy [E, N, K] weights: in-place upgrade + XPU Graph capture & replay.
     num_tokens, topk, hidden, inter = 8, 2, 128, 128
     x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="xpu") * 0.2
     w1_fp8 = torch.randn(
@@ -2459,11 +2459,11 @@ def test_layout_b_square_matrix_non_mutation_and_xpu_graph():
     )
     topk_w, topk_i = torch.topk(scores, topk, dim=-1)
 
-    w1_orig_stride = w1_fp8.stride()
     eager_ref = fused_experts(
         x, w1_fp8, w2_fp8, topk_w, topk_i, use_fp8_w8a8=True, w1_scale=s1, w2_scale=s2
     ).clone()
-    assert w1_fp8.stride() == w1_orig_stride and w1_fp8.is_contiguous()
+    assert w1_fp8.shape == (e_sq, 2 * inter, hidden)
+    assert w1_fp8.stride(1) == 1 and w2_fp8.stride(1) == 1
 
     # Capture XPU Graph after warmup and replay with fresh input values.
     static_x = x.clone()
@@ -2846,6 +2846,494 @@ def test_fused_experts_gelu_erf_and_arbitrary_swiglu_limit():
         )
         torch.testing.assert_close(out_fp8_clamp, ref_clamp, rtol=2e-2, atol=2e-2)
         torch.testing.assert_close(out_bf16_clamp, ref_clamp, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not is_xe2_arch(), reason="W8A16 extreme-scale tests require Xe2")
+@pytest.mark.parametrize("avg_m", [8, 128])
+def test_w8a16_mixed_normal_and_extreme_scales_same_workgroup(avg_m):
+    """Regression test for P0 subgroup divergence inside a single workgroup:
+    mix normal scales and extreme (< 2^-53 and > 2^71) scales across adjacent
+    16-column subgroups within the same 64/128-column workgroup N-tile."""
+    torch.manual_seed(701 + avg_m)
+    torch.xpu.manual_seed_all(701 + avg_m)
+    num_experts, n_dim, k_dim = 2, 128, 128
+    total_m = num_experts * avg_m
+    rows = torch.full((num_experts,), avg_m, dtype=torch.int32, device="xpu")
+    act = torch.randn((total_m, k_dim), dtype=torch.bfloat16, device="xpu") * 0.1
+    w_fp8 = (torch.randn((num_experts, n_dim, k_dim), device="xpu") * 1.5).to(
+        torch.float8_e4m3fn
+    )
+
+    # 1. MXFP8: subgroup 0 normal (127), subgroup 1 subnormal byte=0 (2^-127 < 2^-53),
+    #    subgroup 2 tiny byte=64 (2^-63 < 2^-53), subgroup 3 normal (126).
+    s_mxfp8 = torch.full(
+        (num_experts, n_dim, k_dim // 32), 127, dtype=torch.uint8, device="xpu"
+    )
+    s_mxfp8[:, 16:32, :] = 0
+    s_mxfp8[:, 32:48, 0::2] = 64
+    s_mxfp8[:, 32:48, 1::2] = 127
+    s_mxfp8[:, 48:64, :] = 126
+    s_mxfp8[:, 64:80, :] = 0
+
+    out_mx = torch.empty((total_m, n_dim), dtype=torch.bfloat16, device="xpu")
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_mx, act, w_fp8, s_mxfp8, None, rows, num_experts
+    )
+    s_mx_f32 = torch.exp2(s_mxfp8.float() - 127.0).repeat_interleave(32, dim=2)
+    ref_mx = torch.empty_like(out_mx)
+    for e in range(num_experts):
+        sl = slice(e * avg_m, (e + 1) * avg_m)
+        w_dq = w_fp8[e].float() * s_mx_f32[e]
+        ref_mx[sl] = (act[sl].float() @ w_dq.t()).to(torch.bfloat16)
+    torch.testing.assert_close(out_mx, ref_mx, rtol=1.5e-2, atol=1.5e-2)
+
+    # 2. FP32 group scales: mix normal 0.125 with tiny 1e-22 (< 2^-53) and huge
+    #    2^73 (with tiny activations on a second run) in the same workgroup tile.
+    s_fp32 = torch.full(
+        (num_experts, n_dim, k_dim // 32), 0.125, dtype=torch.float32, device="xpu"
+    )
+    s_fp32[:, 16:32, :] = 1e-22
+    s_fp32[:, 48:64, 0::2] = 1e-20
+    out_f32 = torch.empty((total_m, n_dim), dtype=torch.bfloat16, device="xpu")
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_f32, act, w_fp8, s_fp32, None, rows, num_experts
+    )
+    s_f32_exp = s_fp32.repeat_interleave(32, dim=2)
+    ref_f32 = torch.empty_like(out_f32)
+    for e in range(num_experts):
+        sl = slice(e * avg_m, (e + 1) * avg_m)
+        w_dq = w_fp8[e].float() * s_f32_exp[e]
+        ref_f32[sl] = (act[sl].float() @ w_dq.t()).to(torch.bfloat16)
+    torch.testing.assert_close(out_f32, ref_f32, rtol=1.5e-2, atol=1.5e-2)
+
+    # Huge scale (> 2^71) mixed with normal scale in the same workgroup tile.
+    act_tiny = act * (2.0**-74)
+    s_huge = torch.full(
+        (num_experts, n_dim, k_dim // 32), 1.0, dtype=torch.float32, device="xpu"
+    )
+    s_huge[:, 16:32, :] = 2.0**74
+    out_huge = torch.empty((total_m, n_dim), dtype=torch.bfloat16, device="xpu")
+    torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+        out_huge, act_tiny, w_fp8, s_huge, None, rows, num_experts
+    )
+    s_huge_exp = s_huge.repeat_interleave(32, dim=2)
+    ref_huge = torch.empty_like(out_huge)
+    for e in range(num_experts):
+        sl = slice(e * avg_m, (e + 1) * avg_m)
+        w_dq = w_fp8[e].float() * s_huge_exp[e]
+        ref_huge[sl] = (act_tiny[sl].float() @ w_dq.t()).to(torch.bfloat16)
+    torch.testing.assert_close(out_huge, ref_huge, rtol=1.5e-2, atol=1.5e-2)
+
+
+@pytest.mark.skipif(not is_xe2_arch(), reason="W8A16 g_idx/zp tests require Xe2")
+def test_fused_experts_int8_uint8_w8a16_g_idx_and_channel_zp():
+    """Verify GPTQ desc_act g_idx permutations (w1_g_idx_perm & w2_g_idx_perm),
+    PerChannelN + explicit uint8 weight_zeros, and FP8 bfloat16 scales."""
+    torch.manual_seed(709)
+    torch.xpu.manual_seed_all(709)
+    num_experts, num_tokens, topk, hidden, inter, group_size = 4, 17, 2, 128, 96, 32
+    x = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device="xpu") * 0.25
+    scores = torch.softmax(
+        torch.randn((num_tokens, num_experts), dtype=torch.float32, device="xpu"),
+        dim=-1,
+    )
+    topk_w, topk_i = torch.topk(scores, topk, dim=-1)
+
+    # 1. Per-expert channel permutations on BOTH GEMM1 (hidden) and GEMM2 (inter)
+    w1_perm = torch.stack(
+        [torch.randperm(hidden, device="xpu") for _ in range(num_experts)]
+    )
+    w2_perm = torch.stack(
+        [torch.randperm(inter, device="xpu") for _ in range(num_experts)]
+    )
+    w1_u8_sorted = torch.randint(
+        0, 255, (num_experts, 2 * inter, hidden), dtype=torch.uint8, device="xpu"
+    )
+    w2_u8_sorted = torch.randint(
+        0, 255, (num_experts, hidden, inter), dtype=torch.uint8, device="xpu"
+    )
+    s1 = (
+        torch.rand(
+            (num_experts, 2 * inter, hidden // group_size),
+            dtype=torch.bfloat16,
+            device="xpu",
+        )
+        * 0.002
+        + 0.0005
+    )
+    s2 = (
+        torch.rand(
+            (num_experts, hidden, inter // group_size),
+            dtype=torch.bfloat16,
+            device="xpu",
+        )
+        * 0.002
+        + 0.0005
+    )
+    zp1 = torch.randint(96, 160, s1.shape, dtype=torch.uint8, device="xpu")
+    zp2 = torch.randint(96, 160, s2.shape, dtype=torch.uint8, device="xpu")
+
+    out_gidx = fused_experts(
+        x,
+        w1_u8_sorted,
+        w2_u8_sorted,
+        topk_w,
+        topk_i,
+        use_int8_w8a16=True,
+        w1_scale=s1,
+        w2_scale=s2,
+        w1_zp=zp1,
+        w2_zp=zp2,
+        w1_g_idx_perm=w1_perm,
+        w2_g_idx_perm=w2_perm,
+    )
+    w1_dq_sorted = _dequant_general_block_fp32(w1_u8_sorted, s1, 1, group_size, zp1)
+    w2_dq_sorted = _dequant_general_block_fp32(w2_u8_sorted, s2, 1, group_size, zp2)
+    w1_dq_unperm = torch.empty_like(w1_dq_sorted)
+    w2_dq_unperm = torch.empty_like(w2_dq_sorted)
+    for e in range(num_experts):
+        w1_dq_unperm[e, :, w1_perm[e]] = w1_dq_sorted[e]
+        w2_dq_unperm[e, :, w2_perm[e]] = w2_dq_sorted[e]
+    ref_gidx = _reference_moe_general(x, w1_dq_unperm, w2_dq_unperm, topk_w, topk_i)
+    torch.testing.assert_close(out_gidx, ref_gidx, rtol=2e-2, atol=2e-2)
+
+    # 2. PerChannelN ([E, N] 2D and [E, N, 1] 3D) + explicit uint8 weight_zeros
+    ch_s1 = (
+        torch.rand((num_experts, 2 * inter), dtype=torch.float32, device="xpu") * 0.002
+        + 0.0005
+    )
+    ch_s2 = (
+        torch.rand((num_experts, hidden), dtype=torch.float32, device="xpu") * 0.002
+        + 0.0005
+    )
+    ch_zp1 = torch.randint(
+        96, 160, (num_experts, 2 * inter), dtype=torch.uint8, device="xpu"
+    )
+    ch_zp2 = torch.randint(
+        96, 160, (num_experts, hidden), dtype=torch.uint8, device="xpu"
+    )
+    ref_ch_zp = _reference_moe_general(
+        x,
+        (
+            (w1_u8_sorted.float() - ch_zp1.float().unsqueeze(-1)) * ch_s1.unsqueeze(-1)
+        ).to(torch.bfloat16),
+        (
+            (w2_u8_sorted.float() - ch_zp2.float().unsqueeze(-1)) * ch_s2.unsqueeze(-1)
+        ).to(torch.bfloat16),
+        topk_w,
+        topk_i,
+    )
+    for s1_v, s2_v, z1_v, z2_v in (
+        (ch_s1, ch_s2, ch_zp1, ch_zp2),
+        (
+            ch_s1.unsqueeze(-1),
+            ch_s2.unsqueeze(-1),
+            ch_zp1.unsqueeze(-1),
+            ch_zp2.unsqueeze(-1),
+        ),
+    ):
+        out_ch_zp = fused_experts(
+            x,
+            w1_u8_sorted,
+            w2_u8_sorted,
+            topk_w,
+            topk_i,
+            use_int8_w8a16=True,
+            w1_scale=s1_v,
+            w2_scale=s2_v,
+            w1_zp=z1_v,
+            w2_zp=z2_v,
+        )
+        torch.testing.assert_close(out_ch_zp, ref_ch_zp, rtol=2e-2, atol=2e-2)
+
+    # 3. FP8 with bfloat16 scales
+    w1_fp8 = (torch.randn((num_experts, 2 * inter, hidden), device="xpu") * 1.5).to(
+        torch.float8_e4m3fn
+    )
+    w2_fp8 = (torch.randn((num_experts, hidden, inter), device="xpu") * 1.5).to(
+        torch.float8_e4m3fn
+    )
+    bf16_s1 = torch.full((num_experts, 1), 0.125, dtype=torch.bfloat16, device="xpu")
+    bf16_s2 = torch.full((num_experts, 1), 0.125, dtype=torch.bfloat16, device="xpu")
+    out_fp8_bf16s = fused_experts(
+        x,
+        w1_fp8,
+        w2_fp8,
+        topk_w,
+        topk_i,
+        use_fp8_w8a8=True,
+        w1_scale=bf16_s1,
+        w2_scale=bf16_s2,
+    )
+    ref_fp8_bf16s = _reference_moe_general(
+        x,
+        (w1_fp8.float() * 0.125).to(torch.bfloat16),
+        (w2_fp8.float() * 0.125).to(torch.bfloat16),
+        topk_w,
+        topk_i,
+    )
+    torch.testing.assert_close(out_fp8_bf16s, ref_fp8_bf16s, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(not is_xe2_arch(), reason="Xe2 guard-rail tests require Xe2")
+def test_moe_guard_rails_and_parameter_wrapping():
+    """Verify guard assertions (#2, #3, #4, #6, #8) and nn.Parameter wrapping."""
+    torch.manual_seed(733)
+    torch.xpu.manual_seed_all(733)
+    e_dim, hidden, inter = 4, 128, 64
+    x = torch.randn((8, hidden), dtype=torch.bfloat16, device="xpu") * 0.2
+    topk_w = torch.full((8, 2), 0.5, dtype=torch.float32, device="xpu")
+    topk_i = torch.zeros((8, 2), dtype=torch.int32, device="xpu")
+
+    w1_fp8 = torch.zeros(
+        (e_dim, 2 * inter, hidden), dtype=torch.float8_e4m3fn, device="xpu"
+    )
+    w2_fp8 = torch.zeros(
+        (e_dim, hidden, inter), dtype=torch.float8_e4m3fn, device="xpu"
+    )
+    s1 = torch.ones((e_dim, 1), dtype=torch.float32, device="xpu")
+    s2 = torch.ones((e_dim, 1), dtype=torch.float32, device="xpu")
+
+    # #2: deinterleave_gpt_oss=True rejected on non-BF16, and gate_up_interleaved=False rejected on W8A16
+    with pytest.raises(AssertionError, match="only supported for bfloat16"):
+        convert_weights_to_col_major(w1_fp8, w2_fp8, deinterleave_gpt_oss=True)
+    with pytest.raises(AssertionError, match="gate_up_interleaved=True"):
+        fused_experts(
+            x,
+            w1_fp8,
+            w2_fp8,
+            topk_w,
+            topk_i,
+            use_fp8_w8a8=True,
+            w1_scale=s1,
+            w2_scale=s2,
+            gemm1_alpha=1.702,
+            gemm1_limit=7.0,
+            gate_up_interleaved=False,
+        )
+
+    # #3: nn.Parameter wrapping strips Python attributes; explicit gate_up_interleaved=False preserves GPT-OSS fused BF16
+    w1_bf16 = (
+        torch.randn((e_dim, 2 * inter, hidden), dtype=torch.bfloat16, device="xpu")
+        * 0.1
+    )
+    w2_bf16 = (
+        torch.randn((e_dim, hidden, inter), dtype=torch.bfloat16, device="xpu") * 0.1
+    )
+    b1 = torch.randn((e_dim, 2 * inter), dtype=torch.float32, device="xpu") * 0.05
+    b2 = torch.randn((e_dim, hidden), dtype=torch.float32, device="xpu") * 0.05
+    ref_gpt = fused_experts(
+        x,
+        w1_bf16,
+        w2_bf16,
+        topk_w,
+        topk_i,
+        b1=b1,
+        b2=b2,
+        gemm1_alpha=1.702,
+        gemm1_limit=7.0,
+    )
+    w1_col, w2_col = convert_weights_to_col_major(
+        w1_bf16, w2_bf16, deinterleave_gpt_oss=True
+    )
+    w1_param = torch.nn.Parameter(w1_col, requires_grad=False)
+    w2_param = torch.nn.Parameter(w2_col, requires_grad=False)
+    assert not hasattr(w1_param, "_xpu_gate_up_block_split")
+    out_param = fused_experts(
+        x,
+        w1_param,
+        w2_param,
+        topk_w,
+        topk_i,
+        b1=b1,
+        b2=b2,
+        gemm1_alpha=1.702,
+        gemm1_limit=7.0,
+        gate_up_interleaved=False,
+    )
+    torch.testing.assert_close(out_param, ref_gpt, rtol=1e-2, atol=1e-2)
+
+    # #4: In-place layout upgrade frees legacy memory immediately and eliminates duplicate cache
+    from unittest.mock import patch
+
+    import sgl_kernel.moe as moe_mod
+
+    w1_unwarmed = torch.randn_like(w1_bf16)
+    w2_unwarmed = torch.randn_like(w2_bf16)
+    out_buf = torch.empty_like(x)
+    fused_experts(x, w1_unwarmed, w2_unwarmed, topk_w, topk_i)
+    assert w1_unwarmed.stride(1) == 1 and w2_unwarmed.stride(1) == 1
+    upgraded_ptr = w1_unwarmed.data_ptr()
+
+    g_warm = torch.xpu.XPUGraph()
+    torch.xpu.synchronize()
+    seen_w1_ptrs = []
+    orig_xe20_op = torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20
+
+    def spy_xe20(output, activations, weights, *args, **kwargs):
+        seen_w1_ptrs.append(weights.data_ptr())
+        return orig_xe20_op(output, activations, weights, *args, **kwargs)
+
+    with patch.object(
+        torch.ops.sgl_kernel, "moe_grouped_mm_nt_xe20", side_effect=spy_xe20
+    ):
+        with torch.xpu.graph(g_warm):
+            out_buf.copy_(fused_experts(x, w1_unwarmed, w2_unwarmed, topk_w, topk_i))
+    assert seen_w1_ptrs[0] == upgraded_ptr
+
+    # Xe3 in-place converts marked Layout B back to K-major contiguous and removes _xpu_weights_transposed
+    w_marked_xe3 = moe_mod.mark_weights_col_major(
+        torch.randn((e_dim, hidden, 2 * inter), dtype=torch.bfloat16, device="xpu")
+    )
+    row_1 = moe_mod._ensure_xe3_row_major_weight(w_marked_xe3)
+    assert row_1.is_contiguous() and row_1.shape == (e_dim, 2 * inter, hidden)
+    assert not hasattr(w_marked_xe3, "_xpu_weights_transposed")
+    # Repeated call on Xe3 must remain idempotent and not invert layout
+    row_2 = moe_mod._ensure_xe3_row_major_weight(w_marked_xe3)
+    assert row_2.is_contiguous() and row_2.shape == (e_dim, 2 * inter, hidden)
+    assert row_2.data_ptr() == row_1.data_ptr()
+
+    # Un-warmed graph capture does not mutate .data into graph private pool
+    w_capture = torch.randn_like(w1_bf16)
+    orig_c_ptr = w_capture.data_ptr()
+    g_unwarmed = torch.xpu.XPUGraph()
+    torch.xpu.synchronize()
+    with torch.xpu.graph(g_unwarmed):
+        out_buf.copy_(fused_experts(x, w_capture, w2_unwarmed, topk_w, topk_i))
+    assert w_capture.data_ptr() == orig_c_ptr
+
+    # Xe2 planning for int4 returns STANDARD layout (never COL_MAJOR)
+    plan_int4 = moe_mod.get_moe_weight_plan("int4", (w1_bf16, w2_bf16))
+    assert plan_int4.weight_layout == moe_mod.MoeWeightLayout.STANDARD
+
+    # Xe3 rejects gate_up_interleaved=False
+    with (
+        patch.object(moe_mod, "is_xe2_arch", return_value=False),
+        patch.object(moe_mod, "is_xe3_arch", return_value=True),
+    ):
+        with pytest.raises(AssertionError, match="only supported on Xe2 BF16 MoE"):
+            fused_experts(
+                x, w1_bf16, w2_bf16, topk_w, topk_i, gate_up_interleaved=False
+            )
+
+    # #6: BF16 path also enforces activation / swiglu_limit / gemm1_alpha mutual exclusion
+    with pytest.raises(AssertionError, match="cannot be combined with"):
+        fused_experts(
+            x, w1_bf16, w2_bf16, topk_w, topk_i, activation="gelu_erf", swiglu_limit=5.0
+        )
+    with pytest.raises(AssertionError, match="cannot be combined with swiglu_limit"):
+        fused_experts(
+            x,
+            w1_bf16,
+            w2_bf16,
+            topk_w,
+            topk_i,
+            gemm1_alpha=1.702,
+            gemm1_limit=7.0,
+            swiglu_limit=5.0,
+        )
+    with pytest.raises(AssertionError, match="swiglu_limit > 0"):
+        fused_experts(x, w1_bf16, w2_bf16, topk_w, topk_i, swiglu_limit=0.0)
+
+    # #8: Unaligned ld_b strided Layout-B view is rejected by C++ kernel
+    raw_bad = torch.empty(
+        (e_dim, hidden, 2 * inter + 4), dtype=torch.float8_e4m3fn, device="xpu"
+    )
+    w1_bad_pitch = raw_bad[:, :, : 2 * inter].transpose(
+        1, 2
+    )  # stride(1)==1, ld_b = 132 (% 16 != 0)
+    out_bad = torch.empty((8, 2 * inter), dtype=torch.bfloat16, device="xpu")
+    rows = torch.full((e_dim,), 2, dtype=torch.int32, device="xpu")
+    with pytest.raises(RuntimeError, match="16-byte pitch alignment"):
+        torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16(
+            out_bad, x, w1_bad_pitch, s1, None, rows, e_dim
+        )
+
+    # Corner 1: BF16 fused gated path with inter=48 (N=96, N % 64 != 0) runs safely via unfused 64B-aligned fallback
+    w1_bf16_48 = (
+        torch.randn((e_dim, 2 * 48, hidden), dtype=torch.bfloat16, device="xpu") * 0.1
+    )
+    w2_bf16_48 = (
+        torch.randn((e_dim, hidden, 48), dtype=torch.bfloat16, device="xpu") * 0.1
+    )
+    out_bf16_48 = fused_experts(x, w1_bf16_48, w2_bf16_48, topk_w, topk_i)
+    ref_bf16_48 = _reference_moe_general(x, w1_bf16_48, w2_bf16_48, topk_w, topk_i)
+    torch.testing.assert_close(out_bf16_48, ref_bf16_48, rtol=1.5e-2, atol=1.5e-2)
+
+    # Corner 1b: GPT-OSS block-split with bias and N % 64 != 0 verifies unfused_bias deinterleaving
+    b1_48 = torch.randn((e_dim, 2 * 48), dtype=torch.float32, device="xpu") * 0.05
+    b2_48 = torch.randn((e_dim, hidden), dtype=torch.float32, device="xpu") * 0.05
+    ref_gpt_48 = fused_experts(
+        x,
+        w1_bf16_48,
+        w2_bf16_48,
+        topk_w,
+        topk_i,
+        b1=b1_48,
+        b2=b2_48,
+        gemm1_alpha=1.702,
+        gemm1_limit=7.0,
+    )
+    w1_gpt_48, w2_gpt_48 = convert_weights_to_col_major(
+        w1_bf16_48, w2_bf16_48, deinterleave_gpt_oss=True
+    )
+    out_gpt_48 = fused_experts(
+        x,
+        w1_gpt_48,
+        w2_gpt_48,
+        topk_w,
+        topk_i,
+        b1=b1_48,
+        b2=b2_48,
+        gemm1_alpha=1.702,
+        gemm1_limit=7.0,
+        gate_up_interleaved=False,
+    )
+    torch.testing.assert_close(out_gpt_48, ref_gpt_48, rtol=1e-2, atol=1e-2)
+
+    # Corner 2: convert_weights_to_col_major(..., deinterleave_gpt_oss=True) on already-Layout-B weights
+    w1_plain_col, w2_plain_col = convert_weights_to_col_major(
+        w1_bf16, w2_bf16, deinterleave_gpt_oss=False
+    )
+    assert not getattr(w1_plain_col, "_xpu_gate_up_block_split", False)
+    w1_deint_col, w2_deint_col = convert_weights_to_col_major(
+        w1_plain_col, w2_plain_col, deinterleave_gpt_oss=True
+    )
+    assert getattr(w1_deint_col, "_xpu_gate_up_block_split", False)
+    out_deint_after = fused_experts(
+        x,
+        w1_deint_col,
+        w2_deint_col,
+        topk_w,
+        topk_i,
+        b1=b1,
+        b2=b2,
+        gemm1_alpha=1.702,
+        gemm1_limit=7.0,
+    )
+    torch.testing.assert_close(out_deint_after, ref_gpt, rtol=1e-2, atol=1e-2)
+
+    # Architecture-agnostic get_moe_weight_plan + prepare_moe_weights (Xe2 vs Xe3)
+    plan_xe2 = moe_mod.get_moe_weight_plan(
+        "bf16", (w1_bf16, w2_bf16), deinterleave_gpt_oss=True
+    )
+    assert (
+        plan_xe2.weight_layout == moe_mod.MoeWeightLayout.COL_MAJOR
+        and not plan_xe2.gate_up_interleaved
+    )
+    (pw1, pw2), _ = moe_mod.prepare_moe_weights(plan_xe2, (w1_bf16, w2_bf16))
+    assert pw1.stride(1) == 1 and pw2.stride(1) == 1
+    with (
+        patch.object(moe_mod, "is_xe2_arch", return_value=False),
+        patch.object(moe_mod, "is_xe3_arch", return_value=True),
+    ):
+        plan_xe3 = moe_mod.get_moe_weight_plan("mxfp8", (w1_fp8, w2_fp8), (s1, s2))
+        assert plan_xe3.weight_layout == moe_mod.MoeWeightLayout.STANDARD
+        (pw1_xe3, _), (ps1_xe3, _) = moe_mod.prepare_moe_weights(
+            plan_xe3, (w1_fp8, w2_fp8), (s1, s2)
+        )
+        assert pw1_xe3.data_ptr() == w1_fp8.data_ptr()
+        assert ps1_xe3.data_ptr() == s1.data_ptr()
 
 
 if __name__ == "__main__":

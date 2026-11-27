@@ -320,10 +320,7 @@ constexpr W8A16TileCfg kW8A16Tiles[] = {
 };
 
 int w8a16_tile_id(int avg_m, int /*gemm_k*/, int gemm_n, int /*scale_mode*/, bool /*has_zeros*/) {
-  if (avg_m <= 8) return 0;
-  if (avg_m <= 32) return 1;
-  if (avg_m <= 64 || gemm_n < 128) return 2;
-  return 3;
+  return moe_w8a16::w8a16_select_tile(avg_m, gemm_n);
 }
 
 uint64_t pack_w8a16_key(int tile_id, bool is_int8, int arch) {

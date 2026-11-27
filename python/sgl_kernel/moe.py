@@ -1,6 +1,5 @@
-import threading
-import weakref
-from typing import Any, Dict, Optional, Tuple
+from enum import Enum
+from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -483,23 +482,6 @@ def _should_use_small_moe_prepare(
     )
 
 
-# Keyed by `id(w)` -> (weakref.ref(w), sig, col_major_view). Avoids
-# WeakKeyDictionary, whose key equality invokes `Tensor.__eq__` -> `bool(Tensor)`.
-_xe2_col_major_cache: Dict[
-    int, Tuple["weakref.ReferenceType[torch.Tensor]", Tuple[Any, ...], torch.Tensor]
-] = {}
-_xe2_col_major_cache_lock = threading.Lock()
-
-
-def _evict_xe2_col_major_cache(
-    tensor_id: int, expected_ref: "weakref.ReferenceType[torch.Tensor]"
-) -> None:
-    with _xe2_col_major_cache_lock:
-        cur = _xe2_col_major_cache.get(tensor_id)
-        if cur is not None and cur[0] is expected_ref:
-            _xe2_col_major_cache.pop(tensor_id, None)
-
-
 def is_moe_weight_col_major(w: torch.Tensor) -> bool:
     """Return True if a 3D `[E, N, K]` MoE weight tensor uses N-contiguous Layout B."""
     if getattr(w, "_xpu_weights_transposed", False):
@@ -513,7 +495,13 @@ def is_moe_weight_col_major(w: torch.Tensor) -> bool:
 
 
 def mark_weights_col_major(w: torch.Tensor) -> torch.Tensor:
-    """Mark a physical `[E, K, N]` contiguous tensor as Layout-B column-major."""
+    """Mark a physical `[E, K, N]` contiguous tensor as Layout-B column-major.
+
+    Note: Python tensor attributes are not preserved across `nn.Parameter(w)`,
+    `.data`, or `.view(...)`. Call this on the final `nn.Parameter`/`Tensor`
+    instance, or prefer `convert_weights_to_col_major`, which encodes Layout B
+    directly in physical tensor strides (`shape=[E, N, K], stride(1)==1`).
+    """
     setattr(w, "_xpu_weights_transposed", True)
     return w
 
@@ -547,10 +535,21 @@ def convert_weights_to_col_major(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Convert MoE expert weights `[E, N, K]` once into N-contiguous Layout B on Xe2.
 
+    Returns `[E, N, K]` views with `stride(1) == 1`, so Layout B is preserved
+    across `.data` assignment and `nn.Parameter(...)` wrapping without relying
+    on Python attributes. When `deinterleave_gpt_oss=True` (supported only for
+    BF16 weights) and the returned `w1` is re-wrapped in a new `nn.Parameter`,
+    pass `gate_up_interleaved=False` to `fused_experts`.
+
     On non-Xe2 XPU architectures (e.g. Xe3/CRI, where grouped GEMM consumes
     row-major `[E, N, K]` weights), returns `(w1, w2)` unchanged so callers
     do not need microarchitecture checks.
     """
+    if deinterleave_gpt_oss:
+        assert w1.dtype == torch.bfloat16 and w2.dtype == torch.bfloat16, (
+            "deinterleave_gpt_oss=True is only supported for bfloat16 weights, "
+            f"got w1.dtype={w1.dtype}, w2.dtype={w2.dtype}"
+        )
     if not is_xe2_arch():
         return w1, w2
     w1_norm = _normalize_col_major_view(w1)
@@ -560,6 +559,13 @@ def convert_weights_to_col_major(
         "or both must be row-major [E, N, K]"
     )
     if w1_norm is not None and w2_norm is not None:
+        if deinterleave_gpt_oss and not getattr(
+            w1_norm, "_xpu_gate_up_block_split", False
+        ):
+            w1_src = torch.cat((w1_norm[:, 0::2, :], w1_norm[:, 1::2, :]), dim=1)
+            w1_col = w1_src.transpose(1, 2).contiguous().transpose(1, 2)
+            setattr(w1_col, "_xpu_gate_up_block_split", True)
+            return w1_col, w2_norm
         return w1_norm, w2_norm
 
     w1_src = w1
@@ -572,42 +578,206 @@ def convert_weights_to_col_major(
     return w1_col, w2_col
 
 
-def _ensure_xe2_col_major_weight(w: torch.Tensor) -> torch.Tensor:
-    """Return an N-contiguous Layout-B `[E, N, K]` tensor without mutating `w`.
+class MoeWeightQuantization(str, Enum):
+    BF16 = "bf16"
+    FP8 = "fp8"
+    FP8_BLOCK = "fp8_block"
+    MXFP8 = "mxfp8"
+    MXFP4 = "mxfp4"
+    INT8 = "int8"
+    INT4 = "int4"
 
-    Caches legacy row-major `[E, N, K]` conversions in a thread-safe WeakKey
-    cache so `sglang` `main` callers pay the transpose only once during warmup
-    (and reuse a stable device pointer across XPU Graph capture and replay).
+
+class MoeWeightLayout(str, Enum):
+    STANDARD = "standard"
+    COL_MAJOR = "col_major"
+    PREPACKED = "prepacked"
+
+
+class MoeWeightPlan(NamedTuple):
+    quantization: MoeWeightQuantization
+    weight_layout: MoeWeightLayout
+    scale_layout: MoeWeightLayout
+    gate_up_interleaved: bool = True
+
+
+def get_moe_weight_plan(
+    quantization: str,
+    weights: Tuple[torch.Tensor, torch.Tensor],
+    scales: Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = None,
+    has_bias: bool = False,
+    *,
+    deinterleave_gpt_oss: bool = False,
+) -> MoeWeightPlan:
+    """Plan architecture-appropriate layouts for MoE expert weights and scales.
+
+    Provides a single hardware-agnostic contract for SGLang across Xe2 (BMG,
+    N-contiguous Layout B) and Xe3 (CRI, standard row-major or future prepacked
+    weights + scales).
+    """
+    del scales, has_bias
+    try:
+        quant = MoeWeightQuantization(quantization)
+    except ValueError as exc:
+        supported = ", ".join(item.value for item in MoeWeightQuantization)
+        raise ValueError(
+            f"Unsupported MoE quantization {quantization!r}; expected one of {supported}"
+        ) from exc
+    if len(weights) != 2 or weights[0].ndim != 3 or weights[1].ndim != 3:
+        raise ValueError("MoE weight planning requires two 3D weight tensors")
+    if deinterleave_gpt_oss and quant != MoeWeightQuantization.BF16:
+        raise ValueError("deinterleave_gpt_oss=True is only supported for bf16 MoE")
+
+    if is_xe2_arch() and quant not in (
+        MoeWeightQuantization.MXFP4,
+        MoeWeightQuantization.INT4,
+    ):
+        return MoeWeightPlan(
+            quantization=quant,
+            weight_layout=MoeWeightLayout.COL_MAJOR,
+            scale_layout=MoeWeightLayout.STANDARD,
+            gate_up_interleaved=not deinterleave_gpt_oss,
+        )
+    return MoeWeightPlan(
+        quantization=quant,
+        weight_layout=MoeWeightLayout.STANDARD,
+        scale_layout=MoeWeightLayout.STANDARD,
+        gate_up_interleaved=True,
+    )
+
+
+def prepare_moe_weights(
+    plan: MoeWeightPlan,
+    weights: Tuple[torch.Tensor, torch.Tensor],
+    scales: Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = None,
+) -> Tuple[
+    Tuple[torch.Tensor, torch.Tensor],
+    Optional[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]],
+]:
+    """Prepare `(w1, w2)` and optional `(w1_scale, w2_scale)` according to `plan`."""
+    if len(weights) != 2:
+        raise ValueError("prepare_moe_weights requires a (w1, w2) pair")
+    if plan.weight_layout == MoeWeightLayout.STANDARD:
+        return weights, scales
+    if plan.weight_layout == MoeWeightLayout.COL_MAJOR:
+        w1_col, w2_col = convert_weights_to_col_major(
+            weights[0],
+            weights[1],
+            deinterleave_gpt_oss=not plan.gate_up_interleaved,
+        )
+        return (w1_col, w2_col), scales
+    raise ValueError(f"Unsupported MoE weight layout: {plan.weight_layout}")
+
+
+def _ensure_xe2_col_major_weight(w: torch.Tensor) -> torch.Tensor:
+    """Return an N-contiguous Layout-B `[E, N, K]` tensor without memory duplication.
+
+    When legacy row-major weights are received, upgrades `w.data` in place to Layout B.
+    Rebinding `.data` immediately frees the old row-major buffer from PyTorch memory,
+    preventing duplicate weight allocation (which would double HBM usage and OOM on Xe2).
     """
     norm = _normalize_col_major_view(w)
     if norm is not None:
         return norm
-
     assert (
         w.ndim == 3 and w.stride(2) == 1
     ), f"Expected 3D MoE weight with unit N-stride or unit K-stride, got shape={w.shape}, stride={w.stride()}"
-    w_id = id(w)
-    sig = (
-        w.data_ptr(),
-        tuple(w.shape),
-        tuple(w.stride()),
-        w.dtype,
-        w.device,
-        w._version,
-    )
-    with _xe2_col_major_cache_lock:
-        entry = _xe2_col_major_cache.get(w_id)
-        if entry is not None and entry[0]() is w and entry[1] == sig:
-            return entry[2]
     converted = w.transpose(1, 2).contiguous().transpose(1, 2)
-    with _xe2_col_major_cache_lock:
-        entry = _xe2_col_major_cache.get(w_id)
-        if entry is not None and entry[0]() is w and entry[1] == sig:
-            return entry[2]
-        w_ref = weakref.ref(w)
-        _xe2_col_major_cache[w_id] = (w_ref, sig, converted)
-        weakref.finalize(w, _evict_xe2_col_major_cache, w_id, w_ref)
+    if w.device.type == "xpu" and torch.xpu.is_current_stream_capturing():
+        # Do not in-place rebind `.data` during graph capture without eager warmup;
+        # return the temporary converted view directly to prevent use-after-free
+        # of the un-warmed original buffer on replay.
         return converted
+    with torch.no_grad():
+        w.data = converted
+    return w
+
+
+def _ensure_xe3_row_major_weight(w: torch.Tensor) -> torch.Tensor:
+    """Return a K-contiguous row-major `[E, N, K]` tensor on Xe3 without memory duplication."""
+    norm = _normalize_col_major_view(w)
+    if norm is not None:
+        converted = norm.contiguous()
+        if w.device.type == "xpu" and torch.xpu.is_current_stream_capturing():
+            return converted
+        with torch.no_grad():
+            w.data = converted
+        if hasattr(w, "_xpu_weights_transposed"):
+            delattr(w, "_xpu_weights_transposed")
+        return w
+    assert (
+        w.ndim == 3 and w.stride(2) == 1
+    ), f"Expected 3D MoE weight with unit K-stride or Layout-B view, got shape={w.shape}, stride={w.stride()}"
+    return w
+
+
+def _resolve_moe_activation_type(
+    activation: str,
+    gemm1_alpha: Optional[float] = None,
+    gemm1_limit: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
+    use_mxfp4_xe3: bool = False,
+) -> Tuple[int, str, Optional[float]]:
+    """Map activation name and optional clamp limits to numerical activation_type.
+
+    Returns `(activation_type, activation_str, effective_gemm1_limit)`:
+      0: silu
+      1: gelu_tanh
+      2: swiglu_gpt_oss
+      3: relu2
+      4: swiglu_deepseek_v4
+      5: gelu_erf
+    """
+    if activation == "silu":
+        if gemm1_alpha is not None:
+            assert (
+                gemm1_limit is not None
+            ), "gemm1_limit must be provided when gemm1_alpha is set for swiglu for GPT-OSS"
+            return 2, "swiglu_gpt_oss", gemm1_limit
+        if swiglu_limit is not None:
+            assert swiglu_limit > 0, "swiglu_limit must be > 0"
+            if use_mxfp4_xe3:
+                assert swiglu_limit == 10
+            return 4, "swiglu_deepseek_v4", float(swiglu_limit)
+        return 0, "silu", None
+    if activation in ("gelu", "gelu_tanh"):
+        return 1, "gelu_tanh", None
+    if activation == "gelu_erf":
+        return 5, "gelu_erf", None
+    if activation == "relu2":
+        return 3, "relu2", None
+    raise ValueError(f"Unsupported activation {activation}")
+
+
+def _apply_unfused_moe_activation(
+    intermediate_cache1: torch.Tensor,
+    activation_type: int,
+    gemm1_alpha: Optional[float],
+    gemm1_limit: Optional[float],
+    swiglu_limit: Optional[float],
+    intermediate_cache2: torch.Tensor,
+) -> torch.Tensor:
+    """Apply standalone activation in the unfused GEMM1 -> activation -> GEMM2 sequence."""
+    if activation_type == 2:
+        return torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
+            intermediate_cache1, gemm1_alpha, gemm1_limit
+        )
+    if activation_type == 0:
+        torch.ops.sgl_kernel.silu_and_mul(intermediate_cache2, intermediate_cache1)
+    elif activation_type == 4:
+        torch.ops.sgl_kernel.silu_and_mul_clamp(
+            intermediate_cache2, intermediate_cache1, float(swiglu_limit)
+        )
+    elif activation_type == 1:
+        torch.ops.sgl_kernel.gelu_tanh_and_mul(intermediate_cache2, intermediate_cache1)
+    elif activation_type == 5:
+        torch.ops.sgl_kernel.gelu_and_mul(intermediate_cache2, intermediate_cache1)
+    elif activation_type == 3:
+        torch.clamp_min(intermediate_cache1, 0, out=intermediate_cache2)
+        torch.square(intermediate_cache2, out=intermediate_cache2)
+    else:
+        raise AssertionError(f"unsupported unfused activation type: {activation_type}")
+    return intermediate_cache2
 
 
 def _normalize_block_shape(
@@ -671,8 +841,6 @@ def _validate_w8a16_weight_scale(
         return "mxfp8"
 
     allowed_dtypes = (torch.float32, torch.bfloat16)
-    if not is_int8:
-        allowed_dtypes = (torch.float32, torch.bfloat16)
     assert (
         scale.dtype in allowed_dtypes
     ), f"{name} must have dtype in {allowed_dtypes}, got {scale.dtype}"
@@ -829,6 +997,7 @@ def fused_experts(
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
     swiglu_limit: Optional[float] = None,
+    gate_up_interleaved: bool = True,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -843,7 +1012,10 @@ def fused_experts(
     - b1 (Optional[torch.Tensor]): Optional bias for w1.
     - b2 (Optional[torch.Tensor]): Optional bias for w2.
     - inplace (bool): If True, perform operations in-place to save memory. Defaults to False.
-    - activation (str): The activation function to use ('silu' or 'gelu'). Defaults to 'silu'.
+    - activation (str): Activation function ('silu', 'gelu', 'gelu_tanh', 'gelu_erf',
+        or 'relu2'). Note: for backward compatibility, 'gelu' and 'gelu_tanh'
+        both compute the tanh approximation; pass 'gelu_erf' for exact erf GELU.
+        Defaults to 'silu'.
     - use_fp8_w8a8 (bool): If True, use FP8 E4M3 expert weights from a W8A8
         checkpoint. Xe2 currently has no native FP8-A MoE kernel, so this
         path falls back to BF16 activations and the W8A16 operator. Defaults
@@ -909,8 +1081,14 @@ def fused_experts(
         function.
     - gemm1_limit (Optional[float]): Optional gemm1_limit for the swiglu activation
         function.
-    - swiglu_limit (Optional[float]): Optional swiglu_limit for the swiglu activation
-        function.
+    - swiglu_limit (Optional[float]): Optional positive clamp threshold for
+        clamped SwiGLU (`silu(min(gate, L)) * clamp(up, -L, L)`).
+    - gate_up_interleaved (bool): For GPT-OSS SwiGLU (`gemm1_alpha` set), True
+        indicates `[g0, u0, g1, u1, ...]` row order; set False when BF16 `w1`
+        was block-split into `[gate, up]` halves via
+        `convert_weights_to_col_major(..., deinterleave_gpt_oss=True)` (enables
+        the single-kernel fused BF16 epilogue even after `nn.Parameter` wrapping).
+        Defaults to True.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -948,36 +1126,46 @@ def fused_experts(
             else norm_w1_block_shape
         )
     _SUPPORTED_ACTIVATIONS = ("silu", "gelu", "gelu_tanh", "gelu_erf", "relu2")
+    assert (
+        activation in _SUPPORTED_ACTIVATIONS
+    ), f"Only {_SUPPORTED_ACTIVATIONS} are supported, got {activation!r}"
+    if activation != "silu":
+        assert (
+            gemm1_alpha is None and gemm1_limit is None and swiglu_limit is None
+        ), f"{activation} cannot be combined with gemm1_alpha, gemm1_limit, or swiglu_limit"
+    elif gemm1_alpha is not None:
+        assert gemm1_limit is not None and swiglu_limit is None, (
+            "GPT-OSS SwiGLU requires gemm1_alpha and gemm1_limit, "
+            "and cannot be combined with swiglu_limit"
+        )
+    elif swiglu_limit is not None:
+        assert (
+            swiglu_limit > 0 and gemm1_limit is None and gemm1_alpha is None
+        ), "clamped SwiGLU requires swiglu_limit > 0 without gemm1_alpha/gemm1_limit"
+    else:
+        assert (
+            gemm1_limit is None
+        ), "gemm1_limit requires gemm1_alpha for GPT-OSS SwiGLU"
+
+    w1_gate_up_block_split = (not gate_up_interleaved) or bool(
+        getattr(w1, "_xpu_gate_up_block_split", False)
+    )
     if use_w8a16:
-        assert activation in _SUPPORTED_ACTIVATIONS, (
-            f"W8A16 MoE supports {_SUPPORTED_ACTIVATIONS}, GPT-OSS SwiGLU, and "
-            f"clamped SwiGLU only, got {activation!r}"
+        assert not w1_gate_up_block_split, (
+            "W8A16 MoE requires gate/up weights in checkpoint order "
+            "(gate_up_interleaved=True; do not pass deinterleave_gpt_oss=True)"
         )
         if use_fp8_weight:
             assert (
                 w1_g_idx_perm is None and w2_g_idx_perm is None
             ), "w1_g_idx_perm/w2_g_idx_perm are only supported by INT4/INT8 paths"
-        if activation != "silu":
-            assert (
-                gemm1_alpha is None and gemm1_limit is None and swiglu_limit is None
-            ), f"{activation} cannot be combined with a SwiGLU alpha or clamp"
-        elif gemm1_alpha is not None:
-            assert gemm1_limit is not None and swiglu_limit is None, (
-                "GPT-OSS SwiGLU requires gemm1_alpha and gemm1_limit, "
-                "and cannot use swiglu_limit"
-            )
-        elif swiglu_limit is not None:
-            assert (
-                swiglu_limit > 0 and gemm1_limit is None and gemm1_alpha is None
-            ), "W8A16 clamped SwiGLU requires swiglu_limit > 0"
-        else:
-            assert (
-                gemm1_limit is None
-            ), "gemm1_limit requires gemm1_alpha for GPT-OSS SwiGLU"
-    else:
+    elif w1_gate_up_block_split:
+        assert not (
+            use_mxfp4_w4a16 or use_int4_w4a16
+        ), "gate_up_interleaved=False block-split is only supported for BF16 MoE"
         assert (
-            activation in _SUPPORTED_ACTIVATIONS
-        ), f"Only {_SUPPORTED_ACTIVATIONS} are supported but got {activation}"
+            not is_xe3_arch()
+        ), "gate_up_interleaved=False is only supported on Xe2 BF16 MoE"
 
     # Unified 4-bit W4A16 MoE (mxfp4 or int4). Weights are packed int8/uint8
     # [E, N, K/2]; scales are [E, N, K/group_size] N-outer. For mxfp4 the
@@ -999,11 +1187,15 @@ def fused_experts(
         use_int4_w4a16 and is_xe3_arch()
     ), "the int4 W4A16 grouped GEMM (moe_grouped_mm_nt_xe20_w4a16) is not ported to CRI (Xe3); only use_mxfp4_w4a16 is supported on Xe3"
 
-    # Normalize Xe2 W8A16 and Xe2 BF16 weights to logical `[E, N, K]` with
-    # N-contiguous Layout-B strides (`stride(1) == 1`) before shape checks.
-    if not use_4bit_w4a16 and is_xe2_arch():
-        w1 = _ensure_xe2_col_major_weight(w1)
-        w2 = _ensure_xe2_col_major_weight(w2)
+    # Clean up original caller references before dispatch.
+    w1_orig, w2_orig = w1, w2
+    if not use_4bit_w4a16:
+        w1_norm = _normalize_col_major_view(w1)
+        w2_norm = _normalize_col_major_view(w2)
+        if w1_norm is not None:
+            w1 = w1_norm
+        if w2_norm is not None:
+            w2 = w2_norm
 
     if use_4bit_w4a16:
         assert (
@@ -1064,13 +1256,15 @@ def fused_experts(
         ), "w1_scale/w2_scale must be provided for FP8 weight-only MoE"
         assert w1_scale.dtype in (
             torch.float32,
+            torch.bfloat16,
             torch.uint8,
             torch.float8_e8m0fnu,
         ) and w2_scale.dtype in (
             torch.float32,
+            torch.bfloat16,
             torch.uint8,
             torch.float8_e8m0fnu,
-        ), "FP8 MoE scales must be float32, uint8, or float8_e8m0fnu"
+        ), "FP8 MoE scales must be float32, bfloat16, uint8, or float8_e8m0fnu"
         w1_kind = _validate_w8a16_weight_scale(
             w1_scale,
             w1,
@@ -1093,10 +1287,6 @@ def fused_experts(
             "w1_scale and w2_scale must use the same scalar, channel, MXFP8, or block layout, "
             f"got {w1_kind} vs {w2_kind}"
         )
-        if w1_scale.ndim == 1:
-            w1_scale = w1_scale.unsqueeze(1)
-        if w2_scale.ndim == 1:
-            w2_scale = w2_scale.unsqueeze(1)
         assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
         if not w1_scale.is_contiguous():
             w1_scale = w1_scale.contiguous()
@@ -1181,6 +1371,15 @@ def fused_experts(
     assert (topk_ids.shape == topk_weights.shape) and (
         topk_ids.shape[0] == hidden_states.shape[0]
     ), f"topk_ids shape {topk_ids.shape} and topk_weights shape {topk_weights.shape} must be equal and match hidden_states shape[0] {hidden_states.shape[0]}"
+
+    # Materialize Layout-B (on Xe2) or K-major (on Xe3) only after all validation passes.
+    if not use_4bit_w4a16:
+        if is_xe2_arch():
+            w1 = _ensure_xe2_col_major_weight(w1_orig)
+            w2 = _ensure_xe2_col_major_weight(w2_orig)
+        elif is_xe3_arch():
+            w1 = _ensure_xe3_row_major_weight(w1_orig)
+            w2 = _ensure_xe3_row_major_weight(w2_orig)
 
     num_tokens, hidden_dims = hidden_states.shape
 
@@ -1296,28 +1495,13 @@ def fused_experts(
     )
 
     if use_w8a16:
-        if activation in ("gelu", "gelu_tanh"):
-            activation_type = 1
-        elif activation == "gelu_erf":
-            activation_type = 5
-        elif activation == "relu2":
-            activation_type = 3
-        elif activation != "silu":
-            raise ValueError(
-                f"W8A16 Xe2 path does not support activation={activation!r}; "
-                "supported activations are 'silu', 'gelu', 'gelu_tanh', 'gelu_erf', and 'relu2'"
-            )
-        elif gemm1_alpha is not None:
-            if gemm1_limit is None:
-                raise AssertionError(
-                    "gemm1_limit must be provided when gemm1_alpha is set for swiglu for GPT-OSS"
-                )
-            activation_type = 2
-        elif swiglu_limit is not None:
-            activation_type = 4
-            gemm1_limit = float(swiglu_limit)
-        else:
-            activation_type = 0
+        activation_type, _, _ = _resolve_moe_activation_type(
+            activation=activation,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_limit=gemm1_limit,
+            swiglu_limit=swiglu_limit,
+            use_mxfp4_xe3=False,
+        )
 
         gemm1_output_width = N if activation_type == 3 else 2 * N
         intermediate_cache1 = _get_moe_ws(
@@ -1338,8 +1522,13 @@ def fused_experts(
         )
 
         if activation_type == 2:
-            intermediate_cache2 = torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
-                intermediate_cache1, gemm1_alpha, gemm1_limit
+            intermediate_cache2 = _apply_unfused_moe_activation(
+                intermediate_cache1,
+                activation_type,
+                gemm1_alpha,
+                gemm1_limit,
+                swiglu_limit,
+                intermediate_cache1,
             )
         else:
             intermediate_cache2 = _get_moe_ws(
@@ -1348,29 +1537,14 @@ def fused_experts(
                 hidden_states.dtype,
                 hidden_states.device,
             )
-            if activation_type == 0:
-                torch.ops.sgl_kernel.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1
-                )
-            elif activation_type == 4:
-                torch.ops.sgl_kernel.silu_and_mul_clamp(
-                    intermediate_cache2, intermediate_cache1, float(swiglu_limit)
-                )
-            elif activation_type == 1:
-                torch.ops.sgl_kernel.gelu_tanh_and_mul(
-                    intermediate_cache2, intermediate_cache1
-                )
-            elif activation_type == 5:
-                torch.ops.sgl_kernel.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1
-                )
-            elif activation_type == 3:
-                torch.clamp_min(intermediate_cache1, 0, out=intermediate_cache2)
-                torch.square(intermediate_cache2, out=intermediate_cache2)
-            else:
-                raise AssertionError(
-                    f"unsupported W8A16 activation type: {activation_type}"
-                )
+            intermediate_cache2 = _apply_unfused_moe_activation(
+                intermediate_cache1,
+                activation_type,
+                gemm1_alpha,
+                gemm1_limit,
+                swiglu_limit,
+                intermediate_cache2,
+            )
 
         if w2_g_idx_perm is not None:
             intermediate_cache2 = _apply_per_expert_channel_gather(
@@ -1396,33 +1570,13 @@ def fused_experts(
         )
         return out_hidden_states
 
-    # 0=silu, 1=gelu_tanh, 2=swiglu (silu with alpha/limit clamping for gpt-oss),
-    # 3=relu2, 4=swiglu_deepseek_v4 (clamp gate/up then plain silu * up),
-    # 5=gelu_erf (exact erf GELU).
-    if activation == "silu":
-        activation_type = 0
-        if gemm1_alpha is not None:
-            assert (
-                gemm1_limit is not None
-            ), "gemm1_limit must be provided when gemm1_alpha is set for swiglu for GPT-OSS"
-            activation_type = 2
-            activation = "swiglu_gpt_oss"
-        elif swiglu_limit is not None:
-            assert swiglu_limit > 0, "swiglu_limit must be > 0"
-            if use_mxfp4_xe3:
-                assert swiglu_limit == 10
-            activation_type = 4
-            activation = "swiglu_deepseek_v4"
-            # Carry the clamp threshold in gemm1_limit (the only limit slot).
-            gemm1_limit = float(swiglu_limit)
-    elif activation in ("gelu", "gelu_tanh"):
-        activation_type = 1
-    elif activation == "gelu_erf":
-        activation_type = 5
-    elif activation == "relu2":
-        activation_type = 3
-    else:
-        raise ValueError(f"Unsupported activation {activation}")
+    activation_type, activation, gemm1_limit = _resolve_moe_activation_type(
+        activation=activation,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_limit=gemm1_limit,
+        swiglu_limit=swiglu_limit,
+        use_mxfp4_xe3=use_mxfp4_xe3,
+    )
 
     # Gated activations (silu/gelu/swiglu) split w1's output into gate+up, so
     # w1.shape[1] == 2*N; non-gated relu2 has w1.shape[1] == N. Compare against
@@ -1452,7 +1606,6 @@ def fused_experts(
     _MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD = 4096 * 4096
     avg_m = (M * TopK) // E
     big_weight = K * N > _MOE_GROUPED_GEMM_SMALL_WEIGHT_THRESHOLD
-    w1_gate_up_block_split = bool(getattr(w1, "_xpu_gate_up_block_split", False))
     # The 4-bit W4A16 grouped GEMM uses a two-GEMM path. Keep GEMM1 independent
     # and apply the gated activation with its dedicated elementwise kernel.
     # When GPT-OSS weights have been block-split into [gate, up] halves, always
@@ -1522,8 +1675,13 @@ def fused_experts(
                 gemm1_limit=float(gemm1_limit) if gemm1_limit is not None else 7.0,
             )
         if activation_type == 2:
-            intermediate_cache2 = torch.ops.sgl_kernel.swiglu_gpt_oss_sigmoid_alpha(
-                intermediate_cache1, gemm1_alpha, gemm1_limit
+            intermediate_cache2 = _apply_unfused_moe_activation(
+                intermediate_cache1,
+                activation_type,
+                gemm1_alpha,
+                gemm1_limit,
+                swiglu_limit,
+                intermediate_cache1,
             )
         else:
             intermediate_cache2 = _get_moe_ws(
@@ -1532,25 +1690,14 @@ def fused_experts(
                 hidden_states.dtype,
                 hidden_states.device,
             )
-            if activation_type == 0:
-                torch.ops.sgl_kernel.silu_and_mul(
-                    intermediate_cache2, intermediate_cache1
-                )
-            elif activation_type == 4:
-                torch.ops.sgl_kernel.silu_and_mul_clamp(
-                    intermediate_cache2, intermediate_cache1, float(swiglu_limit)
-                )
-            elif activation_type == 1:
-                torch.ops.sgl_kernel.gelu_tanh_and_mul(
-                    intermediate_cache2, intermediate_cache1
-                )
-            elif activation_type == 5:
-                torch.ops.sgl_kernel.gelu_and_mul(
-                    intermediate_cache2, intermediate_cache1
-                )
-            elif activation_type == 3:
-                torch.clamp_min(intermediate_cache1, 0, out=intermediate_cache2)
-                torch.square(intermediate_cache2, out=intermediate_cache2)
+            intermediate_cache2 = _apply_unfused_moe_activation(
+                intermediate_cache1,
+                activation_type,
+                gemm1_alpha,
+                gemm1_limit,
+                swiglu_limit,
+                intermediate_cache2,
+            )
         if w2_g_idx_perm is not None:
             # GPTQ desc_act/g_idx: reorder each expert's activation slice to
             # match the K-dim sort applied to w2 at weight-load time.

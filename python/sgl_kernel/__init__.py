@@ -212,6 +212,9 @@ fused_hc_head = torch.ops.sgl_kernel.fused_hc_head.default
 mhc_fused_post_pre = torch.ops.sgl_kernel.mhc_fused_post_pre.default
 from sgl_kernel.minimax import minimax_decode_topk, minimax_decode_topk_page_table
 from sgl_kernel.moe import (
+    MoeWeightLayout,
+    MoeWeightPlan,
+    MoeWeightQuantization,
     apply_shuffle_mul_sum,
     biased_topk,
     convert_weights_to_col_major,
@@ -220,6 +223,7 @@ from sgl_kernel.moe import (
     cutlass_fused_experts_mxfp4,
     fp8_blockwise_scaled_grouped_mm,
     fused_experts,
+    get_moe_weight_plan,
     hash_topk,
     mark_weights_col_major,
     moe_align_block_size,
@@ -228,6 +232,7 @@ from sgl_kernel.moe import (
     moe_sum_reduce,
     mxfp4_blockwise_scaled_grouped_mm,
     prepare_moe_input,
+    prepare_moe_weights,
     scatter_tokens_to_experts,
     swiglu_gpt_oss_sigmoid_alpha,
     topk_sigmoid,

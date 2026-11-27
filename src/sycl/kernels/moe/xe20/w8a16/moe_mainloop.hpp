@@ -38,8 +38,6 @@ namespace moe_w8a16 {
 
 using namespace cute;
 
-static constexpr int FP8_GROUP_SIZE_K = 128;
-
 // Number of work-items per subgroup on Xe (SIMD lane count).
 static constexpr int SUBGROUP_SIZE = 16;
 
@@ -433,7 +431,7 @@ struct W8A16Mainloop<
           }
 
           for (int k_tile = 0, k_tile_prefetch = Stages; k_tile < k_tile_count; ++k_tile, ++k_tile_prefetch) {
-            barrier_arrive(barrier_scope);
+            // Do not emit ScopeWorkgroup barriers in this subgroup-divergent fallback loop.
             copy(tiled_copy_a, tAgA(_, _, _, k_tile), tArA_packed);
             copy(tiled_copy_b, tBgBp(_, _, _, k_tile), tBrB_packed);
 
@@ -519,7 +517,6 @@ struct W8A16Mainloop<
             reorder(tArA_packed, tSrA);
             e4m3_reorder_dequant(tBrB_packed, tSrB, mul_of);
             cute::gemm(mma, tSrA, tSrB, tCrC);
-            barrier_wait(barrier_scope);
           }
 
           bool any_shifted = false;

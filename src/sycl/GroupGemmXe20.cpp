@@ -236,17 +236,24 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
       activation_type,
       ". Supported values are 0 (silu), 1 (gelu), 2 (swiglu_gpt_oss), 3 (relu2)");
 
-  if (fuse_act && gate_up_interleaved && activation_type == static_cast<int64_t>(ActivationType::SWIGLU_GPT_OSS)) {
-    // Interleaved [G0, U0, G1, U1, ...] columns have stride 2 along N, whereas
-    // Xe2 2D block VNNI loads require contiguous unit-stride columns. Preserve
-    // full compatibility for interleaved callers by running unfused GEMM1 into
-    // swiglu_gpt_oss_sigmoid_alpha.
+  if (fuse_act && !is_fused_non_gated_relu2 &&
+      ((gate_up_interleaved && activation_type == static_cast<int64_t>(ActivationType::SWIGLU_GPT_OSS)) ||
+       (gemm_n % 64 != 0))) {
+    // Fallback to unfused GEMM1 + standalone activation when:
+    //   1) GPT-OSS weights are still interleaved ([g0, u0, ...] has N-stride 2), or
+    //   2) gemm_n % 64 != 0, where fused B1 base pointer (ptr_B + gemm_n / 2)
+    //      would not satisfy the 64-byte base alignment required by 2D block load.
     at::Tensor intermediate = at::empty({total_m, gemm_n}, activations.options());
+    std::optional<at::Tensor> unfused_bias = bias;
+    if (bias.has_value() && !gate_up_interleaved &&
+        activation_type == static_cast<int64_t>(ActivationType::SWIGLU_GPT_OSS)) {
+      unfused_bias = at::cat({bias->slice(1, 0, gemm_n, 2), bias->slice(1, 1, gemm_n, 2)}, /*dim=*/1).contiguous();
+    }
     moe_grouped_mm_nt_xe20(
         intermediate,
         activations,
         weights_b,
-        bias,
+        unfused_bias,
         total_rows_for_experts,
         n_experts,
         activation_type,
@@ -254,11 +261,29 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
         gemm1_alpha,
         gemm1_limit,
         /*gate_up_interleaved=*/true);
-    static auto op = c10::Dispatcher::singleton()
-                         .findSchemaOrThrow("sgl_kernel::swiglu_gpt_oss_sigmoid_alpha", "")
-                         .typed<at::Tensor(at::Tensor, double, double)>();
-    at::Tensor act_out = op.call(intermediate, gemm1_alpha, gemm1_limit);
-    output.copy_(act_out);
+    if (activation_type == static_cast<int64_t>(ActivationType::SWIGLU_GPT_OSS)) {
+      at::Tensor gpt_in = gate_up_interleaved
+                              ? intermediate
+                              : at::stack(
+                                    {intermediate.slice(1, 0, gemm_n / 2), intermediate.slice(1, gemm_n / 2, gemm_n)},
+                                    /*dim=*/2)
+                                    .flatten(1);
+      static auto op = c10::Dispatcher::singleton()
+                           .findSchemaOrThrow("sgl_kernel::swiglu_gpt_oss_sigmoid_alpha", "")
+                           .typed<at::Tensor(at::Tensor, double, double)>();
+      at::Tensor act_out = op.call(gpt_in, gemm1_alpha, gemm1_limit);
+      output.copy_(act_out);
+    } else if (activation_type == static_cast<int64_t>(ActivationType::SILU)) {
+      static auto op = c10::Dispatcher::singleton()
+                           .findSchemaOrThrow("sgl_kernel::silu_and_mul", "")
+                           .typed<void(at::Tensor&, at::Tensor&)>();
+      op.call(output, intermediate);
+    } else {
+      static auto op = c10::Dispatcher::singleton()
+                           .findSchemaOrThrow("sgl_kernel::gelu_tanh_and_mul", "")
+                           .typed<void(at::Tensor&, at::Tensor&)>();
+      op.call(output, intermediate);
+    }
     return;
   }
 
@@ -269,6 +294,13 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20(
   void* bias_ptr = with_bias ? bias->data_ptr() : nullptr;
   const int ld_b = static_cast<int>(weights_b.stride(2));
   const int64_t expert_stride_b = weights_b.stride(0);
+  TORCH_CHECK(
+      (ld_b * static_cast<int>(weights_b.element_size())) % 16 == 0 &&
+          (expert_stride_b * static_cast<int64_t>(weights_b.element_size())) % 64 == 0,
+      "BF16 Layout-B requires 16-byte pitch alignment and 64-byte expert base alignment, got ld_b=",
+      ld_b,
+      ", expert_stride_b=",
+      expert_stride_b);
 
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // Grouped GEMM: sum over experts of (m_e, K) @ (K, N). Total M rows summed as total_m.

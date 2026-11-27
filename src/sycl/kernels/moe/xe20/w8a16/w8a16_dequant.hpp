@@ -215,6 +215,8 @@ CUTE_DEVICE void uint8_zp_reorder_folded(
         : "=rw"(dst0)
         : "rw"(src0), "rw.u"(scale_c), "rw"(zp_shifts), "rw"(muls));
   }
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
+#error "W8A16 folded reorder is only supported on SYCL_INTEL_TARGET 20 (BMG/Xe20)"
 #endif
 }
 
@@ -241,6 +243,8 @@ CUTE_DEVICE void uint8b128_reorder_unscaled(intel::uchar4 const& src0, intel::us
         : "=rw"(dst0)
         : "rw"(src0), "rw.u"(scale_c), "rw.u"(shift_c));
   }
+#elif defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
+#error "W8A16 folded reorder is only supported on SYCL_INTEL_TARGET 20 (BMG/Xe20)"
 #endif
 }
 

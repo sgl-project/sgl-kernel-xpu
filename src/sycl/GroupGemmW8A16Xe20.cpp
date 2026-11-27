@@ -34,6 +34,7 @@ __attribute__((visibility("default"))) void Xe20MoEGEMMW8A16Launcher(
     const int num_experts,
     int* workspace,
     int ld_b,
+    bool weight_k_major,
     int scale_mode,
     bool static_scheduler);
 
@@ -62,6 +63,7 @@ using SG_4_2_1 = Layout<Shape<_4, _2, _1>, Stride<_2, _1, _0>>;
       const int,                                                                     \
       int*,                                                                          \
       int,                                                                           \
+      bool,                                                                          \
       int,                                                                           \
       bool);
 
@@ -91,6 +93,7 @@ DECLARE_XE20_MOE_W8A16_ALL_SCALE_VARIANTS(Tile_128_128_16, SG_4_2_1)
       n_experts,                                             \
       atomic_buffer.data_ptr<int>(),                         \
       ld_b,                                                  \
+      weight_k_major,                                        \
       scale_mode,                                            \
       static_scheduler)
 
@@ -134,7 +137,17 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
     const int64_t n_experts) {
   CHECK_INPUT(2, at::ScalarType::BFloat16, output);
   CHECK_INPUT(2, at::ScalarType::BFloat16, activations);
-  CHECK_INPUT(3, at::ScalarType::Float8_e4m3fn, weights);
+  CHECK_DEVICE(weights);
+  CHECK_DIM(3, weights);
+  CHECK_DTYPE(at::ScalarType::Float8_e4m3fn, weights);
+  const bool weight_k_major = !weights.is_contiguous();
+  if (weight_k_major) {
+    const auto n = weights.size(1), k = weights.size(2);
+    TORCH_CHECK(
+        weights.strides() == at::IntArrayRef({n * k, 1, n}),
+        "W8A16 weights must be contiguous [E,N,K] or a [E,N,K] view of contiguous [E,K,N]");
+    CHECK_ALIGNMENT(64, weights);
+  }
   CHECK_INPUT(weight_scales);
   CHECK_INPUT(1, at::ScalarType::Int, total_rows_for_experts);
   TORCH_CHECK(output.device() == activations.device(), "output must be on the same device as activations");
@@ -174,12 +187,15 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
   int gemm_k = static_cast<int>(activations.size(1));
   int gemm_n = static_cast<int>(weights.size(1));
   int avg_m = total_m / static_cast<int>(n_experts);
-  int ld_b = static_cast<int>(weights.stride(1));
+  int ld_b = static_cast<int>(weights.stride(weight_k_major ? 2 : 1));
   int scale_mode =
       is_mxfp8 ? static_cast<int>(ScaleMode::BlockMXFP8)
                : (weight_scales.dim() == 1 ? static_cast<int>(ScaleMode::ScalarSingle)
                                            : (weight_scales.dim() == 2 ? static_cast<int>(weight_scales.size(1))
                                                                        : static_cast<int>(ScaleMode::BlockFP32)));
+  TORCH_CHECK(
+      !weight_k_major || scale_mode == static_cast<int>(ScaleMode::ScalarSingle),
+      "K-major W8A16 weights require one scale per expert");
   bool weight_scale_blocked = moe_w8a16::is_block_scale_mode(scale_mode);
   bool static_scheduler = total_m <= n_experts || (!weight_scale_blocked && gemm_k <= 128);
   if (is_mxfp8) {
@@ -195,7 +211,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
   if (bias.has_value()) {
     TORCH_CHECK(bias->size(0) == n_experts && bias->size(1) == gemm_n, "bias shape must be [E, N]");
   }
-  auto stream = at::xpu::getCurrentXPUStream();
+  auto stream = at::xpu::getCurrentXPUStream(activations.get_device());
   auto queue = stream.queue();
   using StreamKey = std::pair<c10::DeviceIndex, c10::StreamId>;
   thread_local std::map<StreamKey, at::Tensor> atomic_buffers;
@@ -241,6 +257,7 @@ SGL_KERNEL_EXPORT void moe_grouped_mm_nt_xe20_w8a16(
           static_cast<int>(n_experts),
           atomic_buffer.data_ptr<int>(),
           ld_b,
+          weight_k_major,
           static_scheduler,
           jit_arch_code(),
           &jit_err),

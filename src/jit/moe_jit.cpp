@@ -277,7 +277,21 @@ bool w4a16_grouped_gemm_launch(
 namespace {
 
 using W8A16Fn = void (*)(
-    void*, const void*, const void*, const void*, const void*, void*, int, int, const int*, int, int*, int, int, bool);
+    void*,
+    const void*,
+    const void*,
+    const void*,
+    const void*,
+    void*,
+    int,
+    int,
+    const int*,
+    int,
+    int*,
+    int,
+    bool,
+    int,
+    bool);
 
 struct W8A16TileCfg {
   const char* tile;
@@ -363,6 +377,7 @@ bool w8a16_grouped_gemm_launch(
     int num_experts,
     int* workspace,
     int ld_b,
+    bool weight_k_major,
     bool static_scheduler,
     int arch,
     std::string* err) {
@@ -381,6 +396,7 @@ bool w8a16_grouped_gemm_launch(
      num_experts,
      workspace,
      ld_b,
+     weight_k_major,
      scale_mode,
      static_scheduler);
   return true;

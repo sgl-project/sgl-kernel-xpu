@@ -1650,6 +1650,30 @@ def test_moe_grouped_mm_fp8_w8a16_scalar_scales(
     torch.testing.assert_close(reference, output.cpu(), rtol=1e-2, atol=5e-2)
 
 
+@pytest.mark.parametrize("rows", [1, 8, 64, 192])
+@pytest.mark.parametrize("gemm_n,gemm_k", [(512, 2048), (2048, 256)])
+def test_moe_grouped_mm_fp8_w8a16_k_major(rows, gemm_n, gemm_k):
+    device, experts = "xpu", 8
+    torch.manual_seed(19)
+    counts = torch.tensor([0, rows, 0, rows, rows, 0, 0, rows], dtype=torch.int32)
+    activations = torch.randn(int(counts.sum()), gemm_k, dtype=torch.bfloat16).to(
+        device
+    )
+    weights = torch.randn(experts, gemm_n, gemm_k).to(torch.float8_e4m3fn).to(device)
+    scales = torch.linspace(0.007, 0.011, experts, device=device)
+    bias = torch.randn(experts, gemm_n, device=device)
+    counts = counts.to(device)
+    canonical = torch.empty(
+        (activations.shape[0], gemm_n), dtype=torch.bfloat16, device=device
+    )
+    packed = torch.empty_like(canonical)
+    launch = torch.ops.sgl_kernel.moe_grouped_mm_nt_xe20_w8a16
+    launch(canonical, activations, weights, scales, bias, counts, experts)
+    weights = weights.transpose(-1, -2).contiguous().transpose(-1, -2)
+    launch(packed, activations, weights, scales, bias, counts, experts)
+    torch.testing.assert_close(canonical, packed, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("rows_per_expert", [(0, 1, 2, 3, 4, 5, 7, 10)])
 def test_moe_grouped_mm_fp8_w8a16_heterogeneous_block_scales(rows_per_expert):
     torch.manual_seed(7)

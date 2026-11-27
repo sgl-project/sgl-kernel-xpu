@@ -35,7 +35,8 @@ template <
     typename TensorD,
     typename TiledMMA,
     bool WeightScalePerExpert = false,
-    bool WeightScaleBlocked = false>
+    bool WeightScaleBlocked = false,
+    bool WeightKMajor = false>
 class W8A16Kernel {
  public:
   using ElementA = cutlass::bfloat16_t;
@@ -61,7 +62,7 @@ class W8A16Kernel {
 
   struct Params {
     const uint8_t* Activations;    // [M_total, K] bf16 bytes
-    const uint8_t* PackedWeights;  // [num_experts, N, K] fp8 e4m3 raw bytes
+    const uint8_t* PackedWeights;  // FP8 [E,N,K] or [E,K,N], selected by WeightKMajor
     const void* WeightScales;      // Per-expert scalar, block scales, or uint8 MXFP8 scales
     const float* Bias;
     ElementD* Outputs;
@@ -83,8 +84,10 @@ class W8A16Kernel {
 
   auto make_B_tensors(uint8_t* ptr_B, int N, int K, int ld_b) {
     auto* e4m3_ptr = reinterpret_cast<cutlass::float_e4m3_t*>(ptr_B);
-    auto B = make_tensor(make_gmem_ptr(e4m3_ptr), make_layout(make_shape(N, K), make_stride(ld_b, _1{})));
-    return B;
+    if constexpr (WeightKMajor)
+      return make_tensor(make_gmem_ptr(e4m3_ptr), make_layout(make_shape(N, K), make_stride(_1{}, ld_b)));
+    else
+      return make_tensor(make_gmem_ptr(e4m3_ptr), make_layout(make_shape(N, K), make_stride(ld_b, _1{})));
   }
 
   // Per-expert weight-scale pointers + row stride. Mirrors MXFP4's
@@ -132,7 +135,7 @@ class W8A16Kernel {
 
       int expert_id = i;
       int ld_b = params.ld_b;
-      int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(N) * static_cast<int64_t>(ld_b);
+      int64_t B_offset = static_cast<int64_t>(expert_id) * (WeightKMajor ? K : N) * ld_b;
       int64_t S_offset = static_cast<int64_t>(expert_id) * scale_n * (WeightScalePerExpert ? 1 : K_scale);
 
       uint8_t* ptr_A_curr_batch = const_cast<uint8_t*>(params.Activations) + pre_rows * K * sizeof(ElementA);
@@ -153,7 +156,7 @@ class W8A16Kernel {
 
         auto tile_coord = make_coord(m_coord, n_coord, _, 0);
         if constexpr (WeightScalePerExpert) {
-          if (params.scale_mode == static_cast<int32_t>(ScaleMode::ScalarSingle)) {
+          if (WeightKMajor || params.scale_mode == static_cast<int32_t>(ScaleMode::ScalarSingle)) {
             moe_xe20::xe_gemm<void, void, void>(
                 A_tensor,
                 B_tensor,

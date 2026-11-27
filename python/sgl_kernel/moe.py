@@ -788,9 +788,6 @@ def fused_experts(
         assert (
             w1_scale is not None and w2_scale is not None
         ), "w1_scale/w2_scale must be provided for FP8 weight-only MoE"
-        assert (
-            w1.is_contiguous() and w2.is_contiguous()
-        ), "FP8 weight-only MoE requires contiguous expert weights"
         _validate_fp8_weight_scale(w1_scale, w1, "w1_scale", allow_scalar=True)
         _validate_fp8_weight_scale(w2_scale, w2, "w2_scale", allow_scalar=True)
         if w1_scale.ndim == 1:

@@ -10,12 +10,12 @@ Reported metrics:
 """
 
 import argparse
-import struct
 
 import sgl_kernel  # noqa: F401
 import torch
 import triton
 import triton.testing
+from sgl_kernel import fp8_paged_mqa_logits_triton
 from sgl_kernel.nsa import _fp8_mqa_logits_impl
 
 
@@ -33,15 +33,10 @@ def make_kv_cache(num_pages, page_size, D, device="xpu"):
     kv = torch.zeros(
         num_pages, page_size, 1, head_dim_with_sf, dtype=torch.uint8, device="cpu"
     )
-    for p in range(num_pages):
-        k_fp8 = torch.randn(page_size, D, dtype=torch.float32) * 0.5
-        k_fp8 = k_fp8.to(torch.float8_e4m3fn).view(torch.uint8)
-        kv[p, :, 0, :D] = k_fp8
-        for t in range(page_size):
-            scale = 0.5 + torch.rand(1).item()
-            scale_bytes = struct.pack("<f", scale)
-            for i, b in enumerate(scale_bytes):
-                kv[p, t, 0, D + i] = b
+    k_fp8 = torch.randn(num_pages, page_size, D, dtype=torch.float32) * 0.5
+    kv[:, :, 0, :D] = k_fp8.to(torch.float8_e4m3fn).view(torch.uint8)
+    scales = 0.5 + torch.rand(num_pages, page_size, dtype=torch.float32)
+    kv[:, :, 0, D:] = scales.contiguous().view(torch.uint8).view(num_pages, page_size, 4)
     return kv.to(device)
 
 
@@ -190,6 +185,67 @@ def run_bench_fp8_paged_mqa_logits(B, H, D, page_size, x_vals=None):
     )
 
 
+# ---------------------------------------------------------------------------
+# Benchmark: fp8_paged_mqa_logits_triton (decode, page_size 64)
+#
+# Single fused kernel, so device memory traffic is the inputs and the output:
+#   Read:  kv_cache (B*msl*(D+4) uint8)  +  q (B*H*D fp8)  +  weights (B*H f32)
+#          + seq_lens (B i32)  +  page_table (B*num_blocks i32)
+#   Write: logits (B*msl f32)
+#
+# FLOPs: 2 * B * H * D * seq_len  (dominant GEMM term)
+# ---------------------------------------------------------------------------
+def run_bench_fp8_paged_mqa_logits_triton(B, H, D, page_size, x_vals=None):
+    device = "xpu"
+    if x_vals is None:
+        x_vals = [1024, 2048, 4096, 8192, 16384, 32768]
+
+    rows = []
+    for seq_len in x_vals:
+        num_blocks = (seq_len + page_size - 1) // page_size
+        num_pages = num_blocks * B
+        msl = num_blocks * page_size
+
+        kv_cache = make_kv_cache(num_pages, page_size, D, device)
+        q = make_fp8_tensor((B, 1, H, D), device)
+        weights = torch.rand(B, H, dtype=torch.float32, device=device)
+        seq_lens = torch.full((B,), seq_len, dtype=torch.int32, device=device)
+        block_tables = (
+            torch.arange(num_blocks, dtype=torch.int32, device=device)
+            .unsqueeze(0)
+            .expand(B, -1)
+            .contiguous()
+        )
+
+        ms = triton.testing.do_bench(
+            lambda: fp8_paged_mqa_logits_triton(
+                q, kv_cache, weights, seq_lens, block_tables, None, msl, False
+            ),
+        )
+        us = ms * 1e3
+
+        bytes_io = (
+            B * msl * (D + 4)  # kv_cache (read)
+            + B * H * D  # q fp8 (read)
+            + B * H * 4  # weights f32 (read)
+            + B * 4  # seq_lens i32 (read)
+            + B * num_blocks * 4  # page_table i32 (read)
+            + B * msl * 4  # logits f32 (written)
+        )
+        flops = 2 * B * H * D * seq_len  # dominant GEMM
+
+        bw = bytes_io / (ms * 1e-3) / 1e9
+        tflops = flops / (ms * 1e-3) / 1e12
+
+        rows.append((seq_len, f"{us:.3f}", f"{bw:.1f}", f"{tflops:.4f}"))
+
+    _print_table(
+        f"fp8_paged_mqa_logits_triton (B={B}, H={H}, D={D}, page_size={page_size})",
+        ["seq_len", "us", "GB/s", "TFLOPS"],
+        rows,
+    )
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Benchmark FP8 MQA logits kernels")
     parser.add_argument("--H", type=int, default=64, help="Number of heads")
@@ -197,6 +253,9 @@ if __name__ == "__main__":
     parser.add_argument("--Nq", type=int, default=1, help="Number of queries (ragged)")
     parser.add_argument("--B", type=int, default=1, help="Batch size (paged)")
     parser.add_argument("--page-size", type=int, default=128, help="Page size (paged)")
+    parser.add_argument(
+        "--triton-B", type=int, default=64, help="Batch size (paged triton)"
+    )
     args = parser.parse_args()
 
     print(f"Config: H={args.H}, D={args.D}")
@@ -205,6 +264,9 @@ if __name__ == "__main__":
     run_bench_fp8_mqa_logits(Nq=args.Nq, H=args.H, D=args.D)
     run_bench_fp8_paged_mqa_logits(
         B=args.B, H=args.H, D=args.D, page_size=args.page_size
+    )
+    run_bench_fp8_paged_mqa_logits_triton(
+        B=args.triton_B, H=args.H, D=args.D, page_size=64
     )
 
     print("Benchmark finished!")

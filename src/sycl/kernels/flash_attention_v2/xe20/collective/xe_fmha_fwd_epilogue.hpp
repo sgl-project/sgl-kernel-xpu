@@ -320,7 +320,8 @@ class FMHAFwdEpilogue {
       }
       CUTLASS_PRAGMA_UNROLL
       for (int i = 0; i < rA_sum.size(); i++) {
-        if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask) {
+        // Non-paged covers seqused_k: a batch with seqused_k == 0 has no keys and a zero sum.
+        if constexpr (CollectiveMainloop::LocalMask || CollectiveMainloop::CausalMask || !CollectiveMainloop::PagedKV) {
           rA_sum(i) = safe_recip(rA_sum(i));
         } else {
           rA_sum(i) = ElementA(1) / rA_sum(i);

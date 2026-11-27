@@ -88,7 +88,11 @@ std::tuple<at::Tensor, c10::optional<at::Tensor>> mha_fwd(
     // attended bidirectionally, causal otherwise.
     std::optional<const at::Tensor>& bidirectional_block_ids_,
     // Optional fp32 ALiBi slopes [num_heads]; bias = -slope * |i + s_k - s_q - j|.
-    std::optional<const at::Tensor>& alibi_slopes_);
+    std::optional<const at::Tensor>& alibi_slopes_,
+    // Optional (b,) int32 real lengths of each q / k sequence for non-paged prefill;
+    // cu_seqlens_q / cu_seqlens_k then give only the offsets, so sequences may be padded.
+    std::optional<const at::Tensor>& seqused_q_,
+    std::optional<const at::Tensor>& seqused_k_);
 
 void flash_mla_decode(
     torch::Tensor& out,

@@ -14,6 +14,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "VecUtils.h"
 #include "sgl_kernel_export.h"
 
 namespace at::native::xpu {
@@ -23,7 +24,7 @@ namespace {
 // Global access is vectorized through vec_t, as in per_tensor_quant_fp8.cpp and
 // TopKRenormProbs.cpp, but by dereferencing a vec_t pointer rather than vec_t::load/store:
 // the member functions scalarize, measured 119 vs 392 GB/s for bf16 at S=32760 H=5120.
-// vec_t<U, N> is aligned to N * sizeof(U); select_vec_size() on the host picks the widest
+// vec_t<U, N> is aligned to N * sizeof(U); get_vec_size() on the host picks the widest
 // width that divides hidden and every vectorized operand's alignment.
 template <typename U, int N>
 inline vec_t<U, N> load_global(const U* ptr) {
@@ -196,28 +197,6 @@ class ScaleResidualNormScaleShiftKernel {
   float eps_;
 };
 
-struct VectorOperand {
-  const void* data;
-  int64_t element_size;
-};
-
-int32_t select_vec_size(int64_t hidden, const std::vector<VectorOperand>& operands) {
-  int32_t vec_size = (hidden % 8 == 0) ? 8 : (hidden % 4 == 0) ? 4 : (hidden % 2 == 0) ? 2 : 1;
-  while (vec_size > 1) {
-    bool aligned = true;
-    for (const auto& operand : operands) {
-      const int64_t alignment = vec_size * operand.element_size;
-      if (reinterpret_cast<uintptr_t>(operand.data) % static_cast<uintptr_t>(alignment) != 0) {
-        aligned = false;
-        break;
-      }
-    }
-    if (aligned) break;
-    vec_size /= 2;
-  }
-  return vec_size;
-}
-
 struct LaunchArgs {
   void* residual_out;
   void* out;
@@ -357,20 +336,11 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_
 
   const int32_t scale_is_vec = scale.numel() == hidden ? 1 : 0;
   const int32_t shift_is_vec = shift.numel() == hidden ? 1 : 0;
+  const OptTensorRef scale_ref = scale_is_vec != 0 ? OptTensorRef(scale) : OptTensorRef{};
+  const OptTensorRef shift_ref = shift_is_vec != 0 ? OptTensorRef(shift) : OptTensorRef{};
+  const int32_t vec_size =
+      get_vec_size(8, {out, residual_output, residual, x, gate, weight, bias, scale_ref, shift_ref});
 
-  const int64_t act_size = x.element_size();
-  const int64_t param_size = scale.element_size();
-  std::vector<VectorOperand> vector_operands = {
-      {out.data_ptr(), act_size},
-      {residual_output.data_ptr(), act_size},
-      {residual.data_ptr(), act_size},
-      {x.data_ptr(), act_size},
-  };
-  if (gate_ptr != nullptr) vector_operands.push_back({gate_ptr, param_size});
-  if (weight_ptr != nullptr) vector_operands.push_back({weight_ptr, param_size});
-  if (bias_ptr != nullptr) vector_operands.push_back({bias_ptr, param_size});
-  if (scale_is_vec != 0) vector_operands.push_back({scale.data_ptr(), param_size});
-  if (shift_is_vec != 0) vector_operands.push_back({shift.data_ptr(), param_size});
   const LaunchArgs args = {
       residual_output.data_ptr(),
       out.data_ptr(),
@@ -387,7 +357,7 @@ SGL_KERNEL_EXPORT std::tuple<torch::Tensor, torch::Tensor> fused_scale_residual_
       gate_row_stride,
       scale_is_vec,
       shift_is_vec,
-      select_vec_size(hidden, vector_operands),
+      vec_size,
       static_cast<float>(eps)};
 
   auto stream = at::xpu::getCurrentXPUStream();

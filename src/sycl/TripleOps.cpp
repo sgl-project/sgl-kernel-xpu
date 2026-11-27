@@ -10,7 +10,6 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
-#include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
 #include "sgl_kernel/aligned_vec.h"

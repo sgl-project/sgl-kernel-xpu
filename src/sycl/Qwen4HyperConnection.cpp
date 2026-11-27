@@ -14,6 +14,7 @@
 
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "VecUtils.h"
 #include "sgl_kernel_export.h"
 
 namespace {
@@ -199,19 +200,6 @@ void launch_rows(sycl::queue& q, int64_t rows, int64_t cols, const Kernel& kerne
   const int64_t groups = div_up(cols, static_cast<int64_t>(FLAT_WG));
   TORCH_CHECK(rows * groups * FLAT_WG <= MAX_ID, "qwen4_hc: too many rows for the padded 2D range: ", rows);
   sycl_kernel_submit(sycl::range<2>(rows, groups * FLAT_WG), sycl::range<2>(1, FLAT_WG), q, kernel);
-}
-
-// Widest V <= max_v such that `inner` elements (the contiguous extent every vector must tile) and all pointers are
-// V-aligned.
-int pick_vec(int64_t inner, std::initializer_list<const at::Tensor*> tensors, int max_v = VEC_SIZE) {
-  for (int v = max_v; v > 1; v /= 2) {
-    bool ok = inner % v == 0;
-    for (const at::Tensor* t : tensors) {
-      ok = ok && reinterpret_cast<uintptr_t>(t->data_ptr()) % (v * sizeof(bf16)) == 0;
-    }
-    if (ok) return v;
-  }
-  return 1;
 }
 
 void check_no_overlap(const at::Tensor& output, std::initializer_list<const at::Tensor*> inputs) {
@@ -449,7 +437,7 @@ SGL_KERNEL_EXPORT void qwen4_hc_silu(torch::Tensor& output, const torch::Tensor&
   auto q = c10::xpu::getCurrentXPUStream().queue();
   const float inv_hc = 1.0f / static_cast<float>(hc_count);
   const int max_v = n <= NARROW_MAX_OUTPUTS ? NARROW_VEC : VEC_SIZE;
-  SGL_DISPATCH_VEC_SIZE_SET(pick_vec(n, {&input, &output}, max_v), (1, 2, 4, 8), [&] {
+  SGL_DISPATCH_VEC_SIZE_SET(get_vec_size(max_v, {input.flatten(), output.flatten()}), (1, 2, 4, 8), [&] {
     constexpr int V = VEC_SIZE;
     const uint32_t items = n / V;
     launch_flat(q, items, SiluKernel<V>{as<bf16xV<V>>(input), as_mut<bf16xV<V>>(output), items, inv_hc});
@@ -472,7 +460,7 @@ qwen4_hc_gate_mix(torch::Tensor& output, const torch::Tensor& input, const torch
   c10::DeviceGuard guard(input.device());
   auto q = c10::xpu::getCurrentXPUStream().queue();
   const int max_v = rows * hidden <= NARROW_MAX_OUTPUTS ? NARROW_VEC : VEC_SIZE;
-  SGL_DISPATCH_VEC_SIZE_SET(pick_vec(hidden, {&input, &gate, &output}, max_v), (1, 2, 4, 8), [&] {
+  SGL_DISPATCH_VEC_SIZE_SET(get_vec_size(max_v, {input, gate, output}), (1, 2, 4, 8), [&] {
     constexpr int V = VEC_SIZE;
     const uint32_t vecs_per_row = hidden / V;
     launch_rows(
@@ -511,7 +499,7 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine(
 
   c10::DeviceGuard guard(residual.device());
   auto q = c10::xpu::getCurrentXPUStream().queue();
-  SGL_DISPATCH_VEC_SIZE_SET(pick_vec(hidden, {&residual, &block_output, &output}), (1, 2, 4, 8), [&] {
+  SGL_DISPATCH_VEC_SIZE_SET(get_vec_size(VEC_SIZE, {residual, block_output, output}), (1, 2, 4, 8), [&] {
     constexpr int V = VEC_SIZE;
     const uint32_t vecs_per_row = hidden / V;
     SGL_DISPATCH_BOOL(injection_data != nullptr, HAS_INJECTION, [&] {
@@ -573,7 +561,7 @@ SGL_KERNEL_EXPORT void qwen4_hc_combine_norm(
   // Both kernels must compute the same combine weight as qwen4_hc_combine.
   const float inv_hc = 1.0f / static_cast<float>(hc_count);
   const float inv_hidden = 1.0f / static_cast<float>(hidden);
-  if (pick_vec(hidden, {&residual, &block_output, &weight, &combined, &normalized}) == VEC_SIZE) {
+  if (get_vec_size(VEC_SIZE, {residual, block_output, weight, combined, normalized}) == VEC_SIZE) {
     const CombineNormArgs args{
         as<bf16x8>(residual),
         as<bf16x8>(block_output),

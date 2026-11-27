@@ -8,7 +8,6 @@
 #include <limits>
 #include <sycl/sycl.hpp>
 
-#include "MemoryAccess.h"
 #include "SGLKernelPerf.h"
 #include "Utils.h"
 #include "sgl_kernel/aligned_vec.h"

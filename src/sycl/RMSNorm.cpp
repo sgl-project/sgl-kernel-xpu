@@ -12,10 +12,10 @@
 #include <sycl/sycl.hpp>
 #include <vector>
 
-#include "MemoryAccess.h"
 #include "Norm.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "VecUtils.h"
 #include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
@@ -123,20 +123,6 @@ class NormNoRstdForward {
   NormNoRstdForward() = delete;
   NormNoRstdForward(scalar_t* X_data, scalar_t* Y_data, accscalar_t eps) : X_data(X_data), Y_data(Y_data), eps(eps) {}
 
-  int get_update_vec_size(int Plane, int vec_size) const {
-    return get_aligned_update_vec_size(Plane, vec_size, X_data, Y_data);
-  }
-
- protected:
-  template <typename... Args>
-  int get_aligned_update_vec_size(int Plane, int vec_size, Args*... args) const {
-    vec_size = get_min_vec_size(vec_size, args...);
-    while (Plane % vec_size != 0) {
-      vec_size = vec_size >> 1;
-    }
-    return vec_size;
-  }
-
  public:
   scalar_t* X_data;
   scalar_t* Y_data;
@@ -151,10 +137,6 @@ class RMSNormNoRstdForward : public NormNoRstdForward<scalar_t> {
   RMSNormNoRstdForward() = delete;
   RMSNormNoRstdForward(scalar_t* X_data, scalar_t* Y_data, weight_t* gamma_data, accscalar_t eps)
       : NormNoRstdForward<scalar_t>(X_data, Y_data, eps), gamma_data(gamma_data) {}
-
-  int get_update_vec_size(int Plane, int vec_size) const {
-    return NF::get_aligned_update_vec_size(Plane, vec_size, NF::X_data, NF::Y_data, gamma_data);
-  }
 
   // Per-element weight application, the single place the normalized value meets
   // gamma.  Shared by the cached and non-cached update() loops and by the
@@ -278,10 +260,6 @@ class AddNoRstdForward : public BaseNorm {
   AddNoRstdForward() = delete;
   AddNoRstdForward(scalar_t* X_data, scalar_t* Y_data, weight_t* gamma_data, accscalar_t eps, scalar_t* add_data)
       : BaseNorm(X_data, Y_data, gamma_data, eps), add_data(add_data) {}
-
-  int get_update_vec_size(int Plane, int vec_size) const {
-    return NF::get_aligned_update_vec_size(Plane, vec_size, NF::X_data, NF::Y_data, Base::gamma_data, add_data);
-  }
 
   template <int vec_size, int ITERS, bool cache_inputs, typename vec_t, typename index_t, typename Cfg>
   void reduce_combine(
@@ -605,7 +583,7 @@ void RMSNormKernelImplInternal(
       sizeof(scalar_t),
       input_batch_stride,
       output_batch_stride,
-      [&](int plane, int max_vec_size) { return rms_norm_no_rstd_forward.get_update_vec_size(plane, max_vec_size); },
+      [&](int /*plane*/, int max_vec_size) { return get_vec_size(max_vec_size, {X, Y, gemma}); },
       input_inner0_size,
       input_inner0_stride,
       output_inner0_size,
@@ -655,9 +633,7 @@ void FusedAddRMSNormKernelImplInternal(
       sizeof(scalar_t),
       N,
       N,
-      [&](int plane, int max_vec_size) {
-        return add_rms_norm_no_rstd_forward.get_update_vec_size(plane, max_vec_size);
-      },
+      [&](int /*plane*/, int max_vec_size) { return get_vec_size(max_vec_size, {X, gemma, residual}); },
       1,
       0,
       1,
@@ -696,9 +672,7 @@ void GemmaRMSNormKernelImplInternal(
       sizeof(scalar_t),
       input_batch_stride,
       output_batch_stride,
-      [&](int plane, int max_vec_size) {
-        return gemma_rms_norm_no_rstd_forward.get_update_vec_size(plane, max_vec_size);
-      },
+      [&](int /*plane*/, int max_vec_size) { return get_vec_size(max_vec_size, {X, Y, gemma}); },
       input_inner0_size,
       input_inner0_stride,
       output_inner0_size,
@@ -726,9 +700,7 @@ void GemmaFusedAddRMSNormKernelImplInternal(
       sizeof(scalar_t),
       N,
       N,
-      [&](int plane, int max_vec_size) {
-        return gemma_add_rms_norm_no_rstd_forward.get_update_vec_size(plane, max_vec_size);
-      },
+      [&](int /*plane*/, int max_vec_size) { return get_vec_size(max_vec_size, {X, gemma, residual}); },
       1,
       0,
       1,

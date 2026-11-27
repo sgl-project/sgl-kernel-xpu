@@ -41,12 +41,13 @@
 #include <c10/xpu/XPUStream.h>
 #include <cutlass/float8.h>
 
+#include <numeric>
 #include <sycl/sycl.hpp>
 
-#include "MemoryAccess.h"
 #include "SGLKernelPerf.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "VecUtils.h"
 #include "sgl_kernel_export.h"
 
 // TODO: Remove CUTLASS emulation and use native SYCL FP8 when available.
@@ -223,11 +224,11 @@ SGL_KERNEL_EXPORT void sgl_per_token_quant_fp8(at::Tensor input, at::Tensor outp
   auto& Q = dpcppGetCurrentQueue();
   const int dev_id = dpcppGetDeviceIdOfCurrentQueue();
 
-  // Choose vector width from device preference, capped so hidden_dim stays divisible.
-  int vec_size = preferred_vector_width(dev_id, input.element_size());
-  while (vec_size > 1 && (hidden_dim % vec_size != 0)) {
-    vec_size /= 2;
-  }
+  // TODO: Previously this only checked static preferred_vector_width and hidden_dim divisibility
+  // (sycl::vec::load/store does not require vector alignment); pass {input, output_q} if switching
+  // to aligned pointer casts.
+  const int max_vec = static_cast<int>(std::gcd<int64_t>(max_vec_size_for_bytes(input.element_size()), hidden_dim));
+  const int vec_size = get_vec_size(max_vec, {});
 
   // Enough tokens to fill the machine → warp kernel (one sub-group per token).
   // Otherwise the block kernel (one work-group per token) gives more parallelism

@@ -5,15 +5,14 @@
 #include <limits>
 #include <sycl/sycl.hpp>
 
-#include "MemoryAccess.h"
 #include "SYCLHelpers.h"
 #include "Utils.h"
+#include "VecUtils.h"
 #include "sgl_kernel/aligned_vec.h"
 #include "sgl_kernel_export.h"
 
 namespace {
 
-constexpr int VEC_BYTES = 16;
 constexpr int WG_SIZE = 128;
 constexpr int SG_SIZE = 16;
 constexpr int64_t MAX_ROWS = std::numeric_limits<int32_t>::max();  // SYCL id queries are 32-bit
@@ -124,14 +123,10 @@ SGL_KERNEL_EXPORT void fused_sigmoid_mul(torch::Tensor& output, torch::Tensor& i
 
   c10::DeviceGuard guard(input.device());
   SYCL_DISPATCH_FLOATING_TYPES_V1(input.scalar_type(), "fused_sigmoid_mul", [&] {
-    constexpr int V = VEC_BYTES / sizeof(scalar_t);
-    auto usable = [&](int vec) {
-      const size_t bytes = vec * sizeof(scalar_t);
-      auto aligned = [&](const torch::Tensor& t) { return reinterpret_cast<uintptr_t>(t.data_ptr()) % bytes == 0; };
-      return head_dim % vec == 0 && gate.stride(0) % vec == 0 && gate_stride_head % vec == 0 && aligned(output) &&
-             aligned(input) && aligned(gate);
-    };
-    const int vec_size = usable(V) ? V : usable(V / 2) ? V / 2 : 1;
+    int vec_size = get_vec_size<scalar_t>({output, input, gate});
+    if (vec_size == 2) {
+      vec_size = 1;
+    }
     SGL_DISPATCH_VEC_SIZE_SET(
         vec_size, (1, 4, 8), [&] { ::launch<scalar_t, VEC_SIZE>(output, input, gate, head_dim, gate_stride_head); });
   });

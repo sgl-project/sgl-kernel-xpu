@@ -10,6 +10,10 @@ def awq_dequantize(
     return torch.ops.sgl_kernel.awq_dequantize.default(qweight, scales, qzeros)
 
 
+def lm_head_gemv(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.ops.sgl_kernel.lm_head_gemv.default(hidden, weight)
+
+
 def int8_scaled_mm(mat_a, mat_b, scales_a, scales_b, out_dtype, bias=None):
     return torch.ops.sgl_kernel.int8_scaled_mm.default(
         mat_a,

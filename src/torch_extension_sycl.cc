@@ -33,6 +33,9 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.def("awq_dequantize(Tensor qweight, Tensor scales, Tensor qzeros) -> Tensor");
   m.impl("awq_dequantize", torch::kXPU, &awq_dequantize);
 
+  m.def("lm_head_gemv(Tensor hidden, Tensor weight) -> Tensor");
+  m.impl("lm_head_gemv", torch::kXPU, &lm_head_gemv);
+
   m.def("silu_and_mul(Tensor! out, Tensor input) -> ()");
   m.impl("silu_and_mul", torch::kXPU, &silu_and_mul);
 

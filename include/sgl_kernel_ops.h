@@ -641,6 +641,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> inkling_attn_prologue_extend(
  * From csrc/gemm
  */
 torch::Tensor awq_dequantize(torch::Tensor qweight, torch::Tensor scales, torch::Tensor qzeros);
+torch::Tensor lm_head_gemv(torch::Tensor hidden, torch::Tensor weight);
 void cutlass_scaled_fp4_mm(
     torch::Tensor& D,
     torch::Tensor const& A,

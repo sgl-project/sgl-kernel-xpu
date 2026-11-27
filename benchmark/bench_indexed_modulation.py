@@ -237,7 +237,7 @@ def _bw_metrics(rows: int, hidden: int, num_tables: int, time_ms: float) -> dict
 # Benchmark configs
 # ---------------------------------------------------------------------------
 rows_range = [0, 1, 16, 64, 128, 256, 512, 1024, 2048, 4096]
-hidden_range = [5376]  # MiniMax-H3 shape only
+hidden_range = [5376]  # For performance, track MiniMax-H3 shape only
 num_indices_range = [2, 3, 4, 5, 8, 16]
 
 all_results = []

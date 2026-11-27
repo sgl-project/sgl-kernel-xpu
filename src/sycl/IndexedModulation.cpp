@@ -151,6 +151,10 @@ static void check_indexed_modulation_inputs(
   CHECK_DEVICE(x);
   CHECK_DEVICE(indexed);
   CHECK_DEVICE(indices);
+  TORCH_CHECK(
+      indexed.device() == x.device() && indices.device() == x.device(),
+      kernel_name,
+      ": all tensors must be on the same device");
   TORCH_CHECK(x.scalar_type() == at::ScalarType::BFloat16, kernel_name, ": x must be bf16");
   TORCH_CHECK(indexed.scalar_type() == at::ScalarType::BFloat16, kernel_name, ": indexed tensor must be bf16");
   TORCH_CHECK(x.dim() == 2, kernel_name, ": x must be 2D [rows, hidden]");
@@ -170,10 +174,11 @@ indexed_scale_shift_bf16_(torch::Tensor& x, torch::Tensor& shift, torch::Tensor&
   TORCH_CHECK(shift.size(0) == scale.size(0), "indexed_scale_shift_bf16_: shift and scale rows must match");
 
   const int64_t rows = x.size(0);
-  if (rows == 0) return;
-
-  auto queue = at::xpu::getCurrentXPUStream().queue();
   const int64_t hidden_size = x.size(1);
+  if (rows == 0 || hidden_size == 0) return;
+
+  c10::DeviceGuard guard(x.device());
+  auto queue = at::xpu::getCurrentXPUStream().queue();
   const int64_t wg_size = indexed_modulation_workgroup_size(hidden_size);
   const int vec_size = select_indexed_modulation_vec_size(hidden_size, {&x, &shift, &scale});
 
@@ -211,6 +216,7 @@ SGL_KERNEL_EXPORT void
 indexed_gate_bf16_(torch::Tensor& x, torch::Tensor& gate, torch::Tensor& other, torch::Tensor& indices) {
   check_indexed_modulation_inputs("indexed_gate_bf16_", x, gate, indices);
   CHECK_DEVICE(other);
+  TORCH_CHECK(other.device() == x.device(), "indexed_gate_bf16_: all tensors must be on the same device");
   TORCH_CHECK(other.scalar_type() == at::ScalarType::BFloat16, "indexed_gate_bf16_: other must be bf16");
   TORCH_CHECK(other.dim() == 2, "indexed_gate_bf16_: other must be 2D [rows, hidden]");
   TORCH_CHECK(other.size(0) == x.size(0), "indexed_gate_bf16_: other rows must match x rows");
@@ -218,10 +224,11 @@ indexed_gate_bf16_(torch::Tensor& x, torch::Tensor& gate, torch::Tensor& other, 
   TORCH_CHECK(other.stride(1) == 1, "indexed_gate_bf16_: other must be contiguous in the last dimension");
 
   const int64_t rows = x.size(0);
-  if (rows == 0) return;
-
-  auto queue = at::xpu::getCurrentXPUStream().queue();
   const int64_t hidden_size = x.size(1);
+  if (rows == 0 || hidden_size == 0) return;
+
+  c10::DeviceGuard guard(x.device());
+  auto queue = at::xpu::getCurrentXPUStream().queue();
   const int64_t wg_size = indexed_modulation_workgroup_size(hidden_size);
   const int vec_size = select_indexed_modulation_vec_size(hidden_size, {&x, &gate, &other});
 

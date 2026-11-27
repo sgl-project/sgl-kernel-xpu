@@ -15,6 +15,7 @@
 # variable of the same name (e.g. `USE_MOE=OFF pip install -v .` or
 # `USE_MOE=0 pip install -v .`). Both `OFF` and `0` (case-insensitive) disable a
 # feature; the environment variable takes precedence when set.
+option(USE_MONO_DECODE "Build experimental Xe2 monolithic decode kernels" OFF)
 option(USE_MOE "Build MoE kernels" ON)
 option(USE_FMHA "Build flash attention kernels" ON)
 option(USE_GDN "Build Gated DeltaNet attention kernels" ON)
@@ -32,7 +33,7 @@ option(USE_MLA_SPARSE_FUSED "Build the fused (single-pass) sparse MLA decode ker
 # (or 1 / On) as a CMake option or environment variable.
 option(USE_SYCL_JIT "Enable runtime-JIT kernels (opt-in; drops their AOT .so instances)" OFF)
 
-foreach(_toggle USE_MOE USE_FMHA USE_GDN USE_MLA USE_QSA USE_MLA_SPARSE_FUSED USE_SYCL_JIT)
+foreach(_toggle USE_MONO_DECODE USE_MOE USE_FMHA USE_GDN USE_MLA USE_QSA USE_MLA_SPARSE_FUSED USE_SYCL_JIT)
     if(DEFINED ENV{${_toggle}} AND NOT "$ENV{${_toggle}}" STREQUAL "")
         # Normalize the env value so 1 / On / ON / on / true / yes all enable and
         # 0 / Off / OFF / false / no disable, independent of CMake's if(<string>)
@@ -122,6 +123,9 @@ file(GLOB host_cpp "./*.cpp" "./*.cc")
 # mla_*.cpp) are non-Xe20 and would otherwise land in device_cpp_common, which
 # is never filtered; removing them from device_cpp up front is the only way to
 # keep them out of the build.
+if(NOT USE_MONO_DECODE OR NOT DPCPP_SYCL_TARGET MATCHES "bmg")
+    list(FILTER device_cpp EXCLUDE REGEX "/models/minicpm5/")
+endif()
 if(NOT USE_FMHA)
     list(FILTER device_cpp EXCLUDE REGEX "/flash_attentionXe[0-9]+\\.cpp$")
 elseif(DPCPP_SYCL_TARGET MATCHES "cri")

@@ -171,3 +171,32 @@ Please read our [Contributing Guidelines](./CONTRIBUTING.md) before submitting a
 ### Release new version
 
 Update version in [pyproject.toml](https://github.com/sgl-project/sgl-kernel-xpu/blob/main/pyproject.toml) and [version.py](https://github.com/sgl-project/sgl-kernel-xpu/blob/main/python/sgl_kernel/version.py)
+
+### MiniCPM5 monokernel on Xe2
+
+`USE_MONO_DECODE` defaults to `OFF`. Build with
+`--config-settings=cmake.define.USE_MONO_DECODE=ON` and
+`--config-settings=cmake.define.DPCPP_SYCL_TARGET=bmg` to include the MiniCPM5 ops.
+Use an SGLang checkout with native MiniCPM5 support and
+`--enable-xpu-monokernel`. Serve with `--dtype bfloat16 --quantization fp8`,
+`--attention-backend intel_xpu --disable-shared-experts-fusion`, and a
+64- or 128-token BF16 KV page. TP2 needs `SYS_PTRACE` when the host restricts ptrace.
+
+The standalone target decoder accepts FP16 or BF16 activations and one to eight
+physical token rows. The SGLang target uses BF16 activations and online FP8
+weights, with per-output-channel linear scales and one scale per expert matrix.
+Decode and DSpark target verification share the layer entry point. The optional
+DSpark draft on B70 accelerates seven-query steps with BF16 activations and
+BF16 or scaled FP8 projections. Other draft configurations use the standard
+SGLang path.
+
+B70 uses 32 work-groups. The B60 path uses 16 work-groups so the hidden-state
+tiles divide evenly and the grid fits in 20 Xe cores. To exercise the 16-group
+path on B70, set `SGLANG_XPU_MONO_WORK_GROUPS=16`.
+
+```bash
+python -m pytest -q tests/minicpm5 -k 'not test_tp2'
+FI_TCP_IFACE=lo torchrun --standalone --nproc-per-node=2 -m pytest -q tests/minicpm5 -k test_tp2
+```
+
+The tests generate weights locally. They compare both reference modes against the fused layer. Mode 1 launches attention and feed-forward separately. Mode 2 uses a caller-provided FP32 all-reduce for each TP2 partial.

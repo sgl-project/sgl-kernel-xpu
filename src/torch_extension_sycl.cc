@@ -19,7 +19,16 @@ limitations under the License.
 #include "sgl_flash_kernel_ops.h"
 #include "sgl_kernel_ops.h"
 #include "sgl_kernel_torch_shim.h"
+#ifdef USE_MINICPM5_MONO_DECODE
+namespace sgl_kernel::minicpm5::xe20 {
+void register_ops(torch::Library& m);
+}
+#endif
+
 TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
+#ifdef USE_MINICPM5_MONO_DECODE
+  sgl_kernel::minicpm5::xe20::register_ops(m);
+#endif
   m.def("convrot_rotate_quantize(Tensor input, int group_size=256) -> (Tensor, Tensor)");
   m.impl("convrot_rotate_quantize", torch::kXPU, &convrot_rotate_quantize);
   m.def(

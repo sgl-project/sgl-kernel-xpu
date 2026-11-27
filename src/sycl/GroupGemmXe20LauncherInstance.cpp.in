@@ -33,7 +33,8 @@ void Xe20MoEGEMMLauncher(
     int* workspace,
     float gemm1_alpha,
     float gemm1_limit,
-    int ld_b_param) {
+    int ld_b_param,
+    int64_t expert_stride_b_param) {
   (void)scales;
   using Element = cutlass::bfloat16_t;
 
@@ -48,7 +49,7 @@ void Xe20MoEGEMMLauncher(
     }
   };
   using StrideA = Stride<int, _1>;
-  using StrideB = Stride<int, _1>;
+  using StrideB = Stride<_1, int>;
   using StrideD = Stride<int, _1>;
   using TensorA = decltype(make_dummy_tensor(Element{}, StrideA{}));
   using TensorB = decltype(make_dummy_tensor(Element{}, StrideB{}));
@@ -90,6 +91,7 @@ void Xe20MoEGEMMLauncher(
       workspace,
       mma,
       static_cast<int32_t>(ld_b_param),
+      expert_stride_b_param,
       static_cast<float>(gemm1_alpha),
       static_cast<float>(gemm1_limit),
   };
@@ -120,7 +122,8 @@ void Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, static_cast<ActivationType>(@ACT_TY
     int*,
     float,
     float,
-    int);
+    int,
+    int64_t);
 
 #ifdef SGL_MOE_JIT_ENTRY
 // Stable C ABI entry for the runtime-JIT path. Only emitted when this TU is
@@ -140,7 +143,8 @@ extern "C" __attribute__((visibility("default"))) void sgl_moe_gg_entry(
     int* workspace,
     float gemm1_alpha,
     float gemm1_limit,
-    int ld_b) {
+    int ld_b,
+    int64_t expert_stride_b) {
   Xe20MoEGEMMLauncher<@TILE@, @SGLAYOUT@, static_cast<ActivationType>(@ACT_TYPE@), @FUSE_ACT@, @WITH_BIAS@>(
       *static_cast<sycl::queue*>(queue_ptr),
       activations,
@@ -155,7 +159,8 @@ extern "C" __attribute__((visibility("default"))) void sgl_moe_gg_entry(
       workspace,
       gemm1_alpha,
       gemm1_limit,
-      ld_b);
+      ld_b,
+      expert_stride_b);
 }
 #endif
 

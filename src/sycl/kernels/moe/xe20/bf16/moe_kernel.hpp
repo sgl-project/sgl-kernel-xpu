@@ -102,6 +102,7 @@ class MoEGEMM {
     int32_t* workspace;
     TiledMMA mma;
     int32_t ld_b;
+    int64_t expert_stride_b;
     float gemm1_alpha = 1.702f;
     float gemm1_limit = 7.0f;
   };
@@ -109,24 +110,15 @@ class MoEGEMM {
   auto make_B_tensors(ElementB* ptr_B, int N, int K, int ld_b) {
     constexpr bool is_fused_gated = FuseAct && (ActType != ActivationType::RELU2);
     if constexpr (is_fused_gated) {
-      // Fused gated activations: split into gate and up weights
-      if constexpr (ActType == ActivationType::SWIGLU_GPT_OSS) {
-        auto B0 =
-            make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(2 * ld_b, _1{})));
-        auto B1 = make_tensor(
-            make_gmem_ptr<ElementB>(ptr_B + ld_b), make_layout(make_shape(N / 2, K), make_stride(2 * ld_b, _1{})));
-        return cute::make_tuple(B0, B1);
-      } else {
-        auto B0 =
-            make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(ld_b, _1{})));
-        ElementB* ptr_B1 = ptr_B + static_cast<int64_t>(N / 2) * ld_b;
-        auto B1 =
-            make_tensor(make_gmem_ptr<ElementB>(ptr_B1), make_layout(make_shape(N / 2, K), make_stride(ld_b, _1{})));
-        return cute::make_tuple(B0, B1);
-      }
+      // Fused gated activations operate on block-split [gate, up] columns in Layout B.
+      auto B0 = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N / 2, K), make_stride(_1{}, ld_b)));
+      ElementB* ptr_B1 = ptr_B + static_cast<int64_t>(N / 2);
+      auto B1 =
+          make_tensor(make_gmem_ptr<ElementB>(ptr_B1), make_layout(make_shape(N / 2, K), make_stride(_1{}, ld_b)));
+      return cute::make_tuple(B0, B1);
     } else {
       // Unfused or fused non-gated RELU2: single weight tensor
-      auto B = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N, K), make_stride(ld_b, _1{})));
+      auto B = make_tensor(make_gmem_ptr<ElementB>(ptr_B), make_layout(make_shape(N, K), make_stride(_1{}, ld_b)));
       return cute::make_tuple(B);
     }
   }
@@ -235,7 +227,7 @@ class MoEGEMM {
 
       int expert_id = i;
       int ld_b = params.ld_b;
-      int64_t B_offset = static_cast<int64_t>(expert_id) * static_cast<int64_t>(N) * static_cast<int64_t>(ld_b);
+      int64_t B_offset = static_cast<int64_t>(expert_id) * params.expert_stride_b;
       ElementA* ptr_A_curr_batch = const_cast<ElementA*>(params.Activations) + pre_rows * K;
       ElementB* ptr_B_curr_batch = const_cast<ElementB*>(params.Weights) + B_offset;
       float* ptr_Bias_curr_batch = nullptr;

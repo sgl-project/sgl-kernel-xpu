@@ -3,29 +3,29 @@ set(GROUP_GEMM_W8A16_XE20_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/group_g
 set(GROUP_GEMM_W8A16_XE20_INST_SRCS)
 file(MAKE_DIRECTORY ${GROUP_GEMM_W8A16_XE20_GEN_DIR})
 
-function(add_group_gemm_w8a16_xe20_inst TILE_M TILE_N TILE_K SG_SHAPE SG_STRIDE SCALE_MODES)
+function(add_group_gemm_w8a16_xe20_inst TILE_M TILE_N TILE_K SG_SHAPE SG_STRIDE WEIGHT_KINDS)
     set(TILE "Shape<${TILE_M}, ${TILE_N}, ${TILE_K}>")
     set(SGLAYOUT "Layout<Shape<${SG_SHAPE}>, Stride<${SG_STRIDE}>>")
-    foreach(scale_mode IN LISTS SCALE_MODES)
-        if(scale_mode STREQUAL "block")
-            set(WEIGHT_SCALE_BLOCKED true)
+    foreach(weight_kind IN LISTS WEIGHT_KINDS)
+        if(weight_kind STREQUAL "int8")
+            set(IS_INT8 true)
         else()
-            set(WEIGHT_SCALE_BLOCKED false)
+            set(IS_INT8 false)
         endif()
-        set(SCALE_GEN_SRC
-            "${GROUP_GEMM_W8A16_XE20_GEN_DIR}/GroupGemmW8A16Xe20_inst_${TILE_M}_${TILE_N}_${TILE_K}_${scale_mode}.cpp")
-        configure_file(${GROUP_GEMM_W8A16_XE20_TEMPLATE} ${SCALE_GEN_SRC} @ONLY)
-        list(APPEND GROUP_GEMM_W8A16_XE20_INST_SRCS ${SCALE_GEN_SRC})
+        set(GEN_SRC
+            "${GROUP_GEMM_W8A16_XE20_GEN_DIR}/GroupGemmW8A16Xe20_inst_${TILE_M}_${TILE_N}_${TILE_K}_${weight_kind}.cpp")
+        configure_file(${GROUP_GEMM_W8A16_XE20_TEMPLATE} ${GEN_SRC} @ONLY)
+        list(APPEND GROUP_GEMM_W8A16_XE20_INST_SRCS ${GEN_SRC})
     endforeach()
     set(GROUP_GEMM_W8A16_XE20_INST_SRCS ${GROUP_GEMM_W8A16_XE20_INST_SRCS} PARENT_SCOPE)
 endfunction()
 
-# W8A16 scalar/block menu: 16x64x32 and 32x64x32 for small/medium M,
-# 64x64x32 for medium-M long-K scalar GEMMs, plus 128x128x16 for
-# large-M scalar GEMMs. Activation is external.
-add_group_gemm_w8a16_xe20_inst("_16" "_64" "_32" "_1, _4, _1" "_4, _1, _0" "scalar;block")
-add_group_gemm_w8a16_xe20_inst("_32" "_64" "_32" "_1, _4, _1" "_4, _1, _0" "scalar;block")
-add_group_gemm_w8a16_xe20_inst("_64" "_64" "_32" "_2, _4, _1" "_4, _1, _0" "scalar")
-add_group_gemm_w8a16_xe20_inst("_128" "_128" "_16" "_4, _2, _1" "_2, _1, _0" "scalar;block")
+# Unified W8A16 tile menu: all scale layouts (scalar, gate+up, per-channel,
+# 128x128 block, K-group, and 1x32 MXFP8) are dispatched at runtime inside one
+# kernel per (tile, weight_kind).
+add_group_gemm_w8a16_xe20_inst("_16" "_64" "_32" "_1, _4, _1" "_4, _1, _0" "fp8;int8")
+add_group_gemm_w8a16_xe20_inst("_32" "_64" "_32" "_1, _4, _1" "_4, _1, _0" "fp8;int8")
+add_group_gemm_w8a16_xe20_inst("_64" "_64" "_32" "_2, _4, _1" "_4, _1, _0" "fp8;int8")
+add_group_gemm_w8a16_xe20_inst("_128" "_128" "_32" "_4, _4, _1" "_4, _1, _0" "fp8;int8")
 
 list(APPEND ATen_XPU_SYCL_XE20 ${GROUP_GEMM_W8A16_XE20_INST_SRCS})

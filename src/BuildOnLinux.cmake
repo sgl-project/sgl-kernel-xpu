@@ -267,6 +267,21 @@ foreach(sycl_src ${ATen_XPU_SYCL_XE20})
   )
 endforeach()
 
+if(TARGET sgl-ops-sycl-minicpm5_decode)
+  target_link_libraries(sgl-ops-sycl-minicpm5_decode PRIVATE
+    sgl-ops-sycl-minicpm5_b70_fp16
+    sgl-ops-sycl-minicpm5_b70_bf16
+    sgl-ops-sycl-minicpm5_b70_draft_bf16
+    sgl-ops-sycl-minicpm5_b60_fp16
+    sgl-ops-sycl-minicpm5_b60_bf16
+    sgl-ops-sycl-minicpm5_b70_fp16_split
+    sgl-ops-sycl-minicpm5_b70_bf16_split
+    sgl-ops-sycl-minicpm5_b60_fp16_split
+    sgl-ops-sycl-minicpm5_b60_bf16_split)
+  target_compile_definitions(common_ops PRIVATE USE_MINICPM5_MONO_DECODE)
+  install(DIRECTORY ${SGL_OPS_XPU_ROOT}/include/sgl_kernel/stage DESTINATION sgl_kernel/include/sgl_kernel)
+endif()
+
 # The FMHA decode/prefill dispatch in flash_attentionXe20.cpp calls the runtime-JIT
 # engine. This must come after the xe20 loop above: `if(TARGET ...)` is evaluated
 # in order, so a check placed before the target exists is silently false and the

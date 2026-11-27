@@ -81,6 +81,7 @@ bool w8a16_grouped_gemm_launch(
     int num_experts,
     int* workspace,
     int ld_b,
+    bool weight_k_major,
     bool static_scheduler,
     int arch = 0,
     std::string* err = nullptr);

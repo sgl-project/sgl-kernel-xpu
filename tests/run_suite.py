@@ -104,6 +104,8 @@ suites = {
         TestFile("test_qwen4_hyperconnection.py"),
         TestFile("test_sigmoid_mul.py"),
         TestFile("test_convrot_int8.py"),
+        TestFile("minicpm5/test_decode.py", 10),
+        TestFile("minicpm5/test_draft.py", 10),
     ],
     # Nightly suite: exercises the wheel installed in the intel/sgl-kernel-xpu-dev
     # nightly image. Populate with longer-running or full-shape tests that are

@@ -644,6 +644,14 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("index_k_norm_rope_pack_store", torch::kXPU, &index_k_norm_rope_pack_store);
 
   /*
+   * Indexed modulation (per-row gather of shift/scale/gate by index)
+   */
+  m.def("indexed_scale_shift_bf16_(Tensor! x, Tensor shift, Tensor scale, Tensor indices) -> ()");
+  m.impl("indexed_scale_shift_bf16_", torch::kXPU, &indexed_scale_shift_bf16_);
+  m.def("indexed_gate_bf16_(Tensor! x, Tensor gate, Tensor other, Tensor indices) -> ()");
+  m.impl("indexed_gate_bf16_", torch::kXPU, &indexed_gate_bf16_);
+
+  /*
    * From fused qk norm rope
    */
   m.def(

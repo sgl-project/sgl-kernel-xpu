@@ -84,6 +84,8 @@ from sgl_kernel.elementwise import (
     gemma_fused_add_rmsnorm,
     gemma_rmsnorm,
     grouped_gemma_rmsnorm,
+    indexed_gate_bf16_,
+    indexed_scale_shift_bf16_,
     multimodal_rotary_embedding,
     qwen4_gate_reduce,
     qwen4_gate_value,

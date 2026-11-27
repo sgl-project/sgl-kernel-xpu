@@ -144,6 +144,12 @@ void qwen4_hc_combine(
     const torch::Tensor& block_output,
     const std::optional<torch::Tensor>& injection,
     int64_t hc_count);
+}  // namespace at::native::xpu
+
+void indexed_scale_shift_bf16_(torch::Tensor& x, torch::Tensor& shift, torch::Tensor& scale, torch::Tensor& indices);
+void indexed_gate_bf16_(torch::Tensor& x, torch::Tensor& gate, torch::Tensor& other, torch::Tensor& indices);
+
+namespace at::native::xpu {
 void qwen4_hc_combine_norm(
     torch::Tensor& combined,
     torch::Tensor& normalized,

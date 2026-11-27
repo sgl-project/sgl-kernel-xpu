@@ -116,14 +116,18 @@ static int64_t indexed_modulation_workgroup_size(int64_t hidden_size) {
 }
 
 // Largest N (lanes of bf16_t packed into one aligned_vector_loop load/store) such that
-// hidden_size and every indexed row stride divide evenly by N; falls back to 1 (scalar).
+// hidden_size, every vectorized operand's row stride, and every vectorized operand's
+// base pointer alignment divide evenly by N (resp. N * sizeof(bf16_t)); falls back to 1 (scalar).
 // Memory-bandwidth-bound, so always prefer the widest N regardless of wg_size/occupancy.
-static int select_indexed_modulation_vec_size(int64_t hidden_size, std::initializer_list<int64_t> row_strides) {
+static int
+select_indexed_modulation_vec_size(int64_t hidden_size, std::initializer_list<const torch::Tensor*> operands) {
   int vec_size = 16 / sizeof(bf16_t);
   while (vec_size > 1) {
+    const auto align_bytes = static_cast<uintptr_t>(vec_size) * sizeof(bf16_t);
     bool ok = hidden_size % vec_size == 0;
-    for (int64_t stride : row_strides) {
-      ok = ok && (stride % vec_size == 0);
+    for (const torch::Tensor* tensor : operands) {
+      ok = ok && (tensor->stride(0) % vec_size == 0) &&
+           (reinterpret_cast<uintptr_t>(tensor->data_ptr()) % align_bytes == 0);
     }
     if (ok) break;
     vec_size >>= 1;
@@ -171,7 +175,7 @@ indexed_scale_shift_bf16_(torch::Tensor& x, torch::Tensor& shift, torch::Tensor&
   auto queue = at::xpu::getCurrentXPUStream().queue();
   const int64_t hidden_size = x.size(1);
   const int64_t wg_size = indexed_modulation_workgroup_size(hidden_size);
-  const int vec_size = select_indexed_modulation_vec_size(hidden_size, {x.stride(0), shift.stride(0), scale.stride(0)});
+  const int vec_size = select_indexed_modulation_vec_size(hidden_size, {&x, &shift, &scale});
 
   dispatch_index_type(indices, "indexed_scale_shift_bf16_", [&](auto index_tag) {
     using index_t = decltype(index_tag);
@@ -219,7 +223,7 @@ indexed_gate_bf16_(torch::Tensor& x, torch::Tensor& gate, torch::Tensor& other, 
   auto queue = at::xpu::getCurrentXPUStream().queue();
   const int64_t hidden_size = x.size(1);
   const int64_t wg_size = indexed_modulation_workgroup_size(hidden_size);
-  const int vec_size = select_indexed_modulation_vec_size(hidden_size, {x.stride(0), gate.stride(0), other.stride(0)});
+  const int vec_size = select_indexed_modulation_vec_size(hidden_size, {&x, &gate, &other});
 
   dispatch_index_type(indices, "indexed_gate_bf16_", [&](auto index_tag) {
     using index_t = decltype(index_tag);

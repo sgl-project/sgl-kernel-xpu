@@ -15,6 +15,30 @@
 
 #include <sycl/sycl.hpp>
 
+// ── JIT cache-invalidation contract ─────────────────────────────────────────
+// sgl::jit::get_or_compile (src/jit/sycl_template_jit.cpp) keys its on-disk
+// .so cache on the RENDERED text of this file (after @KEY@ substitution) plus
+// the compile flags, include dirs, link flags, entry symbol and compiler
+// identity. It does NOT hash the headers this file #includes. Consequently, if
+// a kernel header below is changed in a way that alters the generated code
+// (e.g. adding/removing an in-kernel guard such as the `v_head_id >=
+// num_v_heads` bounds check in chunk_gated_delta_rule_kernels.hpp), a .so
+// cached from the OLD header is still served from the cache -- it predates the
+// change. To force every previously-cached .so to recompile, you MUST also
+// change THIS file whenever the included kernel headers change behaviorally:
+// bump the revision marker below (any text change to this file does it).
+#define SGL_GDN_CHUNK_JIT_HEADER_REVISION 3
+// Revision history (behavioral changes to the included kernel headers that
+// required invalidating previously-cached .so's):
+//   3 -- chunk_fwd_o_kernel gained a work-group barrier between the W@S/Q@S
+//        (state READS from ssm_state) and the state-UPDATE (state READ+WRITE)
+//        phases, eliminating a write-after-read race on ssm_state that
+//        corrupted seeded initial states on some Xe2 parts
+//        (e.g. BMG-G21); fwd_o also gained the nullptr has_initial_state
+//        convention shared with chunk_compute_wu.
+//   2 -- chunk_prepare_kernel gained the `v_head_id >= num_v_heads` bounds
+//        guard, eliminating an out-of-range A_log/dt_bias/alpha read for
+//        value-head subgroup tails (see chunk_gated_delta_rule_kernels.hpp).
 #include "sycl/kernels/gdn_attn/chunk_gated_delta_rule_kernels.hpp"
 // Defines launch_chunk_compute_A_inverse_fused (declared in the header above),
 // matching the AOT TU chunk_gated_delta_rule.cpp.

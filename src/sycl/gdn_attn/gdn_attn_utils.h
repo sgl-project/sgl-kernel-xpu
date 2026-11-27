@@ -13,6 +13,29 @@ static constexpr float l2norm_eps = 0.000001f;
 static constexpr int chunk_size_xe2 = 64;
 static constexpr int A_block_size_xe2 = 16;
 
+// Minimum TOTAL token count across the pure-prefill batch the standalone
+// `gated_delta_rule` op requires before it selects the chunk (parallel)
+// kernel over the sequential (token-serial) kernel. The sequential kernel is
+// token-serial across ALL sequences, so its cost scales with the total token
+// count; the chunk path pays a fixed cost per call (padded-buffer allocation
+// + per-sequence 64-token padding + scatter + per-chunk launches) that only
+// amortizes once the total is large enough, below which the serial
+// recurrence's lack of chunking overheads wins.
+//
+// Provenance: tuned from device-time crossover sweeps (see
+// benchmark/bench_gdn_chunk_dispatch.py; single-sequence crossovers on the
+// target hardware were on the order of a few hundred tokens for nk=16/nv=32
+// and well under 512 for nk=4/nv=12 at TP4, versus the previous hardcoded
+// 2048). 512 is a round value safely above the measured single-sequence
+// crossovers -- below it the chunk path never wins; above it the chunk path
+// wins for every measured batching shape (the previous 2048-only gate left
+// multi-seq batches like 2x2048 on the slow serial kernel). The crossover is
+// geometry-, device- AND batch-shape-dependent (many very short sequences
+// inflate the padded buffer without doing useful work), so this is ONE
+// global heuristic knob, not a tight optimum -- re-run the sweep per target
+// before changing it.
+static constexpr int64_t kChunkMinTokens = 512;
+
 enum class ActMode {
   silu = 0,
   swish = 1,

@@ -539,15 +539,150 @@ SGL_KERNEL_EXPORT void gated_delta_rule(
     const int64_t num_prefills,
     const int64_t num_decodes) {
   auto& queue = dpcppGetCurrentQueue();
+  // The chunk (parallel) path below materializes the input into per-sequence
+  // padded scratch buffers and runs ALL of the prefill sequences through the
+  // chunked delta-rule kernels, so it is valid for PURE-PREFILL, NO-REMAP
+  // calls with any number of sequences (>= 1).
+  //
+  // This predicate must therefore agree with that assumption on EVERY input --
+  // the caller-supplied scalar counts, the tensor-side shapes, the head dims
+  // and the dtypes/contiguity the kernels rely on -- because a mismatch here
+  // cannot be detected later. In particular the chunk kernels re-derive their
+  // batch count from `query_start_loc.size(0) - 1` (NOT from `num_prefills`)
+  // and read `has_initial_state[batch_id]` per sequence, with the private
+  // buffers below sized from the SAME batch count. `num_prefills`/
+  // `num_decodes` are plain caller scalars that can disagree with
+  // `query_start_loc` (a caller-contract violation), so the tensor-side shapes
+  // are pinned to that contract IN ADDITION to the scalar-side checks: any
+  // disagreement fails closed to the sequential kernel (which has tolerable
+  // behavior on such input) instead of silently corrupting the result or
+  // reading out of bounds of the mask. Every condition below is host-side
+  // metadata (sizes/dtypes) -- no device read, no host<->device sync.
+  const bool pure_prefill_contract = num_prefills >= 1 && num_decodes == 0 && !token_indx.has_value() &&
+                                     query_start_loc.numel() == num_prefills + 1 &&
+                                     cache_indices.numel() == num_prefills &&
+                                     (!has_initial_state.has_value() || has_initial_state->numel() == num_prefills);
+  // q/k/v are deliberately NOT required to be contiguous here: the chunk path
+  // scatters them into the padded scratch buffers (stride-aware) below. The
+  // sequential fallback, by contrast, indexes them as packed rows with no
+  // stride information, so it makes them contiguous on its own branch below.
+  //
+  // The token gate is on the TOTAL prefill token count: the sequential kernel
+  // cost is proportional to total tokens (token-serial across sequences), and
+  // the chunk path's fixed cost (padded buffers, scatter, launches) amortizes
+  // over the total. See gdn::kChunkMinTokens for provenance.
+  bool use_chunk = pure_prefill_contract && q.size(0) >= gdn::kChunkMinTokens && q.size(2) == 128 && v.size(2) == 128 &&
+                   q.scalar_type() == at::kBFloat16 && ssm_state.scalar_type() == at::kFloat &&
+                   ssm_state.is_contiguous();
+#ifdef USE_GDN_JIT
+  use_chunk = use_chunk && is_bmg();
+#endif
+  if (use_chunk) {
+    // Device-side construction of the per-sequence 64-aligned layout, with NO
+    // host<->device sync. The chunk kernels expect each sequence's tokens at
+    // `padded_start(seq) + (t - seq_start(seq))`, where padded_start is the
+    // 64-aligned sum of the lengths of all earlier sequences (the same layout
+    // as the fused gdn_attention chunk path's workspace). All of the index
+    // math below is tensor ops on the device.
+    constexpr int64_t kChunk = gdn::chunk_size_xe2;  // 64
+    const int64_t B = num_prefills;
+    const int64_t tot = q.size(0);
+    auto qsl = query_start_loc.to(q.options().dtype(at::kLong)).contiguous();        // [B+1] int64, cu_seqlen
+    auto seq_starts = qsl.slice(0, 0, B);                                            // [B]
+    auto seq_lens = qsl.slice(0, 1, B + 1) - seq_starts;                             // [B]
+    auto aligned_lens = at::floor_divide(seq_lens + (kChunk - 1), kChunk) * kChunk;  // [B]
+    auto padded_start = aligned_lens.cumsum(0) - aligned_lens;                       // [B] aligned offsets
+    // Sequence id per token t. `query_start_loc` follows the cu_seqlen
+    // convention (qsl[0] == 0, non-decreasing, qsl[B] == tot), so for any
+    // valid t, #{boundaries c in qsl with c <= t} == seq_id + 1. This is the
+    // same upper-bound convention the op's other metadata paths use
+    // (sgl_kernel.inkling_sconv: searchsorted(cu, t, right=True) - 1). The
+    // clamp defends a contract violation (t < qsl[0]) instead of producing a
+    // negative index into the index_copy_ scatters below.
+    auto tok = at::arange(tot, qsl.options());
+    auto seq_id = at::searchsorted(qsl, tok, /*out_int32=*/false, /*right=*/true).sub_(1).clamp_(0, B - 1);
+    // dest[t] = position of token t in the padded [N]-slot layout: its
+    // position within its own sequence + that sequence's aligned start. The
+    // t -> dest(t) map is a bijection into B disjoint, in-range slot ranges
+    // (one 64-aligned block per sequence), so the scatters below never write
+    // the same slot twice and never read/write past the end of the buffers.
+    auto dest = tok - seq_starts.index_select(0, seq_id) + padded_start.index_select(0, seq_id);
+
+    auto sections =
+        gdn::gdn_workspace_sections(B, tot, B, q.size(1), v.size(1), q.size(2), v.size(2), 1, q.scalar_type());
+    auto normalized_q = torch::zeros(sections[0].shape, q.options());
+    auto normalized_k = torch::zeros(sections[1].shape, k.options());
+    auto padded_v = torch::zeros(sections[2].shape, v.options());
+    auto beta = torch::zeros(sections[3].shape, b.options().dtype(at::kFloat));
+    auto alpha = torch::zeros(sections[4].shape, a.options().dtype(at::kFloat));
+    // Scatter the real tokens into the padded slots; every other slot (the
+    // per-sequence trailing-frame inside each 64-aligned block, plus any slack
+    // the workspace rounds out with) stays at its zero init, which the chunk
+    // kernels multiply-out (those slots carry zero beta/a, so their
+    // contributions to W/U/state readouts are exactly zero). The zero init
+    // doubles as the per-sequence length mask, exactly as in the fused
+    // gdn_attention path's chunk_causal_conv1d workspace build.
+    const auto contiguous_q = q.contiguous();
+    const auto contiguous_k = k.contiguous();
+    const auto contiguous_v = v.contiguous();
+    normalized_q.index_copy_(0, dest, contiguous_q);
+    normalized_k.index_copy_(0, dest, contiguous_k);
+    padded_v.index_copy_(0, dest, contiguous_v);
+    // The gates are head-major in the chunk workspace ([head, slot]); the
+    // caller's [token, head] layout is transposed on the fly during the
+    // scatter. `b` is sigmoided (the chunk kernels expect beta = sigmoid(b);
+    // the sequential kernel applies sigmoid itself). `a` stays raw (the
+    // prepare kernel applies dt_bias + softplus + A_log, matching the fused
+    // path's contract).
+    beta.index_copy_(1, dest, b.to(at::kFloat).sigmoid().transpose(0, 1));
+    alpha.index_copy_(1, dest, a.to(at::kFloat).transpose(0, 1));
+    l2norm(queue, normalized_q, normalized_k);
+    // The mask batch-size must equal the kernel's (B == numel(qsl) - 1);
+    // materialize the explicit all-True mask when the caller passed None.
+    std::optional<torch::Tensor> initial_state;
+    if (has_initial_state.has_value()) {
+      initial_state = has_initial_state->contiguous();
+    } else {
+      initial_state = torch::ones({B}, q.options().dtype(at::kBool));
+    }
+    chunk_gated_delta_rule(
+        queue,
+        core_attn_out,
+        normalized_q,
+        normalized_k,
+        padded_v,
+        beta,
+        alpha,
+        A_log,
+        dt_bias,
+        ssm_state,
+        query_start_loc,
+        cache_indices,
+        initial_state,
+        static_cast<int>(num_prefills),
+        static_cast<int>(num_decodes));
+    return;
+  }
+  // Sequential fallback. The recurrent kernel indexes q/k/v/b/a as packed
+  // C-contiguous rows with NO stride information (e.g. `q[t * num_k_heads *
+  // head_k_dim + ...]`), so any strided caller view -- e.g. q/k/v split out of
+  // one packed projection tensor -- would be silently misread. Make every one
+  // of them contiguous up front. `.contiguous()` is a no-op (alias, no copy)
+  // when the tensor is already contiguous, so the common case costs nothing.
   std::optional<torch::Tensor> no_num_accepted_tokens{std::nullopt};
+  const auto contiguous_q = q.contiguous();
+  const auto contiguous_k = k.contiguous();
+  const auto contiguous_v = v.contiguous();
+  const auto contiguous_b = b.contiguous();
+  const auto contiguous_a = a.contiguous();
   gdn::gated_delta_rule(
       queue,
       core_attn_out,
-      q,
-      k,
-      v,
-      b,
-      a,
+      contiguous_q,
+      contiguous_k,
+      contiguous_v,
+      contiguous_b,
+      contiguous_a,
       A_log,
       dt_bias,
       ssm_state,

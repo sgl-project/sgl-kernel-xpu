@@ -818,6 +818,51 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("gated_delta_rule_verify", torch::kXPU, &gated_delta_rule_verify);
 #endif  // USE_GDN
 
+#if SYCL_INTEL_TARGET == 20 && defined(USE_MONO_DECODE)
+  /* Qwen3.5 / Qwen3.6 MoE decode (sgl_kernel.qwen35_decode, TP2) */
+  m.def("qwen35_supported(int device) -> bool");
+  m.impl("qwen35_supported", c10::DispatchKey::BackendSelect, &qwen35_supported);
+  m.def("qwen35_max_context() -> int");
+  m.impl("qwen35_max_context", c10::DispatchKey::BackendSelect, &qwen35_max_context);
+  m.def("qwen35_work_groups(int device) -> int");
+  m.impl("qwen35_work_groups", c10::DispatchKey::BackendSelect, &qwen35_work_groups);
+  m.def("qwen35_force_work_groups(int n) -> ()");
+  m.impl("qwen35_force_work_groups", c10::DispatchKey::BackendSelect, &qwen35_force_work_groups);
+  m.def("qwen35_sizes() -> int[]");
+  m.impl("qwen35_sizes", c10::DispatchKey::BackendSelect, &qwen35_sizes);
+  m.def("qwen35_mailbox_never() -> int");
+  m.impl("qwen35_mailbox_never", c10::DispatchKey::BackendSelect, &qwen35_mailbox_never);
+  m.def("qwen35_prepare_layer(bool attn, Tensor[] tensors) -> Tensor[]");
+  m.impl("qwen35_prepare_layer", torch::kXPU, &qwen35_prepare_layer);
+  m.def("qwen35_layer_desc(bool attn, Tensor[] tensors, Tensor mailbox, Tensor peer_mailbox) -> Tensor");
+  m.impl("qwen35_layer_desc", torch::kXPU, &qwen35_layer_desc);
+  m.def("qwen35_mtp_desc(Tensor[] tensors, Tensor mailbox, Tensor peer_mailbox, int rank) -> Tensor");
+  m.impl("qwen35_mtp_desc", torch::kXPU, &qwen35_mtp_desc);
+  m.def(
+      "qwen35_bind_gdn_caches(Tensor(a!) desc, Tensor conv, Tensor ssm, Tensor? inter_ssm, Tensor? inter_conv) -> ()");
+  m.impl("qwen35_bind_gdn_caches", torch::kXPU, &qwen35_bind_gdn_caches);
+  m.def("qwen35_bind_attn_caches(Tensor(a!) desc, Tensor k, Tensor v, int page_size) -> ()");
+  m.impl("qwen35_bind_attn_caches", torch::kXPU, &qwen35_bind_attn_caches);
+  m.def(
+      "qwen35_init_counters(Tensor(a!) counters, Tensor(b!) health, Tensor(c!) health_host, float deadline_s, "
+      "Tensor? peer_health=None) -> ()");
+  m.impl("qwen35_init_counters", torch::kXPU, &qwen35_init_counters);
+  m.def(
+      "qwen35_decode_step(int mode, int i0, int i1, Tensor(e!)? ar, Tensor layers, int l0, int l1, Tensor hidden, "
+      "Tensor residual, Tensor(a!) hid_out, "
+      "Tensor(b!) res_out, Tensor positions, Tensor(c!) workspace, Tensor(d!) counters, int tokens=1, "
+      "Tensor? state_idx=None, Tensor? page_table=None, Tensor? seq_lens=None, Tensor? out_loc=None) -> bool");
+  m.impl("qwen35_decode_step", torch::kXPU, &qwen35_decode_step);
+  m.def(
+      "qwen35_mtp_prologue(Tensor desc, Tensor embed, Tensor hidden, Tensor(a!) out, Tensor(b!) workspace, "
+      "Tensor(c!) counters) -> bool");
+  m.impl("qwen35_mtp_prologue", torch::kXPU, &qwen35_mtp_prologue);
+  m.def("qwen35_split_ar_slots(Tensor layers, int l0, int l1) -> int[]");
+  m.impl("qwen35_split_ar_slots", torch::kCPU, &qwen35_split_ar_slots);
+  m.def("qwen35_fault_inject(Tensor(a!) counters, int delta, bool arrivals=False) -> ()");
+  m.impl("qwen35_fault_inject", torch::kXPU, &qwen35_fault_inject);
+#endif  // Xe20 only Qwen3.5 decode (USE_MONO_DECODE)
+
   /*
    * Mamba causal conv1d (XPU)
    */

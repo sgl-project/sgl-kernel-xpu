@@ -176,6 +176,10 @@ add_subdirectory(${SGL_OPS_XPU_ROOT}/src)
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl_kernel/jit_kernel
         DESTINATION sgl_kernel/include/sgl_kernel
         FILES_MATCHING PATTERN "*.hpp")
+# The decode stage library, for JIT kernels that fuse stages
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/sgl_kernel/stage
+        DESTINATION sgl_kernel/include/sgl_kernel
+        FILES_MATCHING PATTERN "*.hpp")
 
 if(SGL_BUILD_MEMORY_MONITOR)
   install(CODE

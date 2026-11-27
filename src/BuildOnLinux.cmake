@@ -300,6 +300,16 @@ if(USE_MOE AND NOT USE_SYCL_JIT
    sgl-ops-sycl-GroupGemmW8A16Xe20
    PUBLIC sgl-ops-sycl-GroupGemmW8A16Xe20_inst)
 endif()
+# The Qwen3.5 decode ops call the layer launchers (each launcher source is its
+# own library).
+if(TARGET sgl-ops-sycl-qwen35_decode)
+  foreach(_launch gdn attn gdn_verify attn_verify mtp gdn_split attn_split gdn_verify_split attn_verify_split
+          b60_gdn b60_attn b60_gdn_verify b60_attn_verify b60_mtp)
+    foreach(_dt fp16 bf16)
+      target_link_libraries(sgl-ops-sycl-qwen35_decode PUBLIC sgl-ops-sycl-qwen35_${_launch}_launch_${_dt})
+    endforeach()
+  endforeach()
+endif()
 endif() # DPCPP_SYCL_TARGET MATCHES "bmg" (xe20 kernels)
 
 # chunk_gated_delta_rule.cpp lives in the common (non-arch-specific) bucket, so

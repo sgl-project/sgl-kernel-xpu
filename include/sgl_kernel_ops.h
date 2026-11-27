@@ -1762,4 +1762,63 @@ std::tuple<at::Tensor, at::Tensor> minimax_decode_topk_page_table(
     int64_t topk,
     int64_t page_size);
 
+/*
+ * Qwen3.5 / Qwen3.6 MoE decode (Xe2, USE_MONO_DECODE): one resident kernel per
+ * decoder layer at TP2, the TP all-reduces done inside the kernel through a
+ * P2P mailbox in the peer card's memory (src/sycl/models/qwen35/xe20/).
+ */
+bool qwen35_supported(int64_t device);
+int64_t qwen35_max_context();
+int64_t qwen35_work_groups(int64_t device);
+void qwen35_force_work_groups(int64_t n);
+std::vector<int64_t> qwen35_sizes();
+int64_t qwen35_mailbox_never();
+std::vector<at::Tensor> qwen35_prepare_layer(bool attn, const std::vector<at::Tensor>& tensors);
+at::Tensor qwen35_layer_desc(
+    bool attn, const std::vector<at::Tensor>& tensors, const at::Tensor& mailbox, const at::Tensor& peer_mailbox);
+at::Tensor qwen35_mtp_desc(
+    const std::vector<at::Tensor>& tensors, const at::Tensor& mailbox, const at::Tensor& peer_mailbox, int64_t rank);
+void qwen35_bind_gdn_caches(
+    at::Tensor& desc,
+    const at::Tensor& conv,
+    const at::Tensor& ssm,
+    const std::optional<at::Tensor>& inter_ssm,
+    const std::optional<at::Tensor>& inter_conv);
+void qwen35_bind_attn_caches(at::Tensor& desc, const at::Tensor& k, const at::Tensor& v, int64_t page_size);
+void qwen35_init_counters(
+    at::Tensor& counters,
+    at::Tensor& health,
+    at::Tensor& health_host,
+    double deadline_s,
+    const std::optional<at::Tensor>& peer_health);
+bool qwen35_decode_step(
+    int64_t mode,
+    int64_t i0,
+    int64_t i1,
+    const std::optional<at::Tensor>& ar,
+    const at::Tensor& layers,
+    int64_t l0,
+    int64_t l1,
+    const at::Tensor& hidden,
+    const at::Tensor& residual,
+    at::Tensor& hid_out,
+    at::Tensor& res_out,
+    const at::Tensor& positions,
+    at::Tensor& workspace,
+    at::Tensor& counters,
+    int64_t tokens,
+    const std::optional<at::Tensor>& state_idx,
+    const std::optional<at::Tensor>& page_table,
+    const std::optional<at::Tensor>& seq_lens,
+    const std::optional<at::Tensor>& out_loc);
+bool qwen35_mtp_prologue(
+    const at::Tensor& desc,
+    const at::Tensor& embed,
+    const at::Tensor& hidden,
+    at::Tensor& out,
+    at::Tensor& workspace,
+    at::Tensor& counters);
+std::vector<int64_t> qwen35_split_ar_slots(const at::Tensor& layers, int64_t l0, int64_t l1);
+void qwen35_fault_inject(at::Tensor& counters, int64_t delta, bool arrivals);
+
 #pragma GCC visibility pop

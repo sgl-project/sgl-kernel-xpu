@@ -28,7 +28,16 @@ def _gate_ref(x, gate, other, indices):
 
 
 @pytest.mark.parametrize(
-    "rows,hidden,num_indices", [(0, 128, 4), (7, 96, 5), (13, 5376, 3), (16, 128, 4)]
+    "rows,hidden,num_indices",
+    [
+        (0, 100, 4),
+        (3, 0, 5),
+        (7, 96, 5),
+        (13, 5376, 3),
+        (16, 128, 4),
+        (64, 97, 4),
+        (128, 98, 4),
+    ],
 )
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_indexed_scale_shift_bf16(rows, hidden, num_indices, index_dtype):
@@ -49,7 +58,16 @@ def test_indexed_scale_shift_bf16(rows, hidden, num_indices, index_dtype):
 
 
 @pytest.mark.parametrize(
-    "rows,hidden,num_indices", [(0, 128, 4), (7, 96, 5), (13, 5376, 3), (16, 128, 4)]
+    "rows,hidden,num_indices",
+    [
+        (0, 100, 4),
+        (3, 0, 5),
+        (7, 96, 5),
+        (13, 5376, 3),
+        (16, 128, 4),
+        (64, 97, 4),
+        (128, 98, 4),
+    ],
 )
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_indexed_gate_bf16(rows, hidden, num_indices, index_dtype):

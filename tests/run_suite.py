@@ -85,6 +85,7 @@ suites = {
         TestFile("test_sconv_update_sconv_cache.py"),
         TestFile("test_topk_transform.py"),
         TestFile("test_inkling_attn_prologue.py"),
+        TestFile("test_indexed_modulation.py"),
         TestFile("test_hisparse.py"),
         TestFile("test_kvcacheio.py"),
         TestFile("speculative/test_build_eagle_tree.py"),

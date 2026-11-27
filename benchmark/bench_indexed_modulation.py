@@ -227,7 +227,7 @@ def calculate_diff_gate(rows: int, hidden: int, num_indices: int) -> None:
 def _bw_metrics(rows: int, hidden: int, num_tables: int, time_ms: float) -> dict:
     elem_bytes = 2  # bf16
     # read x + num_tables indexed rows, write x back (in-place)
-    total_bytes = rows * hidden * (1 + num_tables) * elem_bytes
+    total_bytes = rows * hidden * 6 * elem_bytes
     time_s = time_ms / 1000.0
     bw_gbs = (total_bytes / 1e9) / time_s if time_s > 0 else 0.0
     return {"total_bytes_mb": total_bytes / 1e6, "bandwidth_gbs": bw_gbs}

@@ -463,21 +463,48 @@ def _flash_attn_with_kvcache_page_size_1(
         max_seqlen_q = q.size(1)
         q = q.reshape(-1, q.size(-2), q.size(-1)).contiguous()
 
-    seqlens = cache_seqlens.long()
     num_slots = page_table.shape[1]
-    # page_table packs the valid (occupied) slots first per row, so masking
-    # by cache_seqlens and flattening yields slots in cu_seqlens_k order.
-    valid = torch.arange(num_slots, device=page_table.device).unsqueeze(
-        0
-    ) < seqlens.unsqueeze(1)
-    flat_slots = page_table.long()[valid]
+    if page_table.shape[0] == 1:
+        # One request: the row is a valid prefix plus -1 padding. Gathering a
+        # fixed-width row keeps the index count static, so an XPU graph can
+        # capture it. Boolean masking cannot (Level Zero error 44).
+        # cu_seqlens_k limits the varlen kernel to the occupied prefix.
+        #
+        # The slot indices are clamped into range first: an unclamped gather
+        # reads the -1 padding as an out-of-bounds index. Clamped entries
+        # land in the tail past cache_seqlens, which the kernel never
+        # attends to, so the result is unchanged.
+        #
+        # Outside graph capture the row is sliced to the live length first,
+        # so the gather costs the real sequence length instead of the full
+        # table width. During capture the width stays at num_slots, the
+        # static shape the graph was captured with.
+        capturing = getattr(torch.xpu, "is_current_stream_capturing", None)
+        if capturing is not None and capturing():
+            width = num_slots
+        else:
+            width = max(int(cache_seqlens.max().item()), 1)
+        flat_slots = (
+            page_table.reshape(-1)[:width]
+            .to(torch.int64)
+            .clamp(min=0, max=num_blocks - 1)
+        )
+        max_seqlen_k = width
+    else:
+        seqlens = cache_seqlens.long()
+        # page_table packs the valid (occupied) slots first per row, so masking
+        # by cache_seqlens and flattening yields slots in cu_seqlens_k order.
+        valid = torch.arange(num_slots, device=page_table.device).unsqueeze(
+            0
+        ) < seqlens.unsqueeze(1)
+        flat_slots = page_table.long()[valid]
+        max_seqlen_k = int(seqlens.max().item()) if seqlens.numel() > 0 else 0
     k_ragged = k_flat.index_select(0, flat_slots).contiguous()
     v_ragged = v_flat.index_select(0, flat_slots).contiguous()
 
     cu_seqlens_k = torch.nn.functional.pad(
         torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32), (1, 0)
     )
-    max_seqlen_k = int(seqlens.max().item()) if seqlens.numel() > 0 else 0
 
     result = flash_attn_varlen_func(
         q,

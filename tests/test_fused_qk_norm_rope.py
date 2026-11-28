@@ -1408,8 +1408,8 @@ def _eager_rope(x, cos_sin_cache, rope_dim, is_neox):
 # rope_dims include MiniMax-H3's 96 of 128 (a non-power-of-2 rotary lane count). Q and K
 # are GQA views of one packed qkv buffer; scales cover unit and large activations.
 # Measured: a different fp32 summation order changes a few elements per 10M; 32768 rows
-# expose one in every case. The last row is MiniMax-H3's DiT attention per rank (TP4 of
-# 56 heads, 5 s at 768p) with positions 0..N-1 as the model passes them.
+# expose one in every case. The last rows are MiniMax-H3's DiT attention (MHA, 56 heads
+# split over TP, head_dim 128, rope_dim 96) with positions 0..N-1 as the model passes them.
 @pytest.mark.parametrize(
     "num_tokens,num_qo_heads,num_kv_heads,head_dim,is_neox,rope_dim,shuffle_positions",
     [
@@ -1421,7 +1421,9 @@ def _eager_rope(x, cos_sin_cache, rope_dim, is_neox):
         (32768, 14, 2, 64, False, 64, True),
         (32768, 14, 2, 128, False, 96, True),
         (32768, 14, 2, 128, False, 128, True),
-        (18880, 14, 14, 128, True, 96, False),  # MiniMax-H3
+        (18880, 14, 14, 128, True, 96, False),  # MiniMax-H3, TP 4 (5 s at 768p)
+        (18880, 7, 7, 128, True, 96, False),  # MiniMax-H3, TP 8: odd head count
+        (37, 56, 56, 128, True, 96, False),  # MiniMax-H3, TP 1: odd token count
     ],
 )
 @pytest.mark.parametrize("scale", [1.0, 30.0])
